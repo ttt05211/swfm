@@ -47,70 +47,19 @@ commit: 64959840a9a4cb54d5b0f6cd4bc6779bb242a853
 
 ## 4. 合并前已修复的问题
 
-### Bug 1：future-only window 可能看不到历史运动
-最初只用 future KTA tube 规划窗口，会让远期 target window 看不到历史位置。
-
-### Bug 2：history-only window 会浪费 MAX_WINDOWS
-反向把 `historical moving + future KTA` 全部当 required support 后，会产生 history-only window；但不同 window 之间没有跨窗口通信，因此它并不能帮助另一个 future window。
-
-最终 contract：
-
-```text
-generation_support -> required future support，决定哪些窗口必须打开
-planning_support   -> context tie-break，只影响候选窗口位置
-```
-
-每一个 selected window 都必须由未覆盖的 future target 触发。
-
-### Bug 3：window 丢失 50×50 全局位置
-现在保存 `window_origin`，从完整 absolute position table 中裁剪对应位置。
-
-### Bug 4：position table convention 与官方不一致
-官方不是简单 50×50 sin-cos，而是 51×51 后截断前 2500 token。当前实现严格复现这一顺序后再 crop，尽量保持 pretrained positional convention。
-
-### Bug 5：position crop 每个 NFE CPU/GPU 同步
-移除逐 window `.tolist()`，改为 GPU tensor vectorized indexing。
-
-### Bug 6：greedy planner 在 GPU 上 Python 同步
-50×50 planner 固定在 CPU 一次运行，origins 再传回 device。
-
-### Bug 7：MAX_WINDOWS 静默截断
-新增 `window_coverage()`；trainer/sampler 默认要求 future generation-support coverage >= 95%，否则 hard fail。只有诊断时允许 `--allow-low-coverage`。
-
-### Bug 8：tiny cache 可能死循环
-- `drop_last=False`
-- empty dataset 直接报错
-- 整个 epoch 没有 active future window 直接报错
-
-### Bug 9：无 active sample 导致 0-batch
-采样时直接返回 `E(empty)` canvas，不进入 transition。
-
-### Bug 10：overlap window 写入顺序依赖
-改为 latent average scatter。
-
-### Bug 11：50×50 -> 20×20 checkpoint shape mismatch
-`load_shape_safe()` 只加载 key 和 shape 都匹配的 tensor，并显式报告 skip。
-
-### Bug 12：M_gen 被错误当 overwrite mask
-最终使用 Static-Protected Motion Composition：
-
-```text
-M_gen               -> computation mask
-confident_static     -> write protection
-WM dynamic semantics -> actual dynamic writes
-```
-
-### Bug 13：Moving-mIoU v2 跨 horizon 错误 micro 聚合
-新增 `MovingMIoUV2MultiHorizon`，强制：
-
-```text
-mIoU@1s
-mIoU@2s
-mIoU@3s
--> arithmetic mean
-```
-
-而不是把三个 horizon 的 voxel/support 混在一起算一次。
+1. **future-only window 可能看不到历史运动**：引入 context support。
+2. **history-only window 会浪费 MAX_WINDOWS**：最终规定 `generation_support` 是 required future support；`planning_support` 只做 context tie-break，每个 selected window 都必须由未覆盖的 future target 触发。
+3. **window 丢失 50×50 全局位置**：保存 `window_origin` 并裁剪 absolute position。
+4. **position convention 与官方不一致**：严格复现官方 51×51 后截断前 2500 token 的顺序。
+5. **position crop 每个 NFE CPU/GPU 同步**：改为 GPU vectorized indexing。
+6. **greedy planner 在 GPU 上 Python 同步**：50×50 planner 固定在 CPU 一次运行。
+7. **MAX_WINDOWS 静默截断**：trainer/sampler 默认要求 future generation-support coverage >= 95%，否则 hard fail。
+8. **tiny cache 可能死循环**：`drop_last=False`、empty dataset hard fail、整 epoch 无 active future window hard fail。
+9. **无 active sample 导致 0-batch**：采样时直接返回 `E(empty)` canvas。
+10. **overlap window 写入顺序依赖**：latent average scatter。
+11. **50×50 -> 20×20 checkpoint shape mismatch**：`load_shape_safe()` 只加载 key 和 shape 均匹配的 tensor。
+12. **M_gen 被错误当 overwrite mask**：使用 Static-Protected Motion Composition；`M_gen` 只控制计算，`confident_static` 控制写保护。
+13. **Moving-mIoU v2 跨 horizon 错误 micro 聚合**：新增 `MovingMIoUV2MultiHorizon`，强制 mIoU@1s、@2s、@3s 后做 arithmetic mean。
 
 ## 5. 已完成测试
 
@@ -121,16 +70,7 @@ python -m py_compile: PASS
 pytest: 8 passed
 ```
 
-覆盖：
-1. horizon-dependent motion tube；
-2. GT coverage / active ratio；
-3. window crop/scatter；
-4. history context 不单独创建无用 window；
-5. MAX_WINDOWS truncation detection；
-6. static-protected composition；
-7. Moving-mIoU v2 0.5m/s 等号边界；
-8. dual-box support trailing ghost / missed arrival；
-9. frozen Moving-mIoU v2 horizon-first aggregation。
+覆盖 motion tube、GT coverage / active ratio、window crop/scatter、history context 不单独创建无用 window、MAX_WINDOWS truncation、static-protected composition、Moving-mIoU v2 0.5m/s 边界、dual-box trailing ghost/missed arrival，以及 horizon-first aggregation。
 
 ## 6. 当前已知但必须用数据验证的 v1 边界
 
@@ -157,15 +97,7 @@ True-moving-only
 - SE3-static + GT-moving oracle headroom。
 
 ### Checkpoint integration
-第一次 tiny run 必须记录：
-
-```text
-loaded tensors / target tensors
-shape-skipped
-missing
-```
-
-如果除新 prior / expected positional item 外还有大量 skip，先停。
+第一次 tiny run 必须记录 `loaded tensors / target tensors / shape-skipped / missing`。如果除新 prior / expected positional item 外还有大量 skip，先停。
 
 ### Tiny overfit
 64/128 windows。训练集都学不上去，不进入 full training。
