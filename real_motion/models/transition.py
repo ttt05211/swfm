@@ -41,12 +41,11 @@ class MotionWindowFlowMatching(FLOW_MATCHING_DOWN_X4_DiT):
             if self.pos_embed.shape[1]!=hw[0]*hw[1]: raise RuntimeError("local pos_embed shape mismatch")
             return self.pos_embed.to(device=device,dtype=dtype)
         if origins.shape!=(batch_size,2): raise ValueError(f"window_origins must be [B,2], got {tuple(origins.shape)}")
-        ph,pw=hw; crops=[]; grid=self.absolute_pos_embed[0]
-        for bi in range(batch_size):
-            y,x0=[int(v) for v in origins[bi].tolist()]
-            if y<0 or x0<0 or y+ph>grid.shape[0] or x0+pw>grid.shape[1]: raise ValueError(f"window origin {(y,x0)} out of full latent bounds")
-            crops.append(grid[y:y+ph,x0:x0+pw].reshape(ph*pw,-1))
-        pos=torch.stack(crops,dim=0).to(device=device,dtype=dtype); return repeat(pos,'b n d -> (b f) n d',f=frames)
+        ph,pw=hw; origins=origins.to(device=self.absolute_pos_embed.device,dtype=torch.long); max_y=self.absolute_pos_embed.shape[1]-ph; max_x=self.absolute_pos_embed.shape[2]-pw
+        if bool(((origins[:,0]<0)|(origins[:,0]>max_y)|(origins[:,1]<0)|(origins[:,1]>max_x)).any()): raise ValueError("window origin out of full latent bounds")
+        yy=origins[:,0,None,None]+torch.arange(ph,device=origins.device)[None,:,None]; xx=origins[:,1,None,None]+torch.arange(pw,device=origins.device)[None,None,:]
+        grid=self.absolute_pos_embed[0]; pos=grid[yy.expand(-1,-1,pw),xx.expand(-1,ph,-1)]; pos=pos.reshape(batch_size,ph*pw,-1).to(device=device,dtype=dtype)
+        return repeat(pos,'b n d -> (b f) n d',f=frames)
 
     def forward_single(self,x,timesteps=None,trajectory=None,prior_condition=None,window_origins=None,**kwargs):
         if prior_condition is None: prior_condition=torch.zeros(x.shape[0],x.shape[1],self.prior_proj.in_features,x.shape[-2],x.shape[-1],dtype=x.dtype,device=x.device)
