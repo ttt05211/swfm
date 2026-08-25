@@ -17,19 +17,19 @@ class WindowPlanner:
         if support.ndim==4: union=support.bool().any(dim=1)
         elif support.ndim==3: union=support.bool()
         else: raise ValueError("support must be [B,T,H,W] or [B,H,W]")
-        b,h,w=union.shape; wh,ww=self.window_hw
+        out_device=union.device; union_cpu=union.detach().cpu(); b,h,w=union_cpu.shape; wh,ww=self.window_hw
         if wh>h or ww>w: raise ValueError("window cannot be larger than latent map")
-        origins=torch.full((b,self.max_windows,2),-1,dtype=torch.long,device=union.device); valid=torch.zeros((b,self.max_windows),dtype=torch.bool,device=union.device)
+        origins=torch.full((b,self.max_windows,2),-1,dtype=torch.long); valid=torch.zeros((b,self.max_windows),dtype=torch.bool)
         for bi in range(b):
-            remaining=union[bi].clone()
+            remaining=union_cpu[bi].clone()
             for ki in range(self.max_windows):
                 if not remaining.any(): break
                 ys,xs=torch.where(remaining); y0=max(0,min(int(ys[0])-wh//2,h-wh)); x0=max(0,min(int(xs[0])-ww//2,w-ww)); best=(int(remaining[y0:y0+wh,x0:x0+ww].sum()),y0,x0); stride=max(1,len(ys)//64)
                 for y,x in zip(ys[::stride],xs[::stride]):
                     cy=max(0,min(int(y)-wh//2,h-wh)); cx=max(0,min(int(x)-ww//2,w-ww)); score=int(remaining[cy:cy+wh,cx:cx+ww].sum())
                     if score>best[0]: best=(score,cy,cx)
-                _,y0,x0=best; origins[bi,ki]=torch.tensor([y0,x0],device=origins.device); valid[bi,ki]=True; remaining[y0:y0+wh,x0:x0+ww]=False
-        return WindowPlan(origins,valid,self.window_hw,(h,w))
+                _,y0,x0=best; origins[bi,ki]=torch.tensor([y0,x0]); valid[bi,ki]=True; remaining[y0:y0+wh,x0:x0+ww]=False
+        return WindowPlan(origins.to(out_device),valid.to(out_device),self.window_hw,(h,w))
 
 def crop_windows(x:torch.Tensor,plan:WindowPlan)->torch.Tensor:
     if x.shape[0]!=plan.origins.shape[0] or tuple(x.shape[-2:])!=plan.full_hw: raise ValueError("input and WindowPlan shape mismatch")
