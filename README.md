@@ -4,29 +4,33 @@
 
 ## 0. 仓库结构
 
-官方 OccFM 作为 submodule 固定在：
+官方 OccFM 固定为 submodule：
 
 ```text
 upstream_occfm -> Orbis36/OccFM-NeurIPS2025
                   commit 64959840a9a4cb54d5b0f6cd4bc6779bb242a853
 ```
 
-我们的实现放在 `real_motion/`、`tools/real_motion/`，不直接魔改官方目录，便于复用 checkpoint、对照 baseline 和以后同步上游。
+我们的代码放在 `real_motion/`、`tools/real_motion/`、`tests/`，不直接魔改官方源码。
 
 首次使用：
 
 ```bash
 git clone --recurse-submodules https://github.com/ttt05211/swfm.git
 cd swfm
-git checkout feat/real-motion-occfm
 git submodule update --init --recursive
 ```
 
----
+已有仓库：
 
-## 1. 方法最终定义
+```bash
+git pull
+git submodule update --init --recursive
+```
 
-历史 occupancy 先 ego-compensate，再按**真实历史运动**划分：
+## 1. 方法定义
+
+历史 occupancy 先做 ego compensation，再按真实历史运动划分：
 
 - `confident_static`
 - `moving`
@@ -34,47 +38,26 @@ git submodule update --init --recursive
 
 处理方式：
 
-1. `confident_static`：不用生成模型，按 benchmark 允许的 future ego pose 做 `SE(3)` transport；
-2. `moving + uncertain`：用 causal KTA 外推；
-3. KTA **不是最终预测器**，只负责：
-   - future motion prior；
-   - future motion tube / sparse computation support；
-4. VAE 完全冻结；static/KTA/moving/target latent 均可在训练前离线缓存；
+1. `confident_static`：不用生成模型，直接通过 benchmark 允许的 future ego `SE(3)` transport；
+2. `moving + uncertain`：由 causal KTA 外推；
+3. KTA **不是最终预测器**，只提供 future motion prior 和 sparse computation support；
+4. VAE 完全冻结；训练前缓存 moving/static/KTA/target latent；
 5. Sparse WM 直接预测 future moving latent，**不预测 KTA residual**；
-6. 最终使用 `Static-Protected Motion Composition`，`M_gen` 只决定哪里计算，不等于哪里覆盖 static。
+6. 最终使用 Static-Protected Motion Composition，`M_gen` 只是 compute mask，不是 overwrite mask。
 
-### 为什么不是 packed-token DiT v1
+### 为什么 v1 是 motion-window sparse backend
 
-官方 OccFM transition 不是纯 token Transformer，而是：
+官方 OccFM transition 是 `Conv3d + temporal attention + U-Net down/up + DiT blocks`，latent spatial size 为 `50x50`。直接改成任意长度 packed tokens 会丢掉大量 checkpoint 可复用结构。
 
-```text
-Conv3d + temporal attention + U-Net down/up + DiT blocks
-```
-
-官方 latent grid 是 `50x50`。直接改成任意长度 token 会让大量 Conv/U-Net checkpoint 无法复用。
-
-因此当前 v1 使用 **motion-window sparse backend**：
-
-- 在 50x50 latent support 上选择少量固定窗口，默认 20x20；
-- 只对这些窗口运行 OccFM transition backbone；
-- overlapping windows 在 latent 空间平均 scatter；
-- support/cache API 与 backend 解耦，以后可替换 packed-token backend。
-
-这是真正减少 world-model 计算，而不是在 dense 50x50 输出上乘一个 mask。
-
----
+因此 v1 在 50x50 latent grid 上选少量固定窗口（默认 20x20），只对这些窗口运行 transition model，再 scatter 回完整 latent canvas。
 
 ## 2. 环境
-
-先按官方 OccFM 环境：
 
 ```bash
 conda create -n swfm python=3.10 -y
 conda activate swfm
-
 pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
   --index-url https://download.pytorch.org/whl/cu128
-
 pip install nuscenes_devkit matplotlib==3.10.3 einops einops_exts \
   pyyaml easydict wandb rich pytest
 ```
@@ -86,67 +69,49 @@ PYTHONPATH=$PWD/upstream_occfm:$PWD \
 python -c "from forecast.models.worldmodels.occfm import OccFM; print('OccFM import OK')"
 ```
 
----
-
-## 3. 正式训练前：必须先做 P0
+## 3. 正式训练前必须先做 P0
 
 ### P0-A：Frozen True-Motion Decomposition（第一个做）
 
-把你之前 semantic split 的实验换成 real-motion split：
+同一个 frozen OccFM checkpoint 分别跑：
 
-1. Full history
-2. true-static-only history
-3. true-moving-only history
-
-全部使用**同一个 frozen OccFM checkpoint**。
+```text
+Full
+True-static-only
+True-moving-only
+```
 
 重点比较：
 
 - Full vs true-static-only 的 true-static IoU；
-- Full vs true-moving-only 的 `Moving-mIoU v2`；
+- Full vs true-moving-only 的 Moving-mIoU v2；
 - mIoU / Dynamic-mIoU 作为辅助。
 
-判定：
-
-- 对应分支几乎不掉：继续 moving-only sparse WM；
-- true-moving-only 明显崩：先回到 full-latent masked formulation，不直接烧 full training。
-
-> P0-A 应复用你已有的 real-motion mask/KTA 生成代码。本仓库不会用 future GT 冒充 causal mask。
+如果 true-moving-only 明显崩，先停，不直接训练 sparse moving-only WM。
 
 ### P0-B：Sparsity + KTA Tube Coverage
 
-样本：
+输入样本：
 
 ```python
-{
-    "kta_support": Tensor[F,H,W],        # causal
-    "gt_moving_support": Tensor[F,H,W],  # 仅用于统计
-}
+{"kta_support": Tensor[F,H,W], "gt_moving_support": Tensor[F,H,W]}
 ```
 
 运行：
 
 ```bash
-PYTHONPATH=$PWD \
-python tools/real_motion/p0_support_stats.py \
-  --input data/p0_support.pt \
-  --radii 0,1,2,3,4,5
+PYTHONPATH=$PWD python tools/real_motion/p0_support_stats.py \
+  --input data/p0_support.pt --radii 0,1,2,3,4,5
 ```
 
-输出：
-
-```text
-radius,coverage,active_ratio
-```
-
-核心图：`GT Moving Coverage vs Active Token Ratio`。
+核心看 `GT Moving Coverage vs Active Token Ratio`。
 
 ### P0-C：Causal Blind-Spot Audit
 
 按 1s/2s/3s 统计：
 
-- historical stationary -> future moving 比例；
-- future moving 中 historical side 没有 causal support 的 innovation / entering-FOV 比例。
+- historical stationary -> future moving；
+- future moving 中 historical side 没有 causal support 的 innovation / entering-FOV。
 
 比例高时扩大 `uncertain`，不要把所有 stationary hard-freeze。
 
@@ -156,20 +121,9 @@ radius,coverage,active_ratio
 Oracle = SE3(true-static) + GT(true-moving)
 ```
 
-报告：
+报告 mIoU、Moving-mIoU v2 和 1s/2s/3s static accuracy。Oracle 没有足够 headroom 时不进入 full training。
 
-- mIoU
-- Moving-mIoU v2
-- 1s / 2s / 3s static branch accuracy
-
-Oracle 没有足够 headroom 时，先改 decomposition/fusion，不进入 full training。
-
-### P0-E / P0-F（低成本建议）
-
-- P0-E：frozen VAE true-moving reconstruction + `E(empty)` scatter sanity；
-- P0-F：profile 原 OccFM 的 VAE encoder / transition model / decoder / other latency。
-
----
+P0-E/P0-F 可顺手做 frozen-VAE true-moving reconstruction 和原 OccFM runtime breakdown。
 
 ## 4. Frozen Moving-mIoU v2
 
@@ -184,77 +138,43 @@ report horizons: 1s / 2s / 3s
 
 定义：
 
-1. 用 GT instance token 匹配 `t0` 和目标 future horizon 的同一实例；
-2. 世界坐标 XY interval speed：
-
-```text
-||c_GT(th,xy)-c_GT(t0,xy)|| / (th-t0) >= 0.5 m/s
-```
-
-则该实例为 Moving；
-3. 在目标 future ego grid 中：
+1. GT instance token 匹配 `t0` 与目标 horizon；
+2. 若世界坐标 XY interval speed >= 0.5 m/s，则为 Moving instance；
+3. future ego grid 中：
 
 ```text
 Support_h = GT Box(t0 -> h) UNION GT Box(th -> h)
 ```
 
-两个 box 都扩 0.5m；
-4. 只在 support 内统计动态 semantic classes，不统计 free/static；
-5. 动态类取 mIoU，再平均 1s/2s/3s。
+两个 box 均扩 0.5 m；
+4. 仅在 support 内统计动态 semantic classes，不统计 free/static；
+5. **先分别计算 mIoU@1s、mIoU@2s、mIoU@3s，再对三个 mIoU 做算术平均。禁止把三个 horizon 的 voxel/support 合并后做 micro mIoU。**
 
-双 support 同时惩罚：
-
-- trailing ghost：旧位置残留；
-- missed arrival：新位置缺失。
-
-future GT **只用于 post-hoc metric**。模型、KTA、WM inference 完全看不到 future GT。出生/消失/端点缺失实例排除并记录。
+双 support 同时惩罚 trailing ghost 和 missed arrival。future GT 只用于 post-hoc metric，模型/KTA/WM inference 完全看不到。
 
 核心实现：`real_motion/metrics/moving_miou_v2.py`。
 
----
+## 5. Frozen VAE latent cache
 
-## 5. Frozen VAE 与 real-motion latent cache
-
-训练时不重复跑 VAE。每个 sample 的 cache contract：
+每个训练 sample：
 
 ```python
 moving_history_latent  # [H,16,50,50]
-future_moving_latent   # [F,16,50,50]，训练 target
+future_moving_latent   # [F,16,50,50]
 static_future_latent   # [F,16,50,50]
 kta_future_latent      # [F,16,50,50]
-generation_support     # [F,50,50] bool：未来 compute/loss support
-planning_support       # [H+F,50,50] bool：建议提供，负责选窗口
+generation_support     # [F,50,50] required future support
+planning_support       # [T,50,50] optional context support
 ```
 
-可选：
-
-```python
-trajectory
-confident_static_mask
-gt_moving_support
-sample_id
-```
-
-检查：
+训练不重复运行 VAE。先检查：
 
 ```bash
-PYTHONPATH=$PWD \
-python tools/real_motion/validate_cache.py --cache data/real_motion_train.pt
+PYTHONPATH=$PWD python tools/real_motion/validate_cache.py \
+  --cache data/real_motion_train.pt
 ```
 
-你现有 preprocessing/KTA pipeline 需要先产生 occupancy-space：
-
-- historical true-moving OCC；
-- future SE3 static OCC；
-- future KTA OCC；
-- causal generation support；
-- future GT moving OCC（只作为训练 target）。
-
-再统一通过同一个官方 frozen VAE 编码并缓存。**不需要再训练小 encoder。**
-
----
-
-## 6. Motion-window planner
+## 6. Window planner：最终 contract
 
 默认：
 
@@ -263,30 +183,20 @@ WINDOW_HW: [20,20]
 MAX_WINDOWS: 8
 ```
 
-两个 support 必须分开：
+必须区分：
 
-- `planning_support`：选窗口，应该覆盖 historical moving 到 future KTA tube 的时空路径；
-- `generation_support`：未来 flow loss / compute mask。
+- `generation_support`：**required future support**，决定哪些窗口必须打开，同时作为 future flow-loss mask；
+- `planning_support`：historical moving + future KTA tube 等上下文，只做候选窗口的 context tie-break，**不能创建 history-only window**。
 
-如果只拿 future tube 选窗口，远期窗口可能把历史位置裁掉。
+原因：当前不同 window 之间没有跨窗口 attention。单独开的 history-only window 不能给另一个 future window 提供历史信息，只会浪费 `MAX_WINDOWS`。
 
-实际流程：
+trainer/sampler 默认要求 future `window_coverage >= 95%`，否则 hard fail；只有诊断时允许 `--allow-low-coverage`。
 
-1. 对 `planning_support` 沿时间取 union；
-2. 50x50 greedy planner 在 CPU 做一次，避免 Python `.item()` 对 CUDA 反复同步；
-3. origins 传回 GPU；
-4. crop history / target / static / KTA / loss mask；
-5. valid windows 展平到 batch；
-6. overlap scatter 做平均；
-7. trainer 计算 `window_coverage`，低于 95% 会报警，避免 `MAX_WINDOWS` 静默漏 support。
-
-代码：`real_motion/windows.py`。
-
----
+> v1 仍有需要数据验证的边界：如果高速目标的历史位置与 future target 间跨度超过单个 window，context tie-break 也不能跨窗口传信息。P0/tiny 阶段必须检查 history-context coverage；不足时先增大 window 或调整 backend，不要直接 full train。
 
 ## 7. Spatially Aligned Conditioning
 
-不用 global cross-attention。
+不用 global cross-attention：
 
 ```text
 prior = concat(static_latent, kta_latent)  # 32 channels
@@ -298,26 +208,13 @@ prior = concat(static_latent, kta_latent)  # 32 channels
    spatial / temporal DiT blocks
 ```
 
-官方 DiTBlock 的参数结构被保留，因此 attention/MLP/AdaLN 权重可以从官方 checkpoint 复用。
+`prior_proj` zero-init。每个 sparse window 使用其在原 50x50 grid 中的绝对位置。
 
-`prior_proj` zero-init：训练开始时新 prior 分支增量为 0。
+### Position convention
 
-### 绝对位置不能丢
-
-不同 window 不能都用同一套“局部 20x20 位置”。当前实现会根据每个 `window_origin`，从完整 `50x50` absolute sin-cos grid 中**向量化裁剪**对应 positional embedding，并在每个 window forward 使用。
-
-这样同时解决：
-
-- sparse crop 后丢失全局位置；
-- 每个 NFE 对 GPU origins `.tolist()` 造成 CPU-GPU 同步。
-
----
+官方 OccFM 对 2500 spatial tokens 实际使用 `grid_size=int(sqrt(N))+1=51` 的 sin-cos grid，再截断前 2500 token。当前实现严格复现这一 token 顺序，再按 `window_origin` 裁剪，避免无意更换 pretrained positional convention。
 
 ## 8. 官方 checkpoint 初始化
-
-不能直接 `strict=False`。
-
-50x50 -> 20x20 后，官方固定 `pos_embed` shape 不同；PyTorch 即使 `strict=False` 也不会自动忽略 tensor shape mismatch。
 
 使用：
 
@@ -325,20 +222,11 @@ prior = concat(static_latent, kta_latent)  # 32 channels
 real_motion/checkpoint.py::load_shape_safe
 ```
 
-只加载：
+只加载 key 和 shape 均匹配的 tensor，并打印复用/跳过统计。第一次服务器 tiny-run 必须检查 reuse report；除预期的新 prior/position 项外若大量 skip，立即停止训练排查。
 
-- key 匹配；
-- shape 完全匹配。
+## 9. Tiny-set overfit
 
-并打印 `loaded / target_total / skipped`。
-
-官方局部 `pos_embed` 因 shape 不同会跳过；实际运行的位置由上面的 50x50 absolute positional crop 提供。
-
----
-
-## 9. 第一场训练：Tiny-set Overfit
-
-先用 64/128 windows：
+先做 64/128 windows：
 
 ```bash
 PYTHONPATH=$PWD/upstream_occfm:$PWD \
@@ -346,51 +234,17 @@ python tools/real_motion/train_sparse.py \
   --cache data/real_motion_tiny.pt \
   --upstream-ckpt logs/occfm/2s_3s_nusc_hist_traj/ckpt/epoch=000199.ckpt \
   --output logs/real_motion/tiny_overfit.pt \
-  --window 20 \
-  --max-windows 8 \
-  --batch-size 2 \
-  --steps 2000 \
-  --lr 2e-5 \
-  --amp
+  --window 20 --max-windows 8 --batch-size 2 \
+  --steps 2000 --lr 2e-5 --amp
 ```
 
-先看：
+先确认 masked flow loss 能下降、train Moving-mIoU v2 能明显提高、window coverage 足够。tiny-set 都学不上去，不进入 full training。
 
-1. masked flow loss 是否持续下降；
-2. train Moving-mIoU v2 是否明显逼近 oracle；
-3. `window_coverage` 是否足够；
-4. active ratio 是否与 P0-B 一致；
-5. window boundary 是否出现 artifact。
+第一版 loss 只有 masked CFM / flow MSE，不加 ABE、Router、repair、preservation、confidence loss。
 
-**tiny-set 都学不上去，不进入 full training。**
+## 10. 稀疏采样
 
-第一版 loss 只有 masked CFM / flow MSE。不加 ABE、Router、repair、preservation、confidence loss。
-
----
-
-## 10. Small held-out -> Full training
-
-顺序固定：
-
-```text
-P0 -> tiny overfit -> small held-out -> freeze hyperparameters -> full training
-```
-
-不要绕过 small held-out 直接 full train。
-
----
-
-## 11. 稀疏采样
-
-先准备同一 frozen VAE 的：
-
-```text
-empty_latent = E(empty occupancy)
-```
-
-不能把数值 0 当成 empty latent。
-
-采样：
+`empty_latent.pt` 必须来自同一个 frozen VAE 的 `E(empty occupancy)`，不能拿数值 0 代替。
 
 ```bash
 PYTHONPATH=$PWD/upstream_occfm:$PWD \
@@ -402,96 +256,50 @@ python tools/real_motion/sample_sparse_latent.py \
   --window 20 --max-windows 8
 ```
 
-没有 active window 的样本直接返回 empty latent canvas，不会把 0-batch 喂给 transition。
+重叠 windows 在 latent 空间平均 scatter，再走官方 frozen decoder。
 
-重叠 windows 在 latent 上平均，然后用官方 frozen decoder 解出 moving occupancy。
+## 11. Static-Protected Motion Composition
 
----
+`M_gen` 是 computation mask，不是 overwrite mask。
 
-## 12. Static-Protected Motion Composition
+最终：
 
-`M_gen` 是 **computation mask，不是 overwrite mask**。
-
-最终规则：
-
-1. `SE3-static` 是 base；
+1. `SE3-static` 为 base；
 2. `confident_static` 永远保护；
 3. WM 只在非 confident-static 区域写动态 semantic prediction；
 4. dilation support 内的 empty/error 不允许擦掉 road/building。
 
-代码：`real_motion/composition.py`
+实现：`real_motion/composition.py`。
 
-命令工具：
+## 12. 第一版不加 confidence gate
 
-```bash
-PYTHONPATH=$PWD \
-python tools/real_motion/compose_occ.py \
-  --static-occ outputs/static.pt \
-  --wm-occ outputs/wm_dynamic.pt \
-  --conf-static outputs/conf_static.pt \
-  --dynamic-classes 1,2,3,4,5,6,7,8 \
-  --output outputs/final_occ.pt
-```
+训练后先统计：
 
-动态类别 ID 请按你实际 nuScenes occupancy label contract 替换，不能照抄示例。
-
----
-
-## 13. 第一版不加 confidence gate
-
-KTA 只是 prior，不是天然可靠 fallback。转弯/加速时需要 WM 推翻 KTA。
-
-训练后再统计：
-
-- voxel-level harm / repair；
-- instance / motion-tube harm / repair；
+- voxel-level harm/repair；
+- instance / motion-tube harm/repair；
 - oracle KTA-vs-WM selector headroom。
 
-只有 oracle selector headroom 很大才研究 gate。
-
-优先级：
+只有 oracle selector headroom 很大才研究 gate。优先级：
 
 ```text
 single-pass lightweight gate > multi-sampling > CFG
 ```
 
-CFG 最后考虑，因为会增加每个 ODE step 的 forward 次数，破坏效率主线。
+## 13. 困难机动分析
 
-诊断代码：`real_motion/metrics/diagnostics.py`。
-
----
-
-## 14. 困难机动分析
-
-不创造新主指标，只把 frozen Moving-mIoU v2 按 instance subset 重算。
-
-Motion subsets：
+Moving-mIoU v2 主定义不变，只做 subset analysis：
 
 - Uniform / Easy
 - Accel / Decel
 - Turning
 - Turning + Speed Change
-
-建议用 interval quantities：
-
-```text
-Delta v_h   = |v_h - v_0|
-Delta psi_h = |wrap(psi_h - psi_0)|
-```
-
-再按 post-hoc KTA center/yaw error 分：
-
-- KTA-Easy
-- KTA-Medium
-- KTA-Hard
+- KTA-Easy / Medium / Hard
 
 阈值只在 train/calibration side 冻结。
 
----
+## 14. 效率报告
 
-## 15. 效率报告
-
-至少：
+至少报告：
 
 - mIoU
 - Moving-mIoU v2
@@ -500,67 +308,38 @@ Delta psi_h = |wrap(psi_h - psi_0)|
 - end-to-end latency / FPS
 - 可选 peak GPU memory
 
-训练使用 latent cache 可以省重复 VAE；但**论文的在线端到端 FPS 必须把推理时一次性的 VAE condition encoding 算进去**。
+论文在线 FPS 必须包含 real-motion/KTA preprocessing、condition VAE encoding、window planning/crop、NFE sparse WM、scatter、decoder 和 composition；不能拿 cache-only 时间冒充端到端 FPS。
 
-微基准：
-
-```bash
-PYTHONPATH=$PWD/upstream_occfm:$PWD \
-python tools/real_motion/profile_backend.py --window 20 --batch 8
-```
-
----
-
-## 16. 单元测试
+## 15. 单元测试
 
 ```bash
 PYTHONPATH=$PWD/upstream_occfm:$PWD pytest -q tests
 ```
 
-当前测试覆盖：
+当前 merge-review：`python -m py_compile` PASS，`pytest` **8 passed**。覆盖 motion tube、coverage、crop/scatter、future-first window planning、truncation、static protection、0.5m/s metric 边界、dual-box support 和 horizon-first aggregation。
 
-- horizon-dependent motion tube；
-- coverage / active ratio；
-- window crop/scatter；
-- planning support 与 loss support 分离；
-- MAX_WINDOWS 截断 coverage；
-- static protection；
-- Moving-mIoU v2 的 0.5m/s 边界；
-- 双 box support 对 trailing ghost / missed arrival 的惩罚。
+## 16. 开发纪律
 
----
+1. 第一个实验永远先做 P0-A；
+2. future GT 不得进入 motion detector / KTA / M_gen；
+3. `generation_support != overwrite mask`；
+4. KTA 是 prior，不是最终答案；
+5. 第一版不做 residual repair；
+6. 第一版不加 Router/CFG/gate；
+7. tiny-set 不能 overfit 时不 full train；
+8. 效率同时看 FLOPs 与真实 latency；
+9. Moving-mIoU v2 contract 不随实验结果修改；
+10. 失败先定位 support / VAE / WM / composition，再改模型。
 
-## 17. 开发纪律
-
-1. **第一个实验永远先做 P0-A。**
-2. future GT 不得进入 motion detector / KTA / M_gen。
-3. `planning_support != generation_support`。
-4. `M_gen != overwrite mask`。
-5. KTA 是 prior，不是最终答案。
-6. 第一版不做 residual repair。
-7. 第一版不加 Router/CFG/gate。
-8. tiny-set 不能 overfit 时不 full train。
-9. 效率同时看 FLOPs 与真实 latency。
-10. Moving-mIoU v2 contract 不随实验结果修改。
-11. 失败时先定位 support / VAE / WM / composition，再改模型。
-
----
-
-## 18. 不提交 GitHub 的数据
+## 17. 不提交 GitHub 的数据
 
 - nuScenes
 - OccFM VAE / world-model checkpoints
 - KTA cache
 - real-motion latent cache
 
-如果 P0 临时使用 GT historical track，请明确标记为 **P0-only diagnostic**，不能作为最终 causal inference。
+## 18. 上游致谢
 
----
+本项目基于 `Orbis36/OccFM-NeurIPS2025`：*Towards foundational LiDAR world models with efficient latent flow matching*, NeurIPS 2025。请保留官方论文引用。
 
-## 19. 上游致谢
-
-本项目基于 `Orbis36/OccFM-NeurIPS2025`：
-
-*Towards foundational LiDAR world models with efficient latent flow matching*, NeurIPS 2025。
-
-请保留官方论文引用。
+更完整的合并前代码审查与服务器验收项见 `IMPLEMENTATION_REVIEW_CN.md`。
