@@ -17,7 +17,8 @@ def main():
     planner=WindowPlanner((a.window,a.window),a.max_windows); outputs=[]
     with torch.no_grad():
         for batch in dl:
-            batch={k:(v.to(dev) if torch.is_tensor(v) else v) for k,v in batch.items()}; plan=planner.plan(batch.get("planning_support",batch["generation_support"])); hist=crop_windows(batch["moving_history_latent"],plan); sta=crop_windows(batch["static_future_latent"],plan); kta=crop_windows(batch["kta_future_latent"],plan); B,K=hist.shape[:2]; valid=plan.valid.reshape(-1)
+            batch={k:(v.to(dev) if torch.is_tensor(v) else v) for k,v in batch.items()}; plan=planner.plan(batch.get("planning_support",batch["generation_support"])); hist=crop_windows(batch["moving_history_latent"],plan); sta=crop_windows(batch["static_future_latent"],plan); kta=crop_windows(batch["kta_future_latent"],plan); B,K=hist.shape[:2]; valid=plan.valid.reshape(-1); F=batch["static_future_latent"].shape[1]
+            if not bool(valid.any()): outputs.append(empty.to(dev)[None,None].expand(B,F,-1,-1,-1).clone().cpu()); continue
             def flat(x): return x.reshape(B*K,*x.shape[2:])[valid]
             fhist,fsta,fkta=map(flat,(hist,sta,kta)); origins=plan.origins.reshape(B*K,2)[valid]; prior=torch.cat([fsta,fkta],dim=2); traj=batch.get("trajectory")
             if traj is not None: traj=traj[:,None].expand(B,K,*traj.shape[1:]).reshape(B*K,*traj.shape[1:])[valid]

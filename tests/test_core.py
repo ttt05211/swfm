@@ -1,6 +1,6 @@
 import torch
 from real_motion.support import build_motion_tube,MotionTubeConfig,coverage_and_active_ratio
-from real_motion.windows import WindowPlanner,crop_windows,scatter_windows
+from real_motion.windows import WindowPlanner,crop_windows,scatter_windows,window_coverage
 from real_motion.composition import static_protected_compose
 
 def test_tube_and_coverage():
@@ -17,3 +17,6 @@ def test_static_protection():
 
 def test_planning_support_can_cover_history_without_expanding_loss():
     planning=torch.zeros(1,4,10,10,dtype=torch.bool); planning[0,0,1,1]=1; planning[0,3,8,8]=1; future_loss=torch.zeros(1,2,10,10,dtype=torch.bool); future_loss[0,1,8,8]=1; plan=WindowPlanner((4,4),4).plan(planning); assert plan.valid.sum()>=2; cropped=crop_windows(future_loss,plan); assert int(cropped.sum())==1
+
+def test_window_coverage_detects_truncation():
+    s=torch.zeros(1,1,10,10,dtype=torch.bool); s[0,0,1,1]=1; s[0,0,8,8]=1; p=WindowPlanner((2,2),1).plan(s); c=window_coverage(s,p); assert 0<float(c[0])<1
