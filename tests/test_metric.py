@@ -1,8 +1,34 @@
 import numpy as np
-from real_motion.metrics.moving_miou_v2 import Box3D,GridSpec,is_moving,moving_support,MovingMIoUV2Accumulator,rasterize_oriented_box
+from real_motion.metrics.moving_miou_v2 import Box3D,GridSpec,is_moving,moving_support,MovingMIoUV2Accumulator,MovingMIoUV2MultiHorizon
 
 def test_interval_contract():
-    a=Box3D("x",4,(0,0,0),(2,1,1),0); b=Box3D("x",4,(1,0,0),(2,1,1),0); assert is_moving(a,b,2.0,0.5); assert not is_moving(a,b,2.01,0.5)
+    a=Box3D("x",4,(0,0,0),(2,1,1),0)
+    b=Box3D("x",4,(1,0,0),(2,1,1),0)
+    assert is_moving(a,b,2.0,0.5)  # equality is moving
+    assert not is_moving(a,b,2.01,0.5)
 
 def test_dual_support_penalizes_ghost_and_miss():
-    g=GridSpec(-5,-5,-1,(0.5,0.5,0.5),(20,20,4)); a=Box3D("x",4,(-1,0,0),(1,1,1),0); b=Box3D("x",4,(1,0,0),(1,1,1),0); s=moving_support(a,b,2.0,g,0.5,0.0); gt=np.full(g.shape_hwd,17,dtype=np.int64); pred=gt.copy(); sa=rasterize_oriented_box(a,g,0); sb=rasterize_oriented_box(b,g,0); gt[sb]=4; pred[sa]=4; acc=MovingMIoUV2Accumulator([4]); acc.update(pred,gt,s); assert acc.compute()["mIoU"]==0.0
+    g=GridSpec(-5,-5,-1,(0.5,0.5,0.5),(20,20,4))
+    a=Box3D("x",4,(-1,0,0),(1,1,1),0)
+    b=Box3D("x",4,(1,0,0),(1,1,1),0)
+    s=moving_support(a,b,2.0,g,0.5,0.0)
+    gt=np.full(g.shape_hwd,17,dtype=np.int64)
+    pred=gt.copy()
+    from real_motion.metrics.moving_miou_v2 import rasterize_oriented_box
+    sa=rasterize_oriented_box(a,g,0); sb=rasterize_oriented_box(b,g,0)
+    gt[sb]=4; pred[sa]=4
+    acc=MovingMIoUV2Accumulator([4]); acc.update(pred,gt,s)
+    assert acc.compute()["mIoU"]==0.0
+
+
+def test_multihorizon_contract_averages_horizon_mious_not_voxels():
+    metric=MovingMIoUV2MultiHorizon([4],(1.0,2.0,3.0))
+    support=np.ones((1,1,2),dtype=bool)
+    gt=np.array([[[4,4]]])
+
+    metric.update(1.0,gt.copy(),gt,support)
+    metric.update(2.0,np.array([[[17,17]]]),gt,support)
+    metric.update(3.0,np.array([[[4,17]]]),gt,support)
+
+    out=metric.compute()
+    assert abs(out["mIoU"]-50.0)<1e-6
