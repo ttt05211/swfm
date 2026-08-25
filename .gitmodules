@@ -1,0 +1,3 @@
+[submodule "upstream_occfm"]
+	path = upstream_occfm
+	url = https://github.com/Orbis36/OccFM-NeurIPS2025.git
