@@ -9,6 +9,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
+import hashlib
 import json
 import yaml
 
@@ -60,6 +61,52 @@ def get_cfg(cfg: Mapping[str, Any], path: str, default=None):
     return _deep_get(cfg, path, default)
 
 
+def _copy_paths(cfg: Mapping[str, Any], paths):
+    out={}
+    for path in paths:
+        value=_deep_get(cfg,path,None)
+        cur=out
+        keys=path.split('.')
+        for key in keys[:-1]: cur=cur.setdefault(key,{})
+        cur[keys[-1]]=deepcopy(value)
+    return out
+
+
+def config_contract(cfg: Mapping[str, Any], kind="cache") -> dict:
+    """Return the stable, path-independent subset that defines an experiment asset.
+
+    ``cache`` includes every setting that changes prepared/latent supervision or
+    precomputed sparse-window geometry, but deliberately excludes pure I/O knobs
+    such as VAE batch size and shard size. ``resume`` additionally freezes the
+    trainable model and optimizer schedule so a resumed run cannot silently
+    continue under a different experiment.
+    """
+    cache_paths=(
+        "UPSTREAM.COMMIT","UPSTREAM.LATENT_HW","UPSTREAM.LATENT_CHANNELS",
+        "UPSTREAM.OCC_RANGE","UPSTREAM.VOXEL_SIZE",
+        "MODEL.WINDOW_HW","MODEL.MAX_WINDOWS","MODEL.MIN_WINDOW_COVERAGE",
+        "MOTION","TARGET","EGO_PROTOCOL",
+        "CACHE.VAE_LATENT_MODE","CACHE.PRECOMPUTE_WINDOW_PLAN",
+        "CACHE.FILTER_EMPTY_GENERATION_SUPPORT","RUNTIME.VAE_AMP",
+    )
+    cache=_copy_paths(cfg,cache_paths)
+    if kind=="cache": return cache
+    if kind=="resume":
+        return {
+            "cache":cache,
+            "model":deepcopy(_deep_get(cfg,"MODEL",{})),
+            "optimization_full":deepcopy(_deep_get(cfg,"OPTIMIZATION.FULL",{})),
+            "amp":deepcopy(_deep_get(cfg,"RUNTIME.AMP",{})),
+            "tf32":deepcopy(_deep_get(cfg,"RUNTIME.TF32",None)),
+        }
+    raise ValueError(f"unknown config contract kind: {kind}")
+
+
+def config_fingerprint(cfg: Mapping[str, Any], kind="cache") -> str:
+    payload=json.dumps(config_contract(cfg,kind),sort_keys=True,separators=(",",":"),ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def validate_runtime_config(cfg: Mapping[str, Any]):
     from .metrics.moving_miou_v2 import (
         PROTOCOL, SPEED_THRESHOLD_MPS, BOX_MARGIN_M,
@@ -91,6 +138,9 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
         raise ValueError("MOTION.KTA_TUBE_RADII must contain six 0.5s radii")
     if any(int(r) < 0 for r in radii):
         raise ValueError("MOTION.KTA_TUBE_RADII cannot be negative")
+    ego=_deep_get(cfg,"EGO_PROTOCOL",{}) or {}
+    if ego and ego.get("FUTURE_POSE_SOURCE") != "gt_future_ego":
+        raise ValueError("SWFM frozen main protocol requires EGO_PROTOCOL.FUTURE_POSE_SOURCE=gt_future_ego")
 
 
 def save_resolved_config(cfg: Mapping[str, Any], output: str | Path):
