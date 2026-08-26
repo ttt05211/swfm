@@ -1,106 +1,76 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SWFM Final Plan — Real-Motion Sparse Occupancy World Model</title><style>body{font-family:Inter,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;max-width:1100px;margin:0 auto;padding:32px 26px;line-height:1.72;color:#1d2433;background:#f7f8fb}main{background:white;padding:42px;border-radius:18px;box-shadow:0 8px 28px #1c29401a}h1{font-size:34px;margin-top:0}h2{margin-top:42px;border-bottom:1px solid #dde3ee;padding-bottom:8px}h3{margin-top:28px}.tag{display:inline-block;padding:4px 10px;border-radius:999px;background:#edf2ff;font-weight:600;margin-right:6px}.good{background:#eefaf2;border-left:4px solid #3e9b62;padding:14px 18px;border-radius:8px}.warn{background:#fff6e7;border-left:4px solid #db9438;padding:14px 18px;border-radius:8px}.eq,.flow,pre{background:#f3f5f9;padding:14px 18px;border-radius:9px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #d9dfeb;padding:9px 11px;text-align:left}th{background:#f2f5fa}code{background:#f0f2f6;padding:2px 5px;border-radius:5px}nav{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 30px}nav a{text-decoration:none;color:#3157a7;background:#eef3ff;padding:6px 10px;border-radius:8px}</style></head><body><main>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SWFM Final Plan — Real-Motion Sparse Occupancy World Model</title>
+<style>body{font-family:Inter,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;max-width:1120px;margin:auto;padding:30px 24px;line-height:1.72;color:#1d2433;background:#f7f8fb}main{background:#fff;padding:42px;border-radius:18px;box-shadow:0 8px 28px #1c294018}h1{font-size:34px;margin-top:0}h2{margin-top:42px;border-bottom:1px solid #dde3ee;padding-bottom:8px}h3{margin-top:26px}.tag{display:inline-block;padding:4px 10px;border-radius:999px;background:#edf2ff;font-weight:600;margin-right:6px}.good{background:#eefaf2;border-left:4px solid #3e9b62;padding:14px 18px;border-radius:8px}.warn{background:#fff6e7;border-left:4px solid #db9438;padding:14px 18px;border-radius:8px}.eq,.flow,pre{background:#f3f5f9;padding:14px 18px;border-radius:9px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #d9dfeb;padding:9px 11px;text-align:left}th{background:#f2f5fa}code{background:#f0f2f6;padding:2px 5px;border-radius:5px}nav{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 30px}nav a{text-decoration:none;color:#3157a7;background:#eef3ff;padding:6px 10px;border-radius:8px}</style></head><body><main>
 <h1>Real-Motion Sparse Occupancy World Model — Final Protocol</h1>
-<p><span class="tag">OccFM-based</span><span class="tag">Causal</span><span class="tag">Motion-window sparse</span></p>
+<p><span class="tag">OccFM-based</span><span class="tag">Causal</span><span class="tag">Motion-window sparse</span><span class="tag">L40S optimized</span></p>
 <p><strong>核心主张：</strong>Compute should follow actual motion rather than semantic movability. Transport what is physically deterministic; generate only what truly moves.</p>
-<nav><a href="#arch">架构</a><a href="#target">Target</a><a href="#sparse">Sparse WM</a><a href="#metric">Moving-mIoU</a><a href="#p0">P0</a><a href="#subset">Subset</a><a href="#eff">Efficiency</a><a href="#train">Training</a></nav>
-
+<nav><a href="#arch">架构</a><a href="#target">Target</a><a href="#sparse">Sparse WM</a><a href="#metric">Moving-mIoU</a><a href="#p0">P0</a><a href="#subset">Subset</a><a href="#l40s">L40S</a><a href="#eff">Efficiency</a><a href="#train">Training</a></nav>
 <h2 id="arch">1. 最终架构</h2>
 <div class="flow">Historical OCC + Historical Ego Poses
-        │
-        ├─ Ego Compensation（只用于 motion inference / KTA）
-        │
-        └─ Causal Real-Motion Decomposition
-              ├─ confident-static ── SE(3) Transport ── Future Static OCC
-              └─ moving + uncertain
-                       │
-                       ├─ Causal KTA ── Future Motion Tube ── Sparse Windows
-                       │
-                       └─ Frozen VAE history / static / KTA latent
-                                  │
-                           Prior-conditioned OccFM CFM
-                                  │
-                         Future WM-dynamic latent
-                                  │
-                           Frozen VAE Decoder
-                                  │
-                    Static-Protected Motion Composition</div>
-<p>Free 是独立状态，不允许通过 <code>state==STATIC</code> 被误 hard-freeze。默认 detector 使用 causal component-track hysteresis：明显移动→moving；低速且 persistence 高→confident-static；证据不足→uncertain。</p>
-
-<h2 id="target">2. 训练 Target 与 Metric Target 完全分开</h2>
-<div class="good"><strong>最终训练 target：</strong>Future dynamic-semantic GT inside causal generation support，而不是“未来 GT 真正移动 instance”。</div>
+  → Ego Compensation
+  → Causal Real-Motion Decomposition
+      ├─ confident-static → SE(3) Transport → Future Static OCC
+      └─ moving + uncertain → causal KTA → horizon-dependent motion tube
+                              → sparse latent windows
+                              → prior-conditioned OccFM CFM
+                              → Future WM-dynamic latent
+  → Frozen VAE Decoder
+  → Static-Protected Motion Composition</div>
+<p>Free 是第四种独立状态，不能被 <code>state==STATIC</code> hard-freeze。默认 detector 使用 causal component-track hysteresis：明显移动→moving；低速且 persistence 高→confident-static；跟踪证据不足→uncertain。</p>
+<h2 id="target">2. Training Target 与 Metric Target 分离</h2>
+<div class="good"><strong>WM target：</strong>Future dynamic-semantic GT inside causal generation support。</div>
 <div class="eq">M_gen = causal(history, KTA)
 O_target^WM = DynamicSemantic(O_GT_future) ∩ M_gen
 Z_target^WM = E_frozen(O_target^WM)</div>
-<p>因此一个历史 uncertain、未来恰好没超过 0.5 m/s 的车仍然是 WM 负责的对象，不会因为 Moving-mIoU 的 post-hoc threshold 而被监督成 empty。</p>
-<table><tr><th>对象</th><th>定义</th><th>用途</th></tr><tr><td><code>generation_support_occ</code></td><td>history + KTA causal support</td><td>计算 / loss / write support</td></tr><tr><td><code>future_dynamic_target_occ</code></td><td>future dynamic semantics ∩ causal support</td><td>WM training target</td></tr><tr><td><code>future_moving_occ</code></td><td>Moving-mIoU eligible GT instances</td><td>metric/P0 only</td></tr><tr><td><code>gt_moving_support</code></td><td>frozen dual-box support</td><td>metric/P0 only</td></tr></table>
-
+<table><tr><th>字段</th><th>定义</th><th>用途</th></tr><tr><td>generation_support_occ</td><td>history + KTA causal support</td><td>compute/loss/write support</td></tr><tr><td>future_dynamic_target_occ</td><td>future dynamic semantics ∩ M_gen</td><td>WM training target</td></tr><tr><td>future_moving_occ / gt_moving_support</td><td>GT instance interval motion</td><td>Moving-mIoU/P0 only</td></tr></table>
+<p>训练 target 统一称 <strong>Future WM-dynamic latent</strong>，不再称 true-moving-only future latent。</p>
 <h2 id="sparse">3. Motion-window Sparse World Model</h2>
-<p>官方 OccFM transition 包含 Conv3d、U-Net down/up 和 DiT block，因此 v1 不强改成任意 packed-token Transformer，而是在 50×50 latent grid 上选少量固定窗口（默认 20×20）。论文措辞统一为 <strong>motion-guided sparse windows / motion blocks</strong>。</p>
-<ul><li><code>generation_support</code> 是 required future support，唯一可创建 window 的信号。</li><li><code>planning_support</code> 只在相同 future coverage 时用 history/KTA context tie-break。</li><li>不同 window 不通信，因此不创建孤立 history-only window。</li><li>重叠 window 从同一个 global 50×50 noise canvas crop 初始 z0。</li><li>M_gen 外每一步 ODE 都 clamp 到真实 <code>E(empty)</code>。</li></ul>
-<h3>3.1 Prior conditioning</h3><p>Static/KTA 与 state 来自同一个 frozen VAE，进入 prior adapter 前与官方 OccFM 一样使用 rescale factor 10；新增 prior projection zero-init，通过 spatially aligned token-wise AdaLN 注入，不用 global cross-attention。</p>
-<h3>3.2 Static-Protected Motion Composition</h3>
-<div class="eq">writable = WM predicts dynamic semantic
+<p>官方 OccFM transition 包含 Conv3d、temporal attention、U-Net down/up 与 DiT block。v1 为最大化 checkpoint 复用，在 50×50 latent grid 上只处理少量固定 motion windows（默认 20×20）。</p>
+<ul><li><code>generation_support</code> 是 required future support，唯一可创建 window 的信号。</li><li><code>planning_support</code> 只做相同 future coverage 下的 history/KTA context tie-break。</li><li>full latent cache 可预计算 <code>window_origins/window_valid</code>，正式训练不再每 step 跑 CPU planner。</li><li>重叠 window 从同一个 global 50×50 noise canvas crop 初始噪声。</li><li>M_gen 外每一步 ODE 都 clamp 到 exact <code>E(empty)</code>。</li></ul>
+<h3>3.1 Static/KTA prior</h3><p>Static/KTA 与 state 使用同一个 frozen VAE，进入 adapter 前按官方 OccFM convention 乘 <code>RESCALE_FACTOR=10</code>；新增 prior projection zero-init，通过 spatially aligned AdaLN 注入。</p>
+<h3>3.2 Static-Protected Motion Composition</h3><div class="eq">writable = WM predicts dynamic semantic
          AND write_support
-         AND NOT confident_static</div>
-<p><code>M_gen</code> 控制“哪里计算”，不是 wholesale overwrite mask；confident-static 是硬保护。</p>
-
+         AND NOT confident_static</div><p><code>M_gen</code> 控制计算范围，不是 wholesale overwrite mask。</p>
 <h2 id="metric">4. Frozen Moving-mIoU v2</h2>
-<div class="warn">主 metric contract 冻结，不跟结果调整。</div>
-<ul><li>protocol: <code>interval_displacement_v2</code></li><li>world XY interval speed ≥ 0.5 m/s → Moving instance</li><li>support = GT Box(t0→h) ∪ GT Box(th→h)，各加 0.5 m margin</li><li>动态类固定：2,3,4,5,6,7,9,10</li><li>1s / 2s / 3s 各自先算 class mIoU，再对三个 horizon 算术平均</li></ul>
-<p>旧位置负责惩罚 trailing ghost，新位置负责 missed arrival；future GT 只用于 metric/target/P0，不进入 causal support construction。</p>
-
+<div class="warn">主 metric contract 冻结，不随结果调整。</div>
+<ul><li>protocol: interval_displacement_v2</li><li>GT world XY interval speed ≥ 0.5 m/s → Moving instance</li><li>evaluation support = Box(t0→h) ∪ Box(th→h)，两者均加 0.5 m margin</li><li>dynamic classes: 2,3,4,5,6,7,9,10</li><li>1s / 2s / 3s 各自 class-mIoU，再对 horizon 算术平均</li></ul>
 <h2 id="p0">5. 正式训练前 P0</h2>
-<h3>P0-A — Frozen Causal Real-Motion Decomposition（第一个方法实验）</h3><p>同一个 frozen OccFM 比较 Full / causal-static-only / moving+uncertain-only。若对应 static/Moving 能力相对 Full 明显 collapse，不进入 moving-only sparse training。</p>
-<h3>P0-B — Arrival Coverage × Sparsity × History Connectivity</h3><p>Generation reachability 使用 future Moving <strong>arrival occupancy</strong>，而不是 dual-box metric support。报告 BEV/latent coverage、active ratio、true-moving sparsity、window slot compute ratio，以及 future window 是否真正包含 historical motion evidence。</p>
-<h3>P0-C — Actual Hard-Static Blind Spot</h3><p>对 future Moving GT instance，把 t0 GT box rasterize 到 t0 ego，并用 t0 semantic class 约束真实 occupied voxels，再与 <code>t0_confident_static_mask</code> 相交。主报告 any / ≥50% / ≥80% hard-static instance ratio 与 hard-static future-moving voxel ratio。历史 GT speed&lt;0.5 只作为辅助统计；no-history/birth 解释 innovation 原因。</p>
-<h3>P0-D — Two Oracle Bounds</h3>
-<table><tr><th>Oracle</th><th>组成</th><th>回答问题</th></tr><tr><td>Decomposition Oracle</td><td>SE3-static + all GT dynamic semantics</td><td>分解本身理论上限</td></tr><tr><td>Causal-Support Oracle</td><td>SE3-static + GT dynamic semantics inside causal support</td><td>KTA/support reachability 后的上限</td></tr></table>
-<p>二者差值 = support/reachability loss；Causal-Support Oracle 与 learned WM 差值 = learning headroom。</p>
-<h3>P0-E — Frozen VAE Sanity</h3><p>比较 full moving reconstruction、causal-support + E(empty) canvas 和 GT-support canvas。</p>
-
-<h2 id="subset">6. 困难机动 / KTA-Hard 必须还是同一个 Moving-mIoU v2</h2>
-<p>旧的 per-instance intersection/union micro IoU 已废弃。新流程：</p>
-<div class="flow">Calibration split
-  -> freeze speed-change / turn-rate / KTA-error cuts
-Test split
-  -> select GT instances by subset
-  -> union each instance's ORIGINAL dual-box support @ 1s/2s/3s
-  -> unchanged MovingMIoUV2MultiHorizon
-  -> strict Moving-mIoU v2 on subset</div>
-<p>因此可以严格报告 Uniform/Easy、Accel/Decel、Turning、Turning+Speed-Change、KTA-Easy/Medium/Hard 的 Moving-mIoU v2。KTA cuts 只在 calibration split 拟合，test 禁止重拟合。</p>
-
-<h2>7. Post-training Harm / Repair 与 Selector Headroom</h2>
-<p>最终 evaluator 同时报告：</p><ul><li>voxel-level micro Repair/Harm</li><li>instance/tube-level macro Repair/Harm</li><li>Oracle KTA-vs-WM selector Moving-mIoU v2</li><li>Oracle selector headroom = Oracle − pure SWFM（pp）</li></ul>
-<p>只有 selector headroom 明显时才考虑 gate；优先 single-pass lightweight gate，CFG 最后。</p>
-
-<h2 id="eff">8. 效率指标必须拆开</h2>
-<table><tr><th>指标</th><th>含义</th></tr><tr><td>Generation-support ratio</td><td>causal M_gen 本身多稀疏</td></tr><tr><td>Window slot compute ratio</td><td>N_window × H_window × W_window / 50²</td></tr><tr><td>GFLOPs</td><td><code>torch.profiler(with_flops=True)</code> 支持算子的 FLOPs</td></tr><tr><td>End-to-end latency/FPS</td><td>motion/SE3/KTA + VAE + planning + NFE + scatter + decoder + composition</td></tr></table>
-<p>GFLOPs 与 latency 用不同 profiler，避免 profiling overhead 污染 FPS。论文 baseline 必须采用相同软件/硬件统计协议。</p>
-
-<h2 id="train">9. YAML 与 Training Discipline</h2>
-<p><code>configs/real_motion_occfm.yaml</code> 是唯一 runtime source-of-truth。核心脚本读取该 YAML、允许显式 CLI override，并保存 resolved config；Moving-mIoU frozen contract 会与代码常量互相校验。</p>
-<h3>9.1 Tiny/small</h3><p><code>train_sparse.py</code> 只用于 64/128 overfit 和 small held-out，不作为最终 full trainer。</p>
-<h3>9.2 Full</h3><p><code>train_full.py</code> 支持 DDP、official-style split-decay AdamW、effective LR scaling、1000-step warmup + cosine、EMA=0.9999、resume、validation 与 best/last/periodic checkpoint。默认 optimization 与官方 OccFM 发布设置对应，并由 YAML 统一控制。</p>
-
-<h2>10. 最终执行顺序</h2>
-<div class="flow">pytest
- -> Official 50×50 transition equivalence
- -> prepare smoke (16 windows)
- -> P0-A
- -> P0-B
- -> P0-C
- -> P0-D
- -> P0-E + profiler smoke
- -> tiny latent cache
- -> 64/128 tiny overfit
- -> small held-out
- -> full latent cache
- -> DDP full training
- -> overall / Moving / subset / Harm-Repair
- -> latency + GFLOPs</div>
-<div class="warn"><strong>停止条件：</strong>transition equivalence、P0-A/B/C/D/E 或 tiny overfit 任一明显失败，都先定位 motion/support、geometry/KTA、VAE、WM optimization 或 composition/evaluation 层；不要直接堆 Router、ABE、repair/confidence loss。</div>
-
-<h2>11. Paper Method 压缩</h2><ol><li><strong>Real-Motion Occupancy Decomposition</strong></li><li><strong>Deterministic Static Transport</strong></li><li><strong>Motion-Guided Sparse Generative World Model</strong></li><li><strong>Static-Protected Motion Composition and Motion-Centric Evaluation</strong></li></ol>
-<p>分析部分再放 P0、Harm/Repair、KTA difficulty、maneuver subsets 和 efficiency，不把诊断机制堆进主架构。</p>
+<h3>P0-A — Frozen causal real-motion decomposition</h3><p>同一 frozen OccFM 比较 Full / causal-static-only / moving+uncertain-only。对应能力明显 collapse 时停止 sparse training。</p>
+<h3>P0-B — Arrival Coverage × Sparsity × History Connectivity</h3><p>Generation reachability 用 future Moving <strong>arrival occupancy</strong>，不是 dual-box metric support。报告 BEV/latent coverage、support ratio、window slot compute ratio、history-connected future windows/cells。</p>
+<h3>P0-C — Actual Hard-Static Blind Spot</h3><p>对 future Moving GT instance，在 t0 ego rasterize 真实 box，<strong>这里 margin=0</strong>，再与 t0 同类 semantic occupancy 相交，最后检查与 <code>t0_confident_static_mask</code> 的 overlap。报告 any / ≥50% / ≥80% hard-static instance ratio 和 voxel ratio。Moving-mIoU 的 0.5m margin 绝不能混入 P0-C。</p>
+<h3>P0-D — Two Oracle Bounds</h3><table><tr><th>Oracle</th><th>组成</th><th>含义</th></tr><tr><td>Decomposition Oracle</td><td>SE3-static + all GT dynamic semantics</td><td>decomposition 理论上限</td></tr><tr><td>Causal-Support Oracle</td><td>SE3-static + GT dynamic semantics inside causal support</td><td>support/reachability 后上限</td></tr></table>
+<h3>P0-E — Frozen VAE sanity</h3><p>检查 moving reconstruction 与 sparse E(empty) canvas 稳定性。</p>
+<h2 id="subset">6. Maneuver / KTA-Hard 仍使用同一 Moving-mIoU v2</h2>
+<div class="flow">Calibration split → freeze speed/turn-rate/KTA-error cuts
+Test split → select GT instances → union original dual-box supports per horizon
+→ unchanged MovingMIoUV2MultiHorizon → strict subset Moving-mIoU v2</div>
+<p>禁止 per-instance micro IoU 冒充 subset Moving-mIoU。</p>
+<h2>7. Post-training Harm / Repair</h2><ul><li>voxel micro Repair/Harm</li><li>instance/tube macro Repair/Harm</li><li>Oracle KTA-vs-WM selector Moving-mIoU v2</li><li>selector headroom = Oracle − pure SWFM</li></ul>
+<h2 id="l40s">8. NVIDIA L40S Runtime Profile</h2>
+<p>正式 profile 针对 L40S 48GB / Ada，但不引入会改变训练协议的 FP8-only 依赖。</p>
+<table><tr><th>模块</th><th>默认</th><th>原因</th></tr><tr><td>Sparse CFM</td><td>BF16 autocast</td><td>L40S Tensor Core 高吞吐；BF16 不需要 GradScaler</td></tr><tr><td>FP32 matmul</td><td>TF32 + high precision policy</td><td>提升未 autocast 算子吞吐</td></tr><tr><td>Frozen OccFM VAE</td><td>FP32</td><td>保持 pretrained latent representation convention；parity 通过后才考虑 VAE BF16</td></tr><tr><td>Optimizer</td><td>CUDA fused AdamW</td><td>减少 optimizer kernel overhead；不可用自动 fallback</td></tr><tr><td>DataLoader</td><td>pin + persistent workers + prefetch</td><td>减少 H2D/input stall</td></tr><tr><td>DDP</td><td>shard-aware sampler + gradient bucket view + static graph</td><td>避免 cache shard thrashing 与额外 gradient copy</td></tr><tr><td>torch.compile</td><td>默认关闭，可显式 benchmark</td><td>active-window batch 动态，防止 graph-break/recompile 反而变慢</td></tr></table>
+<h3>8.1 L40S batch tuning</h3><div class="eq">python tools/real_motion/tune_l40s.py \
+  --cache data/latent_train \
+  --empty-latent data/empty_latent.pt \
+  --upstream-ckpt /path/to/occfm.ckpt \
+  --output outputs/l40s_batch_tune.json</div>
+<p>默认扫描 4/6/8/10/12/16/20/24 samples/GPU，并记录 samples/s、transition windows/s、step latency、peak allocated/reserved VRAM；推荐结果保留至少 3GB memory headroom。最终 batch 必须写入 resolved config。</p>
+<h3>8.2 Cache path</h3><p>Frozen VAE cache builder 支持 batched encode（L40S 默认 4）并预计算 window plan；sharded dataset 使用 shard-local / distributed shard-aware sampling，避免正式训练反复跨 shard <code>torch.load</code>。</p>
+<h2 id="eff">9. 效率指标拆开</h2><table><tr><th>指标</th><th>含义</th></tr><tr><td>Generation-support ratio</td><td>M_gen 本身稀疏度</td></tr><tr><td>Window slot compute ratio</td><td>N_window×H_window×W_window / 50²</td></tr><tr><td>GFLOPs</td><td>torch.profiler(with_flops=True) 支持算子</td></tr><tr><td>End-to-end latency/FPS</td><td>motion/SE3/KTA + VAE + planning + NFE + scatter + decoder + composition</td></tr></table>
+<h2 id="train">10. YAML 与 Training</h2><p><code>configs/real_motion_occfm.yaml</code> 是唯一 runtime source-of-truth；每个 run 保存 resolved config。</p>
+<h3>10.1 Tiny</h3><p><code>train_sparse.py</code> 仅用于 64/128 overfit / small held-out。</p>
+<h3>10.2 Full</h3><p><code>train_full.py</code> 支持 single-GPU 或 DDP、distributed shard-aware sampler、official-style split-decay AdamW、effective LR scaling、warmup+cosine、EMA=0.9999、resume、validation、best/last/periodic checkpoints，以及 L40S runtime profile。</p>
+<h2>11. 最终执行顺序</h2><div class="flow">pytest
+→ official 50×50 transition equivalence
+→ prepare smoke
+→ P0-A → P0-B → P0-C → P0-D → P0-E
+→ tiny latent cache → 64/128 overfit → small held-out
+→ full latent cache + precomputed window plan
+→ L40S batch/compile tuning
+→ full training
+→ overall / Moving / subset / Harm-Repair
+→ L40S latency + GFLOPs</div>
+<div class="warn"><strong>停止条件：</strong>transition equivalence、P0 或 tiny overfit 任一明显失败，先定位 motion/support、geometry/KTA、VAE、WM optimization 或 composition/evaluation；不要直接堆 Router/ABE/confidence loss。</div>
+<h2>12. Paper Method</h2><ol><li>Real-Motion Occupancy Decomposition</li><li>Deterministic Static Transport</li><li>Motion-Guided Sparse Generative World Model</li><li>Static-Protected Motion Composition and Motion-Centric Evaluation</li></ol>
 </main></body></html>
