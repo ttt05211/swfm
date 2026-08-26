@@ -15,7 +15,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from real_motion.dataset import (
     RealMotionCacheDataset, collate_real_motion, ShardShuffleSampler,
-    DistributedShardSampler,
+    DistributedShardSampler, DistributedShardEvalSampler,
+    DistributedExactEvalSampler,
 )
 from real_motion.windows import WindowPlan, WindowPlanner, crop_windows, window_coverage
 from real_motion.models import MotionWindowFlowMatching, RealMotionWindowCFM
@@ -129,8 +130,12 @@ def make_samplers(train_ds,val_ds,distributed,world,rank,seed=20260826):
     if distributed:
         ts=(DistributedShardSampler(train_ds,world,rank,shuffle=True,seed=seed)
             if train_ds.sharded else DistributedSampler(train_ds,num_replicas=world,rank=rank,shuffle=True,drop_last=False,seed=seed))
-        vs=(DistributedShardSampler(val_ds,world,rank,shuffle=False,seed=seed)
-            if val_ds.sharded else DistributedSampler(val_ds,num_replicas=world,rank=rank,shuffle=False,drop_last=False))
+        # Validation does NOT execute a DDP forward. Therefore ranks may process
+        # different numbers of batches safely; every real validation sample is
+        # counted exactly once and only the final numerator/denominator is
+        # all-reduced. Padding would bias val loss and best.pt selection.
+        vs=(DistributedShardEvalSampler(val_ds,world,rank)
+            if val_ds.sharded else DistributedExactEvalSampler(val_ds,world,rank))
     else:
         ts=ShardShuffleSampler(train_ds,seed=seed) if train_ds.sharded else None
         vs=None
