@@ -10,7 +10,7 @@ from real_motion.prepared import PreparedShardDataset
 from real_motion.nuscenes_adapter import NuScenesWindowSource, sample_ego_to_world, wrap_angle
 from real_motion.geometry import quaternion_yaw
 from real_motion.metrics.moving_miou_v2 import (
-    SPEED_THRESHOLD_MPS, BOX_MARGIN_M, Box3D, GridSpec, rasterize_oriented_box,
+    SPEED_THRESHOLD_MPS, Box3D, GridSpec, rasterize_oriented_box,
 )
 from real_motion.runtime_config import add_config_args, load_runtime_config, save_resolved_config
 
@@ -59,7 +59,11 @@ def main():
             for rec in records:
                 inst=rec["instance_token"]; cid=int(rec["class_id"]); ann0=t0_map.get(inst)
                 if ann0 is None: d["no_pre_t0_observation"]+=1; continue
-                box0=ann_to_t0_ego_box(ann0,t0_pose,cid); box_mask=rasterize_oriented_box(box0,metric_grid,BOX_MARGIN_M); inst_vox=box_mask&(t0_sem==cid); denom=int(inst_vox.sum()); overlap=int((inst_vox&hard_static).sum()); frac=overlap/denom if denom else 0.0
+                box0=ann_to_t0_ego_box(ann0,t0_pose,cid)
+                # P0-C audits actual t0 object occupancy. The 0.5m Moving-mIoU
+                # evaluation margin must not leak into this hard-static check.
+                box_mask=rasterize_oriented_box(box0,metric_grid,margin=0.0)
+                inst_vox=box_mask&(t0_sem==cid); denom=int(inst_vox.sum()); overlap=int((inst_vox&hard_static).sum()); frac=overlap/denom if denom else 0.0
                 d["future_moving_t0_voxels"]+=denom; d["hard_static_future_moving_t0_voxels"]+=overlap; d["hard_static_any_instances"]+=int(overlap>0); d["hard_static_ge50_instances"]+=int(frac>=.50); d["hard_static_ge80_instances"]+=int(frac>=.80)
                 prior=None
                 for hm,ht in zip(hist_maps,hist_times):
@@ -69,7 +73,7 @@ def main():
                 if dt>0:
                     cp=np.asarray(prior[0]["translation"],dtype=np.float64); c0=np.asarray(ann0["translation"],dtype=np.float64); hist_speed=float(np.linalg.norm(c0[:2]-cp[:2])/dt); d["historically_stationary_aux"]+=int(hist_speed<SPEED_THRESHOLD_MPS)
         if i%50==0: print("audit",i,"/",n)
-    report={"num_windows":n,"horizons":{}}
+    report={"num_windows":n,"t0_hard_static_box_margin_m":0.0,"horizons":{}}
     for h,d in totals.items():
         iden=d["eligible_future_moving"]; vden=d["future_moving_t0_voxels"]; out=dict(d); out.update({"hard_static_to_future_moving_any_instance_ratio":d["hard_static_any_instances"]/iden if iden else 0.0,"hard_static_to_future_moving_ge50_instance_ratio":d["hard_static_ge50_instances"]/iden if iden else 0.0,"hard_static_to_future_moving_ge80_instance_ratio":d["hard_static_ge80_instances"]/iden if iden else 0.0,"hard_static_to_future_moving_voxel_ratio":d["hard_static_future_moving_t0_voxels"]/vden if vden else 0.0,"historically_stationary_aux_ratio":d["historically_stationary_aux"]/iden if iden else 0.0,"no_pre_t0_ratio":d["no_pre_t0_observation"]/iden if iden else 0.0}); report["horizons"][str(h)]=out
     op=Path(a.output); op.parent.mkdir(parents=True,exist_ok=True); op.write_text(json.dumps(report,indent=2),encoding="utf-8"); save_resolved_config(cfg,op.with_suffix(".resolved.yaml")); print(json.dumps(report["horizons"],indent=2))
