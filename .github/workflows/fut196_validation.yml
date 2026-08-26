@@ -1,0 +1,31 @@
+name: fut196-validation
+
+on:
+  push:
+    branches:
+      - ci/fut196-validation-final
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependency-light test stack
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest numpy pyyaml einops einops-exts
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Python compile gate
+        run: |
+          python -m py_compile $(find real_motion tools tests -name '*.py' -type f)
+      - name: Dependency-light tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/upstream_occfm:${{ github.workspace }}
+        run: |
+          pytest -q tests -m 'not integration'
