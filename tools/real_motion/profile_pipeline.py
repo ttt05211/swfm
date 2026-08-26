@@ -2,7 +2,7 @@
 """End-to-end latency profiler for the actual online SWFM path."""
 import argparse,json,sys,time
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(UP),str(ROOT)]
+ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(ROOT),str(UP)]
 import torch
 from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.prepared import prepare_nuscenes_window,load_nuscenes_window_raw
