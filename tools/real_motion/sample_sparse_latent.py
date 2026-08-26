@@ -2,7 +2,7 @@
 """Sample sparse future WM-dynamic latents with one global noise canvas."""
 import argparse,sys
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(UP),str(ROOT)]
+ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(ROOT),str(UP)]
 import torch
 from torch.utils.data import DataLoader
 from real_motion.dataset import RealMotionCacheDataset,collate_real_motion
