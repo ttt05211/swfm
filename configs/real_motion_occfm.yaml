@@ -9,6 +9,7 @@ MODEL:
   WINDOW_HW: [20, 20]
   MAX_WINDOWS: 8
   MIN_WINDOW_COVERAGE: 0.95
+  MIN_UPSTREAM_REUSE_FRACTION: 0.95
   PRIOR_CHANNELS: 32
   SAMPLE_STEPS: 10
   RESCALE_FACTOR: 10.0
@@ -41,6 +42,11 @@ TARGET:
   WM_TARGET: dynamic_semantics_inside_causal_generation_support
   METRIC_TARGET: interval_displacement_v2_gt_instance_support
   FREE_LABEL: 17
+EGO_PROTOCOL:
+  FUTURE_POSE_SOURCE: gt_future_ego
+  TRAJECTORY_CONDITION_SOURCE: gt_ego_fut_trajs
+  BASELINE_INFORMATION_MATCH: required
+  UPSTREAM_INIT_VARIANT: hist_traj_weights_only
 METRIC:
   PROTOCOL: interval_displacement_v2
   SPEED_THRESHOLD_MPS: 0.5
