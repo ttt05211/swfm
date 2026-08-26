@@ -2,7 +2,7 @@
 """Profile supported PyTorch FLOPs for one online SWFM inference window."""
 import argparse,json,sys
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(UP),str(ROOT)]
+ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(ROOT),str(UP)]
 import torch
 from torch.profiler import profile,ProfilerActivity
 from real_motion.nuscenes_adapter import NuScenesWindowSource
