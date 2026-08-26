@@ -24,10 +24,10 @@
 O_target^WM = DynamicSemantic(O_GT_future) ∩ M_gen
 Z_target^WM = E_frozen(O_target^WM)</div>
 <table><tr><th>字段</th><th>定义</th><th>用途</th></tr><tr><td>generation_support_occ</td><td>history + KTA causal support</td><td>compute/loss/write support</td></tr><tr><td>future_dynamic_target_occ</td><td>future dynamic semantics ∩ M_gen</td><td>WM training target</td></tr><tr><td>future_moving_occ / gt_moving_support</td><td>GT instance interval motion</td><td>Moving-mIoU/P0 only</td></tr></table>
-<p>训练 target 统一称 <strong>Future WM-dynamic latent</strong>，不再称 true-moving-only future latent。</p>
+<p>因此不要再称训练 target 为 “true-moving-only future latent”；统一称 <strong>Future WM-dynamic latent</strong>。</p>
 <h2 id="sparse">3. Motion-window Sparse World Model</h2>
 <p>官方 OccFM transition 包含 Conv3d、temporal attention、U-Net down/up 与 DiT block。v1 为最大化 checkpoint 复用，在 50×50 latent grid 上只处理少量固定 motion windows（默认 20×20）。</p>
-<ul><li><code>generation_support</code> 是 required future support，唯一可创建 window 的信号。</li><li><code>planning_support</code> 只做相同 future coverage 下的 history/KTA context tie-break。</li><li>full latent cache 可预计算 <code>window_origins/window_valid</code>，正式训练不再每 step 跑 CPU planner。</li><li>重叠 window 从同一个 global 50×50 noise canvas crop 初始噪声。</li><li>M_gen 外每一步 ODE 都 clamp 到 exact <code>E(empty)</code>。</li></ul>
+<ul><li><code>generation_support</code> 是 required future support，也是唯一能创建 window 的信号。</li><li><code>planning_support</code> 只做相同 future coverage 下的 history/KTA context tie-break。</li><li>full latent cache 可预计算 <code>window_origins/window_valid</code>，正式训练不再每 step 跑 CPU planner。</li><li>重叠 window 从同一个 global 50×50 noise canvas crop 初始噪声。</li><li>M_gen 外每一步 ODE 都 clamp 到 exact <code>E(empty)</code>。</li></ul>
 <h3>3.1 Static/KTA prior</h3><p>Static/KTA 与 state 使用同一个 frozen VAE，进入 adapter 前按官方 OccFM convention 乘 <code>RESCALE_FACTOR=10</code>；新增 prior projection zero-init，通过 spatially aligned AdaLN 注入。</p>
 <h3>3.2 Static-Protected Motion Composition</h3><div class="eq">writable = WM predicts dynamic semantic
          AND write_support
@@ -38,9 +38,9 @@ Z_target^WM = E_frozen(O_target^WM)</div>
 <h2 id="p0">5. 正式训练前 P0</h2>
 <h3>P0-A — Frozen causal real-motion decomposition</h3><p>同一 frozen OccFM 比较 Full / causal-static-only / moving+uncertain-only。对应能力明显 collapse 时停止 sparse training。</p>
 <h3>P0-B — Arrival Coverage × Sparsity × History Connectivity</h3><p>Generation reachability 用 future Moving <strong>arrival occupancy</strong>，不是 dual-box metric support。报告 BEV/latent coverage、support ratio、window slot compute ratio、history-connected future windows/cells。</p>
-<h3>P0-C — Actual Hard-Static Blind Spot</h3><p>对 future Moving GT instance，在 t0 ego rasterize 真实 box，<strong>这里 margin=0</strong>，再与 t0 同类 semantic occupancy 相交，最后检查与 <code>t0_confident_static_mask</code> 的 overlap。报告 any / ≥50% / ≥80% hard-static instance ratio 和 voxel ratio。Moving-mIoU 的 0.5m margin 绝不能混入 P0-C。</p>
+<h3>P0-C — Actual Hard-Static Blind Spot</h3><p>对 future Moving GT instance，在 t0 ego rasterize其真实 box，<strong>这里 margin=0</strong>，再与 t0 同类 semantic occupancy 相交，最后检查与 <code>t0_confident_static_mask</code> 的 overlap。报告 any / ≥50% / ≥80% hard-static instance ratio 和 voxel ratio。Moving-mIoU 的 0.5m margin 绝不能混入 P0-C。</p>
 <h3>P0-D — Two Oracle Bounds</h3><table><tr><th>Oracle</th><th>组成</th><th>含义</th></tr><tr><td>Decomposition Oracle</td><td>SE3-static + all GT dynamic semantics</td><td>decomposition 理论上限</td></tr><tr><td>Causal-Support Oracle</td><td>SE3-static + GT dynamic semantics inside causal support</td><td>support/reachability 后上限</td></tr></table>
-<h3>P0-E — Frozen VAE sanity</h3><p>检查 moving reconstruction 与 sparse E(empty) canvas 稳定性。</p>
+<h3>P0-E — Frozen VAE sanity</h3><p>严格区分 metric target 与真实 WM target，报告三条主分支：A) <code>true_moving_reconstruction</code>：<code>future_moving_occ</code>；B) <code>wm_target_reconstruction</code>：<code>future_dynamic_target_occ</code> 在 causal support 内的 dynamic-semantic reconstruction；C) <code>causal_sparse_wm_target_canvas</code>：WM-target latent 在 <code>M_gen</code> 外 clamp 到 exact <code>E(empty)</code> 后的 reconstruction，并额外投影到 frozen Moving-mIoU v2。P0-E 不再把 <code>future_moving_occ</code> 当成 WM training target 的替代品。</p>
 <h2 id="subset">6. Maneuver / KTA-Hard 仍使用同一 Moving-mIoU v2</h2>
 <div class="flow">Calibration split → freeze speed/turn-rate/KTA-error cuts
 Test split → select GT instances → union original dual-box supports per horizon
@@ -49,18 +49,14 @@ Test split → select GT instances → union original dual-box supports per hori
 <h2>7. Post-training Harm / Repair</h2><ul><li>voxel micro Repair/Harm</li><li>instance/tube macro Repair/Harm</li><li>Oracle KTA-vs-WM selector Moving-mIoU v2</li><li>selector headroom = Oracle − pure SWFM</li></ul>
 <h2 id="l40s">8. NVIDIA L40S Runtime Profile</h2>
 <p>正式 profile 针对 L40S 48GB / Ada，但不引入会改变训练协议的 FP8-only 依赖。</p>
-<table><tr><th>模块</th><th>默认</th><th>原因</th></tr><tr><td>Sparse CFM</td><td>BF16 autocast</td><td>L40S Tensor Core 高吞吐；BF16 不需要 GradScaler</td></tr><tr><td>FP32 matmul</td><td>TF32 + high precision policy</td><td>提升未 autocast 算子吞吐</td></tr><tr><td>Frozen OccFM VAE</td><td>FP32</td><td>保持 pretrained latent representation convention；parity 通过后才考虑 VAE BF16</td></tr><tr><td>Optimizer</td><td>CUDA fused AdamW</td><td>减少 optimizer kernel overhead；不可用自动 fallback</td></tr><tr><td>DataLoader</td><td>pin + persistent workers + prefetch</td><td>减少 H2D/input stall</td></tr><tr><td>DDP</td><td>shard-aware sampler + gradient bucket view + static graph</td><td>避免 cache shard thrashing 与额外 gradient copy</td></tr><tr><td>torch.compile</td><td>默认关闭，可显式 benchmark</td><td>active-window batch 动态，防止 graph-break/recompile 反而变慢</td></tr></table>
-<h3>8.1 L40S batch tuning</h3><div class="eq">python tools/real_motion/tune_l40s.py \
-  --cache data/latent_train \
-  --empty-latent data/empty_latent.pt \
-  --upstream-ckpt /path/to/occfm.ckpt \
-  --output outputs/l40s_batch_tune.json</div>
-<p>默认扫描 4/6/8/10/12/16/20/24 samples/GPU，并记录 samples/s、transition windows/s、step latency、peak allocated/reserved VRAM；推荐结果保留至少 3GB memory headroom。最终 batch 必须写入 resolved config。</p>
+<table><tr><th>模块</th><th>默认</th><th>原因</th></tr><tr><td>Sparse CFM</td><td>BF16 autocast</td><td>L40S Tensor Core 高吞吐；BF16 不需要 GradScaler</td></tr><tr><td>FP32 matmul</td><td>TF32 + matmul precision high</td><td>提升未 autocast 算子吞吐</td></tr><tr><td>Frozen OccFM VAE</td><td>FP32</td><td>保持 pretrained latent representation convention；只有 parity 通过后才开 VAE BF16</td></tr><tr><td>Optimizer</td><td>CUDA fused AdamW</td><td>减少 optimizer kernel overhead；不可用自动 fallback</td></tr><tr><td>DataLoader</td><td>pin + persistent workers + prefetch</td><td>减少 H2D/input stall</td></tr><tr><td>DDP</td><td>shard-aware sampler + gradient bucket view + static graph</td><td>避免 cache shard thrashing 与额外 gradient copy</td></tr><tr><td>torch.compile</td><td>默认关闭，可显式 benchmark</td><td>active-window batch 动态，防止 graph-break/recompile 反而变慢</td></tr></table>
+<h3>8.1 L40S batch tuning</h3><div class="eq">python tools/real_motion/tune_l40s.py   --cache data/latent_train   --empty-latent data/empty_latent.pt   --upstream-ckpt /path/to/occfm.ckpt   --output outputs/l40s_batch_tune.json</div>
+<p>默认扫描 4/6/8/10/12/16/20/24 samples/GPU，并记录 samples/s、transition windows/s、step latency、peak allocated/reserved VRAM；推荐结果保留至少 3GB memory headroom。最终 batch 必须写进 resolved config。</p>
 <h3>8.2 Cache path</h3><p>Frozen VAE cache builder 支持 batched encode（L40S 默认 4）并预计算 window plan；sharded dataset 使用 shard-local / distributed shard-aware sampling，避免正式训练反复跨 shard <code>torch.load</code>。</p>
 <h2 id="eff">9. 效率指标拆开</h2><table><tr><th>指标</th><th>含义</th></tr><tr><td>Generation-support ratio</td><td>M_gen 本身稀疏度</td></tr><tr><td>Window slot compute ratio</td><td>N_window×H_window×W_window / 50²</td></tr><tr><td>GFLOPs</td><td>torch.profiler(with_flops=True) 支持算子</td></tr><tr><td>End-to-end latency/FPS</td><td>motion/SE3/KTA + VAE + planning + NFE + scatter + decoder + composition</td></tr></table>
 <h2 id="train">10. YAML 与 Training</h2><p><code>configs/real_motion_occfm.yaml</code> 是唯一 runtime source-of-truth；每个 run 保存 resolved config。</p>
 <h3>10.1 Tiny</h3><p><code>train_sparse.py</code> 仅用于 64/128 overfit / small held-out。</p>
-<h3>10.2 Full</h3><p><code>train_full.py</code> 支持 single-GPU 或 DDP、distributed shard-aware sampler、official-style split-decay AdamW、effective LR scaling、warmup+cosine、EMA=0.9999、resume、validation、best/last/periodic checkpoints，以及 L40S runtime profile。</p>
+<h3>10.2 Full</h3><p><code>train_full.py</code> 支持 single-GPU 或 DDP、distributed shard-aware training sampler、official-style split-decay AdamW、effective LR scaling、warmup+cosine、EMA=0.9999、resume、validation、best/last/periodic checkpoints，以及 L40S runtime profile。Validation 使用 exact no-padding distributed sampler：各 rank 不要求相同 val batch 数，因为 forward 直接运行 EMA module，不触发 DDP collectives；最终只 all-reduce真实样本加权的 numerator/denominator，从而避免 padding duplicate 对 <code>best.pt</code> 的偏差。</p>
 <h2>11. 最终执行顺序</h2><div class="flow">pytest
 → official 50×50 transition equivalence
 → prepare smoke
