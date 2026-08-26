@@ -1,0 +1,28 @@
+name: swfm-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  dependency-light:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest numpy pyyaml einops einops-exts
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Compile all Python entrypoints
+        run: python -m py_compile $(find real_motion tools tests -name '*.py' -type f)
+      - name: Run dependency-light tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/upstream_occfm:${{ github.workspace }}
+        run: pytest -q tests -m 'not integration'
