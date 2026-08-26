@@ -7,7 +7,7 @@ throughput tuner rather than a transition-only microbenchmark.
 """
 import argparse,gc,json,sys,time
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(UP),str(ROOT)]
+ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(ROOT),str(UP)]
 import torch
 from torch.optim.swa_utils import AveragedModel,get_ema_avg_fn
 from torch.utils.data import DataLoader
@@ -57,7 +57,6 @@ def main():
             row.update({'samples_per_s':measured_samples/max(elapsed,1e-12),'transition_windows_per_s':measured_windows/max(elapsed,1e-12),'avg_transition_windows_per_step':measured_windows/max(steps,1),'step_ms':1000*elapsed/max(steps,1),'data_wait_ms':1000*data_wait/max(steps,1),'data_wait_fraction':data_wait/max(elapsed,1e-12)})
         del it,loader;gc.collect();return row
 
-    # Stage 1: tune CPU input concurrency at the conservative baseline batch.
     baseline_bs=candidates[0];worker_rows=[]
     for workers in worker_candidates:
         row=benchmark(baseline_bs,workers,max(1,a.worker_steps),20260826+workers);worker_rows.append(row);print('worker probe:',row)
@@ -65,7 +64,6 @@ def main():
     if not valid_workers:raise RuntimeError('all worker probes failed')
     best_worker_row=max(valid_workers,key=lambda r:r['samples_per_s']);best_workers=int(best_worker_row['num_workers']);print('selected workers:',best_workers)
 
-    # Stage 2: scan BPG with the selected input pipeline.
     rows=[]
     for bs in candidates:
         row=benchmark(bs,best_workers,max(1,a.steps),20260926+bs);rows.append(row);print('batch probe:',row)
