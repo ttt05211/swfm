@@ -4,7 +4,8 @@
 L40S optimization:
 - batch the frozen VAE over several prepared windows;
 - keep VAE FP32 by default for representation parity (optional VAE AMP is explicit);
-- optionally precompute sparse-window plans so training never runs the CPU planner.
+- optionally precompute sparse-window plans so training never runs the CPU planner;
+- use per-sample VAE seeds so cache values do not depend on VAE batch size.
 """
 import argparse, sys, json
 from pathlib import Path
@@ -65,12 +66,14 @@ def main():
             future=torch.from_numpy(np.stack([r[1]['future_dynamic_target_occ'] for r in rows]))
             static=torch.from_numpy(np.stack([r[1]['static_future_occ'] for r in rows]))
             kta=torch.from_numpy(np.stack([r[1]['kta_future_occ'] for r in rows]))
-            batch_seed=a.seed+start*101
+            # Each logical sample keeps its own deterministic seed. Therefore
+            # --batch-size changes throughput only, not cached latent values.
+            sample_seeds=[a.seed+r[0]*17 for r in rows]
             with torch.inference_mode(),vae_autocast_context(cfg,device):
-                mh=ad.encode(moving,mode=mode,seed=batch_seed).cpu()
-                ft=ad.encode(future,mode=mode,seed=batch_seed+1).cpu()
-                st=ad.encode(static,mode=mode,seed=batch_seed+2).cpu()
-                kt=ad.encode(kta,mode=mode,seed=batch_seed+3).cpu()
+                mh=ad.encode(moving,mode=mode,seed=sample_seeds).cpu()
+                ft=ad.encode(future,mode=mode,seed=[s+1 for s in sample_seeds]).cpu()
+                st=ad.encode(static,mode=mode,seed=[s+2 for s in sample_seeds]).cpu()
+                kt=ad.encode(kta,mode=mode,seed=[s+3 for s in sample_seeds]).cpu()
 
             for j,(i,s,gen,hist) in enumerate(rows):
                 planning=torch.cat([hist,gen],0)
@@ -102,7 +105,8 @@ def main():
     meta={
         'prepared':str(Path(a.prepared).resolve()),'vae_ckpt':str(Path(a.vae_ckpt).resolve()),
         'vae_ckpt_sha256':file_sha256(a.vae_ckpt),'latent_mode':mode,'seed':a.seed,
-        'vae_batch_size':batch_size,'vae_amp_enabled':bool(get_cfg(cfg,'RUNTIME.VAE_AMP.ENABLED',False)),
+        'vae_seed_contract':'per_sample_index_v1','vae_batch_size':batch_size,
+        'vae_amp_enabled':bool(get_cfg(cfg,'RUNTIME.VAE_AMP.ENABLED',False)),
         'latent_extra_radius':extra,'filtered_empty_generation_support':filter_empty,
         'precomputed_window_plan':precompute,'window_plan_hw':[wh,ww] if precompute else None,
         'window_plan_max_windows':maxw if precompute else None,'resolved_config':cfg,
