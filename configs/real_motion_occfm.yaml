@@ -5,6 +5,9 @@ UPSTREAM:
   LATENT_CHANNELS: 16
   OCC_RANGE: [-40, -40, -1, 40, 40, 5.4]
   VOXEL_SIZE: [0.4, 0.4, 0.4]
+  WM_VARIANT: occfm_fut
+  WM_CONFIG: tools/cfgs/occfm_fut.yaml
+  WM_CHECKPOINT_REL: logs/occfm_fut/2s_3s_nusc_fut_traj/ckpt/epoch=000196.ckpt
 MODEL:
   WINDOW_HW: [20, 20]
   MAX_WINDOWS: 8
@@ -15,6 +18,7 @@ MODEL:
   RESCALE_FACTOR: 10.0
   ALPHA_SHIFT: 3.0
   USE_CFG: false
+  TRAJECTORY_LENGTH: 12
 MOTION:
   STATES: [confident_static, moving, uncertain, free]
   STATIC_MIN_PERSISTENCE: 0.80
@@ -43,10 +47,15 @@ TARGET:
   METRIC_TARGET: interval_displacement_v2_gt_instance_support
   FREE_LABEL: 17
 EGO_PROTOCOL:
+  NAME: occfm_fut_12step_v1
   FUTURE_POSE_SOURCE: gt_future_ego
-  TRAJECTORY_CONDITION_SOURCE: gt_ego_fut_trajs
+  TRAJECTORY_CONDITION_SOURCE: official_temporal_info_first_step_per_frame
+  TRAJECTORY_LENGTH: 12
+  HIST_LAST: 4
+  ZERO_PREFIX_STEPS: 2
+  REQUIRE_TEMPORAL_INFO: true
   BASELINE_INFORMATION_MATCH: required
-  UPSTREAM_INIT_VARIANT: hist_traj_weights_only
+  UPSTREAM_INIT_VARIANT: fut_traj_196
 METRIC:
   PROTOCOL: interval_displacement_v2
   SPEED_THRESHOLD_MPS: 0.5
