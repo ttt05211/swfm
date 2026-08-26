@@ -15,13 +15,16 @@ from torch.utils.data.distributed import DistributedSampler
 
 from real_motion.dataset import (
     RealMotionCacheDataset, collate_real_motion, ShardShuffleSampler,
-    DistributedShardSampler, DistributedShardEvalSampler,
-    DistributedExactEvalSampler,
+    DistributedShardSampler, DistributedShardEvalSampler, DistributedExactEvalSampler,
 )
 from real_motion.windows import WindowPlan, WindowPlanner, crop_windows, window_coverage
 from real_motion.models import MotionWindowFlowMatching, RealMotionWindowCFM
-from real_motion.checkpoint import load_shape_safe
-from real_motion.runtime_config import add_config_args, load_runtime_config, get_cfg, save_resolved_config
+from real_motion.checkpoint import load_shape_safe, require_checkpoint_reuse
+from real_motion.runtime_config import add_config_args, load_runtime_config, get_cfg, save_resolved_config, config_fingerprint
+from real_motion.occfm_io import file_sha256
+from real_motion.training_contract import (
+    validate_cache_pair, load_empty_asset, validate_empty_asset, validate_resume_checkpoint,
+)
 from real_motion.perf import (
     configure_cuda_runtime, autocast_context, needs_grad_scaler,
     dataloader_kwargs, maybe_compile, cuda_device_summary,
@@ -55,7 +58,8 @@ def make_cfm(cfg):
 
 
 def load_empty(path):
-    obj=torch.load(path,map_location='cpu',weights_only=False)
+    """Compatibility helper used by tiny/tuning tools; formal training uses metadata-rich loader."""
+    obj=torch.load(path,map_location='cpu',weights_only=True)
     if isinstance(obj,dict): obj=obj.get('empty_latent',obj.get('latent'))
     if not torch.is_tensor(obj) or obj.ndim!=3: raise ValueError('empty latent must be [C,H,W]')
     return obj
@@ -130,10 +134,6 @@ def make_samplers(train_ds,val_ds,distributed,world,rank,seed=20260826):
     if distributed:
         ts=(DistributedShardSampler(train_ds,world,rank,shuffle=True,seed=seed)
             if train_ds.sharded else DistributedSampler(train_ds,num_replicas=world,rank=rank,shuffle=True,drop_last=False,seed=seed))
-        # Validation does NOT execute a DDP forward. Therefore ranks may process
-        # different numbers of batches safely; every real validation sample is
-        # counted exactly once and only the final numerator/denominator is
-        # all-reduced. Padding would bias val loss and best.pt selection.
         vs=(DistributedShardEvalSampler(val_ds,world,rank)
             if val_ds.sharded else DistributedExactEvalSampler(val_ds,world,rank))
     else:
@@ -171,6 +171,9 @@ def main():
     if rank==0: print('runtime device:',hw)
 
     train_ds=RealMotionCacheDataset(a.train_cache); val_ds=RealMotionCacheDataset(a.val_cache)
+    cache_fp=validate_cache_pair(train_ds.metadata,val_ds.metadata,cfg)
+    empty_cpu,empty_meta=load_empty_asset(a.empty_latent); validate_empty_asset(empty_meta,train_ds.metadata,cache_fp)
+    upstream_sha=file_sha256(a.upstream_ckpt)
     if distributed and not bool(train_ds.metadata.get('filtered_empty_generation_support',False)):
         raise RuntimeError('DDP full training requires cache built with empty-generation-support filtering')
     expected_hw=list(map(int,get_cfg(cfg,'MODEL.WINDOW_HW',[20,20]))); expected_k=int(get_cfg(cfg,'MODEL.MAX_WINDOWS',8))
@@ -197,15 +200,18 @@ def main():
     sched=make_scheduler(opt,int(get_cfg(cfg,'OPTIMIZATION.FULL.WARMUP_STEPS',1000)),
                          epochs*len(tl),float(get_cfg(cfg,'OPTIMIZATION.FULL.MIN_LR_RATIO',.2)))
     ema=AveragedModel(wrapper,avg_fn=get_ema_avg_fn(float(get_cfg(cfg,'OPTIMIZATION.FULL.EMA_DECAY',.9999))),use_buffers=True).to(device)
-    start=0; step=0; best=float('inf')
+    start=0; step=0; best=float('inf'); reuse_fraction=None
     if a.resume:
         ck=torch.load(a.resume,map_location='cpu',weights_only=False)
+        validate_resume_checkpoint(ck,cfg,cache_fp,upstream_sha,empty_cpu)
         wrapper.load_state_dict(ck['wrapper_state_dict'],strict=True); opt.load_state_dict(ck['optimizer'])
         sched.load_state_dict(ck['scheduler']); ema.load_state_dict(ck['ema'])
-        start=int(ck['epoch'])+1; step=int(ck['global_step']); best=float(ck.get('best_val',best))
+        start=int(ck['epoch'])+1; step=int(ck['global_step']); best=float(ck.get('best_val',best)); reuse_fraction=ck.get('upstream_reuse_fraction')
     else:
-        rep=load_shape_safe(cfm.transition,a.upstream_ckpt,verbose=rank==0); ema.update_parameters(wrapper)
-        if rank==0: print('checkpoint reuse:',rep['loaded'],'/',rep['target_total'])
+        rep=load_shape_safe(cfm.transition,a.upstream_ckpt,verbose=rank==0)
+        reuse_fraction=require_checkpoint_reuse(rep,float(get_cfg(cfg,'MODEL.MIN_UPSTREAM_REUSE_FRACTION',.95)))
+        ema.update_parameters(wrapper)
+        if rank==0: print('checkpoint reuse:',rep['loaded'],'/',rep['target_total'],'fraction',reuse_fraction)
 
     if distributed:
         ddp_cfg=get_cfg(cfg,'RUNTIME.DDP',{}) or {}
@@ -219,12 +225,12 @@ def main():
     train_exec=maybe_compile(ddp,cfg,'train')
 
     wh,ww=map(int,get_cfg(cfg,'MODEL.WINDOW_HW')); planner=WindowPlanner((wh,ww),int(get_cfg(cfg,'MODEL.MAX_WINDOWS',8)))
-    empty=load_empty(a.empty_latent).to(device,non_blocking=True); mincov=float(get_cfg(cfg,'MODEL.MIN_WINDOW_COVERAGE',.95))
+    empty=empty_cpu.to(device,non_blocking=True); mincov=float(get_cfg(cfg,'MODEL.MIN_WINDOW_COVERAGE',.95))
     clip=float(get_cfg(cfg,'OPTIMIZATION.FULL.GRAD_NORM_CLIP',5.0)); save_every=int(get_cfg(cfg,'OPTIMIZATION.FULL.SAVE_EVERY_EPOCHS',5))
     out=Path(a.output_dir); ckdir=out/'ckpt'
     if rank==0: ckdir.mkdir(parents=True,exist_ok=True); save_resolved_config(cfg,out/'resolved_config.yaml')
-    use_scaler=needs_grad_scaler(cfg,device,a.amp)
-    scaler=torch.amp.GradScaler('cuda',enabled=use_scaler)
+    use_scaler=needs_grad_scaler(cfg,device,a.amp); scaler=torch.amp.GradScaler('cuda',enabled=use_scaler)
+    resume_fp=config_fingerprint(cfg,'resume')
 
     for epoch in range(start,epochs):
         if ts is not None and hasattr(ts,'set_epoch'): ts.set_epoch(epoch)
@@ -244,7 +250,7 @@ def main():
                 print(f'epoch={epoch} step={step} loss={loss.item():.6f} lr={sched.get_last_lr()[0]:.3e} peak_GB={mem:.2f}')
         val=validate(ema.module,vl,planner,empty,device,mincov,epoch,cfg,a.amp)
         if rank==0:
-            state={'wrapper_state_dict':wrapper.state_dict(),'optimizer':opt.state_dict(),'scheduler':sched.state_dict(),'ema':ema.state_dict(),'epoch':epoch,'global_step':step,'best_val':min(best,val),'cache_metadata':train_ds.metadata,'empty_latent':empty.cpu(),'state_dict':ema.module.cfm.state_dict(),'raw_state_dict':cfm.state_dict(),'resolved_config':cfg,'hardware':cuda_device_summary(device)}
+            state={'wrapper_state_dict':wrapper.state_dict(),'optimizer':opt.state_dict(),'scheduler':sched.state_dict(),'ema':ema.state_dict(),'epoch':epoch,'global_step':step,'best_val':min(best,val),'cache_metadata':train_ds.metadata,'cache_contract_sha256':cache_fp,'resume_contract_sha256':resume_fp,'upstream_ckpt_sha256':upstream_sha,'upstream_reuse_fraction':reuse_fraction,'empty_latent':empty_cpu,'state_dict':ema.module.cfm.state_dict(),'raw_state_dict':cfm.state_dict(),'resolved_config':cfg,'hardware':cuda_device_summary(device)}
             torch.save(state,ckdir/'last.pt')
             if (epoch+1)%save_every==0: torch.save(state,ckdir/f'epoch_{epoch+1:04d}.pt')
             if val<best: best=val; state['best_val']=best; torch.save(state,ckdir/'best.pt')
