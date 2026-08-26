@@ -36,6 +36,23 @@ def _shard_groups(dataset: RealMotionCacheDataset):
     return [(name,groups[name]) for name in sorted(groups)]
 
 
+def _assign_whole_shards(groups, num_replicas, shuffle, seed, epoch):
+    """Greedily assign each physical cache shard to exactly one rank."""
+    g=torch.Generator(); g.manual_seed(int(seed)+int(epoch))
+    order=list(range(len(groups)))
+    if shuffle and order:
+        order=torch.randperm(len(order),generator=g).tolist()
+    rows=[[] for _ in range(int(num_replicas))]; loads=[0]*int(num_replicas)
+    for si in order:
+        _,group=groups[si]
+        owner=min(range(int(num_replicas)),key=lambda r:(loads[r],r))
+        local=list(group)
+        if shuffle and len(local)>1:
+            perm=torch.randperm(len(local),generator=g).tolist(); local=[local[j] for j in perm]
+        rows[owner].extend(local); loads[owner]+=len(local)
+    return rows
+
+
 class ShardShuffleSampler(Sampler):
     """Single-process shard-local shuffle without random shard thrashing."""
     def __init__(self,dataset:RealMotionCacheDataset,seed=0):
@@ -51,13 +68,11 @@ class ShardShuffleSampler(Sampler):
 
 
 class DistributedShardSampler(Sampler):
-    """Assign whole cache shards to DDP ranks, then shuffle locally.
+    """Training sampler: whole-shard ownership plus rank-local padding.
 
-    A normal DistributedSampler (or a strided global index stream) makes every
-    rank load the same large `.pt` shard. Here each physical shard has exactly
-    one owner rank per epoch. Shards are greedily balanced by sample count; all
-    ranks are then padded *from their own local indices* to equal sampler
-    lengths so DDP executes the same number of optimization steps.
+    Every physical shard has one owner rank per epoch. Rank-local samples are
+    padded to the maximum rank length so DDP training executes exactly the same
+    number of forward/backward collectives on every rank.
     """
     def __init__(self,dataset:RealMotionCacheDataset,num_replicas,rank,shuffle=True,seed=0,drop_last=False):
         self.dataset=dataset;self.num_replicas=int(num_replicas);self.rank=int(rank);self.shuffle=bool(shuffle);self.seed=int(seed);self.drop_last=bool(drop_last);self.epoch=0;self.groups=_shard_groups(dataset)
@@ -66,15 +81,8 @@ class DistributedShardSampler(Sampler):
     def set_epoch(self,epoch):self.epoch=int(epoch);self._cached_epoch=None;self._cached_rows=None
     def _rank_rows(self):
         if self._cached_epoch==self.epoch and self._cached_rows is not None:return self._cached_rows
-        g=torch.Generator();g.manual_seed(self.seed+self.epoch)
-        order=list(range(len(self.groups)))
-        if self.shuffle:order=torch.randperm(len(order),generator=g).tolist()
-        rows=[[] for _ in range(self.num_replicas)];loads=[0]*self.num_replicas
-        for si in order:
-            _,group=self.groups[si];owner=min(range(self.num_replicas),key=lambda r:(loads[r],r));local=list(group)
-            if self.shuffle and len(local)>1:
-                perm=torch.randperm(len(local),generator=g).tolist();local=[local[j] for j in perm]
-            rows[owner].extend(local);loads[owner]+=len(local)
+        rows=_assign_whole_shards(self.groups,self.num_replicas,self.shuffle,self.seed,self.epoch)
+        loads=[len(row) for row in rows]
         target=(min(loads) if self.drop_last else max(loads)) if loads else 0
         for r,row in enumerate(rows):
             if self.drop_last:
@@ -88,3 +96,29 @@ class DistributedShardSampler(Sampler):
         self._cached_epoch=self.epoch;self._cached_rows=rows;return rows
     def __len__(self):return len(self._rank_rows()[self.rank])
     def __iter__(self):return iter(list(self._rank_rows()[self.rank]))
+
+
+class DistributedShardEvalSampler(Sampler):
+    """Validation sampler with whole-shard ownership and *no padding*.
+
+    Validation runs the plain EMA module rather than a DDP forward, so ranks may
+    process different numbers of batches safely and all-reduce only the final
+    numerator/denominator. Every validation sample is therefore counted exactly
+    once when selecting best.pt.
+    """
+    def __init__(self,dataset:RealMotionCacheDataset,num_replicas,rank):
+        self.dataset=dataset;self.num_replicas=int(num_replicas);self.rank=int(rank);self.groups=_shard_groups(dataset)
+        if self.num_replicas<=0 or not 0<=self.rank<self.num_replicas:raise ValueError('invalid DDP rank/world size')
+        self.rows=_assign_whole_shards(self.groups,self.num_replicas,False,0,0)
+    def __len__(self):return len(self.rows[self.rank])
+    def __iter__(self):return iter(list(self.rows[self.rank]))
+
+
+class DistributedExactEvalSampler(Sampler):
+    """No-padding validation partition for a non-sharded Dataset."""
+    def __init__(self,dataset,num_replicas,rank):
+        self.dataset=dataset;self.num_replicas=int(num_replicas);self.rank=int(rank)
+        if self.num_replicas<=0 or not 0<=self.rank<self.num_replicas:raise ValueError('invalid DDP rank/world size')
+        self.indices=list(range(self.rank,len(dataset),self.num_replicas))
+    def __len__(self):return len(self.indices)
+    def __iter__(self):return iter(self.indices)
