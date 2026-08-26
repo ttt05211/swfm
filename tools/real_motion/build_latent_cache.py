@@ -17,7 +17,7 @@ from real_motion.cache import save_sharded_cache
 from real_motion.occfm_io import load_official_vae, OccFMVAEAdapter, file_sha256
 from real_motion.support import downsample_support
 from real_motion.windows import WindowPlanner, window_coverage
-from real_motion.runtime_config import add_config_args, load_runtime_config, get_cfg, save_resolved_config
+from real_motion.runtime_config import add_config_args, load_runtime_config, get_cfg, save_resolved_config, config_fingerprint
 from real_motion.perf import configure_cuda_runtime, vae_autocast_context
 
 
@@ -42,11 +42,18 @@ def main():
     wh,ww=map(int,get_cfg(cfg,'MODEL.WINDOW_HW',[20,20])); maxw=int(get_cfg(cfg,'MODEL.MAX_WINDOWS',8)); mincov=float(get_cfg(cfg,'MODEL.MIN_WINDOW_COVERAGE',.95))
     planner=WindowPlanner((wh,ww),maxw) if precompute else None
 
+    vae_hash=file_sha256(a.vae_ckpt); cache_contract_sha=config_fingerprint(cfg,'cache')
+    vae_amp=bool(get_cfg(cfg,'RUNTIME.VAE_AMP.ENABLED',False))
     vae,_=load_official_vae(UP,a.vae_ckpt,device); ad=OccFMVAEAdapter(vae); ds=PreparedShardDataset(a.prepared)
+    empty_seed=a.seed+999
     with torch.inference_mode(),vae_autocast_context(cfg,device):
-        empty=ad.empty_latent(mode=mode,seed=a.seed+999).detach().cpu()
+        empty=ad.empty_latent(mode=mode,seed=empty_seed).detach().cpu()
     Path(a.empty_latent).parent.mkdir(parents=True,exist_ok=True)
-    torch.save({'empty_latent':empty,'mode':mode,'seed':a.seed+999},a.empty_latent)
+    torch.save({
+        'empty_latent':empty,'mode':mode,'seed':empty_seed,'cache_seed':a.seed,
+        'vae_ckpt_sha256':vae_hash,'vae_amp_enabled':vae_amp,
+        'cache_contract_sha256':cache_contract_sha,
+    },a.empty_latent)
     skipped=0; min_plan_cov=1.0
 
     def samples():
@@ -66,8 +73,6 @@ def main():
             future=torch.from_numpy(np.stack([r[1]['future_dynamic_target_occ'] for r in rows]))
             static=torch.from_numpy(np.stack([r[1]['static_future_occ'] for r in rows]))
             kta=torch.from_numpy(np.stack([r[1]['kta_future_occ'] for r in rows]))
-            # Each logical sample keeps its own deterministic seed. Therefore
-            # --batch-size changes throughput only, not cached latent values.
             sample_seeds=[a.seed+r[0]*17 for r in rows]
             with torch.inference_mode(),vae_autocast_context(cfg,device):
                 mh=ad.encode(moving,mode=mode,seed=sample_seeds).cpu()
@@ -104,9 +109,9 @@ def main():
 
     meta={
         'prepared':str(Path(a.prepared).resolve()),'vae_ckpt':str(Path(a.vae_ckpt).resolve()),
-        'vae_ckpt_sha256':file_sha256(a.vae_ckpt),'latent_mode':mode,'seed':a.seed,
+        'vae_ckpt_sha256':vae_hash,'latent_mode':mode,'seed':a.seed,
         'vae_seed_contract':'per_sample_index_v1','vae_batch_size':batch_size,
-        'vae_amp_enabled':bool(get_cfg(cfg,'RUNTIME.VAE_AMP.ENABLED',False)),
+        'vae_amp_enabled':vae_amp,'cache_contract_sha256':cache_contract_sha,
         'latent_extra_radius':extra,'filtered_empty_generation_support':filter_empty,
         'precomputed_window_plan':precompute,'window_plan_hw':[wh,ww] if precompute else None,
         'window_plan_max_windows':maxw if precompute else None,'resolved_config':cfg,
