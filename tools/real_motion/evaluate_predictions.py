@@ -20,12 +20,14 @@ def prediction_map(root):
         idx=json.loads(ip.read_text());return {e['sample_id']:root/e['file'] for e in idx['entries']},idx
     m={}
     for p in sorted(root.glob('*.pt')):
-        o=torch.load(p,map_location='cpu',weights_only=False);m[str(o['sample_id'])]=p
+        o=torch.load(p,map_location='cpu',weights_only=False);sid=str(o['sample_id'])
+        if sid in m:raise RuntimeError(f'duplicate prediction sample_id in legacy scan: {sid}')
+        m[sid]=p
     return m,{'version':'legacy_scan'}
 def dual(rec,grid):
     b0=box3d_from_dict(rec['box0_future_ego']);bh=box3d_from_dict(rec['boxh_future_ego']);return rasterize_oriented_box(b0,grid,BOX_MARGIN_M)|rasterize_oriented_box(bh,grid,BOX_MARGIN_M)
 def main():
-    p=argparse.ArgumentParser();add_config_args(p);p.add_argument('--prepared',required=True);p.add_argument('--pred-dir',required=True);p.add_argument('--output',required=True);p.add_argument('--subset-config',default=None);p.add_argument('--max-windows',type=int,default=None);a=p.parse_args();cfg=load_runtime_config(a.config,a.override)
+    p=argparse.ArgumentParser();add_config_args(p);p.add_argument('--prepared',required=True);p.add_argument('--pred-dir',required=True);p.add_argument('--output',required=True);p.add_argument('--subset-config',default=None);p.add_argument('--max-windows',type=int,default=None);p.add_argument('--allow-missing-predictions',action='store_true',help='diagnostic only; full evaluation is strict by default');a=p.parse_args();cfg=load_runtime_config(a.config,a.override)
     sc=None
     if a.subset_config:
         sc=json.loads(Path(a.subset_config).read_text());
@@ -51,9 +53,11 @@ def main():
             if sc:
                 for name,sup2 in subs.items():ss[name].update(h,pred[fi],gt,sup2);sk[name].update(h,kta[fi],gt,sup2)
         used+=1
+    if missing and not a.allow_missing_predictions:
+        raise RuntimeError(f'missing predictions for {len(missing)}/{n} prepared samples; first IDs: {missing[:10]}')
     if used==0:raise RuntimeError('no predictions matched prepared sample_id')
     wm=moving.compute();oo=om.compute();macro={'num_regions':len(rows),'repair_rate':float(np.mean([r['repair'] for r in rows])) if rows else 0.0,'harm_rate':float(np.mean([r['harm'] for r in rows])) if rows else 0.0,'mean_accuracy_delta':float(np.mean([r['delta'] for r in rows])) if rows else 0.0}
-    report={'num_prepared_considered':n,'num_predictions_used':used,'missing_count':len(missing),'missing_sample_ids':missing[:20],'SWFM':{'overall':mean_h(overall),'dynamic':mean_h(dynamic),'Moving-mIoU_v2':wm},'KTA_composed_baseline':{'overall':mean_h(ko),'Moving-mIoU_v2':km.compute()},'diagnostics':{'moving_support_harm_repair_voxel_micro':hr,'moving_instance_tube_macro':macro,'oracle_selector_Moving-mIoU_v2':oo,'oracle_selector_headroom_pp':float(oo['mIoU']-wm['mIoU'])},'prediction_index':{k:v for k,v in pidx.items() if k!='entries'}}
+    report={'num_prepared_considered':n,'num_predictions_used':used,'complete_prediction_set':len(missing)==0,'missing_count':len(missing),'missing_sample_ids':missing[:20],'SWFM':{'overall':mean_h(overall),'dynamic':mean_h(dynamic),'Moving-mIoU_v2':wm},'KTA_composed_baseline':{'overall':mean_h(ko),'Moving-mIoU_v2':km.compute()},'diagnostics':{'moving_support_harm_repair_voxel_micro':hr,'moving_instance_tube_macro':macro,'oracle_selector_Moving-mIoU_v2':oo,'oracle_selector_headroom_pp':float(oo['mIoU']-wm['mIoU'])},'prediction_index':{k:v for k,v in pidx.items() if k!='entries'}}
     if sc:report['subset_contract']=sc;report['Moving-mIoU_v2_subsets']={x:{'eligible_instance_records':counts[x],'SWFM':ss[x].compute(),'KTA':sk[x].compute()} for x in SUBSET_NAMES}
     op=Path(a.output);op.parent.mkdir(parents=True,exist_ok=True);op.write_text(json.dumps(report,indent=2),encoding='utf-8');save_resolved_config(cfg,op.with_suffix('.resolved.yaml'));print(json.dumps(report['SWFM'],indent=2))
 if __name__=='__main__':main()
