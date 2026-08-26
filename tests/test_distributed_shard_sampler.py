@@ -1,9 +1,12 @@
-from real_motion.dataset import RealMotionCacheDataset, DistributedShardSampler
+from real_motion.dataset import (
+    RealMotionCacheDataset, DistributedShardSampler,
+    DistributedShardEvalSampler, DistributedExactEvalSampler,
+)
 
 
 class _Backend:
     def __init__(self, sizes=(5,4,3)):
-        self.entries=[];self.shard_ranges={};start=0
+        self.entries=[];self.shard_ranges={}
         for sid,n in enumerate(sizes):
             name=f'shard_{sid:03d}.pt';idxs=[]
             for _ in range(n):
@@ -22,10 +25,7 @@ def test_distributed_shard_sampler_whole_shard_ownership_and_equal_steps():
     rows=[list(s) for s in samplers]
     assert len(set(map(len,rows)))==1
     assert set().union(*(set(r) for r in rows))==set(range(12))
-    # Every original sample has a single owner rank; padding may repeat only locally.
-    for idx in range(12):
-        assert sum(idx in set(row) for row in rows)==1
-    # Whole physical shards are not split across ranks.
+    for idx in range(12):assert sum(idx in set(row) for row in rows)==1
     for members in ds.backend.shard_ranges.values():
         owners={r for r,row in enumerate(rows) if members & set(row)}
         assert len(owners)==1
@@ -45,3 +45,25 @@ def test_distributed_shard_sampler_epoch_is_deterministic():
     c=DistributedShardSampler(ds,2,0,shuffle=True,seed=99);c.set_epoch(4)
     assert list(a)==list(b)
     assert list(a)!=list(c)
+
+
+def test_distributed_shard_eval_sampler_has_no_padding_or_duplicates():
+    ds=_fake_dataset((5,4,3))
+    rows=[list(DistributedShardEvalSampler(ds,3,r)) for r in range(3)]
+    flat=[i for row in rows for i in row]
+    assert sorted(flat)==list(range(12))
+    assert len(flat)==len(set(flat))==12
+    # Unequal lengths are allowed for validation; no artificial repeats.
+    assert [len(r) for r in rows]==[5,4,3]
+    for members in ds.backend.shard_ranges.values():
+        owners={r for r,row in enumerate(rows) if members & set(row)}
+        assert len(owners)==1
+
+
+def test_distributed_exact_eval_sampler_nonsharded_is_exact():
+    dataset=list(range(10))
+    rows=[list(DistributedExactEvalSampler(dataset,3,r)) for r in range(3)]
+    flat=[i for row in rows for i in row]
+    assert sorted(flat)==list(range(10))
+    assert len(flat)==len(set(flat))==10
+    assert [len(r) for r in rows]==[4,3,3]
