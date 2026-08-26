@@ -73,19 +73,13 @@ def _copy_paths(cfg: Mapping[str, Any], paths):
 
 
 def config_contract(cfg: Mapping[str, Any], kind="cache") -> dict:
-    """Return the stable, path-independent subset that defines an experiment asset.
-
-    ``cache`` includes every setting that changes prepared/latent supervision or
-    precomputed sparse-window geometry, but deliberately excludes pure I/O knobs
-    such as VAE batch size and shard size. ``resume`` additionally freezes the
-    trainable model and optimizer schedule so a resumed run cannot silently
-    continue under a different experiment.
-    """
+    """Return the stable, path-independent subset that defines an experiment asset."""
     cache_paths=(
         "UPSTREAM.COMMIT","UPSTREAM.LATENT_HW","UPSTREAM.LATENT_CHANNELS",
-        "UPSTREAM.OCC_RANGE","UPSTREAM.VOXEL_SIZE",
+        "UPSTREAM.OCC_RANGE","UPSTREAM.VOXEL_SIZE","UPSTREAM.WM_VARIANT",
+        "UPSTREAM.WM_CONFIG","UPSTREAM.WM_CHECKPOINT_REL",
         "MODEL.WINDOW_HW","MODEL.MAX_WINDOWS","MODEL.MIN_WINDOW_COVERAGE",
-        "MOTION","TARGET","EGO_PROTOCOL",
+        "MODEL.TRAJECTORY_LENGTH","MOTION","TARGET","EGO_PROTOCOL",
         "CACHE.VAE_LATENT_MODE","CACHE.PRECOMPUTE_WINDOW_PLAN",
         "CACHE.FILTER_EMPTY_GENERATION_SUPPORT","RUNTIME.VAE_AMP",
     )
@@ -130,6 +124,7 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
             ok = actual == expected
         if not ok:
             raise ValueError(f"Frozen metric contract mismatch at {path}: YAML={actual!r}, code={expected!r}")
+
     window = _deep_get(cfg, "MODEL.WINDOW_HW")
     if not isinstance(window, list) or len(window) != 2 or min(map(int, window)) <= 0:
         raise ValueError("MODEL.WINDOW_HW must be [H,W] positive integers")
@@ -138,9 +133,34 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
         raise ValueError("MOTION.KTA_TUBE_RADII must contain six 0.5s radii")
     if any(int(r) < 0 for r in radii):
         raise ValueError("MOTION.KTA_TUBE_RADII cannot be negative")
+
+    # Main-paper ego protocol is intentionally frozen to the official OccFM-fut
+    # model released as epoch=000196.ckpt. The official dataset feeds one-step
+    # GT ego offsets for every frame in the 6-history + 6-future window, yielding
+    # [12,2], while HIST_LAST=4 zeros the first 2 history trajectory entries.
+    expected_ego={
+        "NAME":"occfm_fut_12step_v1",
+        "FUTURE_POSE_SOURCE":"gt_future_ego",
+        "TRAJECTORY_CONDITION_SOURCE":"official_temporal_info_first_step_per_frame",
+        "TRAJECTORY_LENGTH":12,
+        "HIST_LAST":4,
+        "ZERO_PREFIX_STEPS":2,
+        "REQUIRE_TEMPORAL_INFO":True,
+        "BASELINE_INFORMATION_MATCH":"required",
+        "UPSTREAM_INIT_VARIANT":"fut_traj_196",
+    }
     ego=_deep_get(cfg,"EGO_PROTOCOL",{}) or {}
-    if ego and ego.get("FUTURE_POSE_SOURCE") != "gt_future_ego":
-        raise ValueError("SWFM frozen main protocol requires EGO_PROTOCOL.FUTURE_POSE_SOURCE=gt_future_ego")
+    for key,expected in expected_ego.items():
+        if ego.get(key)!=expected:
+            raise ValueError(f"Frozen OccFM-fut ego contract mismatch at EGO_PROTOCOL.{key}: {ego.get(key)!r} != {expected!r}")
+    if int(_deep_get(cfg,"MODEL.TRAJECTORY_LENGTH",-1)) != 12:
+        raise ValueError("MODEL.TRAJECTORY_LENGTH must be 12 for OccFM-fut epoch=000196.ckpt")
+    if int(ego["ZERO_PREFIX_STEPS"]) != 6-int(ego["HIST_LAST"]):
+        raise ValueError("OccFM HIST_LAST contract requires ZERO_PREFIX_STEPS = 6 - HIST_LAST")
+    if _deep_get(cfg,"UPSTREAM.WM_VARIANT")!="occfm_fut":
+        raise ValueError("UPSTREAM.WM_VARIANT must be occfm_fut")
+    if _deep_get(cfg,"UPSTREAM.WM_CONFIG")!="tools/cfgs/occfm_fut.yaml":
+        raise ValueError("UPSTREAM.WM_CONFIG must be tools/cfgs/occfm_fut.yaml")
 
 
 def save_resolved_config(cfg: Mapping[str, Any], output: str | Path):
@@ -194,5 +214,10 @@ def make_prepare_config(cfg):
         frame_dt_s=float(get_cfg(cfg,'MOTION.COMPONENT_HISTORY_DT_S',0.5)),
         free_label=int(get_cfg(cfg,'TARGET.FREE_LABEL',17)),
         tube_radii=tuple(int(x) for x in get_cfg(cfg,'MOTION.KTA_TUBE_RADII',[1,2,3,4,5,6])),
+        trajectory_length=int(get_cfg(cfg,'EGO_PROTOCOL.TRAJECTORY_LENGTH',12)),
+        trajectory_hist_last=int(get_cfg(cfg,'EGO_PROTOCOL.HIST_LAST',4)),
+        trajectory_zero_prefix=int(get_cfg(cfg,'EGO_PROTOCOL.ZERO_PREFIX_STEPS',2)),
+        trajectory_protocol=str(get_cfg(cfg,'EGO_PROTOCOL.NAME','occfm_fut_12step_v1')),
+        require_temporal_info=bool(get_cfg(cfg,'EGO_PROTOCOL.REQUIRE_TEMPORAL_INFO',True)),
         grid=grid,motion=motion,kta=kta,
     )
