@@ -1,122 +1,199 @@
 # SWFM 最终实现审查记录
 
-## 结论
+## 当前结论
 
-仓库已经从 Sparse-WM prototype 补成 protocol-synchronized 的 P0 / tiny / full-training 实现，并针对 NVIDIA L40S 48GB 做了不改变科学协议的运行时优化。源码审查通过不等于真实实验通过；服务器仍必须按 transition equivalence → P0-A/B/C/D/E → tiny overfit → full train 顺序验收。
+SWFM 主协议已经从官方 OccFM `hist_traj / epoch=000199.ckpt` 完整迁移到 **OccFM-Fut / epoch=000196.ckpt**。迁移不是只换 checkpoint 路径，而是同步修改了 data → prepared → latent cache → transition architecture → tiny/full training → inference → P0-A → equivalence → L40S tuner → config/documentation 的 trajectory contract。
 
-## 已修 correctness 问题
+正式服务器实验仍必须通过：
 
-1. `FREE` 与 `confident_static` 独立；hard protection 始终与 current occupied 相交。
-2. window 内 `M_gen` 外 latent 每个 ODE step clamp 到 exact `E(empty)`。
-3. overlapping windows 从统一 50×50 global noise canvas crop 初始噪声。
-4. final composition 仅允许 `dynamic_prediction & write_support & ~confident_static` 写入。
-5. raw pipeline 闭环：ego compensation → real-motion → SE3 → causal KTA → tube → target branch。
-6. latent cache 使用 sharded lazy format，full cache 默认过滤 empty-generation-support samples。
-7. Moving-mIoU v2 严格区分 world-motion 判定与 future-ego support rasterization，并固定 horizon-first aggregation。
-8. 50×50 zero-prior official-vs-modified transition equivalence test 已提供。
-9. P0-A/B/C/D/E 都有 executable。
-10. crop/scatter 已 vectorize；formal latent cache 可预计算 `window_origins/window_valid`。
-11. SWFM `tools` 已显式 package 化，复用 sibling entrypoint 的脚本把 repo `ROOT` 放在 upstream OccFM 前，避免 upstream `tools` 遮蔽 `tools.real_motion`。
-12. 正式 evaluator 默认要求 prediction set 完整；缺失任何 prepared sample 都 fail，只有显式 `--allow-missing-predictions` 才允许诊断性子集评测。
+```text
+OccFM-Fut 196 transition equivalence
+→ P0-A/B/C/D/E
+→ tiny overfit
+→ small held-out
+→ full training
+```
 
-## 最终协议同步
+源码审查不能替代 checkpoint + CUDA 的真实 equivalence。
 
-### A. WM target 不等于 Moving-mIoU target
+## 1. Frozen Ego / Trajectory Contract
 
-- `generation_support_occ`：history + KTA causal support；
-- `future_dynamic_target_occ / latent`：causal support 内 future dynamic semantic GT，作为 WM supervision；
-- `future_moving_occ / gt_moving_support`：只用于 Moving-mIoU v2 / P0 metric。
+主协议明确允许 **GT future ego**。
 
-### B. P0-B 使用 arrival coverage
+### 1.1 Future ego pose
 
-Generation reachability 使用 future Moving arrival occupancy，而不是 dual-box old+new metric support。额外报告 window slot compute ratio 与 history-connected future window/cell 指标。
+用于：
 
-### C. P0-C 直接审计真实 hard-static mask
+- confident-static 的 future ego SE(3) transport；
+- KTA t0-ego prediction 到各 target future-ego grid 的坐标变换。
 
-对 future Moving GT instance 的 t0 真实 object occupancy 与 `t0_confident_static_mask` 求交。这里 GT box rasterization 使用 **margin=0**，再与 t0 同类 semantic occupancy 相交；Moving-mIoU 的 0.5m margin 只属于 evaluation support，不能混入 hard-static audit。
+### 1.2 OccFM-Fut 12-step trajectory conditioning
 
-### D. P0-D 两个 Oracle
+严格复现官方 OccFM dataset：
 
-- Decomposition Oracle：SE3-static + all GT dynamic semantics
-- Causal-Support Oracle：SE3-static + GT dynamic semantics inside causal support
+```text
+6 history frames + 6 future frames
+→ 每个 frame 读取 temporal info: gt_ego_fut_trajs
+→ 取该 frame 的第一个 XY step
+→ concatenate 为 [12,2]
+→ HIST_LAST=4
+→ 前 6-4=2 rows 置零
+```
 
-### E. P0-E 同时检查 metric target 与实际 WM target
+冻结值：
 
-P0-E 现在同时报告：
+```yaml
+UPSTREAM.WM_VARIANT: occfm_fut
+UPSTREAM.WM_CONFIG: tools/cfgs/occfm_fut.yaml
+UPSTREAM.WM_CHECKPOINT_REL: logs/occfm_fut/2s_3s_nusc_fut_traj/ckpt/epoch=000196.ckpt
+MODEL.TRAJECTORY_LENGTH: 12
+EGO_PROTOCOL.NAME: occfm_fut_12step_v1
+EGO_PROTOCOL.HIST_LAST: 4
+EGO_PROTOCOL.ZERO_PREFIX_STEPS: 2
+EGO_PROTOCOL.UPSTREAM_INIT_VARIANT: fut_traj_196
+```
 
-- true-moving reconstruction（`future_moving_occ`）；
-- WM-target reconstruction（`future_dynamic_target_occ`）；
-- actual WM target on causal sparse `E(empty)` canvas；
-- sparse canvas 的 Moving-mIoU v2 projection。
+Formal prepare/inference 要求 temporal info 中 12 个 frame 都存在 `gt_ego_fut_trajs`。不允许静默退化回 6-step hist contract。
 
-### F. Subset analysis 仍严格复用 Moving-mIoU v2
+## 2. 为什么不再用 199 初始化
 
-Calibration 冻结 maneuver/KTA cuts；test 只筛 GT instance 并 union 原 dual-box support，然后调用同一个 `MovingMIoUV2MultiHorizon`。不再使用 per-instance micro IoU 冒充 subset Moving-mIoU。
+旧方案用 199 的原因只是 `trajectory_length=6` shape-compatible。现在既然主协议明确使用 GT future ego，196 的 12-step `traj_encoder` 与最终信息协议更匹配，而且论文主 baseline 也应该是 Official OccFM-Fut 196。
 
-### G. Harm/Repair diagnosis
+正式 SWFM transition 现在 `trajectory_length=12`。加载 checkpoint 时要求 `traj_encoder.0.weight` 真正成功复用；误传 199 会因为 shape mismatch / gate 直接停止，而不是随机初始化 trajectory encoder 后继续训练。
 
-最终 evaluator 支持 voxel micro、instance/tube macro 与 Oracle KTA-vs-WM selector headroom；这些只用于 post-training diagnosis，不进入 inference。
+## 3. Fair Baseline Contract
 
-### H. YAML source-of-truth 与 formal asset gate
+主表必须比较同等信息量：
 
-`configs/real_motion_occfm.yaml` + `real_motion/runtime_config.py` 统一控制 method/runtime/optimization，并生成稳定的 cache/resume contract fingerprint。正式 `train_full.py` 默认 fail-closed：
+```text
+SWFM + GT future ego + init OccFM-Fut 196
+vs
+Official dense OccFM-Fut 196
+vs
+其他获得同等 future ego information 的 baseline
+```
 
-- train/val cache 必须使用同一 VAE SHA256、latent mode、VAE AMP convention、latent support radius、motion/support/target contract；
-- `empty_latent.pt` 必须携带并匹配 VAE/cache fingerprint；
-- upstream OccFM transition 的 shape-safe reuse 必须达到 `MODEL.MIN_UPSTREAM_REUSE_FRACTION`，且关键 backbone/trajectory blocks 必须实际加载；
-- resume checkpoint 必须匹配当前 config contract、cache contract、upstream checkpoint SHA256 和 exact empty latent。
+199 hist-only 可以做额外 information ablation，但不能作为“同信息量主 baseline”。
 
-这些 gate 用来防止“训练几天后才发现资产混用”。
+## 4. 已完成的 correctness closure
 
-### I. DDP validation 不重复 padding sample
+1. `FREE` 与 `confident_static` 独立。
+2. `M_gen` 外 latent 每个 ODE step clamp 到 exact `E(empty)`。
+3. overlap windows 共享统一 global noise canvas。
+4. final composition 仅允许 `dynamic_prediction & write_support & ~confident_static`。
+5. raw causal path：ego compensation → real-motion → SE3 → causal KTA → tube。
+6. training target = `future_dynamic_target_occ`，不等于 Moving-mIoU 的 `future_moving_occ`。
+7. Moving-mIoU v2 冻结为 world-motion interval + future-ego dual-box support + horizon-first aggregation。
+8. P0-C 直接检查 actual hard-static mask，margin=0。
+9. P0-D 使用 Decomposition Oracle / Causal-Support Oracle。
+10. P0-E 同时检查 true-moving、actual WM target、causal sparse canvas。
+11. maneuver/KTA-hard subset 只改变 GT instance support，仍调用原 MovingMIoUV2MultiHorizon。
+12. evaluator 默认缺 prediction 直接失败。
+13. DDP validation no-padding，best.pt 不受 duplicate sample bias。
+14. `tools` package shadow 问题已修。
 
-Training 的 distributed shard sampler 为 collective 对齐可以 rank-local padding；validation 使用 exact no-padding sampler。EMA validation 各 rank 可以处理不同样本数，最后只 all-reduce loss numerator/denominator，因此 `best.pt` 不受重复样本 bias。
+## 5. 196 migration 的资产版本门禁
 
-### J. GT future ego protocol 已显式冻结
+Prepared version 已升级：
 
-SWFM 主协议明确使用 **GT future ego pose / GT ego trajectory**：
+```text
+real_motion_prepared_v3_occfm_fut196
+```
 
-- future ego poses 用于 deterministic SE(3) static transport；
-- trajectory conditioning 优先读取 official info 中的 `gt_ego_fut_trajs`；
-- 这是信息协议选择，不是 future semantic/instance GT 泄漏。
+旧 prepared 必须重建。
 
-官方 OccFM 同时发布了 “with future trajectory” 和 “without future trajectory” 两套 forecasting protocol，因此 GT future trajectory 本身是官方支持的评测设置。SWFM 使用 `occfm.yaml` hist-trajectory checkpoint 仅作为权重初始化；论文主表若给 SWFM 使用 GT future ego，则 dense OccFM 等 baseline 也必须使用相同 future-ego information（对官方 OccFM 应使用/对齐 future-trajectory variant），不能拿 hist-only baseline 直接做不等信息量比较。
+Latent cache 明确记录：
 
-## L40S 48GB 最终优化
+```text
+trajectory_protocol = occfm_fut_12step_v1
+trajectory_length = 12
+upstream_wm_variant = occfm_fut
+upstream_init_variant = fut_traj_196
+```
 
-主线不默认 FP8；保持可复现实验协议：
+Formal `train_full.py` fail-closed 检查：
 
-- Sparse CFM：BF16 autocast；BF16 不使用 GradScaler；
-- TF32 + `torch.set_float32_matmul_precision("high")`；
-- cudNN benchmark；
-- Flash / memory-efficient SDPA backend；
-- CUDA fused AdamW，失败 fallback；
-- pinned memory + persistent workers + prefetch；
-- Frozen OccFM VAE 默认 FP32，只有 parity 通过后才显式启用 VAE BF16；
-- full cache batched VAE encoding，并预计算 sparse window plan；
-- `DistributedShardSampler` 避免普通 DistributedSampler 全局 shuffle 导致 shard I/O thrashing；
-- plan 只做一次 H2D 后复用于所有 crop；
-- DDP `gradient_as_bucket_view=True`、`static_graph=True`、bucket tuning；
-- `torch.compile` 默认关闭，只有真实 L40S benchmark 证明有效时开启；
-- `tune_l40s.py` 扫描 workers 与 4/6/8/10/12/16/20/24 samples/GPU，报告 data wait、samples/s、transition windows/s、step latency、peak allocated/reserved VRAM，并默认保留 3GB memory headroom。
+- train/val cache contract fingerprint；
+- VAE SHA256 / latent mode / VAE AMP / latent support radius；
+- 12-step trajectory protocol；
+- `empty_latent.pt` metadata；
+- upstream checkpoint reuse fraction；
+- exact `traj_encoder.0.weight` reuse；
+- resume config/cache/upstream/empty-latent contract。
 
-## Serialized asset trust boundary
+因此旧 199 cache 或旧 resume 不能静默混入 196 实验。
 
-仓库中的 prepared/cache/prediction `.pt` 以及 nuScenes/official-info `.pkl` 属于实验资产。部分数据结构需要 `torch.load(weights_only=False)` / `pickle.load` 才能读取，因此只能加载**自己生成或可信来源**的文件；不要直接运行来源不明的 `.pt/.pkl`。模型权重能使用 `weights_only=True` 的路径优先使用安全加载。
+## 6. P0-A / Transition Equivalence
 
-## 服务器仍必须真实验证
+P0-A frozen dense WM 已改为加载：
 
-1. official 50×50 transition equivalence RMS/max_abs；
-2. nuScenes/Occ3D 路径与 temporal info pickle；
-3. VAE / WM checkpoint state dict；
-4. P0-A real-motion functional separability；
-5. P0-B coverage-sparsity/history connectivity；
-6. P0-C hard-static blind spot；
-7. P0-D Oracle headroom；
-8. P0-E VAE sparse-canvas stability；
-9. 64/128 tiny overfit；
-10. L40S batch / compile tuning；
-11. full convergence；
-12. end-to-end latency 与 GFLOPs。
+```text
+tools/cfgs/occfm_fut.yaml
+epoch=000196.ckpt
+```
 
-任何 gate 失败，优先定位 `motion/support → geometry/KTA → VAE → WM optimization → composition/evaluation`，不要直接增加 Router / ABE / confidence loss。
+并要求 `[12,2]` trajectory。
+
+Transition equivalence 现在比较：
+
+```text
+official OccFM-Fut transition
+trajectory_length=12
+50×50
+same 196 checkpoint
+same 12-step trajectory
+
+vs
+
+modified SWFM transition
+50×50
+zero prior
+origin=(0,0)
+```
+
+`traj_encoder.0.weight` 未成功加载时 equivalence 直接失败。
+
+## 7. L40S 48GB
+
+运行时优化保持不改变科学协议：
+
+- Sparse CFM BF16；
+- Frozen VAE 默认 FP32；
+- TF32 / cuDNN benchmark / efficient SDPA；
+- fused AdamW；
+- pinned/persistent DataLoader；
+- sharded cache + shard-aware sampler；
+- precomputed sparse window plan；
+- DDP gradient bucket view / static graph；
+- `torch.compile` 默认关闭，实测有效才开；
+- tuner 扫 worker + batch size，并且在开始 benchmark 前验证 196 的 12-step trajectory encoder 已加载。
+
+FP8 不进入主论文协议。
+
+## 8. Serialized Asset Trust Boundary
+
+prepared/cache/prediction `.pt` 和 temporal info `.pkl` 只能来自自己生成或可信官方来源。不能直接执行来源不明的 pickle / torch serialized assets。
+
+## 9. 服务器最终验收顺序
+
+```text
+0. pytest
+1. OccFM-Fut 196 50×50 transition equivalence
+2. 16-window prepare smoke；确认每个 trajectory == [12,2] 且前2行0
+3. P0-A
+4. P0-B
+5. P0-C
+6. P0-D
+7. P0-E
+8. tiny latent cache
+9. 64/128 overfit
+10. small held-out
+11. full latent cache
+12. L40S worker/batch tuning
+13. full training
+14. complete inference/evaluation
+15. subset / Harm-Repair
+16. latency / GFLOPs
+```
+
+任何 gate 失败，优先定位 `ego/trajectory protocol → motion/support → geometry/KTA → VAE → WM optimization → composition/evaluation`，不要用 Router / ABE / confidence loss 掩盖基础 contract 问题。
