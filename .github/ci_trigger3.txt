@@ -1,0 +1,1 @@
+OccFM-fut-196 validation trigger after formal asset fixture update.
