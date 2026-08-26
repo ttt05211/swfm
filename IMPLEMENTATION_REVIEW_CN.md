@@ -16,6 +16,8 @@
 8. 50×50 zero-prior official-vs-modified transition equivalence test 已提供。
 9. P0-A/B/C/D/E 都有 executable。
 10. crop/scatter 已 vectorize；formal latent cache 可预计算 `window_origins/window_valid`。
+11. SWFM `tools` 已显式 package 化，复用 sibling entrypoint 的脚本把 repo `ROOT` 放在 upstream OccFM 前，避免 upstream `tools` 遮蔽 `tools.real_motion`。
+12. 正式 evaluator 默认要求 prediction set 完整；缺失任何 prepared sample 都 fail，只有显式 `--allow-missing-predictions` 才允许诊断性子集评测。
 
 ## 最终协议同步
 
@@ -38,17 +40,47 @@ Generation reachability 使用 future Moving arrival occupancy，而不是 dual-
 - Decomposition Oracle：SE3-static + all GT dynamic semantics
 - Causal-Support Oracle：SE3-static + GT dynamic semantics inside causal support
 
-### E. Subset analysis 仍严格复用 Moving-mIoU v2
+### E. P0-E 同时检查 metric target 与实际 WM target
+
+P0-E 现在同时报告：
+
+- true-moving reconstruction（`future_moving_occ`）；
+- WM-target reconstruction（`future_dynamic_target_occ`）；
+- actual WM target on causal sparse `E(empty)` canvas；
+- sparse canvas 的 Moving-mIoU v2 projection。
+
+### F. Subset analysis 仍严格复用 Moving-mIoU v2
 
 Calibration 冻结 maneuver/KTA cuts；test 只筛 GT instance 并 union 原 dual-box support，然后调用同一个 `MovingMIoUV2MultiHorizon`。不再使用 per-instance micro IoU 冒充 subset Moving-mIoU。
 
-### F. Harm/Repair diagnosis
+### G. Harm/Repair diagnosis
 
 最终 evaluator 支持 voxel micro、instance/tube macro 与 Oracle KTA-vs-WM selector headroom；这些只用于 post-training diagnosis，不进入 inference。
 
-### G. YAML source-of-truth
+### H. YAML source-of-truth 与 formal asset gate
 
-`configs/real_motion_occfm.yaml` + `real_motion/runtime_config.py` 统一控制 method/runtime/optimization。每次 run 保存 resolved config；Frozen Moving-mIoU contract 会和代码常量互相校验。
+`configs/real_motion_occfm.yaml` + `real_motion/runtime_config.py` 统一控制 method/runtime/optimization，并生成稳定的 cache/resume contract fingerprint。正式 `train_full.py` 默认 fail-closed：
+
+- train/val cache 必须使用同一 VAE SHA256、latent mode、VAE AMP convention、latent support radius、motion/support/target contract；
+- `empty_latent.pt` 必须携带并匹配 VAE/cache fingerprint；
+- upstream OccFM transition 的 shape-safe reuse 必须达到 `MODEL.MIN_UPSTREAM_REUSE_FRACTION`，且关键 backbone/trajectory blocks 必须实际加载；
+- resume checkpoint 必须匹配当前 config contract、cache contract、upstream checkpoint SHA256 和 exact empty latent。
+
+这些 gate 用来防止“训练几天后才发现资产混用”。
+
+### I. DDP validation 不重复 padding sample
+
+Training 的 distributed shard sampler 为 collective 对齐可以 rank-local padding；validation 使用 exact no-padding sampler。EMA validation 各 rank 可以处理不同样本数，最后只 all-reduce loss numerator/denominator，因此 `best.pt` 不受重复样本 bias。
+
+### J. GT future ego protocol 已显式冻结
+
+SWFM 主协议明确使用 **GT future ego pose / GT ego trajectory**：
+
+- future ego poses 用于 deterministic SE(3) static transport；
+- trajectory conditioning 优先读取 official info 中的 `gt_ego_fut_trajs`；
+- 这是信息协议选择，不是 future semantic/instance GT 泄漏。
+
+官方 OccFM 同时发布了 “with future trajectory” 和 “without future trajectory” 两套 forecasting protocol，因此 GT future trajectory 本身是官方支持的评测设置。SWFM 使用 `occfm.yaml` hist-trajectory checkpoint 仅作为权重初始化；论文主表若给 SWFM 使用 GT future ego，则 dense OccFM 等 baseline 也必须使用相同 future-ego information（对官方 OccFM 应使用/对齐 future-trajectory variant），不能拿 hist-only baseline 直接做不等信息量比较。
 
 ## L40S 48GB 最终优化
 
@@ -66,15 +98,11 @@ Calibration 冻结 maneuver/KTA cuts；test 只筛 GT instance 并 union 原 dua
 - plan 只做一次 H2D 后复用于所有 crop；
 - DDP `gradient_as_bucket_view=True`、`static_graph=True`、bucket tuning；
 - `torch.compile` 默认关闭，只有真实 L40S benchmark 证明有效时开启；
-- `tune_l40s.py` 扫描 4/6/8/10/12/16/20/24 samples/GPU，报告 samples/s、transition windows/s、step latency、peak allocated/reserved VRAM，并默认保留 3GB memory headroom。
+- `tune_l40s.py` 扫描 workers 与 4/6/8/10/12/16/20/24 samples/GPU，报告 data wait、samples/s、transition windows/s、step latency、peak allocated/reserved VRAM，并默认保留 3GB memory headroom。
 
-## 本轮静态验收
+## Serialized asset trust boundary
 
-- 新增/修改 Python 文件再次通过 `python -m py_compile`；
-- dependency-light L40S runtime helper tests：PASS；
-- distributed shard sampler tests：PASS；
-- 之前 protocol closure baseline 已通过完整 dependency-light tests；
-- official checkpoint + CUDA 的 transition equivalence 必须在服务器真实执行，不能由静态审查替代。
+仓库中的 prepared/cache/prediction `.pt` 以及 nuScenes/official-info `.pkl` 属于实验资产。部分数据结构需要 `torch.load(weights_only=False)` / `pickle.load` 才能读取，因此只能加载**自己生成或可信来源**的文件；不要直接运行来源不明的 `.pt/.pkl`。模型权重能使用 `weights_only=True` 的路径优先使用安全加载。
 
 ## 服务器仍必须真实验证
 
