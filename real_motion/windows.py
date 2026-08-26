@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Tuple
 import torch
+
 
 @dataclass(frozen=True)
 class WindowPlan:
@@ -9,14 +10,18 @@ class WindowPlan:
     window_hw: Tuple[int, int]
     full_hw: Tuple[int, int]
 
-class WindowPlanner:
-    """Plan fixed windows that MUST cover required future support.
 
-    ``context_support`` (typically historical moving + future KTA tube) is only
-    a tie-break signal when multiple candidate windows cover the same amount of
-    required future support. It never creates history-only windows by itself.
+class WindowPlanner:
+    """Fixed motion-window planner with future-target-first semantics.
+
+    ``required_support`` is the only signal allowed to create a window.
+    ``context_support`` breaks ties among windows that cover the same number of
+    still-uncovered required cells. Candidate top-left positions are evaluated
+    exhaustively on the tiny 50x50 latent map, so context can actually shift a
+    window toward useful history instead of being restricted to target-centered
+    crops.
     """
-    def __init__(self, window_hw=(20,20), max_windows=8):
+    def __init__(self, window_hw=(20, 20), max_windows=8):
         self.window_hw = tuple(window_hw)
         self.max_windows = int(max_windows)
         if min(self.window_hw) <= 0 or self.max_windows <= 0:
@@ -30,94 +35,147 @@ class WindowPlanner:
             return support.bool()
         raise ValueError("support must be [B,T,H,W] or [B,H,W]")
 
+    @staticmethod
+    def _window_sums(mask_hw: torch.Tensor, wh: int, ww: int) -> torch.Tensor:
+        # Exact integral-image window sums on CPU, output [H-wh+1,W-ww+1].
+        x = mask_hw.to(torch.int32)
+        integral = torch.zeros((x.shape[0] + 1, x.shape[1] + 1), dtype=torch.int32)
+        integral[1:, 1:] = x.cumsum(0).cumsum(1)
+        return (integral[wh:, ww:] - integral[:-wh, ww:]
+                - integral[wh:, :-ww] + integral[:-wh, :-ww])
+
     def plan(self, required_support: torch.Tensor,
              context_support: torch.Tensor | None = None) -> WindowPlan:
         required = self._union_support(required_support)
         context = required if context_support is None else self._union_support(context_support)
         if required.shape != context.shape:
-            raise ValueError("required_support and context_support must align in B,H,W")
+            raise ValueError("required_support/context_support shape mismatch")
 
         out_device = required.device
-        required_cpu = required.detach().cpu()
-        context_cpu = context.detach().cpu()
-        b,h,w = required_cpu.shape
-        wh,ww = self.window_hw
-        if wh > h or ww > w:
+        req = required.detach().cpu()
+        ctx = context.detach().cpu()
+        B, H, W = req.shape
+        wh, ww = self.window_hw
+        if wh > H or ww > W:
             raise ValueError("window cannot be larger than latent map")
 
-        origins = torch.full((b,self.max_windows,2), -1, dtype=torch.long)
-        valid = torch.zeros((b,self.max_windows), dtype=torch.bool)
+        origins = torch.full((B, self.max_windows, 2), -1, dtype=torch.long)
+        valid = torch.zeros((B, self.max_windows), dtype=torch.bool)
+        tie_base = wh * ww + 1
 
-        # 50x50 planning is intentionally CPU-side: Python .item()/where() on a
-        # CUDA tensor would synchronize repeatedly.
-        for bi in range(b):
-            remaining = required_cpu[bi].clone()
-            context_map = context_cpu[bi]
-            for ki in range(self.max_windows):
-                if not remaining.any():
+        for b in range(B):
+            remaining = req[b].clone()
+            context_map = ctx[b]
+            for k in range(self.max_windows):
+                if not bool(remaining.any()):
                     break
-
-                ys,xs = torch.where(remaining)
-                stride = max(1, len(ys)//64)
-                best = None
-                for y,x in zip(ys[::stride], xs[::stride]):
-                    cy = max(0, min(int(y)-wh//2, h-wh))
-                    cx = max(0, min(int(x)-ww//2, w-ww))
-                    required_score = int(remaining[cy:cy+wh, cx:cx+ww].sum())
-                    context_score = int(context_map[cy:cy+wh, cx:cx+ww].sum())
-                    score = (required_score, context_score)
-                    if best is None or score > best[0]:
-                        best = (score, cy, cx)
-
-                _, y0, x0 = best
-                origins[bi,ki] = torch.tensor([y0,x0])
-                valid[bi,ki] = True
+                req_score = self._window_sums(remaining, wh, ww)
+                ctx_score = self._window_sums(context_map, wh, ww)
+                # Lexicographic objective: required coverage dominates context.
+                score = req_score * tie_base + ctx_score
+                score = torch.where(req_score > 0, score, torch.full_like(score, -1))
+                flat = int(score.reshape(-1).argmax())
+                out_w = score.shape[1]
+                y0, x0 = divmod(flat, out_w)
+                origins[b, k] = torch.tensor([y0, x0])
+                valid[b, k] = True
                 remaining[y0:y0+wh, x0:x0+ww] = False
 
         return WindowPlan(origins.to(out_device), valid.to(out_device),
-                          self.window_hw, (h,w))
+                          self.window_hw, (H, W))
+
+
+def _linear_indices(plan: WindowPlan, device=None):
+    device = device or plan.origins.device
+    origins = plan.origins.to(device=device, dtype=torch.long)
+    valid = plan.valid.to(device=device)
+    B, K = valid.shape
+    H, W = plan.full_hw
+    wh, ww = plan.window_hw
+    dy = torch.arange(wh, device=device).view(1, 1, wh, 1)
+    dx = torch.arange(ww, device=device).view(1, 1, 1, ww)
+    y = origins[..., 0].view(B, K, 1, 1) + dy
+    x = origins[..., 1].view(B, K, 1, 1) + dx
+    # Invalid padded windows have origin -1; clamp their indices and zero them
+    # by ``valid`` in the caller.
+    y = y.clamp(0, H - 1)
+    x = x.clamp(0, W - 1)
+    return (y * W + x).reshape(B, K, wh * ww), valid
+
 
 def crop_windows(x: torch.Tensor, plan: WindowPlan) -> torch.Tensor:
-    """Crop [B,...,H,W] into [B,K,...,wh,ww], padding invalid slots with zero."""
+    """Vectorized crop: [B,...,H,W] -> [B,K,...,wh,ww]."""
     if x.shape[0] != plan.origins.shape[0] or tuple(x.shape[-2:]) != plan.full_hw:
         raise ValueError("input and WindowPlan shape mismatch")
-    b = x.shape[0]; k = plan.origins.shape[1]; wh,ww = plan.window_hw
-    out = x.new_zeros((b,k,*x.shape[1:-2],wh,ww))
-    for bi in range(b):
-        for ki in range(k):
-            if not bool(plan.valid[bi,ki]):
-                continue
-            y,x0 = [int(v) for v in plan.origins[bi,ki]]
-            out[bi,ki] = x[bi,...,y:y+wh,x0:x0+ww]
-    return out
+    B = x.shape[0]
+    mid = x.shape[1:-2]
+    H, W = plan.full_hw
+    wh, ww = plan.window_hw
+    C = 1
+    for s in mid:
+        C *= int(s)
+    src = x.reshape(B, C, H * W)
+    idx, valid = _linear_indices(plan, x.device)  # [B,K,P]
+    K, P = idx.shape[1], idx.shape[2]
+    gathered = torch.gather(
+        src[:, None, :, :].expand(B, K, C, H * W),
+        3,
+        idx[:, :, None, :].expand(B, K, C, P),
+    )
+    gathered = gathered * valid[:, :, None, None].to(gathered.dtype)
+    return gathered.reshape(B, K, *mid, wh, ww)
+
 
 def scatter_windows(windows: torch.Tensor, plan: WindowPlan,
                     base: torch.Tensor | None = None,
                     weight: torch.Tensor | None = None) -> torch.Tensor:
-    """Overlap-average [B,K,...,wh,ww] back to [B,...,H,W].
+    """Vectorized overlap-average scatter back to [B,...,H,W].
 
-    ``base`` is used only where no valid window writes. For logits/latents this
-    prevents overwrite-order dependence at window overlaps.
+    ``weight`` may be [B,K] and is applied uniformly to each window. Invalid
+    padded windows never contribute. ``base`` is used only where no window
+    writes.
     """
-    b,k = windows.shape[:2]; h,w = plan.full_hw; wh,ww = plan.window_hw
-    if (b,k) != tuple(plan.valid.shape):
+    B, K = windows.shape[:2]
+    if (B, K) != tuple(plan.valid.shape):
         raise ValueError("window batch/slot mismatch")
-    out = windows.new_zeros((b,*windows.shape[2:-2],h,w))
-    cnt = windows.new_zeros((b,*([1]*(windows.ndim-4)),h,w))
-    if weight is not None and weight.shape[:2] != (b,k):
-        raise ValueError("weight batch/slot mismatch")
-    for bi in range(b):
-        for ki in range(k):
-            if not bool(plan.valid[bi,ki]): continue
-            y,x0 = [int(v) for v in plan.origins[bi,ki]]
-            wwgt = 1.0 if weight is None else weight[bi,ki]
-            out[bi,...,y:y+wh,x0:x0+ww] += windows[bi,ki] * wwgt
-            cnt[bi,...,y:y+wh,x0:x0+ww] += wwgt
-    covered = cnt > 0
+    mid = windows.shape[2:-2]
+    wh, ww = plan.window_hw
+    H, W = plan.full_hw
+    if tuple(windows.shape[-2:]) != (wh, ww):
+        raise ValueError("window spatial shape mismatch")
+
+    C = 1
+    for s in mid:
+        C *= int(s)
+    P = wh * ww
+    vals = windows.reshape(B, K, C, P)
+    idx, valid = _linear_indices(plan, windows.device)
+
+    if weight is None:
+        wk = torch.ones((B, K), device=windows.device, dtype=windows.dtype)
+    else:
+        if tuple(weight.shape) != (B, K):
+            raise ValueError("weight must be [B,K]")
+        wk = weight.to(device=windows.device, dtype=windows.dtype)
+    wk = wk * valid.to(wk.dtype)
+    vals = vals * wk[:, :, None, None]
+
+    vals_flat = vals.permute(0, 2, 1, 3).reshape(B, C, K * P)
+    idx_flat = idx.reshape(B, 1, K * P).expand(B, C, K * P)
+    out = windows.new_zeros((B, C, H * W))
+    out.scatter_add_(2, idx_flat, vals_flat)
+
+    cnt_vals = wk[:, :, None].expand(B, K, P).reshape(B, 1, K * P)
+    cnt_idx = idx.reshape(B, 1, K * P)
+    cnt = windows.new_zeros((B, 1, H * W))
+    cnt.scatter_add_(2, cnt_idx, cnt_vals)
     out = out / cnt.clamp_min(1)
+    out = out.reshape(B, *mid, H, W)
+
     if base is not None:
         if tuple(base.shape) != tuple(out.shape):
             raise ValueError("base shape mismatch")
+        covered = cnt.reshape(B, *([1] * len(mid)), H, W) > 0
         out = torch.where(covered.expand_as(out), out, base)
     return out
 
@@ -125,20 +183,21 @@ def scatter_windows(windows: torch.Tensor, plan: WindowPlan,
 def window_coverage(support: torch.Tensor, plan: WindowPlan) -> torch.Tensor:
     """Per-sample fraction of union support covered by selected windows."""
     if support.ndim == 4:
-        union=support.bool().any(dim=1)
+        union = support.bool().any(dim=1)
     elif support.ndim == 3:
-        union=support.bool()
+        union = support.bool()
     else:
         raise ValueError("support must be [B,T,H,W] or [B,H,W]")
-    if tuple(union.shape[-2:]) != plan.full_hw or union.shape[0] != plan.valid.shape[0]:
+    if union.shape[0] != plan.valid.shape[0] or tuple(union.shape[-2:]) != plan.full_hw:
         raise ValueError("support and plan shape mismatch")
-    cover=torch.zeros_like(union)
-    wh,ww=plan.window_hw
-    for bi in range(union.shape[0]):
-        for ki in range(plan.valid.shape[1]):
-            if not bool(plan.valid[bi,ki]): continue
-            y,x0=[int(v) for v in plan.origins[bi,ki]]
-            cover[bi,y:y+wh,x0:x0+ww]=True
-    numer=(cover & union).flatten(1).sum(1).float()
-    denom=union.flatten(1).sum(1).float()
-    return torch.where(denom>0,numer/denom,torch.ones_like(denom))
+
+    B, H, W = union.shape
+    idx, valid = _linear_indices(plan, union.device)
+    K, P = idx.shape[1:]
+    cover = torch.zeros((B, 1, H * W), device=union.device, dtype=torch.float32)
+    vals = valid.float()[:, :, None].expand(B, K, P).reshape(B, 1, K * P)
+    cover.scatter_add_(2, idx.reshape(B, 1, K * P), vals)
+    cover = cover.reshape(B, H, W) > 0
+    numer = (cover & union).flatten(1).sum(1).float()
+    denom = union.flatten(1).sum(1).float()
+    return torch.where(denom > 0, numer / denom, torch.ones_like(denom))
