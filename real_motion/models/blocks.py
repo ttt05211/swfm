@@ -1,8 +1,37 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
+
+
+def _factorized_tokenwise_modulation(adaLN_modulation, c):
+    """Evaluate Linear(SiLU(c)) while preserving the official 2-D base path.
+
+    For token-wise ``c=[B,N,D]`` we factor the affine map around the first token:
+
+        L(SiLU(c_n)) = L(SiLU(c_0)) + W @ (SiLU(c_n)-SiLU(c_0))
+
+    where ``L(z)=Wz+b``.  This is mathematically identical to applying the
+    original AdaLN MLP to every token.  The important numerical property is that
+    when all token conditions are identical (the zero-prior initialization), the
+    delta is exactly zero and the base modulation is computed with the same
+    ``[B,D]`` GEMM shape as the official OccFM DiTBlock.  That keeps the frozen
+    OccFM transition-equivalence gate strict instead of relaxing its tolerance.
+    """
+    if c.ndim != 3:
+        raise ValueError("factorized token-wise modulation expects [B,N,D]")
+    act, linear = adaLN_modulation[0], adaLN_modulation[1]
+    base_c = c[:, 0, :]
+    base_act = act(base_c)
+    token_act = act(c)
+    base_mod = linear(base_act)
+    delta_act = token_act - base_act[:, None, :]
+    delta_mod = F.linear(delta_act, linear.weight, bias=None)
+    return base_mod[:, None, :] + delta_mod
+
 
 class SpatialAdaLNDiTBlock(nn.Module):
     """State-dict-compatible AdaLN-Zero block with token-wise condition."""
@@ -22,7 +51,11 @@ class SpatialAdaLNDiTBlock(nn.Module):
 
     def forward(self,x,c):
         if c.ndim not in (2,3): raise ValueError("condition must be [B,D] or [B,N,D]")
-        shift_msa,scale_msa,gate_msa,shift_mlp,scale_mlp,gate_mlp=self.adaLN_modulation(c).chunk(6,dim=-1)
+        # Keep the official OccFM DiTBlock path literally 2-D when conditioning
+        # is sequence-wise.  Token-wise conditioning uses an algebraically exact
+        # factorization so the zero-prior case collapses to this same base path.
+        modulation = self.adaLN_modulation(c) if c.ndim == 2 else _factorized_tokenwise_modulation(self.adaLN_modulation, c)
+        shift_msa,scale_msa,gate_msa,shift_mlp,scale_mlp,gate_mlp=modulation.chunk(6,dim=-1)
         if c.ndim==2:
             shift_msa=shift_msa[:,None]; scale_msa=scale_msa[:,None]; gate_msa=gate_msa[:,None]
             shift_mlp=shift_mlp[:,None]; scale_mlp=scale_mlp[:,None]; gate_mlp=gate_mlp[:,None]
