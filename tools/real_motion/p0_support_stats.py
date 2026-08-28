@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""P0-B: support sparsity, expansion stages, window connectivity, and optional latent-energy audit.
+"""P0-B: formal routing support sparsity and optional latent-energy audit.
 
-Two different quantities are reported and must not be conflated:
-1) causal binary support: where the sparse WM is allowed/requested to compute;
-2) latent residual energy: where a GT-moving-only semantic correction actually
-   carries meaningful VAE latent innovation.
+Formal v5 routing:
+- MOVING only -> KTA constant-motion extrapolation -> motion tube;
+- UNCERTAIN eligible things -> zero-object-motion prior -> no motion tube;
+- final generation support = moving tube UNION uncertain zero-motion support.
 
-The optional energy audit uses the deterministic VAE posterior mean to avoid
-sampling noise. It is diagnostic-only and may use GT Moving-v2 support.
+The optional VAE energy audit remains a separate GT-assisted diagnostic and must
+not be confused with causal binary support width.
 """
 import argparse
 import json
@@ -40,11 +40,13 @@ def _stage_template(future_frames):
     return [
         {
             "gt": 0,
-            "kta_r0": 0,
-            "tube": 0,
-            "kta_lat0": 0,
-            "tube_lat0": 0,
-            "tube_lat_extra": 0,
+            "moving_kta": 0,
+            "uncertain_zero": 0,
+            "formal": 0,
+            "moving_kta_lat0": 0,
+            "uncertain_lat0": 0,
+            "formal_lat0": 0,
+            "formal_lat_extra": 0,
             "dense_bev": 0,
             "dense_latent": 0,
             "gt_lat0": 0,
@@ -55,10 +57,9 @@ def _stage_template(future_frames):
 
 def _state_template():
     keys = ("occupied", "confident_static", "moving", "uncertain", "wm_candidate")
-    return {
-        k: {"voxels": 0, "bev_cells": 0}
-        for k in keys
-    } | {"dense_voxels": 0, "dense_bev": 0}
+    return {k: {"voxels": 0, "bev_cells": 0} for k in keys} | {
+        "dense_voxels": 0, "dense_bev": 0
+    }
 
 
 def _accumulate_t0_state(state, sample, free_label=17):
@@ -67,13 +68,12 @@ def _accumulate_t0_state(state, sample, free_label=17):
     sta = np.asarray(sample["t0_confident_static_mask"], dtype=bool)
     mov = np.asarray(sample["t0_moving_mask"], dtype=bool)
     unc = np.asarray(sample["t0_uncertain_mask"], dtype=bool)
-    cand = mov | unc
     masks = {
         "occupied": occupied,
         "confident_static": sta,
         "moving": mov,
         "uncertain": unc,
-        "wm_candidate": cand,
+        "wm_candidate": mov | unc,
     }
     state["dense_voxels"] += int(cur.size)
     state["dense_bev"] += int(cur.shape[0] * cur.shape[1])
@@ -95,34 +95,34 @@ def _finalize_t0_state(state):
     return out
 
 
+def _formal_support(moving_kta, uncertain_zero, radii):
+    tube = build_motion_tube(
+        moving_kta,
+        MotionTubeConfig(radii=list(radii), latent_extra_radius=0),
+    )
+    return tube | uncertain_zero
+
+
 def summarize(samples, radii, extra, schedule, window, maxw):
     F = 6
 
     def mk():
         return [
             {
-                "inter": 0,
-                "gt": 0,
-                "active": 0,
-                "dense": 0,
-                "l_inter": 0,
-                "l_gt": 0,
-                "l_active": 0,
-                "l_dense": 0,
+                "inter": 0, "gt": 0, "active": 0, "dense": 0,
+                "l_inter": 0, "l_gt": 0,
+                "l_active_pre_extra": 0, "l_active": 0, "l_dense": 0,
             }
             for _ in range(F)
         ]
 
     stats = {r: mk() for r in radii}
     scheduled = mk()
-    moving = [
+    moving_truth = [
         {
-            "moving_vox": 0,
-            "occupied_vox": 0,
-            "moving_bev": 0,
-            "dense_bev": 0,
-            "moving_latent": 0,
-            "dense_latent": 0,
+            "moving_vox": 0, "occupied_vox": 0,
+            "moving_bev": 0, "dense_bev": 0,
+            "moving_latent": 0, "dense_latent": 0,
         }
         for _ in range(F)
     ]
@@ -134,61 +134,70 @@ def summarize(samples, radii, extra, schedule, window, maxw):
     for s in samples:
         _accumulate_t0_state(t0_state, s)
 
-        kta = torch.from_numpy(np.asarray(s["kta_support"])).bool()
+        if "moving_kta_support" not in s or "uncertain_zero_support" not in s:
+            raise RuntimeError(
+                "P0-B v5 requires rebuilt prepared data with moving_kta_support "
+                "and uncertain_zero_support"
+            )
+        moving_kta = torch.from_numpy(np.asarray(s["moving_kta_support"])).bool()
+        uncertain_zero = torch.from_numpy(np.asarray(s["uncertain_zero_support"])).bool()
         fg = np.asarray(s["future_gt_occ"])
         fm = np.asarray(s["future_moving_occ"])
         gt = torch.from_numpy((fm != 17).any(axis=-1))
 
         for h in range(F):
-            moving[h]["moving_vox"] += int((fm[h] != 17).sum())
-            moving[h]["occupied_vox"] += int((fg[h] != 17).sum())
+            moving_truth[h]["moving_vox"] += int((fm[h] != 17).sum())
+            moving_truth[h]["occupied_vox"] += int((fg[h] != 17).sum())
             mb = gt[h]
-            moving[h]["moving_bev"] += int(mb.sum())
-            moving[h]["dense_bev"] += mb.numel()
+            moving_truth[h]["moving_bev"] += int(mb.sum())
+            moving_truth[h]["dense_bev"] += mb.numel()
             ml = downsample_support(mb.unsqueeze(0), (50, 50), extra_radius=extra)[0]
-            moving[h]["moving_latent"] += int(ml.sum())
-            moving[h]["dense_latent"] += ml.numel()
+            moving_truth[h]["moving_latent"] += int(ml.sum())
+            moving_truth[h]["dense_latent"] += ml.numel()
 
-        tube = build_motion_tube(kta, MotionTubeConfig(radii=list(schedule), latent_extra_radius=0))
+        formal = _formal_support(moving_kta, uncertain_zero, schedule)
         gl0 = downsample_support(gt, (50, 50), extra_radius=0)
         gl = downsample_support(gt, (50, 50), extra_radius=extra)
-        kta_l0 = downsample_support(kta, (50, 50), extra_radius=0)
-        tube_l0 = downsample_support(tube, (50, 50), extra_radius=0)
-        tl = downsample_support(tube, (50, 50), extra_radius=extra)
+        mk_l0 = downsample_support(moving_kta, (50, 50), extra_radius=0)
+        uz_l0 = downsample_support(uncertain_zero, (50, 50), extra_radius=0)
+        formal_l0 = downsample_support(formal, (50, 50), extra_radius=0)
+        formal_l = downsample_support(formal, (50, 50), extra_radius=extra)
         hl = downsample_support(
             torch.from_numpy(np.asarray(s["history_candidate_support"])).bool(),
-            (50, 50),
-            extra_radius=extra,
+            (50, 50), extra_radius=extra,
         )
 
         for h in range(F):
             d = stages[h]
             d["gt"] += int(gt[h].sum())
-            d["kta_r0"] += int(kta[h].sum())
-            d["tube"] += int(tube[h].sum())
-            d["kta_lat0"] += int(kta_l0[h].sum())
-            d["tube_lat0"] += int(tube_l0[h].sum())
-            d["tube_lat_extra"] += int(tl[h].sum())
+            d["moving_kta"] += int(moving_kta[h].sum())
+            d["uncertain_zero"] += int(uncertain_zero[h].sum())
+            d["formal"] += int(formal[h].sum())
+            d["moving_kta_lat0"] += int(mk_l0[h].sum())
+            d["uncertain_lat0"] += int(uz_l0[h].sum())
+            d["formal_lat0"] += int(formal_l0[h].sum())
+            d["formal_lat_extra"] += int(formal_l[h].sum())
             d["dense_bev"] += int(gt[h].numel())
-            d["dense_latent"] += int(tl[h].numel())
+            d["dense_latent"] += int(formal_l[h].numel())
             d["gt_lat0"] += int(gl0[h].sum())
 
-        req = tl.unsqueeze(0)
-        ctx = torch.cat([hl, tl], 0).unsqueeze(0)
+        req = formal_l.unsqueeze(0)
+        ctx = torch.cat([hl, formal_l], 0).unsqueeze(0)
         plan = planner.plan(req, context_support=ctx)
         hu = hl.any(0)
-        ru = tl.any(0)
+        ru = formal_l.any(0)
         conn = torch.zeros_like(ru)
         nw = int(plan.valid.sum())
         withh = 0
         for ki in range(plan.valid.shape[1]):
             if not bool(plan.valid[0, ki]):
                 continue
-            y, x = [int(v) for v in plan.origins[0, ki].tolist()]
-            has = bool(hu[y:y + window, x:x + window].any())
+            x, y = [int(v) for v in plan.origins[0, ki].tolist()]
+            # Window tensors are latent [X,Y]; keep the same array-axis order.
+            has = bool(hu[x:x + window, y:y + window].any())
             if has:
                 withh += 1
-                conn[y:y + window, x:x + window] |= ru[y:y + window, x:x + window]
+                conn[x:x + window, y:y + window] |= ru[x:x + window, y:y + window]
         rc = int(ru.sum())
         wr.append({
             "future_window_coverage": float(window_coverage(req, plan)[0]),
@@ -203,17 +212,19 @@ def summarize(samples, radii, extra, schedule, window, maxw):
 
         for h in range(F):
             d = scheduled[h]
-            d["inter"] += int((gt[h] & tube[h]).sum())
+            d["inter"] += int((gt[h] & formal[h]).sum())
             d["gt"] += int(gt[h].sum())
-            d["active"] += int(tube[h].sum())
-            d["dense"] += tube[h].numel()
-            d["l_inter"] += int((gl[h] & tl[h]).sum())
+            d["active"] += int(formal[h].sum())
+            d["dense"] += formal[h].numel()
+            d["l_inter"] += int((gl[h] & formal_l[h]).sum())
             d["l_gt"] += int(gl[h].sum())
-            d["l_active"] += int(tl[h].sum())
-            d["l_dense"] += tl[h].numel()
+            d["l_active_pre_extra"] += int(formal_l0[h].sum())
+            d["l_active"] += int(formal_l[h].sum())
+            d["l_dense"] += formal_l[h].numel()
 
         for r in radii:
-            tr = build_motion_tube(kta, MotionTubeConfig(radii=[r] * F, latent_extra_radius=0))
+            tr = _formal_support(moving_kta, uncertain_zero, [r] * F)
+            trl0 = downsample_support(tr, (50, 50), extra_radius=0)
             trl = downsample_support(tr, (50, 50), extra_radius=extra)
             for h in range(F):
                 d = stats[r][h]
@@ -223,20 +234,23 @@ def summarize(samples, radii, extra, schedule, window, maxw):
                 d["dense"] += tr[h].numel()
                 d["l_inter"] += int((gl[h] & trl[h]).sum())
                 d["l_gt"] += int(gl[h].sum())
+                d["l_active_pre_extra"] += int(trl0[h].sum())
                 d["l_active"] += int(trl[h].sum())
                 d["l_dense"] += trl[h].numel()
 
     out = {
+        "routing_contract": {
+            "moving": "KTA_then_tube",
+            "uncertain": "zero_object_motion_no_tube",
+            "generation_support": "moving_tube_union_uncertain_zero",
+            "latent_extra_radius": int(extra),
+        },
         "constant_radius_scan": {},
         "true_moving_sparsity": [],
         "scheduled_radius": [],
         "support_expansion_diagnostic": {
             "t0_motion_state": _finalize_t0_state(t0_state),
             "per_horizon": [],
-            "interpretation": (
-                "These are binary support ratios, not latent residual nonzero/energy ratios. "
-                "Use them to locate where a causal selector expands."
-            ),
         },
         "proposed_window_backend": {},
     }
@@ -248,6 +262,7 @@ def summarize(samples, radii, extra, schedule, window, maxw):
                 "coverage_bev": ratio(d["inter"], d["gt"]),
                 "active_ratio_bev": ratio(d["active"], d["dense"]),
                 "coverage_latent": ratio(d["l_inter"], d["l_gt"]),
+                "active_ratio_latent_before_extra": ratio(d["l_active_pre_extra"], d["l_dense"]),
                 "active_ratio_latent": ratio(d["l_active"], d["l_dense"]),
             }
             for h, d in enumerate(stats[r])
@@ -260,6 +275,7 @@ def summarize(samples, radii, extra, schedule, window, maxw):
             "coverage_bev": ratio(d["inter"], d["gt"]),
             "active_ratio_bev": ratio(d["active"], d["dense"]),
             "coverage_latent": ratio(d["l_inter"], d["l_gt"]),
+            "active_ratio_latent_before_extra": ratio(d["l_active_pre_extra"], d["l_dense"]),
             "active_ratio_latent": ratio(d["l_active"], d["l_dense"]),
         })
 
@@ -267,12 +283,20 @@ def summarize(samples, radii, extra, schedule, window, maxw):
         out["support_expansion_diagnostic"]["per_horizon"].append({
             "horizon_s": 0.5 * (h + 1),
             "gt_moving_bev_ratio": ratio(d["gt"], d["dense_bev"]),
-            "kta_radius0_bev_ratio": ratio(d["kta_r0"], d["dense_bev"]),
-            "scheduled_tube_bev_ratio": ratio(d["tube"], d["dense_bev"]),
+            "moving_kta_radius0_bev_ratio": ratio(d["moving_kta"], d["dense_bev"]),
+            "uncertain_zero_bev_ratio": ratio(d["uncertain_zero"], d["dense_bev"]),
+            "formal_generation_bev_ratio": ratio(d["formal"], d["dense_bev"]),
+            "moving_kta_radius0_latent_ratio": ratio(d["moving_kta_lat0"], d["dense_latent"]),
+            "uncertain_zero_latent_ratio": ratio(d["uncertain_lat0"], d["dense_latent"]),
+            "formal_generation_latent_before_extra_ratio": ratio(d["formal_lat0"], d["dense_latent"]),
+            "formal_generation_latent_after_extra_ratio": ratio(d["formal_lat_extra"], d["dense_latent"]),
+            # Backward-readable aliases used by older print snippets.
+            "kta_radius0_bev_ratio": ratio(d["moving_kta"], d["dense_bev"]),
+            "scheduled_tube_bev_ratio": ratio(d["formal"], d["dense_bev"]),
+            "kta_radius0_latent_before_extra_ratio": ratio(d["moving_kta_lat0"], d["dense_latent"]),
+            "scheduled_tube_latent_before_extra_ratio": ratio(d["formal_lat0"], d["dense_latent"]),
+            "scheduled_tube_latent_after_extra_ratio": ratio(d["formal_lat_extra"], d["dense_latent"]),
             "gt_moving_latent_r0_ratio": ratio(d["gt_lat0"], d["dense_latent"]),
-            "kta_radius0_latent_before_extra_ratio": ratio(d["kta_lat0"], d["dense_latent"]),
-            "scheduled_tube_latent_before_extra_ratio": ratio(d["tube_lat0"], d["dense_latent"]),
-            "scheduled_tube_latent_after_extra_ratio": ratio(d["tube_lat_extra"], d["dense_latent"]),
         })
 
     if wr:
@@ -289,7 +313,7 @@ def summarize(samples, radii, extra, schedule, window, maxw):
             "max_windows": maxw,
         })
 
-    for h, d in enumerate(moving):
+    for h, d in enumerate(moving_truth):
         out["true_moving_sparsity"].append({
             "horizon_s": 0.5 * (h + 1),
             "moving_voxel_over_occupied": ratio(d["moving_vox"], d["occupied_vox"]),
@@ -327,16 +351,13 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
     changed_voxels = 0
     moving_support_voxels = 0
     dense_semantic_voxels = 0
-
     radius_energy = {
         int(r): {"inside": 0.0, "total": 0.0, "active": 0, "dense": 0}
         for r in radii
     }
     per_h = {
-        h: {
-            int(r): {"inside": 0.0, "total": 0.0, "active": 0, "dense": 0}
-            for r in radii
-        }
+        h: {int(r): {"inside": 0.0, "total": 0.0, "active": 0, "dense": 0}
+            for r in radii}
         for h in range(6)
     }
 
@@ -346,20 +367,13 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
             kta = np.asarray(s["kta_future_occ"])
             gt = np.asarray(s["future_gt_occ"])
             support = np.asarray(s["gt_moving_support"], dtype=bool)
-
             hybrid = np.where(support, gt, kta)
             changed_voxels += int(((hybrid != kta) & support).sum())
             moving_support_voxels += int(support.sum())
             dense_semantic_voxels += int(support.size)
 
-            zk = ad.encode(
-                torch.from_numpy(kta).unsqueeze(0),
-                mode="mean",
-            )[0]
-            zh = ad.encode(
-                torch.from_numpy(hybrid).unsqueeze(0),
-                mode="mean",
-            )[0]
+            zk = ad.encode(torch.from_numpy(kta).unsqueeze(0), mode="mean")[0]
+            zh = ad.encode(torch.from_numpy(hybrid).unsqueeze(0), mode="mean")[0]
             residual = (zh - zk).float()
             cell_energy = residual.square().sum(dim=1)
             cell_norm = cell_energy.sqrt()
@@ -376,8 +390,7 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
             moving_bev = torch.from_numpy(support.any(axis=-1)).bool()
             for r in radii:
                 mask = downsample_support(
-                    moving_bev,
-                    (cell_energy.shape[-2], cell_energy.shape[-1]),
+                    moving_bev, (cell_energy.shape[-2], cell_energy.shape[-1]),
                     extra_radius=int(r),
                 ).to(device=cell_energy.device)
                 inside = float(cell_energy[mask].sum().item())
@@ -387,8 +400,7 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
                 radius_energy[int(r)]["active"] += int(mask.sum().item())
                 radius_energy[int(r)]["dense"] += int(mask.numel())
                 for h in range(6):
-                    mh = mask[h]
-                    eh = cell_energy[h]
+                    mh = mask[h]; eh = cell_energy[h]
                     per_h[h][int(r)]["inside"] += float(eh[mh].sum().item())
                     per_h[h][int(r)]["total"] += float(eh.sum().item())
                     per_h[h][int(r)]["active"] += int(mh.sum().item())
@@ -400,8 +412,8 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
         "num_windows": int(n),
         "vae_latent_mode": "mean",
         "target_definition": (
-            "r_motion = E(Y_hybrid)-E(Y_KTA), where Y_hybrid uses GT only inside "
-            "GT Moving-v2 support and equals KTA elsewhere"
+            "r_motion = E(Y_hybrid)-E(Y_prior), where Y_hybrid uses GT only inside "
+            "GT Moving-v2 support and Y_prior is MOVING-KTA + UNCERTAIN zero-motion"
         ),
         "semantic_change": {
             "changed_voxels_where_hybrid_differs_from_kta": int(changed_voxels),
@@ -435,7 +447,6 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
             "energy_fraction": ratio(d["inside"], d["total"]),
             "mask_active_ratio": ratio(d["active"], d["dense"]),
         }
-
     for h in range(6):
         rows = {}
         for r in radii:
@@ -445,13 +456,11 @@ def latent_energy_localization(dataset, n, vae_ckpt, device, radii, thresholds):
                 "mask_active_ratio": ratio(d["active"], d["dense"]),
             }
         result["per_horizon_energy_inside_gt_moving_latent_radius"][str(0.5 * (h + 1))] = rows
-
     return result
 
 
 def main():
-    p = argparse.ArgumentParser()
-    add_config_args(p)
+    p = argparse.ArgumentParser(); add_config_args(p)
     p.add_argument("--prepared", required=True)
     p.add_argument("--radii", default="0,1,2,3,4,5,6")
     p.add_argument("--latent-extra-radius", type=int, default=None)
@@ -459,7 +468,7 @@ def main():
     p.add_argument("--max-windows", type=int, default=None)
     p.add_argument("--window-size", type=int, default=None)
     p.add_argument("--window-slots", type=int, default=None)
-    p.add_argument("--vae-ckpt", default=None, help="optional: enable Motion-Hybrid latent energy audit")
+    p.add_argument("--vae-ckpt", default=None)
     p.add_argument("--device", default="cuda")
     p.add_argument("--energy-max-windows", type=int, default=None)
     p.add_argument("--energy-radii", default="0,1,2,3")
@@ -469,20 +478,12 @@ def main():
 
     cfg = load_runtime_config(a.config, a.override)
     radii = [int(x) for x in a.radii.split(",")]
-    schedule = tuple(
-        int(x)
-        for x in (
-            a.schedule.split(",")
-            if a.schedule
-            else get_cfg(cfg, "MOTION.KTA_TUBE_RADII")
-        )
-    )
-    extra = int(
-        a.latent_extra_radius
-        if a.latent_extra_radius is not None
-        else get_cfg(cfg, "MOTION.LATENT_EXTRA_RADIUS", 1)
-    )
-    window = int(a.window_size or get_cfg(cfg, "MODEL.WINDOW_HW", [20, 20])[0])
+    schedule = tuple(int(x) for x in (
+        a.schedule.split(",") if a.schedule else get_cfg(cfg, "MOTION.KTA_TUBE_RADII")
+    ))
+    extra = int(a.latent_extra_radius if a.latent_extra_radius is not None
+                else get_cfg(cfg, "MOTION.LATENT_EXTRA_RADIUS", 1))
+    window = int(a.window_size or get_cfg(cfg, "MODEL.WINDOW_HW", [20,20])[0])
     slots = int(a.window_slots or get_cfg(cfg, "MODEL.MAX_WINDOWS", 8))
 
     ds = PreparedShardDataset(a.prepared)
@@ -492,15 +493,10 @@ def main():
 
     if a.vae_ckpt:
         energy_n = n if a.energy_max_windows is None else min(n, a.energy_max_windows)
-        energy_radii = [int(x) for x in a.energy_radii.split(",")]
-        thresholds = [float(x) for x in a.energy_thresholds.split(",")]
         res["motion_hybrid_latent_energy_localization"] = latent_energy_localization(
-            ds,
-            energy_n,
-            a.vae_ckpt,
-            a.device,
-            energy_radii,
-            thresholds,
+            ds, energy_n, a.vae_ckpt, a.device,
+            [int(x) for x in a.energy_radii.split(",")],
+            [float(x) for x in a.energy_thresholds.split(",")],
         )
     else:
         res["motion_hybrid_latent_energy_localization"] = {
@@ -508,15 +504,15 @@ def main():
             "reason": "pass --vae-ckpt to run the optional VAE latent energy audit",
         }
 
-    op = Path(a.output)
-    op.parent.mkdir(parents=True, exist_ok=True)
+    op = Path(a.output); op.parent.mkdir(parents=True, exist_ok=True)
     op.write_text(json.dumps(res, indent=2), encoding="utf-8")
     save_resolved_config(cfg, op.with_suffix(".resolved.yaml"))
-
     print(json.dumps({
         "saved": str(a.output),
         "num_windows": n,
+        "routing_contract": res["routing_contract"],
         "t0_motion_state": res["support_expansion_diagnostic"]["t0_motion_state"],
+        "support_per_horizon": res["support_expansion_diagnostic"]["per_horizon"],
         "window_backend": res["proposed_window_backend"],
         "energy_audit": res["motion_hybrid_latent_energy_localization"].get("status"),
     }, indent=2))
