@@ -15,7 +15,7 @@ from .support import MotionTubeConfig, build_motion_tube
 from .nuscenes_adapter import (gt_moving_support_for_horizon, gt_moving_only_semantics,
                                 causal_dynamic_target_semantics)
 
-PREPARED_VERSION = "real_motion_prepared_v4_observed_motion"
+PREPARED_VERSION = "real_motion_prepared_v5_moving_kta_uncertain_zero"
 
 
 @dataclass(frozen=True)
@@ -35,11 +35,30 @@ class PrepareConfig:
     kta: KTAConfig = KTAConfig()
 
 
-def _early_frame_masks(sem, free_label):
-    occupied = sem != free_label
-    zeros = np.zeros_like(occupied)
-    return MotionMasks(zeros, zeros, occupied, ~occupied,
-                       np.zeros_like(sem, dtype=np.float32))
+def _masked_semantics(sem, mask, free_label):
+    out = np.full_like(sem, free_label)
+    out[np.asarray(mask, dtype=bool)] = np.asarray(sem)[np.asarray(mask, dtype=bool)]
+    return out
+
+
+def _early_frame_masks(sem, cfg: PersistenceMotionConfig):
+    """Class-route a prefix that is too short for displacement estimation.
+
+    Background can be deterministically transported immediately. Motion-eligible
+    things remain UNCERTAIN until enough history exists to prove displacement.
+    """
+    sem = np.asarray(sem)
+    occupied = sem != cfg.free_label
+    eligible = occupied & np.isin(
+        sem, np.asarray(tuple(int(c) for c in cfg.motion_eligible_class_ids))
+    )
+    static = occupied & ~eligible
+    moving = np.zeros_like(occupied)
+    uncertain = eligible
+    return MotionMasks(
+        static, moving, uncertain, ~occupied,
+        np.zeros_like(sem, dtype=np.float32),
+    )
 
 
 def _align_observation_sequence(observed, poses, reference_index, grid):
@@ -56,7 +75,7 @@ def causal_history_split(history_native, history_poses, history_observed, cfg: P
     static_frames, moving_frames, candidate_support = [], [], []
     for j in range(len(history_native)):
         if j + 1 < cfg.motion.min_observed_frames:
-            masks = _early_frame_masks(history_native[j], cfg.free_label)
+            masks = _early_frame_masks(history_native[j], cfg.motion)
         else:
             prefix_sem = history_native[:j+1]
             prefix_obs = history_observed[:j+1]
@@ -66,9 +85,11 @@ def causal_history_split(history_native, history_poses, history_observed, cfg: P
             masks = decompose_masks(
                 aligned, cfg.motion, history_observed=aligned_obs
             )
-        sta, mov = split_semantics(history_native[j], masks, cfg.free_label)
+        sta, candidate = split_semantics(history_native[j], masks, cfg.free_label)
         static_frames.append(sta)
-        moving_frames.append(mov)
+        # Legacy cache key name is moving_history_occ, but the formal meaning is
+        # generator-visible history = MOVING union UNCERTAIN eligible things.
+        moving_frames.append(candidate)
         candidate_support.append(masks.wm_candidate.any(axis=2))
     return np.stack(static_frames), np.stack(moving_frames), np.stack(candidate_support)
 
@@ -203,19 +224,48 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
     )
 
     horizons = [(i + 1) * cfg.frame_dt_s for i in range(cfg.future_frames)]
-    kta_t0, _, components = causal_kta(
-        aligned_hist, t0_masks.wm_candidate, horizons, cfg.grid, cfg.kta
+
+    # Routing contract:
+    #   MOVING    -> constant-motion KTA, then causal motion tube;
+    #   UNCERTAIN -> zero object-motion anchor, ego-transported only, no tube.
+    moving_kta_t0, _, components = causal_kta(
+        aligned_hist, t0_masks.moving, horizons, cfg.grid, cfg.kta
     )
+    uncertain_current = _masked_semantics(
+        hist[-1], t0_masks.uncertain, cfg.free_label
+    )
+
+    moving_kta_future = []
+    uncertain_zero_future = []
     kta_future = []
-    for sem_t0, pose_h in zip(kta_t0, fut_poses):
-        kta_future.append(warp_semantic_grid(
-            sem_t0, relative_transform(t0_pose, pose_h), cfg.grid, cfg.free_label
-        ))
+    for moving_t0, pose_h in zip(moving_kta_t0, fut_poses):
+        rel = relative_transform(t0_pose, pose_h)
+        moving_h = warp_semantic_grid(
+            moving_t0, rel, cfg.grid, cfg.free_label
+        )
+        uncertain_h = warp_semantic_grid(
+            uncertain_current, rel, cfg.grid, cfg.free_label
+        )
+        # Explicit motion has priority if a moving extrapolation and a
+        # zero-motion uncertain anchor collide after transport.
+        combined = uncertain_h.copy()
+        write = moving_h != cfg.free_label
+        combined[write] = moving_h[write]
+        moving_kta_future.append(moving_h)
+        uncertain_zero_future.append(uncertain_h)
+        kta_future.append(combined)
+
+    moving_kta_future = np.stack(moving_kta_future)
+    uncertain_zero_future = np.stack(uncertain_zero_future)
     kta_future = np.stack(kta_future)
-    kta_support = (kta_future != cfg.free_label).any(axis=3)
-    generation_support = build_motion_tube(
-        torch.from_numpy(kta_support), MotionTubeConfig(cfg.tube_radii, 0)
+
+    moving_kta_support = (moving_kta_future != cfg.free_label).any(axis=3)
+    uncertain_zero_support = (uncertain_zero_future != cfg.free_label).any(axis=3)
+    kta_support = moving_kta_support | uncertain_zero_support
+    moving_generation_support = build_motion_tube(
+        torch.from_numpy(moving_kta_support), MotionTubeConfig(cfg.tube_radii, 0)
     ).cpu().numpy()
+    generation_support = moving_generation_support | uncertain_zero_support
 
     if include_gt:
         gt_supports, gt_moving, moving_records, excluded = [], [], [], []
@@ -260,7 +310,12 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
         "static_future_occ": static_future,
         "confident_static_future_mask": protected_future,
         "kta_future_occ": kta_future,
+        "moving_kta_future_occ": moving_kta_future,
+        "uncertain_zero_future_occ": uncertain_zero_future,
         "kta_support": kta_support,
+        "moving_kta_support": moving_kta_support,
+        "uncertain_zero_support": uncertain_zero_support,
+        "moving_generation_support": moving_generation_support,
         "generation_support_occ": generation_support,
         "trajectory": trajectory,
         "trajectory_protocol": cfg.trajectory_protocol,
@@ -317,7 +372,7 @@ class PreparedShardDataset:
         self.root = Path(root)
         self.index = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
         if self.index.get("version") != PREPARED_VERSION:
-            raise ValueError(f"unsupported prepared version {self.index.get('version')}; rebuild prepared data for observation-aware real-motion decomposition")
+            raise ValueError(f"unsupported prepared version {self.index.get('version')}; rebuild prepared data for moving-only KTA routing")
         self.entries = self.index["entries"]
         self._cached_name = None; self._cached_shard = None
     def __len__(self): return len(self.entries)
