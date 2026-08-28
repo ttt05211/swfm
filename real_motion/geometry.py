@@ -1,14 +1,18 @@
-"""Rigid geometry for ego-aligned occupancy processing.
+"""Rigid geometry for ego-aligned Occ3D occupancy processing.
 
-Grid convention used by OccFM / Occ3D in this repository:
-    semantic grid shape = [H(y), W(x), D(z)]
-    world/ego metric coordinate = (x, y, z)
+Official Occ3D array convention
+-------------------------------
+The released ``semantics``/``mask_lidar`` arrays are indexed as ``[X,Y,Z]``:
+array axis 0 maps to metric x, axis 1 to metric y, and axis 2 to metric z.
+Occ3D's official ``voxel2points`` helper uses exactly this mapping.
 
-The default nuScenes geometry is 200x200x16 with range
+For backward API compatibility the dataclass field is still named
+``shape_hwd`` throughout this repository, but its value must be interpreted as
+``(X,Y,Z)``.  The default nuScenes volume is 200x200x16 with range
 [-40,-40,-1, 40,40,5.4] and 0.4 m voxels.
 """
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 import math
 import numpy as np
 
@@ -19,15 +23,16 @@ class OccupancyGrid:
     y_min: float = -40.0
     z_min: float = -1.0
     voxel_size: tuple = (0.4, 0.4, 0.4)
+    # Legacy field name; order is (X,Y,Z), matching official Occ3D arrays.
     shape_hwd: tuple = (200, 200, 16)
 
     @property
     def x_max(self):
-        return self.x_min + self.shape_hwd[1] * self.voxel_size[0]
+        return self.x_min + self.shape_hwd[0] * self.voxel_size[0]
 
     @property
     def y_max(self):
-        return self.y_min + self.shape_hwd[0] * self.voxel_size[1]
+        return self.y_min + self.shape_hwd[1] * self.voxel_size[1]
 
     @property
     def z_max(self):
@@ -71,8 +76,8 @@ def relative_transform(src_ego_to_world: np.ndarray, dst_ego_to_world: np.ndarra
     return np.linalg.inv(np.asarray(dst_ego_to_world)) @ np.asarray(src_ego_to_world)
 
 
-def _occupied_indices_to_xyz(indices_yxz: np.ndarray, grid: OccupancyGrid) -> np.ndarray:
-    iy, ix, iz = indices_yxz.T
+def _occupied_indices_to_xyz(indices_xyz: np.ndarray, grid: OccupancyGrid) -> np.ndarray:
+    ix, iy, iz = indices_xyz.T
     vx, vy, vz = grid.voxel_size
     x = grid.x_min + (ix.astype(np.float64) + 0.5) * vx
     y = grid.y_min + (iy.astype(np.float64) + 0.5) * vy
@@ -85,9 +90,9 @@ def _xyz_to_indices(xyz: np.ndarray, grid: OccupancyGrid):
     ix = np.floor((xyz[:, 0] - grid.x_min) / vx).astype(np.int64)
     iy = np.floor((xyz[:, 1] - grid.y_min) / vy).astype(np.int64)
     iz = np.floor((xyz[:, 2] - grid.z_min) / vz).astype(np.int64)
-    H, W, D = grid.shape_hwd
-    valid = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H) & (iz >= 0) & (iz < D)
-    return iy, ix, iz, valid
+    X, Y, Z = grid.shape_hwd
+    valid = (ix >= 0) & (ix < X) & (iy >= 0) & (iy < Y) & (iz >= 0) & (iz < Z)
+    return ix, iy, iz, valid
 
 
 def warp_semantic_grid(
@@ -96,7 +101,7 @@ def warp_semantic_grid(
     grid: OccupancyGrid = OccupancyGrid(),
     free_label: int = 17,
 ) -> np.ndarray:
-    """Nearest-cell rigid warp with deterministic collision resolution.
+    """Nearest-cell rigid warp for official Occ3D ``[X,Y,Z]`` arrays.
 
     In a collision, the transformed source voxel whose center is closest to the
     destination cell center wins. This avoids order-dependent writes.
@@ -112,13 +117,13 @@ def warp_semantic_grid(
     xyz = _occupied_indices_to_xyz(occ_idx, grid)
     xyz_h = np.concatenate([xyz, np.ones((len(xyz), 1), dtype=np.float64)], axis=1)
     dst_xyz = (np.asarray(src_to_dst, dtype=np.float64) @ xyz_h.T).T[:, :3]
-    iy, ix, iz, valid = _xyz_to_indices(dst_xyz, grid)
+    ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
     if not valid.any():
         return out
 
     src_idx = occ_idx[valid]
     vals = sem[tuple(src_idx.T)]
-    iy, ix, iz = iy[valid], ix[valid], iz[valid]
+    ix, iy, iz = ix[valid], iy[valid], iz[valid]
     dst_xyz = dst_xyz[valid]
 
     vx, vy, vz = grid.voxel_size
@@ -128,16 +133,15 @@ def warp_semantic_grid(
         grid.z_min + (iz + 0.5) * vz,
     ], axis=1)
     dist2 = np.sum((dst_xyz - centers) ** 2, axis=1)
-    H, W, D = grid.shape_hwd
-    flat = (iy * W + ix) * D + iz
+    X, Y, Z = grid.shape_hwd
+    flat = (ix * Y + iy) * Z + iz
 
-    # Lexicographic order: target cell first, distance second.
     order = np.lexsort((dist2, flat))
     flat_sorted = flat[order]
     first = np.ones(len(order), dtype=bool)
     first[1:] = flat_sorted[1:] != flat_sorted[:-1]
     chosen = order[first]
-    out[iy[chosen], ix[chosen], iz[chosen]] = vals[chosen]
+    out[ix[chosen], iy[chosen], iz[chosen]] = vals[chosen]
     return out
 
 
