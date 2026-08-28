@@ -4,6 +4,7 @@ Contract:
 - motion decision uses GT instance centers in WORLD XY;
 - rasterization uses the same t0/th boxes transformed into the TARGET FUTURE
   ego grid;
+- Occ3D arrays use official [X,Y,Z] axis order;
 - support is their union with 0.5 m margin;
 - only dynamic semantic classes are scored;
 - mIoU is computed independently at 1s/2s/3s, then arithmetic-averaged.
@@ -24,7 +25,6 @@ NUSCENES_LABELS = (
     "driveable_surface", "other_flat", "sidewalk", "terrain", "manmade",
     "vegetation", "free",
 )
-# Frozen dynamic semantic class set used by the metric.
 DYNAMIC_CLASS_IDS = (2, 3, 4, 5, 6, 7, 9, 10)
 
 
@@ -43,6 +43,7 @@ class GridSpec:
     y_min: float = -40.0
     z_min: float = -1.0
     voxel_size: tuple = (0.4, 0.4, 0.4)
+    # Legacy field name; order is (X,Y,Z), matching Occ3D labels.npz.
     shape_hwd: tuple = (200, 200, 16)
 
 
@@ -61,30 +62,30 @@ def is_moving_world(center0_world, centerh_world, dt,
 
 
 def rasterize_oriented_box(box: Box3D, grid: GridSpec = GridSpec(), margin=BOX_MARGIN_M):
-    """Rasterize an oriented box already expressed in target ego coordinates."""
-    H, W, D = grid.shape_hwd
+    """Rasterize a target-ego box into an Occ3D ``[X,Y,Z]`` mask."""
+    NX, NY, NZ = grid.shape_hwd
     vx, vy, vz = grid.voxel_size
-    xs = grid.x_min + (np.arange(W) + 0.5) * vx
-    ys = grid.y_min + (np.arange(H) + 0.5) * vy
-    zs = grid.z_min + (np.arange(D) + 0.5) * vz
+    xs = grid.x_min + (np.arange(NX) + 0.5) * vx
+    ys = grid.y_min + (np.arange(NY) + 0.5) * vy
+    zs = grid.z_min + (np.arange(NZ) + 0.5) * vz
     cx, cy, cz = box.center_xyz
     l, w, h = box.size_lwh
     radius = 0.5 * math.hypot(l + 2*margin, w + 2*margin)
     xi = np.where((xs >= cx-radius) & (xs <= cx+radius))[0]
     yi = np.where((ys >= cy-radius) & (ys <= cy+radius))[0]
     zi = np.where((zs >= cz-h/2-margin) & (zs <= cz+h/2+margin))[0]
-    out = np.zeros((H, W, D), dtype=bool)
+    out = np.zeros((NX, NY, NZ), dtype=bool)
     if not len(xi) or not len(yi) or not len(zi):
         return out
-    X, Y = np.meshgrid(xs[xi], ys[yi])
-    dx, dy = X-cx, Y-cy
+    xx_metric, yy_metric = np.meshgrid(xs[xi], ys[yi], indexing="xy")
+    dx, dy = xx_metric-cx, yy_metric-cy
     c, s = math.cos(box.yaw), math.sin(box.yaw)
     lx = c*dx + s*dy
     ly = -s*dx + c*dy
     inside = (np.abs(lx) <= l/2+margin) & (np.abs(ly) <= w/2+margin)
-    yy, xx = np.where(inside)
+    row_y, col_x = np.where(inside)
     for z in zi:
-        out[yi[yy], xi[xx], z] = True
+        out[xi[col_x], yi[row_y], z] = True
     return out
 
 
