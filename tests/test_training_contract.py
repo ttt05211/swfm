@@ -22,7 +22,7 @@ def _meta(cfg):
 def test_cache_contract_detects_motion_mismatch():
     cfg=load_runtime_config();train=_meta(cfg);val=_meta(cfg)
     assert validate_cache_pair(train,val,cfg)==config_fingerprint(cfg,'cache')
-    bad=copy.deepcopy(cfg);bad['MOTION']['KTA_TUBE_RADII']=[2,2,3,4,5,6]
+    bad=copy.deepcopy(cfg);bad['MOTION']['KTA_ENDPOINT_TUBE_RADII']=[1,2,3,4,5,6]
     val_bad=_meta(bad)
     try:
         validate_cache_pair(train,val_bad,cfg)
