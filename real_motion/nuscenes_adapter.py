@@ -140,10 +140,37 @@ class NuScenesWindowSource:
                 yield WindowTokens(scene_name=scene["name"],history_tokens=tuple(tokens[i-history+1:i+1]),t0_token=tokens[i],future_tokens=tuple(tokens[i+1:i+future+1]));emitted+=1
                 if max_windows is not None and emitted>=max_windows:return
 
-    def load_semantics(self,scene_name,token):
-        path=Path(self.dataroot)/"gts"/scene_name/token/"labels.npz"
+    def _label_path(self,scene_name,token):
+        return Path(self.dataroot)/"gts"/scene_name/token/"labels.npz"
+
+    def load_occ3d(self,scene_name,token,require_lidar_mask=True):
+        """Load semantic occupancy and the real LiDAR observation mask.
+
+        Formal motion decomposition must use ``mask_lidar`` to distinguish a
+        genuinely observed free voxel from an unobserved/warped hole.  Falling
+        back to semantic non-free is intentionally disallowed when
+        ``require_lidar_mask`` is True.
+        """
+        path=self._label_path(scene_name,token)
         if not path.exists():raise FileNotFoundError(path)
-        return np.load(path)["semantics"]
+        with np.load(path) as data:
+            if "semantics" not in data:raise KeyError(f"{path} lacks semantics")
+            sem=np.asarray(data["semantics"])
+            if "mask_lidar" in data:
+                obs=np.asarray(data["mask_lidar"],dtype=bool)
+            elif require_lidar_mask:
+                raise KeyError(f"{path} lacks required Occ3D mask_lidar")
+            else:
+                obs=sem!=17
+        if obs.shape!=sem.shape:
+            raise ValueError(f"mask_lidar shape {obs.shape} != semantics {sem.shape} in {path}")
+        return sem,obs
+
+    def load_semantics(self,scene_name,token):
+        return self.load_occ3d(scene_name,token,require_lidar_mask=False)[0]
+
+    def load_lidar_observation(self,scene_name,token):
+        return self.load_occ3d(scene_name,token,require_lidar_mask=True)[1]
 
     def pose(self,token):return sample_ego_to_world(self.nusc,token)
 
