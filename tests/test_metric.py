@@ -23,6 +23,16 @@ def test_dual_support_penalizes_ghost_and_miss():
     assert acc.compute()["mIoU"]==0.0
 
 
+def test_raster_axis0_is_metric_x():
+    from real_motion.metrics.moving_miou_v2 import rasterize_oriented_box
+    g=GridSpec(0,0,0,(1,1,1),(4,7,2))
+    # Center x=1.5, y=5.5 must hit array [1,5,*], not [5,1,*].
+    b=Box3D("x",4,(1.5,5.5,0.5),(0.8,0.8,0.8),0)
+    s=rasterize_oriented_box(b,g,0)
+    assert s[1,5,0]
+    assert s.shape==(4,7,2)
+
+
 def test_multihorizon_contract_averages_horizon_mious_not_voxels():
     metric=MovingMIoUV2MultiHorizon()
     support=np.ones((1,1,2),dtype=bool); gt=np.array([[[4,4]]])
