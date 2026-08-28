@@ -3,13 +3,13 @@ from pathlib import Path
 import json
 import torch
 
-CACHE_VERSION = "real_motion_v4"
-LEGACY_VERSIONS = ("real_motion_v1", "real_motion_v2", "real_motion_v3")
+CACHE_VERSION = "real_motion_v5"
+LEGACY_VERSIONS = ("real_motion_v1", "real_motion_v2", "real_motion_v3", "real_motion_v4")
 REQUIRED_KEYS = (
-    "moving_history_latent",   # [H,C,50,50]
+    "moving_history_latent",   # [H,C,50,50], generator-visible MOVING|UNCERTAIN history
     "future_dynamic_target_latent",  # [F,C,50,50], causal-support training target
     "static_future_latent",    # [F,C,50,50]
-    "kta_future_latent",       # [F,C,50,50]
+    "kta_future_latent",       # [F,C,50,50], MOVING KTA + UNCERTAIN zero-motion anchor
     "generation_support",      # [F,50,50] bool
 )
 
