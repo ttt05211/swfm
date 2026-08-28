@@ -24,7 +24,7 @@ def test_online_prepare_never_loads_future_semantics():
             self.loaded.append(token);x=np.full((4,4,2),17,dtype=np.int64);x[1,1 if token=='h0' else 2,0]=4;return x
         def pose(self,token):return np.eye(4)
         def official_trajectory(self,history,future,hist_last=2,zero_prefix=0,require_info=False):return np.zeros((4,2),dtype=np.float32)
-    src=Source();w=WindowTokens('s',('h0','h1'),'h1',('f0','f1'));cfg=PrepareConfig(history_frames=2,future_frames=2,frame_dt_s=0.5,tube_radii=(0,0),trajectory_length=4,trajectory_hist_last=2,trajectory_zero_prefix=0,trajectory_protocol='unit_4step',require_temporal_info=False,grid=tiny_grid(),motion=PersistenceMotionConfig(min_observed_frames=2),kta=KTAConfig(history_dt_s=0.5,max_match_distance_m=3.0));out=prepare_nuscenes_window(src,w,cfg,include_gt=False);assert src.loaded==['h0','h1'];assert 'future_gt_occ' not in out;assert out['generation_support_occ'].shape==(2,4,4);assert out['trajectory'].shape==(4,2)
+    src=Source();w=WindowTokens('s',('h0','h1'),'h1',('f0','f1'));cfg=PrepareConfig(history_frames=2,future_frames=2,frame_dt_s=0.5,tube_radii=(0,0),trajectory_length=4,trajectory_hist_last=2,trajectory_zero_prefix=0,trajectory_protocol='unit_4step',require_temporal_info=False,grid=tiny_grid(),motion=PersistenceMotionConfig(min_observed_frames=2,min_static_observations=2),kta=KTAConfig(history_dt_s=0.5,max_match_distance_m=3.0));out=prepare_nuscenes_window(src,w,cfg,include_gt=False);assert src.loaded==['h0','h1'];assert 'future_gt_occ' not in out;assert out['generation_support_occ'].shape==(2,4,4);assert out['trajectory'].shape==(4,2)
 
 def test_component_track_marks_whole_shifted_object_moving():
     x=np.full((3,8,8,2),17,dtype=np.int64);x[0,3:5,1:3,0]=4;x[1,3:5,2:4,0]=4;x[2,3:5,3:5,0]=4;cfg=PersistenceMotionConfig(history_dt_s=0.5,voxel_size_xy_m=(0.4,0.4),moving_speed_mps=0.5,static_speed_mps=0.2);m=decompose_masks(x,cfg);cur=(x[-1]==4);assert cur.sum()==4;assert m.moving[cur].all();assert not m.confident_static[cur].any();assert not m.uncertain[cur].any()
@@ -33,4 +33,60 @@ def test_component_track_marks_persistent_object_static():
     x=np.full((3,8,8,2),17,dtype=np.int64);x[:,3:5,3:5,0]=4;m=decompose_masks(x,PersistenceMotionConfig());cur=(x[-1]==4);assert m.confident_static[cur].all();assert not m.moving[cur].any()
 
 def test_component_without_history_is_uncertain_not_static():
-    x=np.full((3,8,8,2),17,dtype=np.int64);x[-1,3:5,3:5,0]=4;m=decompose_masks(x,PersistenceMotionConfig());cur=(x[-1]==4);assert m.uncertain[cur].all();assert not m.confident_static[cur].any()
+    x=np.full((3,8,8,2),17,dtype=np.int64);x[-1,3:5,3:5,0]=4;m=decompose_masks(x,PersistenceMotionConfig());cur=(x[-1]==4);assert m.uncertain[cur].all();assert not m.confident_static[cur].any();assert not m.moving[cur].any()
+
+
+def test_unobserved_holes_are_not_negative_static_evidence():
+    x=np.full((4,6,6,1),17,dtype=np.int64)
+    x[:,2,2,0]=15
+    obs=np.zeros_like(x,dtype=bool)
+    obs[0,2,2,0]=True
+    obs[2,2,2,0]=True
+    obs[3,2,2,0]=True
+    cfg=PersistenceMotionConfig(min_static_observations=3,use_component_tracks=False)
+    m=decompose_masks(x,cfg,history_observed=obs)
+    assert m.confident_static[2,2,0]
+    assert not m.moving[2,2,0]
+    assert m.persistence[2,2,0]==1.0
+
+
+def test_one_observation_never_becomes_confident_static():
+    x=np.full((4,6,6,1),17,dtype=np.int64)
+    x[-1,2,2,0]=4
+    obs=np.zeros_like(x,dtype=bool)
+    obs[-1,2,2,0]=True
+    cfg=PersistenceMotionConfig(min_static_observations=3)
+    m=decompose_masks(x,cfg,history_observed=obs)
+    assert m.uncertain[2,2,0]
+    assert not m.confident_static[2,2,0]
+    assert not m.moving[2,2,0]
+
+
+def test_noneligible_stuff_centroid_shift_cannot_become_moving():
+    # driveable_surface (11) shifts as a connected component.  This is exactly
+    # the failure mode that inflated P0-B: stuff centroid jitter must not create
+    # physical MOVING evidence.
+    x=np.full((3,10,10,1),17,dtype=np.int64)
+    x[0,3:6,1:4,0]=11
+    x[1,3:6,2:5,0]=11
+    x[2,3:6,3:6,0]=11
+    obs=x!=17
+    cfg=PersistenceMotionConfig(min_static_observations=3)
+    m=decompose_masks(x,cfg,history_observed=obs)
+    cur=x[-1]==11
+    assert not m.moving[cur].any()
+    assert m.uncertain[cur].all()
+
+
+def test_low_persistence_alone_never_means_moving():
+    x=np.full((3,6,6,1),17,dtype=np.int64)
+    x[0,2,2,0]=4
+    x[1,2,2,0]=7
+    x[2,2,2,0]=4
+    obs=np.zeros_like(x,dtype=bool)
+    obs[:,2,2,0]=True
+    cfg=PersistenceMotionConfig(min_static_observations=3,use_component_tracks=False)
+    m=decompose_masks(x,cfg,history_observed=obs)
+    assert m.persistence[2,2,0] < cfg.static_min_persistence
+    assert m.uncertain[2,2,0]
+    assert not m.moving[2,2,0]
