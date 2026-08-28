@@ -21,8 +21,13 @@ MODEL:
   TRAJECTORY_LENGTH: 12
 MOTION:
   STATES: [confident_static, moving, uncertain, free]
+  OBSERVATION_SOURCE: occ3d_mask_lidar
   STATIC_MIN_PERSISTENCE: 0.80
+  MIN_STATIC_OBSERVATIONS: 3
+  # Retained only for legacy/audit comparability. Low persistence no longer
+  # directly creates MOVING in the formal observation-aware detector.
   MOVING_MAX_PERSISTENCE: 0.50
+  MOTION_ELIGIBLE_CLASS_IDS: [2, 3, 4, 5, 6, 7, 9, 10]
   USE_COMPONENT_TRACKS: true
   COMPONENT_HISTORY_DT_S: 0.5
   COMPONENT_MAX_STEP_M: 4.0
@@ -34,7 +39,7 @@ MOTION:
   KTA_TUBE_RADII: [1, 2, 3, 4, 5, 6]
   LATENT_EXTRA_RADIUS: 1
 CACHE:
-  VERSION: real_motion_v3
+  VERSION: real_motion_v4
   SHARDED: true
   PREPARED_SHARD_SIZE: 16
   LATENT_SHARD_SIZE: 128
