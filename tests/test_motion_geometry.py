@@ -12,6 +12,19 @@ def test_free_is_never_confident_static():
 def test_relative_identity_warp():
     g=tiny_grid();sem=np.full(g.shape_hwd,17,dtype=np.int64);sem[1,2,0]=4;T=np.eye(4);assert np.array_equal(warp_semantic_grid(sem,relative_transform(T,T),g,17),sem)
 
+
+def test_occ3d_axis0_is_metric_x():
+    # Use an asymmetric grid so an accidental [Y,X,Z] implementation cannot
+    # pass by symmetry.  A +1m metric-x transform must increment array axis 0.
+    g=OccupancyGrid(-2,-3,-1,(1,1,1),(4,6,2))
+    sem=np.full(g.shape_hwd,17,dtype=np.int64);sem[1,4,0]=4
+    T=np.eye(4);T[0,3]=1.0
+    warped=warp_semantic_grid(sem,T,g,17)
+    assert warped[2,4,0]==4
+    assert warped[1,5,0]==17
+    assert g.x_max==2 and g.y_max==3
+
+
 def test_kta_constant_translation():
     g=tiny_grid();hist=np.full((2,*g.shape_hwd),17,dtype=np.int64);hist[0,1,1,0]=4;hist[1,1,2,0]=4;cand=np.zeros(g.shape_hwd,dtype=bool);cand[1,2,0]=1;pred,_,comps=causal_kta(hist,cand,[1.0],g,KTAConfig(history_dt_s=1.0,max_match_distance_m=2.0));assert len(comps)==1;assert pred[0,1,3,0]==4
 
@@ -63,9 +76,6 @@ def test_one_observation_never_becomes_confident_static():
 
 
 def test_noneligible_stuff_centroid_shift_cannot_become_moving():
-    # driveable_surface (11) shifts as a connected component.  This is exactly
-    # the failure mode that inflated P0-B: stuff centroid jitter must not create
-    # physical MOVING evidence.
     x=np.full((3,10,10,1),17,dtype=np.int64)
     x[0,3:6,1:4,0]=11
     x[1,3:6,2:5,0]=11
