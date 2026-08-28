@@ -18,7 +18,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest numpy pyyaml einops einops-exts
+          python -m pip install pytest numpy pyyaml easydict einops einops-exts
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Compile all Python entrypoints
         run: python -m py_compile $(find real_motion tools tests -name '*.py' -type f)
