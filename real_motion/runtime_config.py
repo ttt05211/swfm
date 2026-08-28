@@ -134,6 +134,23 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
     if any(int(r) < 0 for r in radii):
         raise ValueError("MOTION.KTA_TUBE_RADII cannot be negative")
 
+    # Observation-aware real-motion contract.  Semantic identity gates only
+    # whether object-level displacement tracking is meaningful; MOVING still
+    # requires measured historical displacement.
+    if _deep_get(cfg, "MOTION.OBSERVATION_SOURCE") != "occ3d_mask_lidar":
+        raise ValueError("MOTION.OBSERVATION_SOURCE must be occ3d_mask_lidar")
+    eligible = tuple(int(x) for x in _deep_get(cfg, "MOTION.MOTION_ELIGIBLE_CLASS_IDS", []))
+    if eligible != tuple(DYNAMIC_CLASS_IDS):
+        raise ValueError(
+            f"MOTION.MOTION_ELIGIBLE_CLASS_IDS must be {tuple(DYNAMIC_CLASS_IDS)}, got {eligible}"
+        )
+    min_static_obs = int(_deep_get(cfg, "MOTION.MIN_STATIC_OBSERVATIONS", -1))
+    if not 1 <= min_static_obs <= 6:
+        raise ValueError("MOTION.MIN_STATIC_OBSERVATIONS must be in [1,6]")
+    static_p = float(_deep_get(cfg, "MOTION.STATIC_MIN_PERSISTENCE", -1.0))
+    if not 0.0 <= static_p <= 1.0:
+        raise ValueError("MOTION.STATIC_MIN_PERSISTENCE must be in [0,1]")
+
     # Main-paper ego protocol is intentionally frozen to the official OccFM-fut
     # model released as epoch=000196.ckpt. The official dataset feeds one-step
     # GT ego offsets for every frame in the 6-history + 6-future window, yielding
@@ -196,6 +213,8 @@ def make_prepare_config(cfg):
         static_min_persistence=float(get_cfg(cfg,'MOTION.STATIC_MIN_PERSISTENCE',0.8)),
         moving_max_persistence=float(get_cfg(cfg,'MOTION.MOVING_MAX_PERSISTENCE',0.5)),
         min_observed_frames=2,
+        min_static_observations=int(get_cfg(cfg,'MOTION.MIN_STATIC_OBSERVATIONS',3)),
+        motion_eligible_class_ids=tuple(int(x) for x in get_cfg(cfg,'MOTION.MOTION_ELIGIBLE_CLASS_IDS',[2,3,4,5,6,7,9,10])),
         history_dt_s=float(get_cfg(cfg,'MOTION.COMPONENT_HISTORY_DT_S',0.5)),
         voxel_size_xy_m=(voxel[0],voxel[1]),
         use_component_tracks=bool(get_cfg(cfg,'MOTION.USE_COMPONENT_TRACKS',True)),
