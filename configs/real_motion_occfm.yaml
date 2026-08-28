@@ -25,9 +25,14 @@ MOTION:
   STATIC_MIN_PERSISTENCE: 0.80
   MIN_STATIC_OBSERVATIONS: 3
   # Retained only for legacy/audit comparability. Low persistence no longer
-  # directly creates MOVING in the formal observation-aware detector.
+  # directly creates MOVING in the formal detector.
   MOVING_MAX_PERSISTENCE: 0.50
   MOTION_ELIGIBLE_CLASS_IDS: [2, 3, 4, 5, 6, 7, 9, 10]
+  BACKGROUND_ROUTE: confident_static
+  ELIGIBLE_NONMOVING_ROUTE: uncertain
+  KTA_INPUT_STATE: moving
+  UNCERTAIN_PRIOR: zero_object_motion
+  UNCERTAIN_TUBE_RADIUS: 0
   USE_COMPONENT_TRACKS: true
   COMPONENT_HISTORY_DT_S: 0.5
   COMPONENT_MAX_STEP_M: 4.0
@@ -36,10 +41,12 @@ MOTION:
   COMPONENT_MIN_TRACK_FRAMES: 2
   KTA_HISTORY_DT_S: 0.5
   KTA_MAX_MATCH_DISTANCE_M: 6.0
+  # Kept unchanged until the moving-only KTA rerun re-measures the radius tradeoff.
   KTA_TUBE_RADII: [1, 2, 3, 4, 5, 6]
+  # Also kept unchanged for the next P0-B sensitivity rerun; do not treat it as final.
   LATENT_EXTRA_RADIUS: 1
 CACHE:
-  VERSION: real_motion_v4
+  VERSION: real_motion_v5
   SHARDED: true
   PREPARED_SHARD_SIZE: 16
   LATENT_SHARD_SIZE: 128
