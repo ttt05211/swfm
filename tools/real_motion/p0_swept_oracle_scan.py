@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""P0-E oracle: endpoint squares vs swept moving corridors.
+"""P0-D2 oracle: endpoint squares vs swept moving corridors.
 
 This script intentionally operates from raw nuScenes/Occ3D windows rather than
-changing the prepared-cache contract.  It never trains a model.  For each raw
+changing the prepared-cache contract. It never trains a model. For each raw
 window it rebuilds the causal t0 motion split, constructs a current->KTA
 swept corridor for MOVING components in the correct common ego frame, then
 warps that corridor into each future ego frame before oracle composition.
@@ -116,6 +116,40 @@ def _parse_routes(path):
     return routes
 
 
+def _accumulate_support_hits(st, gt_support, mtube, utube):
+    """Count GT moving voxels covered by 2-D MOVING/UNCERTAIN supports.
+
+    gt_support is [F,X,Y,Z], while mtube/utube are BEV [F,X,Y]. The BEV write
+    permission applies to every height cell at that XY location, so expand only
+    the support masks over Z before intersecting. This keeps the attribution a
+    true voxel count and avoids accidentally leaving the Z dimension unsummed.
+    """
+    gt_support = gt_support.bool()
+    mtube = mtube.bool()
+    utube = utube.bool()
+    if gt_support.ndim != 4:
+        raise ValueError(f"gt_moving_support must be [F,X,Y,Z], got {tuple(gt_support.shape)}")
+    if tuple(gt_support.shape[:3]) != tuple(mtube.shape) or tuple(mtube.shape) != tuple(utube.shape):
+        raise ValueError(
+            f"support shape mismatch: gt={tuple(gt_support.shape)}, "
+            f"moving={tuple(mtube.shape)}, uncertain={tuple(utube.shape)}"
+        )
+
+    mtube_vox = mtube.unsqueeze(-1)
+    utube_vox = utube.unsqueeze(-1)
+    reduce_dims = (1, 2, 3)
+    st["gt_total"] += gt_support.sum(dim=reduce_dims, dtype=torch.float64).numpy()
+    st["moving_hit"] += (
+        gt_support & mtube_vox
+    ).sum(dim=reduce_dims, dtype=torch.float64).numpy()
+    st["uncertain_hit_only"] += (
+        gt_support & ~mtube_vox & utube_vox
+    ).sum(dim=reduce_dims, dtype=torch.float64).numpy()
+    st["missed"] += (
+        gt_support & ~(mtube_vox | utube_vox)
+    ).sum(dim=reduce_dims, dtype=torch.float64).numpy()
+
+
 def main():
     p = argparse.ArgumentParser()
     add_config_args(p)
@@ -135,7 +169,7 @@ def main():
     latent_hw = tuple(int(v) for v in get_cfg(cfg, "UPSTREAM.LATENT_HW", [50, 50]))
     window_hw = get_cfg(cfg, "MODEL.WINDOW_HW", [20, 20])
     if int(window_hw[0]) != int(window_hw[1]):
-        raise ValueError("P0-E currently expects square windows")
+        raise ValueError("P0-D2 currently expects square windows")
     window = int(window_hw[0])
     max_slots = int(get_cfg(cfg, "MODEL.MAX_WINDOWS", 8))
     planner = WindowPlanner((window, window), max_slots)
@@ -222,14 +256,7 @@ def main():
             st["window_coverage"].append(float(window_coverage(req, plan)[0]))
 
             gt_support = torch.from_numpy(np.asarray(base["gt_moving_support"])).bool()
-            st["gt_total"] += gt_support.sum(dim=(1, 2), dtype=torch.float64).numpy()
-            st["moving_hit"] += (gt_support & mtube).sum(dim=(1, 2), dtype=torch.float64).numpy()
-            st["uncertain_hit_only"] += (
-                gt_support & ~mtube & utube
-            ).sum(dim=(1, 2), dtype=torch.float64).numpy()
-            st["missed"] += (
-                gt_support & ~(mtube | utube)
-            ).sum(dim=(1, 2), dtype=torch.float64).numpy()
+            _accumulate_support_hits(st, gt_support, mtube, utube)
 
             for h, fi in REPORT.items():
                 gt = np.asarray(base["future_gt_occ"])[fi]
