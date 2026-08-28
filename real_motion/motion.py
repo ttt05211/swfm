@@ -10,8 +10,7 @@ motion-eligible thing component.  Low persistence alone is never evidence of
 motion.  Everything else that is currently occupied is ``UNCERTAIN``.
 
 Free space is not a confident-static occupancy and must never be protected by
-composition.  The high-level :func:`decompose_masks` API returns explicit masks
-so callers cannot accidentally freeze free space.
+composition.  Occ3D semantic arrays follow the official ``[X,Y,Z]`` axis order.
 """
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -23,7 +22,7 @@ UNCERTAIN = np.uint8(2)
 FREE = np.uint8(3)
 
 # nuScenes/Occ3D thing classes for which object/component displacement is
-# physically meaningful.  Semantic identity only decides whether to *test*
+# physically meaningful. Semantic identity only decides whether to *test*
 # motion; MOVING still requires measured historical displacement.
 DEFAULT_MOTION_ELIGIBLE_CLASS_IDS = (2, 3, 4, 5, 6, 7, 9, 10)
 
@@ -32,7 +31,7 @@ DEFAULT_MOTION_ELIGIBLE_CLASS_IDS = (2, 3, 4, 5, 6, 7, 9, 10)
 class PersistenceMotionConfig:
     free_label: int = 17
     static_min_persistence: float = 0.80
-    # Kept for backward-compatible config loading/audits.  The formal detector
+    # Kept for backward-compatible config loading/audits. The formal detector
     # no longer maps low persistence directly to MOVING.
     moving_max_persistence: float = 0.50
     min_observed_frames: int = 2
@@ -66,7 +65,7 @@ class MotionMasks(NamedTuple):
 def _validate_observation(history_semantics, history_observed):
     x = np.asarray(history_semantics)
     if history_observed is None:
-        # Synthetic/unit-test fallback.  Formal nuScenes preparation passes
+        # Synthetic/unit-test fallback. Formal nuScenes preparation passes
         # Occ3D mask_lidar explicitly and therefore never infers observation
         # from semantic free/non-free labels.
         return x != 17
@@ -86,21 +85,21 @@ def decompose_ego_aligned_history(
     """Low-level observation-conditioned persistence state for aligned history.
 
     Args:
-        history_semantics: ``[T,H,W,D]`` integer semantic labels, already
+        history_semantics: ``[T,X,Y,Z]`` integer semantic labels, already
             transformed into the current frame's occupancy grid.
-        history_observed: aligned ``[T,H,W,D]`` observation mask.  Formal Occ3D
+        history_observed: aligned ``[T,X,Y,Z]`` observation mask. Formal Occ3D
             preparation supplies ``mask_lidar``; an unobserved voxel is neither
             positive nor negative evidence for persistence.
 
     Returns:
-        state: ``[H,W,D]`` with STATIC/UNCERTAIN/FREE.  MOVING is introduced
+        state: ``[X,Y,Z]`` with STATIC/UNCERTAIN/FREE. MOVING is introduced
             only later by explicit component displacement.
         occupied: current-frame semantic occupancy mask.
         persistence: same-class fraction over genuinely observed frames.
     """
     x = np.asarray(history_semantics)
     if x.ndim != 4 or x.shape[0] < cfg.min_observed_frames:
-        raise ValueError("history_semantics must be [T,H,W,D] with enough frames")
+        raise ValueError("history_semantics must be [T,X,Y,Z] with enough frames")
     if cfg.min_static_observations < 1:
         raise ValueError("min_static_observations must be >= 1")
 
@@ -126,31 +125,31 @@ def decompose_ego_aligned_history(
     return state, occupied, persistence.astype(np.float32)
 
 
-def _components_8(mask_hw: np.ndarray):
-    m = np.asarray(mask_hw, dtype=bool)
-    H, W = m.shape
+def _components_8(mask_xy: np.ndarray):
+    m = np.asarray(mask_xy, dtype=bool)
+    X, Y = m.shape
     seen = np.zeros_like(m)
     out = []
-    for y0, x0 in np.argwhere(m):
-        if seen[y0, x0]:
+    for x0, y0 in np.argwhere(m):
+        if seen[x0, y0]:
             continue
-        stack = [(int(y0), int(x0))]
-        seen[y0, x0] = True
+        stack = [(int(x0), int(y0))]
+        seen[x0, y0] = True
         cells = []
         while stack:
-            y, x = stack.pop()
-            cells.append((y, x))
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
+            x, y = stack.pop()
+            cells.append((x, y))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
                         continue
-                    yy, xx = y + dy, x + dx
+                    xx, yy = x + dx, y + dy
                     if (
-                        0 <= yy < H and 0 <= xx < W and m[yy, xx]
-                        and not seen[yy, xx]
+                        0 <= xx < X and 0 <= yy < Y and m[xx, yy]
+                        and not seen[xx, yy]
                     ):
-                        seen[yy, xx] = True
-                        stack.append((yy, xx))
+                        seen[xx, yy] = True
+                        stack.append((xx, yy))
         out.append(np.asarray(cells, dtype=np.int64))
     return out
 
@@ -184,10 +183,11 @@ def _frame_components(
 
 def _centroid_metric(cells, cfg: PersistenceMotionConfig):
     vx, vy = cfg.voxel_size_xy_m
-    # Absolute grid origin cancels in displacement; x is column, y is row.
+    # Official Occ3D BEV indices are [x_index, y_index]. Absolute origin
+    # cancels in displacement, so only axis order and voxel scale matter here.
     return np.array([
-        (cells[:, 1].mean() + 0.5) * vx,
-        (cells[:, 0].mean() + 0.5) * vy,
+        (cells[:, 0].mean() + 0.5) * vx,
+        (cells[:, 1].mean() + 0.5) * vy,
     ], dtype=np.float64)
 
 
@@ -200,7 +200,7 @@ def _promote_explicit_component_motion(
     """Promote only motion-eligible components with explicit displacement.
 
     Stuff/background classes are never turned into MOVING by connected-component
-    centroid jitter.  For eligible thing classes, semantic identity only gates
+    centroid jitter. For eligible thing classes, semantic identity only gates
     whether tracking is attempted; the state transition to MOVING still requires
     a causal, matched historical displacement above ``moving_speed_mps``.
     """
@@ -225,8 +225,6 @@ def _promote_explicit_component_motion(
             cur_c = _centroid_metric(cells, cfg)
             ref = cur_c
             track = [cur_c]
-            # Greedy backward association, one physical step at a time.  No
-            # future frame or GT instance token is used.
             for ti in range(len(hist) - 2, -1, -1):
                 candidates = frame_comps[ti].get(cls, [])
                 if not candidates:
