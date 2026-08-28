@@ -41,10 +41,12 @@ MOTION:
   COMPONENT_MIN_TRACK_FRAMES: 2
   KTA_HISTORY_DT_S: 0.5
   KTA_MAX_MATCH_DISTANCE_M: 6.0
-  # Kept unchanged until the moving-only KTA rerun re-measures the radius tradeoff.
+  # Kept unchanged until end-to-end support/quality ablations select a final schedule.
   KTA_TUBE_RADII: [1, 2, 3, 4, 5, 6]
-  # Also kept unchanged for the next P0-B sensitivity rerun; do not treat it as final.
-  LATENT_EXTRA_RADIUS: 1
+  # P0-B v5 showed radius=1 roughly triples active latent support with only
+  # modest window-coverage benefit; formal sparse support therefore uses no
+  # additional latent dilation.
+  LATENT_EXTRA_RADIUS: 0
 CACHE:
   VERSION: real_motion_v5
   SHARDED: true
