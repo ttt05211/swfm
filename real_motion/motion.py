@@ -4,13 +4,22 @@ The final method must never use future GT to build these masks.
 
 Motion contract
 ---------------
-``STATIC`` means there is sufficient *observed* history supporting persistence.
-``MOVING`` is stronger: it requires explicit historical displacement of a
-motion-eligible thing component.  Low persistence alone is never evidence of
-motion.  Everything else that is currently occupied is ``UNCERTAIN``.
+``STATIC`` is the deterministic background route. Non-motion-eligible occupied
+classes are transported by ego motion and are never promoted to MOVING by
+component jitter.
 
-Free space is not a confident-static occupancy and must never be protected by
-composition.  Occ3D semantic arrays follow the official ``[X,Y,Z]`` axis order.
+``MOVING`` is stricter: it requires explicit historical displacement of a
+motion-eligible thing component.
+
+A motion-eligible thing that is not explicitly moving is ``UNCERTAIN`` rather
+than hard-static. This preserves generator write access for parked-to-moving or
+otherwise future-ambiguous objects. Low persistence alone is never evidence of
+motion.
+
+Occ3D ``mask_lidar`` is still used to compute observation-conditioned
+persistence as a diagnostic/stationarity signal, but semantic route eligibility
+controls the hard-static safety boundary. Free space is never protected.
+Occ3D semantic arrays follow the official ``[X,Y,Z]`` axis order.
 """
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -31,7 +40,7 @@ DEFAULT_MOTION_ELIGIBLE_CLASS_IDS = (2, 3, 4, 5, 6, 7, 9, 10)
 class PersistenceMotionConfig:
     free_label: int = 17
     static_min_persistence: float = 0.80
-    # Kept for backward-compatible config loading/audits. The formal detector
+    # Retained for backward-compatible config loading/audits. The formal route
     # no longer maps low persistence directly to MOVING.
     moving_max_persistence: float = 0.50
     min_observed_frames: int = 2
@@ -58,7 +67,7 @@ class MotionMasks(NamedTuple):
 
     @property
     def wm_candidate(self) -> np.ndarray:
-        """Observed-moving plus motion-uncertain occupancy."""
+        """Generator-write occupancy: explicit MOVING plus eligible UNCERTAIN."""
         return self.moving | self.uncertain
 
 
@@ -77,12 +86,19 @@ def _validate_observation(history_semantics, history_observed):
     return obs
 
 
+def _motion_eligible_mask(current_semantics, cfg: PersistenceMotionConfig):
+    return np.isin(
+        np.asarray(current_semantics),
+        np.asarray(tuple(int(c) for c in cfg.motion_eligible_class_ids), dtype=np.int64),
+    )
+
+
 def decompose_ego_aligned_history(
     history_semantics: np.ndarray,
     cfg: PersistenceMotionConfig = PersistenceMotionConfig(),
     history_observed: np.ndarray | None = None,
 ):
-    """Low-level observation-conditioned persistence state for aligned history.
+    """Compute observation-conditioned same-class persistence.
 
     Args:
         history_semantics: ``[T,X,Y,Z]`` integer semantic labels, already
@@ -92,8 +108,8 @@ def decompose_ego_aligned_history(
             positive nor negative evidence for persistence.
 
     Returns:
-        state: ``[X,Y,Z]`` with STATIC/UNCERTAIN/FREE. MOVING is introduced
-            only later by explicit component displacement.
+        state: preliminary ``[X,Y,Z]`` persistence state. The final hard-static
+            versus uncertain routing is applied in :func:`decompose_masks`.
         occupied: current-frame semantic occupancy mask.
         persistence: same-class fraction over genuinely observed frames.
     """
@@ -112,7 +128,6 @@ def decompose_ego_aligned_history(
     denom = np.maximum(observed_count, 1)
     persistence = (same & observed).sum(axis=0) / denom
 
-    # Low persistence means insufficient stationary evidence, not motion.
     enough_static_evidence = observed_count >= int(cfg.min_static_observations)
     occ_static = occupied & enough_static_evidence & (
         persistence >= cfg.static_min_persistence
@@ -197,13 +212,7 @@ def _promote_explicit_component_motion(
     history_observed,
     cfg: PersistenceMotionConfig,
 ):
-    """Promote only motion-eligible components with explicit displacement.
-
-    Stuff/background classes are never turned into MOVING by connected-component
-    centroid jitter. For eligible thing classes, semantic identity only gates
-    whether tracking is attempted; the state transition to MOVING still requires
-    a causal, matched historical displacement above ``moving_speed_mps``.
-    """
+    """Promote only motion-eligible components with explicit displacement."""
     hist = np.asarray(history_semantics)
     obs = _validate_observation(hist, history_observed)
     cur = hist[-1]
@@ -259,24 +268,34 @@ def decompose_masks(
     cfg: PersistenceMotionConfig = PersistenceMotionConfig(),
     history_observed: np.ndarray | None = None,
 ) -> MotionMasks:
-    """Return the safe, explicit four-way decomposition contract.
+    """Return the formal deterministic/generative routing partition.
 
-    ``confident_static`` requires enough genuinely observed history with high
-    same-class persistence. ``moving`` requires explicit displacement of a
-    motion-eligible thing. All other current occupancy is ``uncertain``.
+    Final routing deliberately separates *current physical motion* from *safe
+    deterministic transport*:
+
+    - non-motion-eligible occupied background -> ``confident_static``;
+    - eligible component with explicit historical displacement -> ``moving``;
+    - every other eligible occupied thing -> ``uncertain``;
+    - free -> ``free``.
+
+    Thus a parked car is not called MOVING, but it is also never hard-locked as
+    STATIC; the generator retains permission to predict a future start/turn.
     """
+    hist = np.asarray(history_semantics)
     state, occupied, persistence = decompose_ego_aligned_history(
-        history_semantics, cfg, history_observed=history_observed
+        hist, cfg, history_observed=history_observed
     )
     if cfg.use_component_tracks:
         state = _promote_explicit_component_motion(
-            state, history_semantics, history_observed, cfg
+            state, hist, history_observed, cfg
         )
         state[~occupied] = FREE
 
-    confident_static = occupied & (state == STATIC)
-    moving = occupied & (state == MOVING)
-    uncertain = occupied & (state == UNCERTAIN)
+    current = hist[-1]
+    eligible = occupied & _motion_eligible_mask(current, cfg)
+    moving = eligible & (state == MOVING)
+    uncertain = eligible & ~moving
+    confident_static = occupied & ~eligible
     free = ~occupied
 
     total = (
