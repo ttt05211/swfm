@@ -12,10 +12,11 @@ from .geometry import (
 from .motion import PersistenceMotionConfig, decompose_masks, split_semantics, MotionMasks
 from .kta import KTAConfig, causal_kta
 from .support import MotionTubeConfig, build_motion_tube
+from .swept_support import swept_support_in_future_ego
 from .nuscenes_adapter import (gt_moving_support_for_horizon, gt_moving_only_semantics,
                                 causal_dynamic_target_semantics)
 
-PREPARED_VERSION = "real_motion_prepared_v5_moving_kta_uncertain_zero"
+PREPARED_VERSION = "real_motion_prepared_v6_hybrid_balanced_r1"
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,10 @@ class PrepareConfig:
     future_frames: int = 6
     frame_dt_s: float = 0.5
     free_label: int = 17
-    tube_radii: tuple = (1, 2, 3, 4, 5, 6)
+    support_geometry: str = "hybrid_endpoint_swept_v1"
+    endpoint_tube_radii: tuple = (1, 2, 3, 4, 4, 5)
+    swept_tube_radii: tuple = (1, 1, 1, 1, 1, 1)
+    uncertain_tube_radii: tuple = (0, 0, 0, 1, 2, 3)
     trajectory_length: int = 12
     trajectory_hist_last: int = 4
     trajectory_zero_prefix: int = 2
@@ -33,6 +37,11 @@ class PrepareConfig:
     grid: OccupancyGrid = OccupancyGrid()
     motion: PersistenceMotionConfig = PersistenceMotionConfig()
     kta: KTAConfig = KTAConfig()
+
+    @property
+    def tube_radii(self):
+        """Backward-compatible alias for endpoint radii used by old audit code."""
+        return self.endpoint_tube_radii
 
 
 def _masked_semantics(sem, mask, free_label):
@@ -195,11 +204,13 @@ def _enrich_motion_records(records, source, window, t0_pose, components, horizon
 
 
 def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig(), include_gt=True, raw=None):
-    """Prepare one 6+6 window under the official OccFM-fut trajectory protocol."""
+    """Prepare one 6+6 window under the frozen hybrid-support OccFM-fut protocol."""
     if len(window.history_tokens) != cfg.history_frames or len(window.future_tokens) != cfg.future_frames:
         raise ValueError("window length does not match PrepareConfig")
     if cfg.trajectory_length != cfg.history_frames + cfg.future_frames:
         raise ValueError("OccFM-fut trajectory length must equal 6-history + 6-future window length")
+    if cfg.support_geometry != "hybrid_endpoint_swept_v1":
+        raise ValueError(f"unsupported formal support geometry {cfg.support_geometry}")
 
     raw = load_nuscenes_window_raw(source, window, cfg, include_gt) if raw is None else raw
     hist = np.asarray(raw["history_occ"])
@@ -226,8 +237,9 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
     horizons = [(i + 1) * cfg.frame_dt_s for i in range(cfg.future_frames)]
 
     # Routing contract:
-    #   MOVING    -> constant-motion KTA, then causal motion tube;
-    #   UNCERTAIN -> zero object-motion anchor, ego-transported only, no tube.
+    #   MOVING    -> KTA endpoint prior; write support is endpoint tube + thin swept corridor.
+    #   UNCERTAIN -> zero object-motion prior; write support expands only by the frozen schedule.
+    # Swept support is permission for the learned WM, never a semantic occupancy prediction.
     moving_kta_t0, _, components = causal_kta(
         aligned_hist, t0_masks.moving, horizons, cfg.grid, cfg.kta
     )
@@ -262,10 +274,24 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
     moving_kta_support = (moving_kta_future != cfg.free_label).any(axis=3)
     uncertain_zero_support = (uncertain_zero_future != cfg.free_label).any(axis=3)
     kta_support = moving_kta_support | uncertain_zero_support
-    moving_generation_support = build_motion_tube(
-        torch.from_numpy(moving_kta_support), MotionTubeConfig(cfg.tube_radii, 0)
+
+    swept_kta_support = swept_support_in_future_ego(
+        components, horizons, t0_pose, fut_poses, cfg.grid
+    )
+    endpoint_generation_support = build_motion_tube(
+        torch.from_numpy(moving_kta_support),
+        MotionTubeConfig(cfg.endpoint_tube_radii, 0),
     ).cpu().numpy()
-    generation_support = moving_generation_support | uncertain_zero_support
+    swept_generation_support = build_motion_tube(
+        torch.from_numpy(swept_kta_support),
+        MotionTubeConfig(cfg.swept_tube_radii, 0),
+    ).cpu().numpy()
+    uncertain_generation_support = build_motion_tube(
+        torch.from_numpy(uncertain_zero_support),
+        MotionTubeConfig(cfg.uncertain_tube_radii, 0),
+    ).cpu().numpy()
+    moving_generation_support = endpoint_generation_support | swept_generation_support
+    generation_support = moving_generation_support | uncertain_generation_support
 
     if include_gt:
         gt_supports, gt_moving, moving_records, excluded = [], [], [], []
@@ -314,9 +340,17 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
         "uncertain_zero_future_occ": uncertain_zero_future,
         "kta_support": kta_support,
         "moving_kta_support": moving_kta_support,
+        "swept_kta_support": swept_kta_support,
         "uncertain_zero_support": uncertain_zero_support,
+        "endpoint_generation_support": endpoint_generation_support,
+        "swept_generation_support": swept_generation_support,
+        "uncertain_generation_support": uncertain_generation_support,
         "moving_generation_support": moving_generation_support,
         "generation_support_occ": generation_support,
+        "support_geometry": cfg.support_geometry,
+        "endpoint_tube_radii": np.asarray(cfg.endpoint_tube_radii, dtype=np.int64),
+        "swept_tube_radii": np.asarray(cfg.swept_tube_radii, dtype=np.int64),
+        "uncertain_tube_radii": np.asarray(cfg.uncertain_tube_radii, dtype=np.int64),
         "trajectory": trajectory,
         "trajectory_protocol": cfg.trajectory_protocol,
         "horizons_s": np.asarray(horizons, dtype=np.float32),
@@ -372,7 +406,10 @@ class PreparedShardDataset:
         self.root = Path(root)
         self.index = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
         if self.index.get("version") != PREPARED_VERSION:
-            raise ValueError(f"unsupported prepared version {self.index.get('version')}; rebuild prepared data for moving-only KTA routing")
+            raise ValueError(
+                f"unsupported prepared version {self.index.get('version')}; "
+                "rebuild prepared data for frozen hybrid-balanced-r1 support"
+            )
         self.entries = self.index["entries"]
         self._cached_name = None; self._cached_shard = None
     def __len__(self): return len(self.entries)
