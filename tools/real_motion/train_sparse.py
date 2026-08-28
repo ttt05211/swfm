@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny/small diagnostic trainer under the OccFM-fut-196 trajectory contract."""
+"""Tiny/small diagnostic trainer under the frozen Hybrid-Balanced-R1 contract."""
 import argparse,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2];UP=ROOT/'upstream_occfm';sys.path[:0]=[str(ROOT),str(UP)]
@@ -10,13 +10,7 @@ from real_motion.windows import WindowPlanner,crop_windows,window_coverage
 from real_motion.models import MotionWindowFlowMatching,RealMotionWindowCFM
 from real_motion.checkpoint import load_shape_safe
 from real_motion.runtime_config import add_config_args,load_runtime_config,get_cfg,save_resolved_config
-
-
-def load_empty(path):
-    o=torch.load(path,map_location='cpu',weights_only=True)
-    if isinstance(o,dict):o=o.get('empty_latent',o.get('latent'))
-    if not torch.is_tensor(o) or o.ndim!=3:raise ValueError('empty latent must be [C,H,W]')
-    return o
+from real_motion.training_contract import validate_cache_metadata,load_empty_asset,validate_empty_asset
 
 
 def main():
@@ -28,9 +22,9 @@ def main():
     wh=int(a.window or get_cfg(cfg,'MODEL.WINDOW_HW',[20,20])[0]);maxw=int(a.max_windows or get_cfg(cfg,'MODEL.MAX_WINDOWS',8));bs=int(a.batch_size or get_cfg(cfg,'OPTIMIZATION.TINY.BATCH_SIZE',2));steps=int(a.steps or get_cfg(cfg,'OPTIMIZATION.TINY.STEPS',2000));lr=float(a.lr or get_cfg(cfg,'OPTIMIZATION.TINY.BASE_LR',2e-5));mincov=float(a.min_window_coverage or get_cfg(cfg,'MODEL.MIN_WINDOW_COVERAGE',0.95));traj_len=int(get_cfg(cfg,'MODEL.TRAJECTORY_LENGTH',12));ds=RealMotionCacheDataset(a.cache)
     if traj_len!=12:raise ValueError('OccFM-fut 196 requires MODEL.TRAJECTORY_LENGTH=12')
     if len(ds)==0:raise RuntimeError('empty cache dataset')
+    cache_fp=validate_cache_metadata('tiny',ds.metadata,cfg);empty,empty_meta=load_empty_asset(a.empty_latent);validate_empty_asset(empty_meta,ds.metadata,cache_fp)
     sampler=ShardShuffleSampler(ds,seed=20260826) if ds.sharded else None
     dl=DataLoader(ds,batch_size=bs,shuffle=sampler is None,sampler=sampler,num_workers=a.num_workers,collate_fn=collate_real_motion,drop_last=False,pin_memory=True)
-    empty=load_empty(a.empty_latent)
     tr=MotionWindowFlowMatching(in_channels=16,out_channels=16,model_channels=128,channel_multi=[2,4],input_size=[wh,wh],trajectory_length=traj_len,init_kernel_size=7,init_3d_conv_channels=64,attn_dim=32,temporal_attn_head=8,spatial_attn_head=8,prior_channels=int(get_cfg(cfg,'MODEL.PRIOR_CHANNELS',32)))
     model=RealMotionWindowCFM(tr,rescale_factor=float(get_cfg(cfg,'MODEL.RESCALE_FACTOR',10)),sample_steps=int(get_cfg(cfg,'MODEL.SAMPLE_STEPS',10)),alpha_shift=float(get_cfg(cfg,'MODEL.ALPHA_SHIFT',3))).to(device)
     rep=load_shape_safe(model.transition,a.upstream_ckpt,verbose=True)
@@ -54,7 +48,7 @@ def main():
             if step%20==0:print(f'step={step} loss={loss.item():.6f} coverage={mc:.4f}')
             if step>=steps:break
         if step==before:raise RuntimeError('entire epoch produced no active future windows')
-    out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True);torch.save({'state_dict':model.state_dict(),'args':vars(a),'checkpoint_reuse':rep,'cache_metadata':ds.metadata,'empty_latent':empty.cpu(),'resolved_config':cfg,'upstream_variant':'occfm_fut_epoch196'},out);save_resolved_config(cfg,out.with_suffix('.resolved.yaml'));print('saved',out)
+    out=Path(a.output);out.parent.mkdir(parents=True,exist_ok=True);torch.save({'state_dict':model.state_dict(),'args':vars(a),'checkpoint_reuse':rep,'cache_metadata':ds.metadata,'cache_contract_sha256':cache_fp,'empty_latent':empty.cpu(),'resolved_config':cfg,'upstream_variant':'occfm_fut_epoch196'},out);save_resolved_config(cfg,out.with_suffix('.resolved.yaml'));print('saved',out)
 
 
 if __name__=='__main__':main()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build sharded raw prepared windows from nuScenes + Occ3D under OccFM-fut-196."""
+"""Build sharded prepared windows under frozen Hybrid-Balanced-R1 support."""
 import argparse,sys
 from pathlib import Path
 from dataclasses import asdict
@@ -14,9 +14,9 @@ def main():
     def gen():
         for i,w in enumerate(source.iter_windows(history=pcfg.history_frames,future=pcfg.future_frames,stride=a.stride,max_windows=a.max_windows)):
             s=prepare_nuscenes_window(source,w,pcfg)
-            if i%25==0:print('prepared',i,s['sample_id'],'traj',s['trajectory'].shape)
+            if i%25==0:print('prepared',i,s['sample_id'],'traj',s['trajectory'].shape,'support',s['support_geometry'])
             yield s
-    meta={'prepared_version':PREPARED_VERSION,'dataroot':str(Path(a.dataroot).resolve()),'info_pkl':str(Path(a.info_pkl).resolve()),'history_frames':pcfg.history_frames,'future_frames':pcfg.future_frames,'frame_dt_s':pcfg.frame_dt_s,'trajectory_protocol':pcfg.trajectory_protocol,'trajectory_length':pcfg.trajectory_length,'trajectory_hist_last':pcfg.trajectory_hist_last,'trajectory_zero_prefix':pcfg.trajectory_zero_prefix,'require_temporal_info':pcfg.require_temporal_info,'upstream_wm_variant':'occfm_fut','upstream_init_variant':'fut_traj_196','tube_radii':list(pcfg.tube_radii),'motion_config':asdict(pcfg.motion),'kta_config':asdict(pcfg.kta),'grid':asdict(pcfg.grid),'causal':True,'resolved_config':cfg};idx=save_prepared_shards(a.output,gen(),shard,meta);save_resolved_config(cfg,Path(a.output)/'resolved_config.yaml');print('saved',idx['num_samples'],'protocol',pcfg.trajectory_protocol)
+    meta={'prepared_version':PREPARED_VERSION,'dataroot':str(Path(a.dataroot).resolve()),'info_pkl':str(Path(a.info_pkl).resolve()),'history_frames':pcfg.history_frames,'future_frames':pcfg.future_frames,'frame_dt_s':pcfg.frame_dt_s,'trajectory_protocol':pcfg.trajectory_protocol,'trajectory_length':pcfg.trajectory_length,'trajectory_hist_last':pcfg.trajectory_hist_last,'trajectory_zero_prefix':pcfg.trajectory_zero_prefix,'require_temporal_info':pcfg.require_temporal_info,'upstream_wm_variant':'occfm_fut','upstream_init_variant':'fut_traj_196','support_geometry':pcfg.support_geometry,'endpoint_tube_radii':list(pcfg.endpoint_tube_radii),'swept_tube_radii':list(pcfg.swept_tube_radii),'uncertain_tube_radii':list(pcfg.uncertain_tube_radii),'motion_config':asdict(pcfg.motion),'kta_config':asdict(pcfg.kta),'grid':asdict(pcfg.grid),'causal':True,'resolved_config':cfg};idx=save_prepared_shards(a.output,gen(),shard,meta);save_resolved_config(cfg,Path(a.output)/'resolved_config.yaml');print('saved',idx['num_samples'],'protocol',pcfg.trajectory_protocol,'support',pcfg.support_geometry)
 
 
 if __name__=='__main__':main()

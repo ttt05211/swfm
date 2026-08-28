@@ -128,11 +128,25 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
     window = _deep_get(cfg, "MODEL.WINDOW_HW")
     if not isinstance(window, list) or len(window) != 2 or min(map(int, window)) <= 0:
         raise ValueError("MODEL.WINDOW_HW must be [H,W] positive integers")
-    radii = list(_deep_get(cfg, "MOTION.KTA_TUBE_RADII", []))
-    if len(radii) != 6:
-        raise ValueError("MOTION.KTA_TUBE_RADII must contain six 0.5s radii")
-    if any(int(r) < 0 for r in radii):
-        raise ValueError("MOTION.KTA_TUBE_RADII cannot be negative")
+
+    support_expected = {
+        "MOTION.SUPPORT_GEOMETRY": "hybrid_endpoint_swept_v1",
+        "MOTION.KTA_ENDPOINT_TUBE_RADII": [1, 2, 3, 4, 4, 5],
+        "MOTION.KTA_SWEPT_TUBE_RADII": [1, 1, 1, 1, 1, 1],
+        "MOTION.UNCERTAIN_TUBE_RADII": [0, 0, 0, 1, 2, 3],
+        "MOTION.LATENT_EXTRA_RADIUS": 0,
+    }
+    for path, expected in support_expected.items():
+        actual = _deep_get(cfg, path)
+        if isinstance(expected, list):
+            ok = list(actual or []) == expected
+        else:
+            ok = actual == expected
+        if not ok:
+            raise ValueError(
+                f"Frozen hybrid support contract mismatch at {path}: "
+                f"YAML={actual!r}, code={expected!r}"
+            )
 
     if _deep_get(cfg, "MOTION.OBSERVATION_SOURCE") != "occ3d_mask_lidar":
         raise ValueError("MOTION.OBSERVATION_SOURCE must be occ3d_mask_lidar")
@@ -225,7 +239,10 @@ def make_prepare_config(cfg):
         history_frames=6,future_frames=6,
         frame_dt_s=float(get_cfg(cfg,'MOTION.COMPONENT_HISTORY_DT_S',0.5)),
         free_label=int(get_cfg(cfg,'TARGET.FREE_LABEL',17)),
-        tube_radii=tuple(int(x) for x in get_cfg(cfg,'MOTION.KTA_TUBE_RADII',[1,2,3,4,5,6])),
+        support_geometry=str(get_cfg(cfg,'MOTION.SUPPORT_GEOMETRY','hybrid_endpoint_swept_v1')),
+        endpoint_tube_radii=tuple(int(x) for x in get_cfg(cfg,'MOTION.KTA_ENDPOINT_TUBE_RADII',[1,2,3,4,4,5])),
+        swept_tube_radii=tuple(int(x) for x in get_cfg(cfg,'MOTION.KTA_SWEPT_TUBE_RADII',[1,1,1,1,1,1])),
+        uncertain_tube_radii=tuple(int(x) for x in get_cfg(cfg,'MOTION.UNCERTAIN_TUBE_RADII',[0,0,0,1,2,3])),
         trajectory_length=int(get_cfg(cfg,'EGO_PROTOCOL.TRAJECTORY_LENGTH',12)),
         trajectory_hist_last=int(get_cfg(cfg,'EGO_PROTOCOL.HIST_LAST',4)),
         trajectory_zero_prefix=int(get_cfg(cfg,'EGO_PROTOCOL.ZERO_PREFIX_STEPS',2)),
