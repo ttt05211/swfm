@@ -134,9 +134,6 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
     if any(int(r) < 0 for r in radii):
         raise ValueError("MOTION.KTA_TUBE_RADII cannot be negative")
 
-    # Observation-aware real-motion contract.  Semantic identity gates only
-    # whether object-level displacement tracking is meaningful; MOVING still
-    # requires measured historical displacement.
     if _deep_get(cfg, "MOTION.OBSERVATION_SOURCE") != "occ3d_mask_lidar":
         raise ValueError("MOTION.OBSERVATION_SOURCE must be occ3d_mask_lidar")
     eligible = tuple(int(x) for x in _deep_get(cfg, "MOTION.MOTION_ELIGIBLE_CLASS_IDS", []))
@@ -151,10 +148,6 @@ def validate_runtime_config(cfg: Mapping[str, Any]):
     if not 0.0 <= static_p <= 1.0:
         raise ValueError("MOTION.STATIC_MIN_PERSISTENCE must be in [0,1]")
 
-    # Main-paper ego protocol is intentionally frozen to the official OccFM-fut
-    # model released as epoch=000196.ckpt. The official dataset feeds one-step
-    # GT ego offsets for every frame in the 6-history + 6-future window, yielding
-    # [12,2], while HIST_LAST=4 zeros the first 2 history trajectory entries.
     expected_ego={
         "NAME":"occfm_fut_12step_v1",
         "FUTURE_POSE_SOURCE":"gt_future_ego",
@@ -206,8 +199,8 @@ def make_prepare_config(cfg):
     occ_range=list(get_cfg(cfg,'UPSTREAM.OCC_RANGE',[-40,-40,-1,40,40,5.4]))
     voxel=tuple(float(x) for x in get_cfg(cfg,'UPSTREAM.VOXEL_SIZE',[0.4,0.4,0.4]))
     xmin,ymin,zmin,xmax,ymax,zmax=map(float,occ_range)
-    W=round((xmax-xmin)/voxel[0]);H=round((ymax-ymin)/voxel[1]);D=round((zmax-zmin)/voxel[2])
-    grid=OccupancyGrid(x_min=xmin,y_min=ymin,z_min=zmin,voxel_size=voxel,shape_hwd=(H,W,D))
+    X=round((xmax-xmin)/voxel[0]);Y=round((ymax-ymin)/voxel[1]);Z=round((zmax-zmin)/voxel[2])
+    grid=OccupancyGrid(x_min=xmin,y_min=ymin,z_min=zmin,voxel_size=voxel,shape_hwd=(X,Y,Z))
     motion=PersistenceMotionConfig(
         free_label=int(get_cfg(cfg,'TARGET.FREE_LABEL',17)),
         static_min_persistence=float(get_cfg(cfg,'MOTION.STATIC_MIN_PERSISTENCE',0.8)),
