@@ -7,7 +7,7 @@ import numpy as np
 
 from .geometry import (
     OccupancyGrid, ego_compensate_sequence, transport_current_to_future,
-    transport_mask_to_future, relative_transform, warp_semantic_grid,
+    transport_mask_to_future, relative_transform, warp_semantic_grid, warp_mask,
 )
 from .motion import PersistenceMotionConfig, decompose_masks, split_semantics, MotionMasks
 from .kta import KTAConfig, causal_kta
@@ -15,7 +15,7 @@ from .support import MotionTubeConfig, build_motion_tube
 from .nuscenes_adapter import (gt_moving_support_for_horizon, gt_moving_only_semantics,
                                 causal_dynamic_target_semantics)
 
-PREPARED_VERSION = "real_motion_prepared_v3_occfm_fut196"
+PREPARED_VERSION = "real_motion_prepared_v4_observed_motion"
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,16 @@ def _early_frame_masks(sem, free_label):
                        np.zeros_like(sem, dtype=np.float32))
 
 
-def causal_history_split(history_native, history_poses, cfg: PrepareConfig):
+def _align_observation_sequence(observed, poses, reference_index, grid):
+    """Rigidly align boolean observation masks with the same ego transform as semantics."""
+    ref = poses[reference_index]
+    return np.stack([
+        warp_mask(mask, relative_transform(pose, ref), grid=grid)
+        for mask, pose in zip(observed, poses)
+    ], axis=0)
+
+
+def causal_history_split(history_native, history_poses, history_observed, cfg: PrepareConfig):
     """Causally split every history frame in its own ego coordinates."""
     static_frames, moving_frames, candidate_support = [], [], []
     for j in range(len(history_native)):
@@ -50,9 +59,13 @@ def causal_history_split(history_native, history_poses, cfg: PrepareConfig):
             masks = _early_frame_masks(history_native[j], cfg.free_label)
         else:
             prefix_sem = history_native[:j+1]
+            prefix_obs = history_observed[:j+1]
             prefix_pose = history_poses[:j+1]
             aligned = ego_compensate_sequence(prefix_sem, prefix_pose, -1, cfg.grid, cfg.free_label)
-            masks = decompose_masks(aligned, cfg.motion)
+            aligned_obs = _align_observation_sequence(prefix_obs, prefix_pose, -1, cfg.grid)
+            masks = decompose_masks(
+                aligned, cfg.motion, history_observed=aligned_obs
+            )
         sta, mov = split_semantics(history_native[j], masks, cfg.free_label)
         static_frames.append(sta)
         moving_frames.append(mov)
@@ -60,9 +73,26 @@ def causal_history_split(history_native, history_poses, cfg: PrepareConfig):
     return np.stack(static_frames), np.stack(moving_frames), np.stack(candidate_support)
 
 
+def _load_history_semantics_and_observation(source, scene_name, tokens, free_label):
+    semantics, observed = [], []
+    for token in tokens:
+        if hasattr(source, "load_occ3d"):
+            sem, obs = source.load_occ3d(scene_name, token, require_lidar_mask=True)
+        else:
+            # Unit-test/custom-source compatibility only. Formal NuScenesWindowSource
+            # always exposes load_occ3d and requires Occ3D mask_lidar.
+            sem = source.load_semantics(scene_name, token)
+            obs = np.asarray(sem) != free_label
+        semantics.append(np.asarray(sem))
+        observed.append(np.asarray(obs, dtype=bool))
+    return np.stack(semantics), np.stack(observed)
+
+
 def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(), include_gt=True):
     """Load raw arrays/poses once; trajectory matches official OccFM-fut exactly."""
-    hist = np.stack([source.load_semantics(window.scene_name, t) for t in window.history_tokens])
+    hist, hist_obs = _load_history_semantics_and_observation(
+        source, window.scene_name, window.history_tokens, cfg.free_label
+    )
     fut_gt = (np.stack([source.load_semantics(window.scene_name, t) for t in window.future_tokens])
               if include_gt else None)
     trajectory = source.official_trajectory(
@@ -82,6 +112,7 @@ def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(
         raise ValueError("OccFM-fut trajectory prefix masking does not match HIST_LAST contract")
     return {
         "history_occ": hist,
+        "history_observed": hist_obs,
         "future_gt_occ": fut_gt,
         "history_poses": [source.pose(t) for t in window.history_tokens],
         "future_poses": [source.pose(t) for t in window.future_tokens],
@@ -151,13 +182,17 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
 
     raw = load_nuscenes_window_raw(source, window, cfg, include_gt) if raw is None else raw
     hist = np.asarray(raw["history_occ"])
+    hist_obs = np.asarray(raw["history_observed"], dtype=bool)
     fut_gt = None if not include_gt else np.asarray(raw["future_gt_occ"])
     hist_poses = list(raw["history_poses"])
     fut_poses = list(raw["future_poses"])
     t0_pose = hist_poses[-1]
 
     aligned_hist = ego_compensate_sequence(hist, hist_poses, -1, cfg.grid, cfg.free_label)
-    t0_masks = decompose_masks(aligned_hist, cfg.motion)
+    aligned_obs = _align_observation_sequence(hist_obs, hist_poses, -1, cfg.grid)
+    t0_masks = decompose_masks(
+        aligned_hist, cfg.motion, history_observed=aligned_obs
+    )
     static_current, _ = split_semantics(hist[-1], t0_masks, cfg.free_label)
 
     static_future = transport_current_to_future(
@@ -203,7 +238,9 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
     else:
         gt_supports = gt_moving = future_dynamic_target = moving_records = excluded = None
 
-    static_hist, moving_hist, hist_candidate_support = causal_history_split(hist, hist_poses, cfg)
+    static_hist, moving_hist, hist_candidate_support = causal_history_split(
+        hist, hist_poses, hist_obs, cfg
+    )
     trajectory = np.asarray(raw["trajectory"], dtype=np.float32)
     if trajectory.shape != (cfg.trajectory_length,2):
         raise ValueError(f"prepared trajectory shape {trajectory.shape} violates {cfg.trajectory_protocol}")
@@ -216,6 +253,7 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
         "t0_token": window.t0_token,
         "future_tokens": list(window.future_tokens),
         "full_history_occ": hist,
+        "history_observation_mask": hist_obs,
         "static_history_occ": static_hist,
         "moving_history_occ": moving_hist,
         "history_candidate_support": hist_candidate_support,
@@ -230,6 +268,7 @@ def prepare_nuscenes_window(source, window, cfg: PrepareConfig = PrepareConfig()
         "t0_confident_static_mask": t0_masks.confident_static,
         "t0_moving_mask": t0_masks.moving,
         "t0_uncertain_mask": t0_masks.uncertain,
+        "t0_persistence": t0_masks.persistence,
         "kta_components": [
             {
                 "class_id": c.class_id,
@@ -278,7 +317,7 @@ class PreparedShardDataset:
         self.root = Path(root)
         self.index = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
         if self.index.get("version") != PREPARED_VERSION:
-            raise ValueError(f"unsupported prepared version {self.index.get('version')}; rebuild prepared data for OccFM-fut 196")
+            raise ValueError(f"unsupported prepared version {self.index.get('version')}; rebuild prepared data for observation-aware real-motion decomposition")
         self.entries = self.index["entries"]
         self._cached_name = None; self._cached_shard = None
     def __len__(self): return len(self.entries)
