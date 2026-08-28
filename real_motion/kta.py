@@ -4,6 +4,8 @@ This is intentionally simple and replaceable. It uses only historical
 occupancy after ego compensation, matches current BEV components to the previous
 frame, estimates a constant planar velocity, and extrapolates current voxels.
 Future GT is never consumed.
+
+Occ3D arrays follow official ``[X,Y,Z]`` order.
 """
 from dataclasses import dataclass
 from typing import Sequence
@@ -23,44 +25,44 @@ class KTAConfig:
 @dataclass
 class MotionComponent:
     class_id: int
-    bev_cells: np.ndarray       # [N,2] y,x
-    voxel_indices: np.ndarray   # [M,3] y,x,z
+    bev_cells: np.ndarray       # [N,2] x_index,y_index
+    voxel_indices: np.ndarray   # [M,3] x_index,y_index,z_index
     centroid_xy_m: np.ndarray   # [2] x,y
     velocity_xy_mps: np.ndarray # [2] x,y
     matched: bool
 
 
-def _components_8(mask_hw: np.ndarray):
-    """Small dependency-free 8-connected component extraction."""
-    m = np.asarray(mask_hw, dtype=bool)
-    H, W = m.shape
+def _components_8(mask_xy: np.ndarray):
+    """Small dependency-free 8-connected component extraction on [X,Y]."""
+    m = np.asarray(mask_xy, dtype=bool)
+    X, Y = m.shape
     seen = np.zeros_like(m)
     comps = []
-    for y0, x0 in np.argwhere(m):
-        if seen[y0, x0]:
+    for x0, y0 in np.argwhere(m):
+        if seen[x0, y0]:
             continue
-        stack = [(int(y0), int(x0))]
-        seen[y0, x0] = True
+        stack = [(int(x0), int(y0))]
+        seen[x0, y0] = True
         cells = []
         while stack:
-            y, x = stack.pop()
-            cells.append((y, x))
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
+            x, y = stack.pop()
+            cells.append((x, y))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
                         continue
-                    yy, xx = y + dy, x + dx
-                    if 0 <= yy < H and 0 <= xx < W and m[yy, xx] and not seen[yy, xx]:
-                        seen[yy, xx] = True
-                        stack.append((yy, xx))
+                    xx, yy = x + dx, y + dy
+                    if 0 <= xx < X and 0 <= yy < Y and m[xx, yy] and not seen[xx, yy]:
+                        seen[xx, yy] = True
+                        stack.append((xx, yy))
         comps.append(np.asarray(cells, dtype=np.int64))
     return comps
 
 
-def _centroid_xy(cells_yx: np.ndarray, grid: OccupancyGrid):
+def _centroid_xy(cells_xy: np.ndarray, grid: OccupancyGrid):
     vx, vy, _ = grid.voxel_size
-    y = grid.y_min + (cells_yx[:, 0] + 0.5) * vy
-    x = grid.x_min + (cells_yx[:, 1] + 0.5) * vx
+    x = grid.x_min + (cells_xy[:, 0] + 0.5) * vx
+    y = grid.y_min + (cells_xy[:, 1] + 0.5) * vy
     return np.array([x.mean(), y.mean()], dtype=np.float64)
 
 
@@ -95,7 +97,7 @@ def estimate_components(
     """Estimate current component velocities from the final two aligned frames."""
     hist = np.asarray(aligned_history)
     if hist.ndim != 4 or hist.shape[0] < 2:
-        raise ValueError("aligned_history must be [T,H,W,D] with T>=2")
+        raise ValueError("aligned_history must be [T,X,Y,Z] with T>=2")
     if current_candidate_mask.shape != hist.shape[1:]:
         raise ValueError("candidate mask shape mismatch")
 
@@ -135,34 +137,32 @@ def extrapolate_components(
     """Translate current component voxels under constant planar velocity.
 
     Returns:
-        semantics: [F,H,W,D] in the same reference ego grid as current_semantics.
-        bev_support: [F,H,W]
+        semantics: [F,X,Y,Z] in the same reference ego grid as current_semantics.
+        bev_support: [F,X,Y]
     """
-    H, W, D = grid.shape_hwd
+    X, Y, Z = grid.shape_hwd
     vx, vy, _ = grid.voxel_size
     outputs = []
     supports = []
-    # Large components first gives deterministic collision behavior.
     ordered = sorted(components, key=lambda c: (-len(c.voxel_indices), c.class_id))
     for horizon in horizons_s:
-        out = np.full((H, W, D), free_label, dtype=current_semantics.dtype)
-        sup = np.zeros((H, W), dtype=bool)
+        out = np.full((X, Y, Z), free_label, dtype=current_semantics.dtype)
+        sup = np.zeros((X, Y), dtype=bool)
         for comp in ordered:
             dx = int(np.rint(comp.velocity_xy_mps[0] * float(horizon) / vx))
             dy = int(np.rint(comp.velocity_xy_mps[1] * float(horizon) / vy))
             vox = comp.voxel_indices
-            yy = vox[:, 0] + dy
-            xx = vox[:, 1] + dx
+            xx = vox[:, 0] + dx
+            yy = vox[:, 1] + dy
             zz = vox[:, 2]
-            valid = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W) & (zz >= 0) & (zz < D)
+            valid = (xx >= 0) & (xx < X) & (yy >= 0) & (yy < Y) & (zz >= 0) & (zz < Z)
             if not valid.any():
                 continue
-            yy, xx, zz = yy[valid], xx[valid], zz[valid]
-            # Only write into still-free destination cells. Ordering is deterministic.
-            free_dst = out[yy, xx, zz] == free_label
-            yy, xx, zz = yy[free_dst], xx[free_dst], zz[free_dst]
-            out[yy, xx, zz] = comp.class_id
-            sup[yy, xx] = True
+            xx, yy, zz = xx[valid], yy[valid], zz[valid]
+            free_dst = out[xx, yy, zz] == free_label
+            xx, yy, zz = xx[free_dst], yy[free_dst], zz[free_dst]
+            out[xx, yy, zz] = comp.class_id
+            sup[xx, yy] = True
         outputs.append(out)
         supports.append(sup)
     return np.stack(outputs, axis=0), np.stack(supports, axis=0)
