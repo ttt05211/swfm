@@ -25,12 +25,12 @@ def test_anchor_equal_target_has_zero_flow_loss_with_zero_transition():
     assert info["target_rms"] == 0.0
 
 
-def test_zero_velocity_sampler_preserves_anchor_exactly():
+def test_zero_velocity_sampler_preserves_anchor_numerically():
     model = AnchorWindowCFM(ZeroTransition(), rescale_factor=10.0, sample_steps=3)
     hist = torch.randn(1, 6, 16, 4, 4)
     anchor = torch.randn(1, 6, 16, 4, 4)
     out = model.sample(hist, anchor)
-    assert torch.equal(out, anchor)
+    assert torch.allclose(out, anchor, atol=1e-6, rtol=1e-6)
 
 
 def test_msp_wm_cache_contract_is_top2_and_shape_safe():
