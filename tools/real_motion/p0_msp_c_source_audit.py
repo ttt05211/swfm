@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """P0-F0.5: split P0-F0 C into source-association failure modes.
 
-Important contract: the frozen Moving-mIoU v2 records already require the same
-instance token at t0 and the future horizon. Therefore this audit does not call C
-"future birth". Instead it checks whether a causal t0 occupancy component exists
-and why the GT-supervision matcher failed to associate it.
+Important contract: frozen Moving-mIoU v2 records already require the same
+instance token at t0 and the future horizon. Therefore C is not called a future
+birth here. The audit separates GT-to-component association mechanics from
+orthogonal t0 occupancy evidence and boundary truncation.
 """
 import argparse
 import json
@@ -55,6 +55,13 @@ from tools.real_motion.p0_hybrid_scene_disjoint_validate import (
 )
 
 REPORT_INDICES = {1.0: 1, 2.0: 3, 3.0: 5}
+OCC_EVIDENCE_KEYS = (
+    "same_class_occ_in_exact_t0_box",
+    "same_class_occ_only_after_0p5m_margin",
+    "no_same_class_occ_in_0p5m_box",
+    "t0_box_outside_grid",
+)
+BOUNDARY_KEYS = ("touches_xy_boundary", "not_on_xy_boundary")
 
 
 def _ann_map(nusc, sample_token):
@@ -131,20 +138,17 @@ def _finalize(table):
     return out
 
 
+def _cross_keys():
+    return tuple(f"{m}|{o}" for m in CATEGORIES for o in OCC_EVIDENCE_KEYS)
+
+
 def _new_horizon_state():
     return {
         "mechanism": {k: _counter() for k in CATEGORIES},
         "distance_bin": {k: _counter() for k in DISTANCE_BINS},
-        "occupancy_evidence": {
-            "same_class_occ_in_exact_t0_box": _counter(),
-            "same_class_occ_only_after_0p5m_margin": _counter(),
-            "no_same_class_occ_in_0p5m_box": _counter(),
-            "t0_box_outside_grid": _counter(),
-        },
-        "boundary": {
-            "touches_xy_boundary": _counter(),
-            "not_on_xy_boundary": _counter(),
-        },
+        "occupancy_evidence": {k: _counter() for k in OCC_EVIDENCE_KEYS},
+        "boundary": {k: _counter() for k in BOUNDARY_KEYS},
+        "mechanism_x_occupancy_evidence": {k: _counter() for k in _cross_keys()},
     }
 
 
@@ -157,6 +161,26 @@ def _merge_state(dst, src):
     for section in dst:
         for key in dst[section]:
             _merge_counter(dst[section][key], src[section][key])
+
+
+def _occupancy_evidence(sem0, ann0, t0_pose, class_id, metric_grid):
+    box0 = _ann_to_t0_box(ann0, t0_pose, class_id)
+    exact = rasterize_oriented_box(box0, metric_grid, margin=0.0)
+    expanded = rasterize_oriented_box(box0, metric_grid, margin=0.5)
+    in_grid = bool(expanded.any())
+    if not in_grid:
+        key = "t0_box_outside_grid"
+    else:
+        exact_occ = int(((sem0 == int(class_id)) & exact).sum())
+        expanded_occ = int(((sem0 == int(class_id)) & expanded).sum())
+        if exact_occ > 0:
+            key = "same_class_occ_in_exact_t0_box"
+        elif expanded_occ > 0:
+            key = "same_class_occ_only_after_0p5m_margin"
+        else:
+            key = "no_same_class_occ_in_0p5m_box"
+    boundary = "touches_xy_boundary" if mask_touches_xy_boundary(expanded) else "not_on_xy_boundary"
+    return key, boundary
 
 
 def main():
@@ -220,7 +244,9 @@ def main():
         )
         instance_by_token = {str(x["instance_token"]): x for x in instances}
         ann0_map = _ann_map(source.nusc, w.t0_token)
-        sem0 = np.asarray(raw["history_occ"][-1])
+        # Candidate components are extracted from aligned_hist[-1], so use that
+        # exact representation for the occupancy-evidence audit as well.
+        sem0 = np.asarray(aligned_hist[-1])
 
         for horizon, fi in REPORT_INDICES.items():
             state = per_h[str(horizon)]
@@ -258,33 +284,25 @@ def main():
                 arrival_n = int(arrival.sum())
                 missed_n = int((arrival & ~support_h[..., None]).sum())
 
-                _add(state["mechanism"][detail.category], arrival_voxels=arrival_n, missed_voxels=missed_n)
-                _add(state["distance_bin"][distance_bin(detail.nearest_distance_m)], arrival_voxels=arrival_n, missed_voxels=missed_n)
-
                 if present:
-                    box0 = _ann_to_t0_box(ann0, t0_pose, cls)
-                    exact = rasterize_oriented_box(box0, metric_grid, margin=0.0)
-                    expanded = rasterize_oriented_box(box0, metric_grid, margin=0.5)
-                    in_grid = bool(expanded.any())
-                    exact_occ = int(((sem0 == cls) & exact).sum()) if in_grid else 0
-                    expanded_occ = int(((sem0 == cls) & expanded).sum()) if in_grid else 0
-                    if not in_grid:
-                        occ_key = "t0_box_outside_grid"
-                    elif exact_occ > 0:
-                        occ_key = "same_class_occ_in_exact_t0_box"
-                    elif expanded_occ > 0:
-                        occ_key = "same_class_occ_only_after_0p5m_margin"
-                    else:
-                        occ_key = "no_same_class_occ_in_0p5m_box"
-                    boundary_key = (
-                        "touches_xy_boundary" if mask_touches_xy_boundary(expanded)
-                        else "not_on_xy_boundary"
+                    occ_key, boundary_key = _occupancy_evidence(
+                        sem0, ann0, t0_pose, cls, metric_grid
                     )
                 else:
+                    # This path is fail-closed below; keep a valid accounting key
+                    # so a contract violation still produces debuggable output.
                     occ_key = "t0_box_outside_grid"
                     boundary_key = "not_on_xy_boundary"
+
+                _add(state["mechanism"][detail.category], arrival_voxels=arrival_n, missed_voxels=missed_n)
+                _add(state["distance_bin"][distance_bin(detail.nearest_distance_m)], arrival_voxels=arrival_n, missed_voxels=missed_n)
                 _add(state["occupancy_evidence"][occ_key], arrival_voxels=arrival_n, missed_voxels=missed_n)
                 _add(state["boundary"][boundary_key], arrival_voxels=arrival_n, missed_voxels=missed_n)
+                _add(
+                    state["mechanism_x_occupancy_evidence"][f"{detail.category}|{occ_key}"],
+                    arrival_voxels=arrival_n,
+                    missed_voxels=missed_n,
+                )
 
                 if len(examples) < 40 and missed_n > 0:
                     examples.append({
@@ -307,9 +325,8 @@ def main():
     for hstate in per_h.values():
         _merge_state(aggregate, hstate)
 
-    # By construction gt_moving_support_for_horizon only emits common t0/future
-    # dynamic instances. A non-zero missing-t0 count therefore indicates a code
-    # or dataset-contract violation, not a legitimate birth category.
+    # gt_moving_support_for_horizon only emits common t0/future dynamic
+    # instances. A missing t0 annotation is therefore a contract violation.
     invariant["C_records_that_are_true_births_under_record_contract"] = 0
     if invariant["C_records_missing_t0_annotation"] != 0:
         raise RuntimeError(
@@ -322,19 +339,20 @@ def main():
             "distance_bin": _finalize(state["distance_bin"]),
             "occupancy_evidence": _finalize(state["occupancy_evidence"]),
             "boundary": _finalize(state["boundary"]),
+            "mechanism_x_occupancy_evidence": _finalize(
+                state["mechanism_x_occupancy_evidence"]
+            ),
         }
 
     mech = aggregate["mechanism"]
-    potentially_recoverable = (
-        mech[C_DISTANCE_GATE]["missed_voxels"]
-        + mech[C_ONE_TO_ONE_CONFLICT]["missed_voxels"]
-    )
-    no_candidate = mech[C_NO_SAME_CLASS_CANDIDATE]["missed_voxels"]
     total_c_miss = sum(v["missed_voxels"] for v in mech.values())
+    conflict_miss = mech[C_ONE_TO_ONE_CONFLICT]["missed_voxels"]
+    distance_miss = mech[C_DISTANCE_GATE]["missed_voxels"]
+    no_candidate_miss = mech[C_NO_SAME_CLASS_CANDIDATE]["missed_voxels"]
 
     report = {
         "protocol": {
-            "name": "p0_f05_c_source_audit_v1",
+            "name": "p0_f05_c_source_audit_v2",
             "num_windows": len(windows),
             "num_unique_scenes": len({w.scene_name for w in windows}),
             "scene_seed": int(a.scene_seed),
@@ -348,24 +366,25 @@ def main():
         "aggregate": finalize_state(aggregate),
         "summary": {
             "C_missed_voxels": int(total_c_miss),
-            "candidate_exists_but_label_association_failed_missed_voxels": int(potentially_recoverable),
-            "candidate_exists_but_label_association_failed_share": float(
-                potentially_recoverable / max(total_c_miss, 1)
-            ),
-            "no_same_class_candidate_missed_voxels": int(no_candidate),
-            "no_same_class_candidate_share": float(no_candidate / max(total_c_miss, 1)),
+            "definite_one_to_one_match_conflict_missed_voxels": int(conflict_miss),
+            "definite_one_to_one_match_conflict_share": float(conflict_miss / max(total_c_miss, 1)),
+            "same_class_candidate_beyond_4m_gate_missed_voxels": int(distance_miss),
+            "same_class_candidate_beyond_4m_gate_share": float(distance_miss / max(total_c_miss, 1)),
+            "no_same_class_candidate_missed_voxels": int(no_candidate_miss),
+            "no_same_class_candidate_share": float(no_candidate_miss / max(total_c_miss, 1)),
             "interpretation": (
-                "distance-gate/conflict rows still have a causal same-class MSP candidate; "
-                "they are false-C for source availability and indicate supervision association limits"
+                "within-gate unmatched rows are definite supervision matching conflicts; "
+                "beyond-gate rows are ambiguous and must be read together with the GT-box occupancy cross-tab"
             ),
         },
         "examples_first_40_missed_C": examples,
         "notes": [
-            "Primary mechanism explains the GT-to-candidate association failure.",
-            "Occupancy evidence is orthogonal and tests whether same-class Occ3D voxels exist inside the t0 GT box.",
-            "Boundary statistics identify edge/FOV truncation rather than treating it as a birth.",
-            "If distance-gate/conflict dominates, fix MSP supervision association before training or adding global queries.",
-            "If no-same-class-candidate plus no-occupancy-evidence dominates, object-centric MSP has a genuine current-occupancy source limitation.",
+            "Primary mechanism explains GT-to-candidate association mechanics.",
+            "Occupancy evidence is orthogonal and tests same-class Occ3D voxels inside the t0 GT box.",
+            "The mechanism_x_occupancy_evidence cross-tab is the main table for deciding whether C is true source absence or label-association error.",
+            "Boundary statistics identify edge/FOV truncation rather than calling it a birth.",
+            "A within-gate unmatched candidate is a definite one-to-one matching artifact under the frozen greedy matcher.",
+            "A beyond-gate same-class candidate is not automatically the correct source; inspect occupancy evidence before treating it as recoverable.",
         ],
     }
 
