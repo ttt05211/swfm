@@ -2,8 +2,8 @@
 """Build small GT-supervised MSP probe caches from causal occupancy features.
 
 Train mode uses a deterministic round-robin over scenes to avoid taking hundreds
-of adjacent windows from one scene.  Validation mode takes exactly one midpoint
-window per scene.  Future instance GT is stored only as supervision labels; the
+of adjacent windows from one scene. Validation mode takes exactly one midpoint
+window per scene. Future instance GT is stored only as supervision labels; the
 MSP feature tensor is built exclusively from causal occupancy components.
 """
 import argparse
@@ -27,12 +27,15 @@ from real_motion.msp import (
 from real_motion.nuscenes_adapter import NuScenesWindowSource, WindowTokens
 from real_motion.runtime_config import (
     add_config_args,
+    config_fingerprint,
     load_runtime_config,
     make_prepare_config,
     save_resolved_config,
 )
 
 DEFAULT_SEED = 20260829
+FEATURE_CONTRACT = "causal_occ_components_only_no_gt_instance_features"
+TARGET_CONTRACT = "future_gt_instance_motion_labels_training_only"
 
 
 def _eligible_windows_for_scene(source, scene, history, future, stride):
@@ -76,7 +79,7 @@ def select_windows(source, *, mode, history=6, future=6, stride=1,
         selected = [ws[len(ws)//2] for _, ws in groups]
         return selected if max_windows is None else selected[:int(max_windows)]
 
-    # Scene-balanced round robin.  Shuffle temporal indices independently per
+    # Scene-balanced round robin. Shuffle temporal indices independently per
     # scene, then take one window from each scene before taking a second one.
     queues = []
     for _, ws in groups:
@@ -175,8 +178,9 @@ def main():
         "match_max_distance_m": float(a.match_max_distance_m),
         "feature_dim": FEATURE_DIM,
         "feature_names": list(FEATURE_NAMES),
-        "feature_contract": "causal_occ_components_only_no_gt_instance_features",
-        "target_contract": "future_gt_instance_motion_labels_training_only",
+        "feature_contract": FEATURE_CONTRACT,
+        "target_contract": TARGET_CONTRACT,
+        "config_contract_sha256": config_fingerprint(cfg, "cache"),
         "num_windows": len(records),
         "num_unique_scenes": len(scenes),
         "scene_names": scenes,
