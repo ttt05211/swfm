@@ -6,7 +6,7 @@ A = a future-moving GT instance is matched at t0 to an occupancy component that
 B = it is matched to a DORMANT motion-capable occupancy component.
 C = no causal t0 occupancy component can be matched to that GT instance.
 
-GT instance identity is used only for this diagnostic.  Candidate components and
+GT instance identity is used only for this diagnostic. Candidate components and
 source states are derived from occupancy history exactly as they would be at
 inference.
 """
@@ -21,11 +21,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 
 from real_motion.geometry import ego_compensate_sequence
-from real_motion.metrics.moving_miou_v2 import (
-    GridSpec,
-    box3d_from_dict if False else Box3D,
-    rasterize_oriented_box,
-)
+from real_motion.metrics.moving_miou_v2 import GridSpec, rasterize_oriented_box
 from real_motion.msp import (
     SOURCE_A, SOURCE_B, SOURCE_C,
     dynamic_t0_instances,
@@ -198,7 +194,6 @@ def main():
             "C is therefore not simply nuScenes birth count; it means the object-centric MSP has no matched causal occupancy source at t0.",
         ],
     }
-    # Aggregate across 1/2/3 s for quick feasibility reading.
     agg = {s: _empty_row() for s in SOURCES}
     for rows in per_h.values():
         for s in SOURCES:
