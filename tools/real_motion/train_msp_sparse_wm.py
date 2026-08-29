@@ -2,9 +2,14 @@
 """Train the first real Top-2 MSP-routed Sparse World Model.
 
 Frozen routing: one set of two 20x20 latent windows per sample, predicted by the
-already-trained causal MSP.  Trainable part: an OccFM-Fut-196 initialized local
+already-trained causal MSP. Trainable part: an OccFM-Fut-196 initialized local
 operator flowing from the KTA/zero-motion anchor latent to the full GT latent.
 Only latent flow MSE is used; there is no occupancy CE/Lovasz/ABE/router loss.
+
+Samples for which the frozen MSP selects no valid window are legitimate
+anchor-only cases. They contribute no Sparse-WM gradient and are skipped during
+training/latent validation instead of being treated as an error. Real occupancy
+evaluation still preserves the causal anchor for those samples.
 """
 from __future__ import annotations
 
@@ -76,12 +81,15 @@ def _validate_cache_pair(train_ds, val_ds):
 
 
 def prepare_batch(batch, device):
+    """Crop valid Top-2 windows; return None for a legitimate anchor-only batch."""
     origins_cpu = batch["window_origins"].long()
     valid_cpu = batch["window_valid"].bool()
     B, K = valid_cpu.shape
     if K != 2:
         raise RuntimeError(f"P0-F3 expects K=2, got {K}")
     plan_cpu = WindowPlan(origins_cpu, valid_cpu, (20, 20), (50, 50))
+    if not bool(plan_cpu.valid.any()):
+        return None
     batch = {
         k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
         for k, v in batch.items()
@@ -96,8 +104,6 @@ def prepare_batch(batch, device):
     anchor = crop_windows(batch["anchor_future_latent"], plan)
     target = crop_windows(batch["gt_future_latent"], plan)
     valid = plan.valid.reshape(-1)
-    if not bool(valid.any()):
-        raise RuntimeError("batch contains no valid Top-2 MSP windows")
 
     def flat(x):
         return x.reshape(B * K, *x.shape[2:])[valid]
@@ -119,8 +125,15 @@ def validate(model, loader, device):
     cos = 0.0
     target_rms = 0.0
     pred_rms = 0.0
+    skipped_batches = 0
+    skipped_samples = 0
     for batch in loader:
-        hist, target, anchor, traj, origins = prepare_batch(batch, device)
+        prepared = prepare_batch(batch, device)
+        if prepared is None:
+            skipped_batches += 1
+            skipped_samples += len(batch.get("sample_id", []))
+            continue
+        hist, target, anchor, traj, origins = prepared
         loss, info = model.flow_loss(
             hist, target, anchor,
             trajectory=traj,
@@ -135,13 +148,66 @@ def validate(model, loader, device):
         pred_rms += float(info["pred_rms"]) * n
         count += n
     model.train()
-    d = max(count, 1)
+    if count <= 0:
+        raise RuntimeError("validation contains no valid routed Sparse-WM windows")
+    d = float(count)
     return {
         "loss": total / d,
         "cosine": cos / d,
         "target_rms": target_rms / d,
         "pred_rms": pred_rms / d,
         "num_windows": count,
+        "skipped_empty_batches": skipped_batches,
+        "skipped_anchor_only_samples": skipped_samples,
+    }
+
+
+def _architecture(args):
+    return {
+        "window_hw": [20, 20],
+        "topk": 2,
+        "sample_steps": int(args.sample_steps),
+        "source_noise_std": float(args.source_noise_std),
+        "prior_channels": 16,
+        "flow": "anchor_to_full_gt_latent",
+    }
+
+
+def _validate_resume_checkpoint(ck, args, train_ds, val_ds):
+    arch = ck.get("architecture", {})
+    if list(arch.get("window_hw", [])) != [20, 20] or int(arch.get("topk", -1)) != 2:
+        raise RuntimeError("resume checkpoint is not the frozen Top-2/20x20 P0-F3 model")
+    if int(arch.get("sample_steps", args.sample_steps)) != int(args.sample_steps):
+        raise RuntimeError("resume checkpoint sample_steps differs from current command")
+    if float(arch.get("source_noise_std", args.source_noise_std)) != float(args.source_noise_std):
+        raise RuntimeError("resume checkpoint source_noise_std differs from current command")
+    ctm = ck.get("train_metadata", {})
+    cvm = ck.get("val_metadata", {})
+    for key in ("msp_checkpoint_sha256", "vae_checkpoint_sha256"):
+        if ctm.get(key) and ctm.get(key) != train_ds.metadata.get(key):
+            raise RuntimeError(f"resume train metadata mismatch for {key}")
+        if cvm.get(key) and cvm.get(key) != val_ds.metadata.get(key):
+            raise RuntimeError(f"resume val metadata mismatch for {key}")
+
+
+def _checkpoint_payload(
+    *, model_state, optimizer, step, best_val, history, train_ds, val_ds,
+    args, upstream_ckpt, reuse, skipped_train_batches,
+):
+    return {
+        "state_dict": model_state,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": int(step),
+        "best_val_loss": float(best_val),
+        "training_history": list(history),
+        "train_metadata": train_ds.metadata,
+        "val_metadata": val_ds.metadata,
+        "architecture": _architecture(args),
+        "upstream_checkpoint": str(Path(upstream_ckpt).resolve()),
+        "upstream_checkpoint_sha256": file_sha256(upstream_ckpt),
+        "upstream_reuse": reuse,
+        "skipped_empty_train_batches": int(skipped_train_batches),
+        "args": vars(args),
     }
 
 
@@ -151,7 +217,8 @@ def main():
     p.add_argument("--val-cache", required=True)
     p.add_argument("--upstream-ckpt", required=True)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--steps", type=int, default=3000,
+                   help="absolute target optimizer step, including resumed steps")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-5)
@@ -162,6 +229,8 @@ def main():
     p.add_argument("--seed", type=int, default=20260829)
     p.add_argument("--device", default="cuda")
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--resume-from", default=None,
+                   help="P0-F3 best/latest checkpoint. Old checkpoints without optimizer state resume weights/history and reset AdamW moments.")
     a = p.parse_args()
     if min(a.steps, a.batch_size, a.val_every) <= 0:
         raise ValueError("steps/batch-size/val-every must be positive")
@@ -198,7 +267,6 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
     use_amp = bool(a.amp and device.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=False)  # BF16 does not need scaling.
 
     out = Path(a.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -206,8 +274,33 @@ def main():
     best_state = None
     history = []
     step = 0
+    skipped_train_batches = 0
+
+    if a.resume_from:
+        ck = torch.load(a.resume_from, map_location="cpu", weights_only=False)
+        _validate_resume_checkpoint(ck, a, train_ds, val_ds)
+        model.load_state_dict(ck["state_dict"], strict=True)
+        step = int(ck.get("step", 0))
+        if step < 0 or step > a.steps:
+            raise RuntimeError(f"resume step {step} is incompatible with target --steps {a.steps}")
+        best_val = float(ck.get("best_val_loss", float("inf")))
+        history = list(ck.get("training_history", []))
+        skipped_train_batches = int(ck.get("skipped_empty_train_batches", 0))
+        if np.isfinite(best_val):
+            best_state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
+        opt_state = ck.get("optimizer_state_dict")
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+            print(f"resumed model+optimizer from {a.resume_from} at step={step} best_val={best_val:.6f}")
+        else:
+            print(
+                f"resumed model weights/history from legacy checkpoint {a.resume_from} "
+                f"at step={step} best_val={best_val:.6f}; optimizer moments reset"
+            )
+
     iterator = iter(train_loader)
     model.train()
+    last_info = None
 
     while step < a.steps:
         try:
@@ -215,7 +308,16 @@ def main():
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
-        hist, target, anchor, traj, origins = prepare_batch(batch, device)
+        prepared = prepare_batch(batch, device)
+        if prepared is None:
+            skipped_train_batches += 1
+            if skipped_train_batches <= 3 or skipped_train_batches % 10 == 0:
+                print(
+                    f"skip anchor-only batch: skipped={skipped_train_batches} "
+                    f"optimizer_step={step}"
+                )
+            continue
+        hist, target, anchor, traj, origins = prepared
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
             loss, info = model.flow_loss(
@@ -229,6 +331,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         step += 1
+        last_info = info
         if step == 1 or step % 20 == 0:
             print(
                 f"step={step} loss={float(loss.item()):.6f} "
@@ -240,56 +343,64 @@ def main():
             row = {"step": step, "train": info, "val": val}
             history.append(row)
             print("validation", json.dumps(row))
+
+            current_state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
+            torch.save(
+                _checkpoint_payload(
+                    model_state=current_state,
+                    optimizer=optimizer,
+                    step=step,
+                    best_val=min(best_val, float(val["loss"])),
+                    history=history,
+                    train_ds=train_ds,
+                    val_ds=val_ds,
+                    args=a,
+                    upstream_ckpt=a.upstream_ckpt,
+                    reuse=reuse,
+                    skipped_train_batches=skipped_train_batches,
+                ),
+                out / "latest.pt",
+            )
             if val["loss"] < best_val:
                 best_val = float(val["loss"])
-                best_state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
+                best_state = current_state
                 torch.save(
-                    {
-                        "state_dict": best_state,
-                        "step": step,
-                        "best_val_loss": best_val,
-                        "training_history": history,
-                        "train_metadata": train_ds.metadata,
-                        "val_metadata": val_ds.metadata,
-                        "architecture": {
-                            "window_hw": [20, 20],
-                            "topk": 2,
-                            "sample_steps": int(a.sample_steps),
-                            "source_noise_std": float(a.source_noise_std),
-                            "prior_channels": 16,
-                            "flow": "anchor_to_full_gt_latent",
-                        },
-                        "upstream_checkpoint": str(Path(a.upstream_ckpt).resolve()),
-                        "upstream_checkpoint_sha256": file_sha256(a.upstream_ckpt),
-                        "upstream_reuse": reuse,
-                        "args": vars(a),
-                    },
+                    _checkpoint_payload(
+                        model_state=best_state,
+                        optimizer=optimizer,
+                        step=step,
+                        best_val=best_val,
+                        history=history,
+                        train_ds=train_ds,
+                        val_ds=val_ds,
+                        args=a,
+                        upstream_ckpt=a.upstream_ckpt,
+                        reuse=reuse,
+                        skipped_train_batches=skipped_train_batches,
+                    ),
                     out / "best.pt",
                 )
 
     if best_state is None:
         raise RuntimeError("no validation checkpoint was produced")
+    if last_info is None and step < a.steps:
+        raise RuntimeError("no optimizer step was completed")
+
     model.load_state_dict(best_state, strict=True)
     torch.save(
-        {
-            "state_dict": best_state,
-            "step": step,
-            "best_val_loss": best_val,
-            "training_history": history,
-            "train_metadata": train_ds.metadata,
-            "val_metadata": val_ds.metadata,
-            "architecture": {
-                "window_hw": [20, 20], "topk": 2,
-                "sample_steps": int(a.sample_steps),
-                "source_noise_std": float(a.source_noise_std),
-                "prior_channels": 16,
-                "flow": "anchor_to_full_gt_latent",
-            },
-            "upstream_checkpoint": str(Path(a.upstream_ckpt).resolve()),
-            "upstream_checkpoint_sha256": file_sha256(a.upstream_ckpt),
-            "upstream_reuse": reuse,
-            "args": vars(a),
-        },
+        _checkpoint_payload(
+            model_state=best_state,
+            optimizer=optimizer,
+            step=step,
+            best_val=best_val,
+            history=history,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            args=a,
+            upstream_ckpt=a.upstream_ckpt,
+            reuse=reuse,
+            skipped_train_batches=skipped_train_batches,
+        ),
         out / "last.pt",
     )
     (out / "training_report.json").write_text(
@@ -298,6 +409,8 @@ def main():
             "best_val_loss": best_val,
             "history": history,
             "upstream_reuse_fraction": reuse_fraction,
+            "skipped_empty_train_batches": skipped_train_batches,
+            "resumed_from": a.resume_from,
             "decision": "Evaluate real occupancy with eval_msp_sparse_wm.py; latent loss alone is not a GO signal.",
         }, indent=2),
         encoding="utf-8",
