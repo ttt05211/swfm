@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from real_motion.msp import (
     MSPCandidate,
@@ -81,6 +82,17 @@ def test_c_source_within_gate_means_one_to_one_association_conflict():
     assert row.nearest_candidate_index == 1
     assert row.nearest_assigned_token == "other-b"
     assert row.candidate_within_gate
+
+
+def test_c_source_within_gate_unassigned_candidate_breaks_matcher_invariant():
+    with pytest.raises(RuntimeError, match="matcher invariant is broken"):
+        classify_unmatched_instance(
+            class_id=4,
+            center_xy_t0_m=np.zeros(2),
+            candidates=[_candidate(0.5, 0.0, cls=4)],
+            candidate_tokens=[None],
+            match_max_distance_m=4.0,
+        )
 
 
 def test_distance_bins_have_stable_boundaries():
