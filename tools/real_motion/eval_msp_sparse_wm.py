@@ -29,6 +29,13 @@ from real_motion.windows import WindowPlan, crop_windows, scatter_windows
 from tools.real_motion.train_msp_sparse_wm import make_model
 
 REPORT = {1.0: 1, 2.0: 3, 3.0: 5}
+EVAL_KEYS = (
+    "eval_future_gt_occ",
+    "eval_static_future_occ",
+    "eval_confident_static_future_mask",
+    "eval_kta_future_occ",
+    "eval_gt_moving_support",
+)
 
 
 def _prepared_map(ds):
@@ -74,11 +81,27 @@ def _update(state, horizon, pred, gt, moving_support):
     state["moving"].update(horizon, pred, gt, moving_support)
 
 
+def _base_from_cache_sample(s):
+    missing = [k for k in EVAL_KEYS if k not in s]
+    if missing:
+        return None
+    return {
+        "future_gt_occ": s["eval_future_gt_occ"].cpu().numpy(),
+        "static_future_occ": s["eval_static_future_occ"].cpu().numpy(),
+        "confident_static_future_mask": s["eval_confident_static_future_mask"].cpu().numpy(),
+        "kta_future_occ": s["eval_kta_future_occ"].cpu().numpy(),
+        "gt_moving_support": s["eval_gt_moving_support"].cpu().numpy(),
+    }
+
+
 @torch.no_grad()
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
-    p.add_argument("--prepared", required=True)
+    p.add_argument(
+        "--prepared", default=None,
+        help="optional legacy/full prepared val cache; unnecessary when --cache contains compact eval payload",
+    )
     p.add_argument("--vae-ckpt", required=True)
     p.add_argument("--sparse-ckpt", required=True)
     p.add_argument("--output", required=True)
@@ -108,11 +131,20 @@ def main():
 
     vae, _ = load_official_vae(UP, a.vae_ckpt, device)
     va = OccFMVAEAdapter(vae)
-    prepared = PreparedShardDataset(a.prepared)
-    pmap = _prepared_map(prepared)
-    missing = [str(e["sample_id"]) for e in ds.entries if str(e["sample_id"]) not in pmap]
-    if missing:
-        raise RuntimeError(f"prepared val dataset misses {len(missing)} cache samples, e.g. {missing[:3]}")
+
+    prepared = None
+    pmap = None
+    if a.prepared:
+        prepared = PreparedShardDataset(a.prepared)
+        pmap = _prepared_map(prepared)
+        missing = [str(e["sample_id"]) for e in ds.entries if str(e["sample_id"]) not in pmap]
+        if missing:
+            raise RuntimeError(f"prepared val dataset misses {len(missing)} cache samples, e.g. {missing[:3]}")
+    elif not bool(ds.metadata.get("include_eval_payload", False)):
+        raise RuntimeError(
+            "cache does not advertise compact eval payload; provide --prepared or rebuild val cache "
+            "with build_msp_wm_cache_direct.py --include-eval-payload"
+        )
 
     anchor_state = _new_metrics()
     model_state = _new_metrics()
@@ -123,7 +155,12 @@ def main():
 
     for i in range(len(ds)):
         s = ds[i]
-        base = prepared[pmap[str(s["sample_id"])]]
+        base = _base_from_cache_sample(s)
+        if base is None:
+            if prepared is None:
+                raise RuntimeError(f"{s['sample_id']}: compact eval payload missing")
+            base = prepared[pmap[str(s["sample_id"])]]
+
         origins = s["window_origins"].unsqueeze(0).long()
         valid = s["window_valid"].unsqueeze(0).bool()
         plan_cpu = WindowPlan(origins, valid, (20, 20), (50, 50))
@@ -146,16 +183,10 @@ def main():
             traj = s["trajectory"].to(device).unsqueeze(0)
             traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[flat_valid]
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                pred = model.sample(
-                    fh, fa, trajectory=traj, window_origins=orig
-                )
-            pad = torch.zeros(
-                B * K, *pred.shape[1:], device=device, dtype=pred.dtype
-            )
+                pred = model.sample(fh, fa, trajectory=traj, window_origins=orig)
+            pad = torch.zeros(B * K, *pred.shape[1:], device=device, dtype=pred.dtype)
             pad[flat_valid] = pred
-            fused = scatter_windows(
-                pad.reshape(B, K, *pred.shape[1:]), plan, base=anchor_full
-            )
+            fused = scatter_windows(pad.reshape(B, K, *pred.shape[1:]), plan, base=anchor_full)
 
         decoded = va.decode_labels(fused.float())[0].cpu().numpy()
         spatial = window_plan_support(plan_cpu)[0]
@@ -202,6 +233,7 @@ def main():
             "window_hw": [20, 20],
             "slot_compute_ratio": float(np.mean(valid_windows) * 400.0 / 2500.0),
             "unique_latent_ratio": float(np.mean(unique_ratios)),
+            "eval_source": "compact_cache_payload" if bool(ds.metadata.get("include_eval_payload", False)) else "prepared",
             "fusion": "outside selected windows preserve KTA/zero anchor; inside use decoded WM dynamic semantics",
         },
         "causal_anchor": anchor_report,
