@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build the frozen Top-2 MSP cache for anchor-centered Sparse-WM training.
 
-The router is frozen.  Future GT is used only to build the World-Model target;
-it never enters MSP features or window selection.  The VAE uses deterministic
+The router is frozen. Future GT is used only to build the World-Model target;
+it never enters MSP features or window selection. The VAE uses deterministic
 FP32 mean latents so the target ``z_gt-z_anchor`` is not polluted by independent
 posterior sampling noise.
 """
@@ -22,9 +22,7 @@ import torch
 
 from real_motion.composition import static_protected_compose
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
-from real_motion.msp import (
-    FEATURE_DIM, MSPProbeHead, collate_probe_records, rasterize_msp_scores,
-)
+from real_motion.msp import FEATURE_DIM, MSPProbeHead, collate_probe_records, rasterize_msp_scores
 from real_motion.msp_window import plan_topk_score_windows, score_capture_ratio
 from real_motion.msp_wm_cache import save_msp_wm_shards
 from real_motion.occfm_io import OccFMVAEAdapter, file_sha256, load_official_vae
@@ -114,11 +112,15 @@ def main():
             f"prepared dataset misses {len(missing)} MSP samples, e.g. {missing[:3]}; "
             "build prepared assets covering the exact MSP probe windows"
         )
+    # Keep the exact same sample set, but read prepared shards sequentially
+    # instead of thrashing them in the probe's randomized scene-balanced order.
+    records = sorted(records, key=lambda r: pmap[str(r["sample_id"])])
 
     vae, _ = load_official_vae(UP, a.vae_ckpt, device)
     va = OccFMVAEAdapter(vae)
     scenes = sorted({str(r["scene_name"]) for r in records})
     route_capture = []
+    route_valid_windows = []
 
     def generated_samples():
         for route_start in range(0, len(records), a.route_batch_size):
@@ -130,11 +132,9 @@ def main():
             }
             pred = msp(bdev["features"], bdev["candidate_mask"])
             scores = rasterize_msp_scores(pred, bdev, latent_hw=latent_hw, grid=pcfg.grid)
-            plan = plan_topk_score_windows(
-                scores, window_hw=window_hw, max_windows=a.topk
-            )
-            capture = score_capture_ratio(scores, plan).detach().cpu().tolist()
-            route_capture.extend(float(x) for x in capture)
+            plan = plan_topk_score_windows(scores, window_hw=window_hw, max_windows=a.topk)
+            route_capture.extend(float(x) for x in score_capture_ratio(scores, plan).detach().cpu().tolist())
+            route_valid_windows.extend(int(x) for x in plan.valid.sum(dim=1).detach().cpu().tolist())
             origins_all = plan.origins.detach().cpu()
             valid_all = plan.valid.detach().cpu()
 
@@ -151,9 +151,8 @@ def main():
                 za = va.encode(anchor, mode="mean").float().cpu()
                 zg = va.encode(gt, mode="mean").float().cpu()
 
-                off = sub_start
                 for j, (r, s) in enumerate(zip(sub, rows)):
-                    pi = off + j
+                    pi = sub_start + j
                     yield {
                         "sample_id": str(r["sample_id"]),
                         "scene_name": str(r["scene_name"]),
@@ -194,18 +193,23 @@ def main():
         "probe_selection": probe_meta.get("selection"),
         "probe_seed": probe_meta.get("seed"),
     }
-    idx = save_msp_wm_shards(
-        a.output, generated_samples(), shard_size=a.shard_size, metadata=metadata
-    )
+    idx = save_msp_wm_shards(a.output, generated_samples(), shard_size=a.shard_size, metadata=metadata)
     ip = Path(a.output) / "index.json"
     obj = json.loads(ip.read_text(encoding="utf-8"))
-    obj["metadata"]["mean_score_capture_ratio"] = float(np.mean(route_capture)) if route_capture else 0.0
-    obj["metadata"]["mean_valid_windows"] = float(
-        sum(int(s) for s in [])
-    ) if False else None
+    obj["metadata"].update({
+        "mean_score_capture_ratio": float(np.mean(route_capture)) if route_capture else 0.0,
+        "mean_valid_windows": float(np.mean(route_valid_windows)) if route_valid_windows else 0.0,
+        "slot_compute_ratio": (
+            float(np.mean(route_valid_windows)) * window_hw[0] * window_hw[1]
+            / float(latent_hw[0] * latent_hw[1])
+            if route_valid_windows else 0.0
+        ),
+    })
     ip.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     print("saved", idx["num_samples"], "samples to", a.output)
     print("mean MSP score capture:", obj["metadata"]["mean_score_capture_ratio"])
+    print("mean valid windows:", obj["metadata"]["mean_valid_windows"])
+    print("slot compute ratio:", obj["metadata"]["slot_compute_ratio"])
 
 
 if __name__ == "__main__":
