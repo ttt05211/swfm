@@ -33,15 +33,43 @@ L = ||v_theta - v*||^2
 
 VAE cache 强制 **FP32 posterior mean**，避免 anchor 与 GT 的独立 posterior sample noise 被误当成运动 residual。
 
-## 1. 构建 Top-2 WM cache
+## 1. 精确构建 MSP 对应 prepared assets
 
-要求现有 prepared dataset 覆盖 MSP probe 的 1024 train / 128 val sample IDs。Builder 会按 prepared index 重新排序读取，减少 shard/NAS 随机抖动；样本集合不变。
+不要用普通 `prepare_nuscenes.py --max-windows 1024/128`：MSP train 是 scene-balanced round-robin，val 是 scene-disjoint midpoint，普通时间顺序不能保证 sample IDs 一致。
+
+从已经冻结的 MSP probe cache 直接读取 `scene/history/t0/future tokens`，只 prepare 同一批 1024 train / 128 val windows：
+
+```bash
+python tools/real_motion/prepare_exact_msp_windows.py \
+  --msp-cache data/msp_probe_train_1024.pt \
+  --dataroot /path/to/nuscenes \
+  --info-pkl /path/to/nuscenes_infos_train_temporal_v3_scene.pkl \
+  --output data/prepared_msp_train_1024
+
+python tools/real_motion/prepare_exact_msp_windows.py \
+  --msp-cache data/msp_probe_val_128.pt \
+  --dataroot /path/to/nuscenes \
+  --info-pkl /path/to/nuscenes_infos_val_temporal_v3_scene.pkl \
+  --output data/prepared_msp_val_128
+```
+
+该 builder：
+
+- 不重新选择窗口；
+- 强制复用 MSP cache 内的 `resolved_config`；
+- 验证 `sample_id == scene:t0_token`、history 末帧等于 t0、6+6 token 长度；
+- 保证最终 prepared sample-ID 集合与 MSP cache 完全一致；
+- 为 NAS I/O 按 `scene + t0 timestamp` 重排同一窗口集合；
+- 对重复 Occ3D frame / pose 使用小型进程内 LRU cache；
+- 已存在 `index.json` 时拒绝覆盖，避免混合旧资产。
+
+## 2. 构建 Top-2 WM cache
 
 Train：
 
 ```bash
 python tools/real_motion/build_msp_wm_cache.py \
-  --prepared data/prepared_train \
+  --prepared data/prepared_msp_train_1024 \
   --msp-cache data/msp_probe_train_1024.pt \
   --msp-checkpoint outputs/p0_f1_msp_probe/msp_probe_best.pt \
   --vae-ckpt /path/to/OccFM/logs/occfm_vae/100ep_3docc_sem_voxel/ckpt/epoch=000100.ckpt \
@@ -54,7 +82,7 @@ Validation：
 
 ```bash
 python tools/real_motion/build_msp_wm_cache.py \
-  --prepared data/prepared_val \
+  --prepared data/prepared_msp_val_128 \
   --msp-cache data/msp_probe_val_128.pt \
   --msp-checkpoint outputs/p0_f1_msp_probe/msp_probe_best.pt \
   --vae-ckpt /path/to/OccFM/logs/occfm_vae/100ep_3docc_sem_voxel/ckpt/epoch=000100.ckpt \
@@ -63,9 +91,9 @@ python tools/real_motion/build_msp_wm_cache.py \
   --vae-batch-size 4
 ```
 
-`index.json` 必须显示 train/val 都是 `topk=2`、`window_hw=[20,20]`、`vae_mode=mean`，并记录同一个 MSP/VAE SHA256。
+WM-cache builder 会按 prepared index 重新排序读取，减少 shard/NAS 随机抖动；样本集合不变。`index.json` 必须显示 train/val 都是 `topk=2`、`window_hw=[20,20]`、`vae_mode=mean`，并记录同一个 MSP/VAE SHA256。
 
-## 2. 训练
+## 3. 训练
 
 第一轮固定 3000 steps；这不是 200-epoch full run。
 
@@ -83,12 +111,12 @@ python tools/real_motion/train_msp_sparse_wm.py \
 
 训练日志同时报告 loss、velocity cosine、target RMS、prediction RMS。Best checkpoint 仍按 scene-disjoint val latent loss 保存，但 **latent loss 下降本身不是 GO 标准**。
 
-## 3. 真实 occupancy 评测
+## 4. 真实 occupancy 评测
 
 ```bash
 python tools/real_motion/eval_msp_sparse_wm.py \
   --cache data/msp_wm_val_top2 \
-  --prepared data/prepared_val \
+  --prepared data/prepared_msp_val_128 \
   --vae-ckpt /path/to/OccFM/logs/occfm_vae/100ep_3docc_sem_voxel/ckpt/epoch=000100.ckpt \
   --sparse-ckpt outputs/p0_f3_top2_sparse_wm/best.pt \
   --output outputs/p0_f3_top2_sparse_wm/eval.json \
