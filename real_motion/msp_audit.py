@@ -1,9 +1,9 @@
 """Dependency-light helpers for auditing P0-F0 C-source attribution.
 
 The P0-F0 C bucket means a future-moving GT instance was not associated with a
-causal t0 MSP candidate.  It does *not* imply a future birth: the frozen
+causal t0 MSP candidate. It does *not* imply a future birth: the frozen
 Moving-mIoU v2 record set contains only instances common to t0 and the future
-horizon.  This module separates label-association failures from a genuine lack
+horizon. This module separates label-association failures from a genuine lack
 of an occupancy candidate.
 """
 from __future__ import annotations
@@ -69,11 +69,11 @@ def classify_unmatched_instance(
 ) -> CSourceClassification:
     """Explain why one GT instance landed in P0-F0 bucket C.
 
-    This mirrors the mechanics of ``match_candidates_to_instances`` but does not
-    use future GT.  A candidate within the matching gate means the object-centric
-    source exists and C was caused by one-to-one association competition.  A
-    candidate outside the gate means a causal same-class component exists but
-    the supervision matcher could not safely associate it.
+    This mirrors ``match_candidates_to_instances`` but does not use future GT.
+    A candidate within the matching gate can leave the GT instance unmatched
+    only if that candidate was consumed by another GT instance under the frozen
+    greedy one-to-one matcher. A candidate outside the gate is only an ambiguous
+    same-class candidate; it is not automatically the correct physical source.
     """
     if match_max_distance_m <= 0:
         raise ValueError("match_max_distance_m must be positive")
@@ -91,7 +91,9 @@ def classify_unmatched_instance(
     for i, cand in enumerate(candidates):
         if int(cand.class_id) != int(class_id):
             continue
-        d = float(np.linalg.norm(np.asarray(cand.centroid_xy_m, dtype=np.float64) - center))
+        d = float(
+            np.linalg.norm(np.asarray(cand.centroid_xy_m, dtype=np.float64) - center)
+        )
         same.append((d, i))
     if not same:
         return CSourceClassification(
@@ -103,6 +105,11 @@ def classify_unmatched_instance(
     if d > float(match_max_distance_m):
         return CSourceClassification(
             C_DISTANCE_GATE, d, i, assigned, False
+        )
+    if assigned is None:
+        raise RuntimeError(
+            "unmatched GT has an unassigned same-class candidate inside the match gate; "
+            "greedy matcher invariant is broken"
         )
     return CSourceClassification(
         C_ONE_TO_ONE_CONFLICT, d, i, assigned, True
