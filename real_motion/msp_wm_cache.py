@@ -123,8 +123,16 @@ def save_msp_wm_shards(output_dir, samples, *, shard_size=64, metadata=None, ver
                 "scene_name": str(s["scene_name"]),
             })
 
+    is_v2 = version == MSP_WM_CACHE_VERSION_V2
+    is_v3 = version == MSP_WM_CACHE_VERSION_V3
     for sample in samples:
-        validate_msp_wm_sample(sample)
+        validate_msp_wm_sample(
+            sample,
+            require_full_history=is_v2 or is_v3,
+            require_write_support=is_v2 or is_v3,
+            require_gt_target=not is_v3,
+            require_repair_target=is_v3,
+        )
         shard.append(sample)
         if len(shard) >= int(shard_size):
             flush(shard, shard_id)
