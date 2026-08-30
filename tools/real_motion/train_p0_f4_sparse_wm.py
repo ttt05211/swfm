@@ -38,7 +38,7 @@ from real_motion.windows import WindowPlan, crop_windows
 PRED_HW = (20, 20)
 CONTEXT_HW = (40, 40)
 FULL_HW = (50, 50)
-LOSS_CONTRACT = "strong_anchor_to_gt_masked_local_flow_full_history_context_no_auxiliary_losses"
+LOSS_CONTRACT = "strong_anchor_to_gt_local_flow_full_history_context_no_auxiliary_losses"
 
 
 def _validate_cache_pair(train_ds, val_ds):
