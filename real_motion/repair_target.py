@@ -47,7 +47,9 @@ def apply_dynamic_repair(
     out[write3d & anchor_dynamic] = int(free_label)
     out[write3d & proposal_dynamic] = proposal[write3d & proposal_dynamic]
 
-    outside = ~write3d
+    # Boolean indexing with [T,X,Y] (or [X,Y]) preserves the final Z dimension,
+    # which makes this assertion valid for arbitrary occupancy height.
+    outside = ~write
     if not np.array_equal(out[outside], anchor[outside]):
         raise AssertionError("dynamic repair modified occupancy outside causal support")
     return out
