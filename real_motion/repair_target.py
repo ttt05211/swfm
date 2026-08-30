@@ -11,40 +11,30 @@ from typing import Iterable
 import numpy as np
 
 
-def build_dynamic_repair_endpoint(
+def apply_dynamic_repair(
     anchor_occ: np.ndarray,
-    gt_occ: np.ndarray,
+    proposal_occ: np.ndarray,
     write_support_bev: np.ndarray,
     *,
     dynamic_class_ids: Iterable[int],
     free_label: int = 17,
 ) -> np.ndarray:
-    """Return an anchor-preserving semantic repair endpoint.
+    """Apply dynamic-only proposal semantics inside a causal BEV write support.
 
-    Args:
-        anchor_occ: [T,X,Y,Z] strong causal future anchor semantics.
-        gt_occ: [T,X,Y,Z] future GT semantics, used only to construct training
-            supervision / oracle endpoint.
-        write_support_bev: [T,X,Y] causal MSP support in future ego frames.
-        dynamic_class_ids: semantic classes whose occupancy may be repaired.
-        free_label: semantic free-space label.
-
-    Contract:
-        - outside write support, output is bit-exact anchor occupancy;
-        - inside support, anchor dynamic voxels are cleared;
-        - inside support, GT dynamic voxels are inserted;
-        - static / non-dynamic anchor semantics are never replaced by GT.
-
-    This is the exact deployment semantics used by the same-support GT repair
-    oracle, but only the encoded endpoint enters Sparse-WM training.
+    ``anchor_occ`` and ``proposal_occ`` may be either one horizon [X,Y,Z] or a
+    temporal stack [T,X,Y,Z]. ``write_support_bev`` must match the leading BEV
+    dimensions ([X,Y] or [T,X,Y]). Outside support the output is bit-exact
+    anchor occupancy. Inside support, anchor dynamic voxels are cleared and
+    proposal dynamic voxels are inserted; static/non-dynamic anchor semantics
+    are never copied from the proposal.
     """
     anchor = np.asarray(anchor_occ)
-    gt = np.asarray(gt_occ)
+    proposal = np.asarray(proposal_occ)
     write = np.asarray(write_support_bev, dtype=bool)
-    if anchor.shape != gt.shape or anchor.ndim != 4:
-        raise ValueError("anchor_occ and gt_occ must match [T,X,Y,Z]")
-    if write.shape != anchor.shape[:3]:
-        raise ValueError("write_support_bev must match anchor [T,X,Y]")
+    if anchor.shape != proposal.shape or anchor.ndim not in (3, 4):
+        raise ValueError("anchor_occ and proposal_occ must match [X,Y,Z] or [T,X,Y,Z]")
+    if write.shape != anchor.shape[:-1]:
+        raise ValueError("write_support_bev must match anchor leading BEV dimensions")
 
     dynamic = np.asarray(tuple(int(c) for c in dynamic_class_ids), dtype=np.int64)
     if dynamic.size == 0:
@@ -53,15 +43,34 @@ def build_dynamic_repair_endpoint(
     out = anchor.copy()
     write3d = write[..., None]
     anchor_dynamic = np.isin(anchor, dynamic)
-    gt_dynamic = np.isin(gt, dynamic)
-
+    proposal_dynamic = np.isin(proposal, dynamic)
     out[write3d & anchor_dynamic] = int(free_label)
-    out[write3d & gt_dynamic] = gt[write3d & gt_dynamic]
+    out[write3d & proposal_dynamic] = proposal[write3d & proposal_dynamic]
 
-    # Strong preservation assertion: causal support is the only semantic write
-    # authority. This is cheap compared with cache construction and catches any
-    # accidental GT leakage immediately.
     outside = ~write3d
     if not np.array_equal(out[outside], anchor[outside]):
-        raise AssertionError("repair endpoint modified occupancy outside causal support")
+        raise AssertionError("dynamic repair modified occupancy outside causal support")
     return out
+
+
+def build_dynamic_repair_endpoint(
+    anchor_occ: np.ndarray,
+    gt_occ: np.ndarray,
+    write_support_bev: np.ndarray,
+    *,
+    dynamic_class_ids: Iterable[int],
+    free_label: int = 17,
+) -> np.ndarray:
+    """Return the P0-F5 occupancy-space training endpoint.
+
+    Future GT is used only as the dynamic proposal inside the already-causal MSP
+    support. The resulting endpoint is exactly Strong W2Det outside support and
+    is then encoded by the frozen VAE to define the flow target.
+    """
+    return apply_dynamic_repair(
+        anchor_occ,
+        gt_occ,
+        write_support_bev,
+        dynamic_class_ids=dynamic_class_ids,
+        free_label=free_label,
+    )
