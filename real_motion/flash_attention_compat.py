@@ -11,16 +11,8 @@ from __future__ import annotations
 import torch
 
 
-def patch_occfm_flash_attention_backward_dtype() -> bool:
-    """Patch the pinned OccFM FlashAttentionFunction once per process.
-
-    Returns True when the patch is installed and False when it was already
-    installed. The patch is intentionally local to runtime; the pinned upstream
-    submodule remains byte-for-byte unchanged.
-    """
-    from forecast.ops.flash_attention.flash_attention import FlashAttentionFunction
-
-    cls = FlashAttentionFunction
+def _patch_flash_attention_class(cls) -> bool:
+    """Install the dtype guard on one FlashAttention autograd Function class."""
     if getattr(cls, "_swfm_grad_dtype_patch", False):
         return False
 
@@ -39,3 +31,15 @@ def patch_occfm_flash_attention_backward_dtype() -> bool:
     cls._swfm_grad_dtype_patch = True
     cls._swfm_original_backward = original_backward
     return True
+
+
+def patch_occfm_flash_attention_backward_dtype() -> bool:
+    """Patch the pinned OccFM FlashAttentionFunction once per process.
+
+    Returns True when the patch is installed and False when it was already
+    installed. The patch is intentionally local to runtime; the pinned upstream
+    submodule remains byte-for-byte unchanged.
+    """
+    from forecast.ops.flash_attention.flash_attention import FlashAttentionFunction
+
+    return _patch_flash_attention_class(FlashAttentionFunction)
