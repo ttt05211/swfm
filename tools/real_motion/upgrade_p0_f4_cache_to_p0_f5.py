@@ -54,6 +54,13 @@ from real_motion.strong_w2det import StrongW2DetConfig, strong_w2det_sequence
 PROGRESS_NAME = ".index.partial.json"
 EVAL_OCC_KEYS = ("eval_future_gt_occ", "eval_strong_anchor_occ")
 FREE_LABEL = 17
+PROGRESS_PROVENANCE_KEYS = (
+    "incremental_upgrade",
+    "incremental_upgrade_source_index_sha256",
+    "repair_endpoint_contract",
+    "target",
+    "vae_checkpoint_sha256",
+)
 
 
 class CachedNuScenesWindowSource(NuScenesWindowSource):
@@ -72,7 +79,17 @@ def _atomic_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def _load_progress(root: Path, *, resume: bool):
+def _validate_partial_metadata(partial_metadata: dict, expected_metadata: dict) -> None:
+    for key in PROGRESS_PROVENANCE_KEYS:
+        if partial_metadata.get(key) != expected_metadata.get(key):
+            raise RuntimeError(
+                f"partial cache provenance mismatch for {key}: "
+                f"{partial_metadata.get(key)!r} != {expected_metadata.get(key)!r}. "
+                "Do not resume a direct-builder or different-source cache into this output."
+            )
+
+
+def _load_progress(root: Path, *, resume: bool, expected_metadata: dict | None = None):
     final = root / "index.json"
     partial = root / PROGRESS_NAME
     if final.exists():
@@ -86,15 +103,23 @@ def _load_progress(root: Path, *, resume: bool):
     obj = json.loads(partial.read_text(encoding="utf-8"))
     if obj.get("version") != MSP_WM_CACHE_VERSION_V3:
         raise RuntimeError("partial cache version is not P0-F5/v3")
+    if expected_metadata is not None:
+        _validate_partial_metadata(obj.get("metadata") or {}, expected_metadata)
     entries = obj.get("entries", [])
     seen = {str(e["sample_id"]) for e in entries}
+    if len(seen) != len(entries):
+        raise RuntimeError("partial cache contains duplicate sample IDs")
     shard_ids = [int(Path(e["shard"]).stem.split("_")[-1]) for e in entries]
     return entries, seen, (max(shard_ids) + 1 if shard_ids else 0)
 
 
 def _write_cache(root: Path, samples, metadata, *, shard_size: int, resume: bool):
     root.mkdir(parents=True, exist_ok=True)
-    entries, seen, shard_id = _load_progress(root, resume=resume)
+    entries, seen, shard_id = _load_progress(
+        root,
+        resume=resume,
+        expected_metadata=metadata,
+    )
     shard = []
 
     def commit(items, sid):
@@ -288,11 +313,17 @@ def main():
         raise ValueError("vae-batch-size/shard-size must be positive")
 
     source_root = Path(a.source_cache).expanduser().resolve()
+    out_root = Path(a.output).expanduser().resolve()
+    if out_root == source_root:
+        raise RuntimeError("--output must be different from --source-cache")
     if not (source_root / "index.json").is_file():
         raise FileNotFoundError(f"P0-F4 cache index not found: {source_root / 'index.json'}")
     source_ds = MSPWorldModelCacheDataset(source_root)
     source_meta = source_ds.metadata
     validate_p0_f4_upgrade_source(source_ds.version, source_meta)
+    source_ids = [str(e["sample_id"]) for e in source_ds.entries]
+    if len(set(source_ids)) != len(source_ids):
+        raise RuntimeError("source P0-F4 cache contains duplicate sample IDs")
 
     vae_path = _resolve_file(a.vae_ckpt, source_meta, "vae_checkpoint", "VAE checkpoint")
     expected_vae_sha = source_meta.get("vae_checkpoint_sha256")
@@ -328,18 +359,11 @@ def main():
         if int(pcfg.free_label) != FREE_LABEL:
             raise RuntimeError(f"P0-F5 repair contract expects free label {FREE_LABEL}")
         record_map = {str(r["sample_id"]): r for r in records}
-        source_ids = {str(e["sample_id"]) for e in source_ds.entries}
-        missing_ids = sorted(source_ids - set(record_map))
+        missing_ids = sorted(set(source_ids) - set(record_map))
         if missing_ids:
             raise RuntimeError(f"{len(missing_ids)} P0-F4 sample IDs missing from MSP probe cache")
         raw_source = CachedNuScenesWindowSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
 
-    device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
-    vae, _ = load_official_vae(UP, vae_path, device)
-    va = OccFMVAEAdapter(vae)
-
-    out_root = Path(a.output).expanduser().resolve()
-    _, already_done, _ = _load_progress(out_root, resume=a.resume) if out_root.exists() else ([], set(), 0)
     metadata = make_p0_f5_upgrade_metadata(
         source_meta,
         source_cache=source_root,
@@ -355,6 +379,23 @@ def main():
     if metadata.get("loss_contract") != P0_F5_LOSS_CONTRACT or metadata.get("target") != P0_F5_TARGET:
         raise AssertionError("unexpected P0-F5 target metadata")
 
+    _, already_done, _ = (
+        _load_progress(out_root, resume=a.resume, expected_metadata=metadata)
+        if out_root.exists()
+        else ([], set(), 0)
+    )
+    unknown_done = sorted(already_done - set(source_ids))
+    if unknown_done:
+        raise RuntimeError("partial output contains sample IDs not present in source P0-F4 cache")
+
+    # Do not even instantiate the VAE if a resume already contains every source
+    # sample and only needs its final index committed.
+    va = None
+    if len(already_done) < len(source_ds):
+        device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
+        vae, _ = load_official_vae(UP, vae_path, device)
+        va = OccFMVAEAdapter(vae)
+
     def upgraded_samples():
         pending = []
         prepared = len(already_done)
@@ -364,6 +405,8 @@ def main():
         def flush(rows):
             if not rows:
                 return []
+            if va is None:
+                raise RuntimeError("internal error: VAE is unavailable for pending repair endpoints")
             repair_batch = torch.from_numpy(np.stack([row[1] for row in rows]))
             zr = va.encode(repair_batch, mode="mean").float().cpu()
             out = []
@@ -425,6 +468,11 @@ def main():
         shard_size=int(a.shard_size),
         resume=bool(a.resume),
     )
+    final_ids = [str(e["sample_id"]) for e in index["entries"]]
+    if len(final_ids) != len(source_ids) or set(final_ids) != set(source_ids):
+        raise RuntimeError(
+            f"upgraded cache sample set mismatch: source={len(source_ids)} output={len(final_ids)}"
+        )
     print(json.dumps({
         "output": str(out_root),
         "num_samples": index["num_samples"],
