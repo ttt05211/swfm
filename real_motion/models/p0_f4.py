@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from .anchor_cfm import AnchorWindowCFM
-from .transition import MotionWindowFlowMatching
+from .transition_full_context import MotionWindowFlowMatchingFullContext
 
 
 def make_p0_f4_model(window=20, *, sample_steps=10, source_noise_std=0.0):
-    tr = MotionWindowFlowMatching(
+    tr = MotionWindowFlowMatchingFullContext(
         in_channels=16,
         out_channels=16,
         model_channels=128,
