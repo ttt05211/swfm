@@ -2,10 +2,12 @@
 
 The expensive future transition is executed only on selected 20x20 windows.
 Each future window starts from a causal semantic anchor latent and flows toward
-full future GT. P0-F4 optionally conditions the transition on a larger crop of
+a target latent. P0-F4 optionally conditions the transition on a larger crop of
 full historical occupancy latent and can restrict the single FM objective to a
-causal sparse write mask. Legacy callers that omit both arguments keep the
-original P0-F3 behavior exactly.
+causal sparse write mask. P0-F5 changes the endpoint to an encoded occupancy
+repair target. P0-F6 can additionally request the differentiable endpoint
+estimate from the same FM forward pass for decoder-aware semantic supervision.
+Legacy callers keep the previous behavior by leaving ``return_endpoint=False``.
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ import torch.nn as nn
 
 
 class AnchorWindowCFM(nn.Module):
-    """Conditional flow from an anchor latent to the future GT latent."""
+    """Conditional flow from an anchor latent to a future target latent."""
 
     def __init__(
         self,
@@ -94,6 +96,7 @@ class AnchorWindowCFM(nn.Module):
         window_origins: torch.Tensor | None = None,
         t_override: float | torch.Tensor | None = None,
         source_noise: torch.Tensor | None = None,
+        return_endpoint: bool = False,
     ) -> tuple[torch.Tensor, dict]:
         if target_future.shape != anchor_future.shape:
             raise ValueError("target_future and anchor_future must match")
@@ -174,13 +177,22 @@ class AnchorWindowCFM(nn.Module):
             dot = (p * y).sum(dim=1)
             denom = p.norm(dim=1) * y.norm(dim=1)
             cosine = torch.where(denom > 0, dot / denom.clamp_min(1e-12), torch.zeros_like(dot))
-        return loss, {
+        info = {
             "loss": float(loss.detach().cpu()),
             "target_rms": float(target_rms.detach().cpu()),
             "pred_rms": float(pred_rms.detach().cpu()),
             "cosine": float(cosine.mean().detach().cpu()),
             "loss_active_fraction": active_fraction,
         }
+        if return_endpoint:
+            # For the linear conditional path x_t=(1-t)x_0+t*x_1 and velocity
+            # v=x_1-x_0, the endpoint is x_1=x_t+(1-t)v.  Keep this tensor in
+            # the graph so a frozen decoder can supervise final semantics.
+            info["predicted_endpoint"] = (
+                xt + (1.0 - t) * pred
+            ) / self.rescale_factor
+            info["sampled_t"] = t
+        return loss, info
 
     @torch.no_grad()
     def sample(
