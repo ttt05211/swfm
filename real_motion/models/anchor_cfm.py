@@ -1,10 +1,11 @@
 """Anchor-centered local flow matching for MSP-selected World-Model windows.
 
-This module is intentionally small.  The expensive model is only executed on
-pre-selected spatial windows.  Each selected window starts from the causal
-KTA/zero-motion anchor latent and is trained to flow toward the full future GT
-latent.  Outside selected windows the anchor is preserved by scatter/fusion,
-not learned by an auxiliary preservation loss.
+The expensive future transition is executed only on selected 20x20 windows.
+Each future window starts from a causal semantic anchor latent and flows toward
+full future GT. P0-F4 optionally conditions the transition on a larger crop of
+full historical occupancy latent and can restrict the single FM objective to a
+causal sparse write mask. Legacy callers that omit both arguments keep the
+original P0-F3 behavior exactly.
 """
 from __future__ import annotations
 
@@ -13,14 +14,7 @@ import torch.nn as nn
 
 
 class AnchorWindowCFM(nn.Module):
-    """Conditional flow from an anchor latent to the future GT latent.
-
-    Unlike the older sparse target path, the transition always sees a *full
-    latent state* inside the selected crop: ``x_t=(1-t) z_anchor + t z_gt``.
-    The regression target is the local latent innovation ``z_gt-z_anchor``.
-    This keeps the inherited OccFM operator in the original latent numeric
-    domain while making the final prediction anchor-preserving by construction.
-    """
+    """Conditional flow from an anchor latent to the future GT latent."""
 
     def __init__(
         self,
@@ -52,10 +46,41 @@ class AnchorWindowCFM(nn.Module):
         if anchor.ndim != 5 or history.ndim != 5:
             raise ValueError("anchor/history must be [B,T,C,H,W]")
         zeros = torch.zeros(
-            anchor.shape[0], history.shape[1], *anchor.shape[2:],
-            device=anchor.device, dtype=anchor.dtype,
+            anchor.shape[0],
+            history.shape[1],
+            *anchor.shape[2:],
+            device=anchor.device,
+            dtype=anchor.dtype,
         )
         return torch.cat([zeros, anchor], dim=1)
+
+    @staticmethod
+    def _validate_history_context(history_context, history):
+        if history_context is None:
+            return
+        if history_context.ndim != 5:
+            raise ValueError("history_context must be [B,T,C,H,W]")
+        if history_context.shape[:3] != history.shape[:3]:
+            raise ValueError("history_context B,T,C must match local history")
+        if history_context.shape[-2] < history.shape[-2] or history_context.shape[-1] < history.shape[-1]:
+            raise ValueError("history_context must not be spatially smaller than local history")
+
+    @staticmethod
+    def _normalize_loss_mask(loss_mask, target):
+        if loss_mask is None:
+            return None
+        m = loss_mask.to(device=target.device, dtype=target.dtype)
+        if m.ndim == 4:
+            m = m.unsqueeze(2)
+        if m.ndim != 5:
+            raise ValueError("loss_mask must be [B,T,H,W] or [B,T,1,H,W]")
+        if m.shape[0] != target.shape[0] or m.shape[1] != target.shape[1] or m.shape[-2:] != target.shape[-2:]:
+            raise ValueError("loss_mask must align with target B,T,H,W")
+        if m.shape[2] not in (1, target.shape[2]):
+            raise ValueError("loss_mask channel dimension must be 1 or match target")
+        if m.shape[2] == 1:
+            m = m.expand(-1, -1, target.shape[2], -1, -1)
+        return m
 
     def flow_loss(
         self,
@@ -63,6 +88,8 @@ class AnchorWindowCFM(nn.Module):
         target_future: torch.Tensor,
         anchor_future: torch.Tensor,
         *,
+        history_context: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
         trajectory: torch.Tensor | None = None,
         window_origins: torch.Tensor | None = None,
         t_override: float | torch.Tensor | None = None,
@@ -72,10 +99,13 @@ class AnchorWindowCFM(nn.Module):
             raise ValueError("target_future and anchor_future must match")
         if history.ndim != 5 or target_future.ndim != 5:
             raise ValueError("history/target must be [B,T,C,H,W]")
+        self._validate_history_context(history_context, history)
 
         hist = history * self.rescale_factor
         target = target_future * self.rescale_factor
         anchor = anchor_future * self.rescale_factor
+        ctx = None if history_context is None else history_context * self.rescale_factor
+        mask = self._normalize_loss_mask(loss_mask, target)
         if source_noise is None:
             eps = torch.zeros_like(anchor) if self.source_noise_std == 0 else torch.randn_like(anchor)
         else:
@@ -107,23 +137,49 @@ class AnchorWindowCFM(nn.Module):
             "timesteps": t[:, 0, 0, 0, 0] * self.time_scalar,
             "trajectory": trajectory,
             "prior_condition": prior,
+            "history_context": ctx,
             "window_origins": window_origins,
         }
         pred = self.transition(batch)["predicted_latent"][:, history.shape[1]:]
         velocity_target = target - source
-        loss = (pred - velocity_target).square().mean()
+        sq = (pred - velocity_target).square()
+        if mask is None:
+            loss = sq.mean()
+            metric_mask = None
+        else:
+            denom = mask.sum()
+            if float(denom.detach().cpu()) <= 0:
+                raise ValueError("loss_mask selects no latent elements")
+            loss = (sq * mask).sum() / denom
+            metric_mask = mask
 
         with torch.no_grad():
-            p = pred.float().reshape(pred.shape[0], -1)
-            y = velocity_target.float().reshape(velocity_target.shape[0], -1)
+            pf = pred.float()
+            yf = velocity_target.float()
+            if metric_mask is not None:
+                mf = metric_mask.float()
+                pf = pf * mf
+                yf = yf * mf
+                target_rms = (velocity_target.float().square() * mf).sum() / mf.sum().clamp_min(1.0)
+                pred_rms = (pred.float().square() * mf).sum() / mf.sum().clamp_min(1.0)
+                target_rms = target_rms.sqrt()
+                pred_rms = pred_rms.sqrt()
+                active_fraction = float(metric_mask[:, :, :1].float().mean().detach().cpu())
+            else:
+                target_rms = velocity_target.float().square().mean().sqrt()
+                pred_rms = pred.float().square().mean().sqrt()
+                active_fraction = 1.0
+            p = pf.reshape(pred.shape[0], -1)
+            y = yf.reshape(velocity_target.shape[0], -1)
             dot = (p * y).sum(dim=1)
             denom = p.norm(dim=1) * y.norm(dim=1)
             cosine = torch.where(denom > 0, dot / denom.clamp_min(1e-12), torch.zeros_like(dot))
         return loss, {
             "loss": float(loss.detach().cpu()),
-            "target_rms": float(velocity_target.float().square().mean().sqrt().detach().cpu()),
-            "pred_rms": float(pred.float().square().mean().sqrt().detach().cpu()),
+            "target_rms": float(target_rms.detach().cpu()),
+            "pred_rms": float(pred_rms.detach().cpu()),
             "cosine": float(cosine.mean().detach().cpu()),
+            "loss_active_fraction": active_fraction,
         }
 
     @torch.no_grad()
@@ -132,14 +188,17 @@ class AnchorWindowCFM(nn.Module):
         history: torch.Tensor,
         anchor_future: torch.Tensor,
         *,
+        history_context: torch.Tensor | None = None,
         trajectory: torch.Tensor | None = None,
         window_origins: torch.Tensor | None = None,
         initial_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if history.ndim != 5 or anchor_future.ndim != 5:
             raise ValueError("history/anchor must be [B,T,C,H,W]")
+        self._validate_history_context(history_context, history)
         hist = history * self.rescale_factor
         anchor = anchor_future * self.rescale_factor
+        ctx = None if history_context is None else history_context * self.rescale_factor
         if initial_noise is None:
             eps = torch.zeros_like(anchor) if self.source_noise_std == 0 else torch.randn_like(anchor)
         else:
@@ -149,23 +208,22 @@ class AnchorWindowCFM(nn.Module):
         future = anchor + self.source_noise_std * eps
         prior = self._align_prior(anchor_future, history) * self.rescale_factor
 
-        timesteps = torch.linspace(
-            0, 1, self.sample_steps + 1, device=hist.device, dtype=hist.dtype
-        )
-        shifted = 1 - (self.alpha_shift * timesteps) / (
-            1 + (self.alpha_shift - 1) * timesteps
-        )
+        timesteps = torch.linspace(0, 1, self.sample_steps + 1, device=hist.device, dtype=hist.dtype)
+        shifted = 1 - (self.alpha_shift * timesteps) / (1 + (self.alpha_shift - 1) * timesteps)
         shifted = shifted.flip(0)
         for tc, tp in zip(shifted[:-1], shifted[1:]):
             seq = torch.cat([hist, future], dim=1)
             batch = {
                 "noised_sequence": seq,
                 "timesteps": torch.full(
-                    (hist.shape[0],), float(tc * self.time_scalar),
-                    device=hist.device, dtype=hist.dtype,
+                    (hist.shape[0],),
+                    float(tc * self.time_scalar),
+                    device=hist.device,
+                    dtype=hist.dtype,
                 ),
                 "trajectory": trajectory,
                 "prior_condition": prior,
+                "history_context": ctx,
                 "window_origins": window_origins,
             }
             velocity = self.transition(batch)["predicted_latent"][:, history.shape[1]:]
