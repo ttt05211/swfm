@@ -84,6 +84,23 @@ class AnchorWindowCFM(nn.Module):
             m = m.expand(-1, -1, target.shape[2], -1, -1)
         return m
 
+    @staticmethod
+    def _force_output_grad_dtype(x: torch.Tensor) -> torch.Tensor:
+        """Keep custom AMP attention backward gradients in the forward dtype.
+
+        The pinned OccFM FlashAttention autograd Function assumes ``grad_output``
+        has the same dtype as its saved q/k/v tensors. Decoder-aware P0-F6 can
+        feed an FP32 semantic gradient into a BF16 transition output, which the
+        custom backward does not cast and then fails inside ``einsum``. Register
+        the cast exactly at the transition-output boundary so the combined FM +
+        semantic gradient enters the pinned transition in its native AMP dtype.
+        This changes neither the forward value nor the loss definition.
+        """
+        if x.requires_grad and x.is_floating_point():
+            dtype = x.dtype
+            x.register_hook(lambda grad: grad.to(dtype=dtype))
+        return x
+
     def flow_loss(
         self,
         history: torch.Tensor,
@@ -144,6 +161,7 @@ class AnchorWindowCFM(nn.Module):
             "window_origins": window_origins,
         }
         pred = self.transition(batch)["predicted_latent"][:, history.shape[1]:]
+        pred = self._force_output_grad_dtype(pred)
         velocity_target = target - source
         sq = (pred - velocity_target).square()
         if mask is None:
