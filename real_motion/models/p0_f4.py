@@ -1,11 +1,18 @@
 """Factory for the P0-F4 strong-anchor full-context Sparse World Model."""
 from __future__ import annotations
 
+from real_motion.flash_attention_compat import patch_occfm_flash_attention_backward_dtype
+
 from .anchor_cfm import AnchorWindowCFM
 from .transition_full_context import MotionWindowFlowMatchingFullContext
 
 
 def make_p0_f4_model(window=20, *, sample_steps=10, source_noise_std=0.0):
+    # P0-F6 decoder-aware training can send FP32 semantic gradients into the
+    # BF16 graph created by the pinned OccFM custom FlashAttention under AMP.
+    # Patch that upstream backward boundary once per process; this is a no-op on
+    # repeated calls and does not alter forward values or checkpoint contents.
+    patch_occfm_flash_attention_backward_dtype()
     tr = MotionWindowFlowMatchingFullContext(
         in_channels=16,
         out_channels=16,
