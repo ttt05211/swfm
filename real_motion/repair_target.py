@@ -23,10 +23,14 @@ def apply_dynamic_repair(
 
     ``anchor_occ`` and ``proposal_occ`` may be either one horizon [X,Y,Z] or a
     temporal stack [T,X,Y,Z]. ``write_support_bev`` must match the leading BEV
-    dimensions ([X,Y] or [T,X,Y]). Outside support the output is bit-exact
-    anchor occupancy. Inside support, anchor dynamic voxels are cleared and
-    proposal dynamic voxels are inserted; static/non-dynamic anchor semantics
-    are never copied from the proposal.
+    dimensions ([X,Y] or [T,X,Y]).
+
+    Contract (kept identical to the frozen P0-F4 same-support repair oracle):
+    - outside support, output is bit-exact anchor occupancy;
+    - inside support, anchor dynamic voxels are first cleared;
+    - proposal dynamic voxels are then written and may overwrite the anchor
+      semantic at the same voxel;
+    - proposal non-dynamic semantics are never copied into the result.
     """
     anchor = np.asarray(anchor_occ)
     proposal = np.asarray(proposal_occ)
