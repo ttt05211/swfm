@@ -4,7 +4,8 @@
 Frozen routing remains the P0-F2 Real-Motion MSP Top-2 plan. The expensive
 future transition predicts 20x20 windows from a strong W2Det future anchor,
 while each local transition sees a 40x40 crop of full historical occupancy
-latent as additional context. Only latent flow MSE is used in this first run.
+latent as additional context. The only objective is latent flow MSE, evaluated
+only on the same causal MSP support that is authorized to write at inference.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from real_motion.windows import WindowPlan, crop_windows
 PRED_HW = (20, 20)
 CONTEXT_HW = (40, 40)
 FULL_HW = (50, 50)
-LOSS_CONTRACT = "strong_anchor_to_gt_local_flow_full_history_context_no_auxiliary_losses"
+LOSS_CONTRACT = "strong_anchor_to_gt_masked_local_flow_full_history_context_no_auxiliary_losses"
 
 
 def _validate_cache_pair(train_ds, val_ds):
@@ -71,7 +72,7 @@ def _validate_cache_pair(train_ds, val_ds):
 
 
 def prepare_batch(batch, device):
-    """Crop 20x20 prediction state and 40x40 full-history context."""
+    """Crop 20x20 prediction state, 40x40 context, and causal FM mask."""
     origins_cpu = batch["window_origins"].long()
     valid_cpu = batch["window_valid"].bool()
     B, K = valid_cpu.shape
@@ -96,20 +97,27 @@ def prepare_batch(batch, device):
     )
     anchor = crop_windows(batch["anchor_future_latent"], plan)
     target = crop_windows(batch["gt_future_latent"], plan)
-    valid = plan.valid.reshape(-1)
+    write = crop_windows(batch["msp_write_support_latent"], plan).bool()
+
+    slot_valid = plan.valid.reshape(-1)
+    write_flat = write.reshape(B * K, *write.shape[2:])
+    effective = slot_valid & write_flat.reshape(B * K, -1).any(dim=1)
+    if not bool(effective.any()):
+        return None
 
     def flat(x):
-        return x.reshape(B * K, *x.shape[2:])[valid]
+        return x.reshape(B * K, *x.shape[2:])[effective]
 
     hist_local, hist_context, anchor, target = map(
         flat, (hist_local, hist_context, anchor, target)
     )
-    origins = plan.origins.reshape(B * K, 2)[valid]
+    loss_mask = write_flat[effective].unsqueeze(2)
+    origins = plan.origins.reshape(B * K, 2)[effective]
     traj = batch["trajectory"]
     if tuple(traj.shape[1:]) != (12, 2):
         raise RuntimeError(f"trajectory batch must be [B,12,2], got {tuple(traj.shape)}")
-    traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[valid]
-    return hist_local, hist_context, target, anchor, traj, origins
+    traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[effective]
+    return hist_local, hist_context, target, anchor, loss_mask, traj, origins
 
 
 @torch.no_grad()
@@ -120,6 +128,7 @@ def validate(model, loader, device):
     cos = 0.0
     target_rms = 0.0
     pred_rms = 0.0
+    active = 0.0
     skipped_batches = 0
     skipped_samples = 0
     for batch in loader:
@@ -128,12 +137,13 @@ def validate(model, loader, device):
             skipped_batches += 1
             skipped_samples += len(batch.get("sample_id", []))
             continue
-        hist, context, target, anchor, traj, origins = prepared
+        hist, context, target, anchor, loss_mask, traj, origins = prepared
         loss, info = model.flow_loss(
             hist,
             target,
             anchor,
             history_context=context,
+            loss_mask=loss_mask,
             trajectory=traj,
             window_origins=origins,
             t_override=0.5,
@@ -144,16 +154,18 @@ def validate(model, loader, device):
         cos += float(info["cosine"]) * n
         target_rms += float(info["target_rms"]) * n
         pred_rms += float(info["pred_rms"]) * n
+        active += float(info.get("loss_active_fraction", 1.0)) * n
         count += n
     model.train()
     if count <= 0:
-        raise RuntimeError("validation contains no valid routed Sparse-WM windows")
+        raise RuntimeError("validation contains no causal MSP write windows")
     d = float(count)
     return {
         "loss": total / d,
         "cosine": cos / d,
         "target_rms": target_rms / d,
         "pred_rms": pred_rms / d,
+        "loss_active_fraction": active / d,
         "num_windows": count,
         "skipped_empty_batches": skipped_batches,
         "skipped_anchor_only_samples": skipped_samples,
@@ -172,6 +184,7 @@ def _architecture(args):
         "context_channels": 16,
         "flow": "strong_w2det_anchor_to_full_gt_latent",
         "history": "full_history_latent",
+        "loss": "masked_flow_mse_on_causal_msp_write_support",
     }
 
 
@@ -183,6 +196,8 @@ def _validate_resume_checkpoint(ck, args, train_ds, val_ds):
         raise RuntimeError("resume prediction window differs")
     if list(arch.get("context_hw", [])) != list(CONTEXT_HW):
         raise RuntimeError("resume context window differs")
+    if arch.get("loss") != "masked_flow_mse_on_causal_msp_write_support":
+        raise RuntimeError("resume loss contract differs")
     if int(arch.get("sample_steps", args.sample_steps)) != int(args.sample_steps):
         raise RuntimeError("resume sample_steps differs")
     if float(arch.get("source_noise_std", args.source_noise_std)) != float(args.source_noise_std):
@@ -319,9 +334,9 @@ def main():
         if prepared is None:
             skipped_train_batches += 1
             if skipped_train_batches <= 3 or skipped_train_batches % 10 == 0:
-                print(f"skip anchor-only batch: skipped={skipped_train_batches} optimizer_step={step}")
+                print(f"skip no-write batch: skipped={skipped_train_batches} optimizer_step={step}")
             continue
-        hist, context, target, anchor, traj, origins = prepared
+        hist, context, target, anchor, loss_mask, traj, origins = prepared
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
             loss, info = model.flow_loss(
@@ -329,6 +344,7 @@ def main():
                 target,
                 anchor,
                 history_context=context,
+                loss_mask=loss_mask,
                 trajectory=traj,
                 window_origins=origins,
             )
@@ -343,7 +359,7 @@ def main():
             print(
                 f"step={step} loss={float(loss.item()):.6f} "
                 f"cos={info['cosine']:.4f} target_rms={info['target_rms']:.5f} "
-                f"pred_rms={info['pred_rms']:.5f}"
+                f"pred_rms={info['pred_rms']:.5f} active={info.get('loss_active_fraction',1.0):.4f}"
             )
         if step % a.val_every == 0 or step == a.steps:
             val = validate(model, val_loader, device)
