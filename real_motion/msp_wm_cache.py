@@ -7,14 +7,18 @@ import torch
 from torch.utils.data import Dataset
 
 MSP_WM_CACHE_VERSION = "msp_topk_anchor_wm_v1"  # legacy P0-F3
-MSP_WM_CACHE_VERSION_V2 = "msp_topk_strong_w2det_fullctx_wm_v2"
-SUPPORTED_VERSIONS = {MSP_WM_CACHE_VERSION, MSP_WM_CACHE_VERSION_V2}
+MSP_WM_CACHE_VERSION_V2 = "msp_topk_strong_w2det_fullctx_wm_v2"  # P0-F4
+MSP_WM_CACHE_VERSION_V3 = "msp_topk_strong_w2det_repair_endpoint_wm_v3"  # P0-F5
+SUPPORTED_VERSIONS = {
+    MSP_WM_CACHE_VERSION,
+    MSP_WM_CACHE_VERSION_V2,
+    MSP_WM_CACHE_VERSION_V3,
+}
 
 COMMON_REQUIRED = (
     "sample_id",
     "scene_name",
     "anchor_future_latent",
-    "gt_future_latent",
     "window_origins",
     "window_valid",
     "trajectory",
@@ -29,6 +33,14 @@ def _history_key(sample):
     raise KeyError("MSP-WM cache requires full_history_latent or moving_history_latent")
 
 
+def _target_key(sample):
+    if "repair_target_latent" in sample:
+        return "repair_target_latent"
+    if "gt_future_latent" in sample:
+        return "gt_future_latent"
+    raise KeyError("MSP-WM cache requires repair_target_latent or gt_future_latent")
+
+
 def validate_msp_wm_sample(
     sample,
     *,
@@ -37,21 +49,29 @@ def validate_msp_wm_sample(
     trajectory_length=12,
     require_full_history=False,
     require_write_support=False,
+    require_gt_target=False,
+    require_repair_target=False,
 ):
     missing = [k for k in COMMON_REQUIRED if k not in sample]
     if missing:
         raise KeyError(f"MSP-WM cache missing keys {missing}")
     hkey = _history_key(sample)
     if require_full_history and hkey != "full_history_latent":
-        raise KeyError("P0-F4 requires full_history_latent")
+        raise KeyError("this cache contract requires full_history_latent")
+
+    tkey = _target_key(sample)
+    if require_gt_target and tkey != "gt_future_latent":
+        raise KeyError("this cache contract requires gt_future_latent")
+    if require_repair_target and tkey != "repair_target_latent":
+        raise KeyError("P0-F5 requires repair_target_latent")
 
     hist = sample[hkey]
     anc = sample["anchor_future_latent"]
-    tgt = sample["gt_future_latent"]
+    tgt = sample[tkey]
     if not all(torch.is_tensor(x) and x.ndim == 4 for x in (hist, anc, tgt)):
         raise ValueError("history/anchor/target latents must be [T,C,H,W]")
     if anc.shape != tgt.shape:
-        raise ValueError("anchor and GT future latent shapes must match")
+        raise ValueError("anchor and target future latent shapes must match")
     if hist.shape[1:] != anc.shape[1:]:
         raise ValueError("history/future latent C,H,W must match")
     if tuple(anc.shape[-2:]) != tuple(latent_hw):
@@ -71,7 +91,7 @@ def validate_msp_wm_sample(
         raise ValueError(f"trajectory must be [{trajectory_length},2]")
 
     if require_write_support and "msp_write_support_latent" not in sample:
-        raise KeyError("P0-F4 requires msp_write_support_latent")
+        raise KeyError("this cache contract requires msp_write_support_latent")
     if "msp_write_support_latent" in sample:
         ws = sample["msp_write_support_latent"]
         expected = (int(anc.shape[0]), *tuple(latent_hw))
@@ -103,8 +123,16 @@ def save_msp_wm_shards(output_dir, samples, *, shard_size=64, metadata=None, ver
                 "scene_name": str(s["scene_name"]),
             })
 
+    is_v2 = version == MSP_WM_CACHE_VERSION_V2
+    is_v3 = version == MSP_WM_CACHE_VERSION_V3
     for sample in samples:
-        validate_msp_wm_sample(sample)
+        validate_msp_wm_sample(
+            sample,
+            require_full_history=is_v2 or is_v3,
+            require_write_support=is_v2 or is_v3,
+            require_gt_target=not is_v3,
+            require_repair_target=is_v3,
+        )
         shard.append(sample)
         if len(shard) >= int(shard_size):
             flush(shard, shard_id)
@@ -144,13 +172,16 @@ class MSPWorldModelCacheDataset(Dataset):
             self._shard_name = e["shard"]
         s = self._shard[e["index"]]
         is_v2 = self.version == MSP_WM_CACHE_VERSION_V2
+        is_v3 = self.version == MSP_WM_CACHE_VERSION_V3
         validate_msp_wm_sample(
             s,
             topk=self.metadata.get("topk"),
             latent_hw=tuple(self.metadata.get("latent_hw", [50, 50])),
             trajectory_length=int(self.metadata.get("trajectory_length", 12)),
-            require_full_history=is_v2,
-            require_write_support=is_v2,
+            require_full_history=is_v2 or is_v3,
+            require_write_support=is_v2 or is_v3,
+            require_gt_target=not is_v3,
+            require_repair_target=is_v3,
         )
         return s
 
@@ -159,12 +190,15 @@ def collate_msp_wm(batch):
     if not batch:
         raise ValueError("cannot collate empty MSP-WM batch")
     hkey = _history_key(batch[0])
+    tkey = _target_key(batch[0])
     if any(_history_key(s) != hkey for s in batch):
         raise ValueError("mixed MSP-WM history contracts in one batch")
+    if any(_target_key(s) != tkey for s in batch):
+        raise ValueError("mixed MSP-WM target contracts in one batch")
     tensor_keys = [
         hkey,
         "anchor_future_latent",
-        "gt_future_latent",
+        tkey,
         "window_origins",
         "window_valid",
         "trajectory",
