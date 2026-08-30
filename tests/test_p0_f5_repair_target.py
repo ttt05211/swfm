@@ -6,11 +6,11 @@ DYN = (2, 3, 4, 5, 6, 7, 9, 10)
 FREE = 17
 
 
-def test_repair_preserves_outside_support_and_static_inside():
+def test_repair_matches_frozen_dynamic_oracle_semantics():
     anchor = np.full((2, 4, 4, 2), FREE, dtype=np.uint8)
     proposal = anchor.copy()
 
-    # Static anchor semantic inside support must survive.
+    # Proposal dynamic is allowed to overwrite the anchor semantic inside support.
     anchor[0, 1, 1, 0] = 11
     proposal[0, 1, 1, 0] = 2
 
@@ -18,6 +18,10 @@ def test_repair_preserves_outside_support_and_static_inside():
     anchor[0, 1, 1, 1] = 2
     # New dynamic location is inserted from the proposal.
     proposal[0, 1, 2, 1] = 2
+
+    # Non-dynamic proposal semantics are never copied.
+    anchor[0, 1, 2, 0] = 12
+    proposal[0, 1, 2, 0] = 13
 
     # Outside support proposal content must never leak into the endpoint.
     proposal[0, 3, 3, 1] = 3
@@ -29,9 +33,10 @@ def test_repair_preserves_outside_support_and_static_inside():
         anchor, proposal, write, dynamic_class_ids=DYN, free_label=FREE
     )
 
-    assert out[0, 1, 1, 0] == 11
+    assert out[0, 1, 1, 0] == 2
     assert out[0, 1, 1, 1] == FREE
     assert out[0, 1, 2, 1] == 2
+    assert out[0, 1, 2, 0] == 12
     assert out[0, 3, 3, 1] == anchor[0, 3, 3, 1]
     assert np.array_equal(out[~write], anchor[~write])
 
