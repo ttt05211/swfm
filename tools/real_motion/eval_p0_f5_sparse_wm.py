@@ -37,6 +37,7 @@ REPAIR_CONTRACT = "strong_anchor_outside_support_gt_dynamic_inside_support_v1"
 EVAL_KEYS = (
     "eval_future_gt_occ",
     "eval_strong_anchor_occ",
+    "eval_repair_target_occ",
     "eval_gt_moving_support",
 )
 
@@ -167,6 +168,7 @@ def main():
 
         gt_future = s["eval_future_gt_occ"].cpu().numpy()
         anchor_future = s["eval_strong_anchor_occ"].cpu().numpy()
+        repair_target_future = s["eval_repair_target_occ"].cpu().numpy()
         moving_support = s["eval_gt_moving_support"].cpu().numpy().astype(bool)
         for h, fi in REPORT.items():
             gt = gt_future[fi]
@@ -189,6 +191,11 @@ def main():
                 dynamic_class_ids=DYNAMIC_CLASS_IDS,
                 free_label=FREE,
             )
+            if not np.array_equal(oracle, repair_target_future[fi]):
+                raise RuntimeError(
+                    f"{s['sample_id']} horizon={h}: cached P0-F5 training endpoint "
+                    "does not match the reported same-support GT repair oracle"
+                )
             _update(oracle_state, h, oracle, gt, moving_support[fi])
 
         if i % 8 == 0:
@@ -215,6 +222,7 @@ def main():
             "training_target": "Enc(occupancy-space Strong-W2Det-preserving sparse GT-dynamic repair endpoint)",
             "latent_loss_mask": "none",
             "fusion": "Strong W2Det exact default; decoded WM dynamic semantics may write only inside causal MSP horizon support",
+            "endpoint_oracle_consistency": "bit-exact checked on all reported horizons",
         },
         "strong_w2det_anchor": anchor_report,
         "trained_sparse_wm": model_report,
