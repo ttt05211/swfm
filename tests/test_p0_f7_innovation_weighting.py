@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn as nn
 
@@ -51,7 +52,7 @@ def test_optimizer_uses_small_lr_only_for_upstream_loaded_parameters():
         weight_decay=1e-2,
     )
     lrs = sorted(group["lr"] for group in optimizer.param_groups)
-    assert lrs == [2e-6, 2e-5]
+    assert lrs == pytest.approx([2e-6, 2e-5])
     assert summary["num_pretrained_tensors"] == 2
     assert summary["num_new_or_unloaded_tensors"] == 2
     assert set(summary["new_or_unloaded_names"]) == {
