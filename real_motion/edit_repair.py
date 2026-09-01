@@ -36,7 +36,7 @@ CLEAR = 1
 WRITE_OFFSET = 2
 NUM_ACTIONS = WRITE_OFFSET + len(DYNAMIC_IDS)  # KEEP, CLEAR, WRITE x8
 OCC_SHAPE = (6, 200, 200, 16)
-BEV_SHAPE = OCC_SHAPE[:-1]
+MOVING_SHAPE = OCC_SHAPE
 
 
 def _semantic_slots(occ: np.ndarray) -> np.ndarray:
@@ -83,16 +83,14 @@ def _stable_subsample(indices: np.ndarray, limit: int, key: str) -> np.ndarray:
     return indices[pick]
 
 
-def _moving_flags_for_flat(flat_indices: np.ndarray, moving_support_bev: np.ndarray) -> np.ndarray:
+def _moving_flags_for_flat(flat_indices: np.ndarray, moving_support: np.ndarray) -> np.ndarray:
+    """Read the frozen Moving-mIoU v2 voxel support at exact flattened voxels."""
     if flat_indices.size == 0:
         return np.zeros((0,), dtype=np.bool_)
-    stride = OCC_SHAPE[1] * OCC_SHAPE[2] * OCC_SHAPE[3]
-    rem = flat_indices.astype(np.int64, copy=False) % stride
-    t = flat_indices.astype(np.int64, copy=False) // stride
-    x = rem // (OCC_SHAPE[2] * OCC_SHAPE[3])
-    rem = rem % (OCC_SHAPE[2] * OCC_SHAPE[3])
-    y = rem // OCC_SHAPE[3]
-    return moving_support_bev[t, x, y].astype(np.bool_, copy=False)
+    moving = np.asarray(moving_support, dtype=bool)
+    if tuple(moving.shape) != MOVING_SHAPE:
+        raise ValueError(f"moving support must be {MOVING_SHAPE}, got {moving.shape}")
+    return moving.reshape(-1)[flat_indices.astype(np.int64, copy=False)].astype(np.bool_, copy=False)
 
 
 def build_anchor_relative_edit_record(
@@ -107,6 +105,9 @@ def build_anchor_relative_edit_record(
 ) -> dict:
     """Build exact deployment-aligned KEEP/CLEAR/WRITE supervision.
 
+    ``moving_support_bev`` keeps its legacy argument name for call compatibility,
+    but is the exact frozen Moving-mIoU v2 voxel support [T,X,Y,Z].
+
     All edit voxels inside the causal MSP support are retained. KEEP examples
     contain every correct dynamic anchor voxel plus a compact deterministic pool
     of background KEEP voxels near edits (then, if needed, elsewhere in support).
@@ -116,8 +117,8 @@ def build_anchor_relative_edit_record(
     moving = np.asarray(moving_support_bev, dtype=bool)
     if tuple(gt.shape) != OCC_SHAPE or tuple(anchor.shape) != OCC_SHAPE:
         raise ValueError(f"GT/anchor must be {OCC_SHAPE}, got {gt.shape}/{anchor.shape}")
-    if tuple(moving.shape) != BEV_SHAPE:
-        raise ValueError(f"moving support must be {BEV_SHAPE}, got {moving.shape}")
+    if tuple(moving.shape) != MOVING_SHAPE:
+        raise ValueError(f"moving support must be {MOVING_SHAPE}, got {moving.shape}")
 
     support_bev = latent_support_to_occ_bev_np(write_support_latent)
     support = np.broadcast_to(support_bev[..., None], OCC_SHAPE)
