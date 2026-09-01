@@ -1,14 +1,14 @@
 """Anchor-relative sparse edit supervision for P0-F8.
 
 P0-F8 predicts actions relative to the exact Strong-W2Det occupancy anchor:
-KEEP, CLEAR, or WRITE one of the eight motion-capable semantic classes.  The
+KEEP, CLEAR, or WRITE one of the eight motion-capable semantic classes. The
 training sidecar stores every dynamic EDIT voxel and a compact pool of hard KEEP
-voxels.  Balanced sampling keeps all edits while subsampling KEEP examples so
+voxels. Balanced sampling keeps all edits while subsampling KEEP examples so
 majority-class anchor preservation cannot swamp repair gradients.
 
 Lovasz supervision is applied to the *resulting* 9-way dynamic semantic
 probability after marginalizing the action probabilities through the anchor,
-rather than to action IDs themselves.  This makes the IoU surrogate match the
+rather than to action IDs themselves. This makes the IoU surrogate match the
 occupancy that would exist after applying the predicted edit.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from .metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from .occfm_io import file_sha256
-from .semantic_repair import collapse_dynamic_logits, latent_support_to_occ_bev_np
+from .semantic_repair import latent_support_to_occ_bev_np
 
 P0_F8_EDIT_CACHE_VERSION = "p0_f8_anchor_relative_edit_targets_v1"
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
@@ -70,7 +70,10 @@ def _near_bev(mask: np.ndarray, radius: int = 1) -> np.ndarray:
 
 
 def _stable_subsample(indices: np.ndarray, limit: int, key: str) -> np.ndarray:
-    if limit <= 0 or indices.size <= limit:
+    """Deterministically bound a sparse pool; zero means keep none."""
+    if limit <= 0:
+        return indices[:0]
+    if indices.size <= limit:
         return indices
     digest = hashlib.sha256(str(key).encode("utf-8")).digest()
     seed = int.from_bytes(digest[:8], "little", signed=False)
@@ -104,7 +107,7 @@ def build_anchor_relative_edit_record(
 ) -> dict:
     """Build exact deployment-aligned KEEP/CLEAR/WRITE supervision.
 
-    All edit voxels inside the causal MSP support are retained.  KEEP examples
+    All edit voxels inside the causal MSP support are retained. KEEP examples
     contain every correct dynamic anchor voxel plus a compact deterministic pool
     of background KEEP voxels near edits (then, if needed, elsewhere in support).
     """
@@ -137,9 +140,8 @@ def build_anchor_relative_edit_record(
     hard_keep_flat = np.flatnonzero(keep_dynamic.reshape(-1)).astype(np.int32, copy=False)
     hard_keep_a = a_slot.reshape(-1)[hard_keep_flat.astype(np.int64)].astype(np.uint8, copy=False)
 
-    # Background KEEP examples are useful because inference evaluates every voxel
-    # inside the write support. Prefer locations near an actual edit so these are
-    # hard negatives, then fill from the remaining support if the pool is small.
+    # Background KEEP examples matter because inference evaluates every voxel in
+    # write support. Prefer locations near a real edit, then fill from elsewhere.
     edit_bev = edit.any(axis=-1)
     near = _near_bev(edit_bev, radius=1)
     bg_keep = support & (a_slot == 0) & (g_slot == 0)
@@ -219,8 +221,8 @@ def validate_edit_record(record: dict) -> bool:
             if torch.unique(idx).numel() != idx.numel():
                 raise ValueError(f"P0-F8 {k} contains duplicates")
     if ne:
-        a = record["edit_actions"].long()
-        if int(a.min()) < CLEAR or int(a.max()) >= NUM_ACTIONS:
+        actions = record["edit_actions"].long()
+        if int(actions.min()) < CLEAR or int(actions.max()) >= NUM_ACTIONS:
             raise ValueError("P0-F8 edit actions must be CLEAR or WRITE")
         rs = record["edit_result_slots"].long()
         if int(rs.min()) < 0 or int(rs.max()) >= NUM_RESULT_CLASSES:
@@ -229,8 +231,8 @@ def validate_edit_record(record: dict) -> bool:
         x = record[k].long()
         if x.numel() and (int(x.min()) < 0 or int(x.max()) >= NUM_RESULT_CLASSES):
             raise ValueError(f"P0-F8 {k} out of range")
-    p = record["keep_priority"].long()
-    if p.numel() and (int(p.min()) < 0 or int(p.max()) > 2):
+    priority = record["keep_priority"].long()
+    if priority.numel() and (int(priority.min()) < 0 or int(priority.max()) > 2):
         raise ValueError("P0-F8 keep priority must be 0..2")
     return True
 
@@ -337,13 +339,10 @@ def action_probs_to_result_probs(
         raise ValueError("anchor slots out of range")
     p = F.softmax(action_logits.float(), dim=-1)
     result = p.new_zeros((p.shape[0], NUM_RESULT_CLASSES))
-    # CLEAR always maps to background.
     result[:, 0] = result[:, 0] + p[:, CLEAR]
-    # WRITE slot s maps to result slot s.
     for slot in range(1, NUM_RESULT_CLASSES):
         action = WRITE_OFFSET + slot - 1
         result[:, slot] = result[:, slot] + p[:, action]
-    # KEEP maps to the current anchor semantic slot.
     result.scatter_add_(1, anchor[:, None], p[:, KEEP:KEEP + 1])
     return result
 
@@ -415,8 +414,14 @@ def anchor_relative_edit_loss(
         edit = actions != KEEP
         keep = ~edit
         acc = (pred == actions).float().mean()
-        edit_acc = (pred[edit] == actions[edit]).float().mean() if bool(edit.any()) else torch.tensor(float("nan"))
-        false_edit = (pred[keep] != KEEP).float().mean() if bool(keep.any()) else torch.tensor(float("nan"))
+        edit_acc = (
+            (pred[edit] == actions[edit]).float().mean()
+            if bool(edit.any()) else torch.tensor(float("nan"))
+        )
+        false_edit = (
+            (pred[keep] != KEEP).float().mean()
+            if bool(keep.any()) else torch.tensor(float("nan"))
+        )
     return loss, {
         "ce": float(ce.detach().cpu()),
         "lovasz": float(lovasz.detach().cpu()),
@@ -459,7 +464,6 @@ def apply_anchor_relative_actions(
         mask = act == action
         if mask.any():
             flat[idx[mask]] = int(SLOT_TO_DYNAMIC[slot])
-    # KEEP and invalid CLEAR-on-static are exact no-ops by construction.
     return out
 
 
