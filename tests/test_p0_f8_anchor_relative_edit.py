@@ -34,8 +34,8 @@ def _toy_record(easy_keep_limit=0):
 
     support = torch.zeros(6, 50, 50, dtype=torch.bool)
     support[0, 0, 0] = True
-    moving = np.zeros((6, 200, 200), dtype=bool)
-    moving[0, 0, 0] = True
+    moving = np.zeros((6, 200, 200, 16), dtype=bool)
+    moving[0, 0, 0, 0] = True
     rec = build_anchor_relative_edit_record(
         sample_id="scene:sample",
         scene_name="scene",
@@ -70,8 +70,13 @@ def test_balanced_sampling_keeps_all_edits_and_prioritizes_hard_keep():
     assert sel["num_keeps"] == 3
     assert sel["actions"][:3].ne(KEEP).all()
     assert sel["actions"][3:].eq(KEEP).all()
-    # The first selected KEEP is the true-moving dynamic KEEP (priority 2).
+    # The first selected KEEP is the exact true-moving dynamic KEEP (priority 2).
     assert int(sel["anchor_slots"][3]) > 0
+
+
+def test_true_motion_priority_is_voxel_exact_not_bev_broadcast():
+    rec, _, _ = _toy_record(easy_keep_limit=0)
+    assert rec["keep_priority"].tolist() == [2]
 
 
 def test_action_probability_projection_is_anchor_relative():
