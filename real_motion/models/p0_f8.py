@@ -39,9 +39,12 @@ class AnchorRelativeEditHead(nn.Module):
         nn.init.normal_(self.horizon_embed.weight, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)
-        # Start close to exact anchor preservation while keeping a tiny gradient
-        # path from the edit objective back into semantic evidence / the WM.
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=1e-3)
+        # KEEP bias makes the initial argmax anchor-preserving.  The final-layer
+        # weights must nevertheless be large enough that edit supervision has a
+        # useful gradient path back through frozen decoder evidence into the WM;
+        # an almost-zero head would make shared-gradient lambda calibration
+        # artificially explode.
+        nn.init.normal_(self.fc2.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.fc2.bias)
         with torch.no_grad():
             self.fc2.bias[0] = float(keep_bias)
