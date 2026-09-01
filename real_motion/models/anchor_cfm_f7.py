@@ -31,8 +31,8 @@ class InnovationWeightedAnchorWindowCFM(AnchorWindowCFM):
             focus = energy / (energy + mean_energy)
 
         lies in [0,1]. Raw weights are ``1 + alpha * focus`` and are normalized
-        to mean 1 per sample. Therefore alpha=0 is exactly the P0-F6 uniform
-        MSE, while alpha>0 increases gradient share on true innovation without
+        to mean 1 per sample. Therefore alpha=0 gives uniform weights exactly,
+        while alpha>0 increases gradient share on true innovation without
         dropping supervision anywhere.
         """
         if alpha < 0:
@@ -122,26 +122,41 @@ class InnovationWeightedAnchorWindowCFM(AnchorWindowCFM):
         pred = self.transition(batch)["predicted_latent"][:, history.shape[1]:]
         pred = self._force_output_grad_dtype(pred)
         velocity_target = target - source
-        sq = (pred - velocity_target).float().square()
+        sq_native = (pred - velocity_target).square()
 
-        weight, weight_info = self.innovation_weights(
-            velocity_target,
-            alpha=float(innovation_weight_alpha),
-        )
-        weight_full = weight.expand(-1, -1, sq.shape[2], -1, -1)
-
-        if mask is None:
-            loss = (sq * weight_full).mean()
-            unweighted_loss = sq.mean()
-            metric_mask = None
+        # Preserve the exact P0-F6 FM reduction for the alpha=0 ablation.
+        if float(innovation_weight_alpha) == 0.0:
+            weight, weight_info = self.innovation_weights(velocity_target, alpha=0.0)
+            if mask is None:
+                loss = sq_native.mean()
+                unweighted_loss = loss
+                metric_mask = None
+            else:
+                denom = mask.sum()
+                if float(denom.detach().cpu()) <= 0:
+                    raise ValueError("loss_mask selects no latent elements")
+                loss = (sq_native * mask).sum() / denom
+                unweighted_loss = loss
+                metric_mask = mask
         else:
-            mf = mask.float()
-            denom = (mf * weight_full).sum()
-            if float(denom.detach().cpu()) <= 0:
-                raise ValueError("loss_mask selects no latent elements")
-            loss = (sq * mf * weight_full).sum() / denom
-            unweighted_loss = (sq * mf).sum() / mf.sum().clamp_min(1.0)
-            metric_mask = mask
+            sq = sq_native.float()
+            weight, weight_info = self.innovation_weights(
+                velocity_target,
+                alpha=float(innovation_weight_alpha),
+            )
+            weight_full = weight.expand(-1, -1, sq.shape[2], -1, -1)
+            if mask is None:
+                loss = (sq * weight_full).mean()
+                unweighted_loss = sq.mean()
+                metric_mask = None
+            else:
+                mf = mask.float()
+                denom = (mf * weight_full).sum()
+                if float(denom.detach().cpu()) <= 0:
+                    raise ValueError("loss_mask selects no latent elements")
+                loss = (sq * mf * weight_full).sum() / denom
+                unweighted_loss = (sq * mf).sum() / mf.sum().clamp_min(1.0)
+                metric_mask = mask
 
         with torch.no_grad():
             pf = pred.float()
