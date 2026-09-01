@@ -298,6 +298,19 @@ def _encode_batch(va, rows, *, device, pin_memory: bool):
     return out
 
 
+def _resolve_device(spec: str) -> torch.device:
+    """Resolve bare ``cuda`` to an indexed device accepted by set_device()."""
+    requested = torch.device(spec)
+    if requested.type != "cuda":
+        return requested
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    index = requested.index
+    if index is None:
+        index = int(torch.cuda.current_device())
+    return torch.device("cuda", index)
+
+
 @torch.inference_mode()
 def main():
     p = argparse.ArgumentParser()
@@ -337,9 +350,9 @@ def main():
         16, max(1, os.cpu_count() or 1)
     )
     prefetch = int(a.prefetch_windows) if int(a.prefetch_windows) > 0 else 4 * workers
-    device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
+    device = _resolve_device(a.device)
     if device.type == "cuda":
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(int(device.index))
 
     probe_meta, records, cfg = base._load_probe(a.msp_cache)
     msp_ck, msp = base._load_msp(a.msp_checkpoint, device)
