@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 import torch
 from torch.utils.data import Dataset
 
@@ -14,6 +15,13 @@ SUPPORTED_VERSIONS = {
     MSP_WM_CACHE_VERSION_V2,
     MSP_WM_CACHE_VERSION_V3,
 }
+
+# MSPWorldModelCacheDataset keeps one mutable shard cache.  A module-level lock
+# protects that small critical section when the fast F7 cache builder reads an
+# optional reuse dataset from several preparation threads.  DataLoader worker
+# processes each have their own lock, so normal multi-process training is not
+# serialized across processes.
+_SHARD_READ_LOCK = threading.RLock()
 
 COMMON_REQUIRED = (
     "sample_id",
@@ -167,10 +175,16 @@ class MSPWorldModelCacheDataset(Dataset):
 
     def __getitem__(self, idx):
         e = self.entries[int(idx)]
-        if e["shard"] != self._shard_name:
-            self._shard = torch.load(self.root / e["shard"], map_location="cpu", weights_only=False)
-            self._shard_name = e["shard"]
-        s = self._shard[e["index"]]
+        # Protect the coupled mutable (_shard_name, _shard) cache. Without this,
+        # thread A can load shard A, thread B can replace self._shard with shard B,
+        # and thread A can then index the wrong shard.
+        with _SHARD_READ_LOCK:
+            if e["shard"] != self._shard_name:
+                self._shard = torch.load(
+                    self.root / e["shard"], map_location="cpu", weights_only=False
+                )
+                self._shard_name = e["shard"]
+            s = self._shard[e["index"]]
         is_v2 = self.version == MSP_WM_CACHE_VERSION_V2
         is_v3 = self.version == MSP_WM_CACHE_VERSION_V3
         validate_msp_wm_sample(
