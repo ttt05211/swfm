@@ -1,9 +1,9 @@
 """P0-F7 innovation-weighted anchor-centered flow matching.
 
 This keeps the P0-F6 endpoint/semantic path unchanged and changes only the base
-FM reduction.  Every latent element remains supervised, but cells whose encoded
+FM reduction. Every latent element remains supervised, but cells whose encoded
 repair endpoint differs strongly from the Strong-W2Det anchor receive more
-relative weight.  The weights are bounded and normalized to unit mean per
+relative weight. The weights are bounded and normalized to unit mean per
 sample, so the global FM scale stays comparable to P0-F6.
 """
 from __future__ import annotations
@@ -26,12 +26,12 @@ class InnovationWeightedAnchorWindowCFM(AnchorWindowCFM):
         """Return unit-mean soft weights derived from target repair energy.
 
         ``velocity_target`` is ``Z_repair - Z_anchor`` after the model's latent
-        rescale.  Energy is channel RMS per latent cell.  The bounded focus
+        rescale. Energy is channel RMS per latent cell. The bounded focus
 
             focus = energy / (energy + mean_energy)
 
-        lies in [0,1].  Raw weights are ``1 + alpha * focus`` and are normalized
-        to mean 1 per sample.  Therefore alpha=0 is exactly the P0-F6 uniform
+        lies in [0,1]. Raw weights are ``1 + alpha * focus`` and are normalized
+        to mean 1 per sample. Therefore alpha=0 is exactly the P0-F6 uniform
         MSE, while alpha>0 increases gradient share on true innovation without
         dropping supervision anywhere.
         """
@@ -40,19 +40,19 @@ class InnovationWeightedAnchorWindowCFM(AnchorWindowCFM):
         if velocity_target.ndim != 5:
             raise ValueError("velocity_target must be [B,T,C,H,W]")
 
-        vf = velocity_target.float()
-        energy = vf.square().mean(dim=2, keepdim=True).add(float(eps)).sqrt()
+        vf = velocity_target.detach().float()
+        energy = vf.square().mean(dim=2, keepdim=True).sqrt()
         mean_energy = energy.mean(dim=(1, 3, 4), keepdim=True)
-        focus = energy / (energy + mean_energy.clamp_min(float(eps)))
+        focus = energy / (energy + mean_energy + float(eps))
         raw = 1.0 + float(alpha) * focus
         norm = raw.mean(dim=(1, 3, 4), keepdim=True).clamp_min(float(eps))
         weight = raw / norm
         info = {
-            "innovation_energy_mean": float(energy.mean().detach().cpu()),
-            "innovation_focus_mean": float(focus.mean().detach().cpu()),
-            "innovation_weight_mean": float(weight.mean().detach().cpu()),
-            "innovation_weight_max": float(weight.max().detach().cpu()),
-            "innovation_weight_min": float(weight.min().detach().cpu()),
+            "innovation_energy_mean": float(energy.mean().cpu()),
+            "innovation_focus_mean": float(focus.mean().cpu()),
+            "innovation_weight_mean": float(weight.mean().cpu()),
+            "innovation_weight_max": float(weight.max().cpu()),
+            "innovation_weight_min": float(weight.min().cpu()),
         }
         return weight, info
 
