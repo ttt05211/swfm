@@ -6,6 +6,7 @@ from real_motion.edit_repair_v2 import (
     select_stratified_balanced_edit_supervision,
     split_population_edit_loss,
 )
+from tools.real_motion.p0_f8_train_impl_v2 import edit_loss_for_endpoint_v2
 
 
 def _record(*, num_dynamic_keeps=4, num_background_keeps=4):
@@ -141,3 +142,59 @@ def test_full_pool_lovasz_penalizes_unsampled_background_false_write():
     assert good_info["pool_false_edit_rate"] == 0.0
     assert bad_info["pool_false_edit_rate"] > 0.0
     assert bad_info["balanced_false_edit_rate"] == 0.0
+
+
+class _FakeEditCache:
+    def __init__(self, record):
+        self.record = record
+
+    def get_batch(self, sample_ids):
+        assert list(sample_ids) == ["scene:sample"]
+        return [self.record]
+
+
+class _FakeVAE:
+    def decode_logits_at_flat_indices(self, endpoint, indices_per_sample):
+        scalar = endpoint.mean()
+        out = []
+        for idx in indices_per_sample:
+            n = int(idx.numel())
+            # Create differentiable semantic evidence whose class ordering varies
+            # with the endpoint value, so both CE and Lovasz have a gradient path.
+            basis = torch.arange(18, device=endpoint.device, dtype=endpoint.dtype)
+            out.append(scalar * basis.unsqueeze(0).expand(n, -1))
+        return out
+
+
+class _FakeModel:
+    def edit_head(self, semantic_logits, anchor_slots, horizons):
+        del anchor_slots, horizons
+        # Preserve a differentiable path from semantic evidence to ten actions.
+        return semantic_logits[:, :10]
+
+
+def test_v2_edit_loss_wires_full_pool_decoder_once_and_balanced_ce_subset():
+    rec = _record(num_dynamic_keeps=4, num_background_keeps=4)
+    endpoint = torch.ones((1, 6, 1, 1, 1), requires_grad=True)
+    loss, info = edit_loss_for_endpoint_v2(
+        _FakeModel(),
+        endpoint,
+        sample_ids=["scene:sample"],
+        edit_cache=_FakeEditCache(rec),
+        vae=_FakeVAE(),
+        keep_ratio=1.0,
+        keep_when_no_edit=64,
+        lovasz_weight=0.5,
+        deterministic=True,
+        selection_seed=7,
+    )
+    assert torch.isfinite(loss)
+    assert info["num_edits"] == 4
+    assert info["num_keeps"] == 4
+    assert info["num_dynamic_keeps"] == 2
+    assert info["num_background_keeps"] == 2
+    assert info["num_supervised_voxels"] == 8
+    assert info["num_lovasz_voxels"] == 12
+    loss.backward()
+    assert endpoint.grad is not None
+    assert torch.isfinite(endpoint.grad).all()
