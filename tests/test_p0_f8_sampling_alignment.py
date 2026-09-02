@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from real_motion.edit_repair import CLEAR, KEEP, WRITE_OFFSET
@@ -6,7 +8,11 @@ from real_motion.edit_repair_v2 import (
     select_stratified_balanced_edit_supervision,
     split_population_edit_loss,
 )
-from tools.real_motion.p0_f8_train_impl_v2 import edit_loss_for_endpoint_v2
+from tools.real_motion.p0_f8_train_impl_v2 import (
+    _merge_latest_train_v2_fields,
+    aggregate_edit_validation_infos,
+    edit_loss_for_endpoint_v2,
+)
 
 
 def _record(*, num_dynamic_keeps=4, num_background_keeps=4):
@@ -193,8 +199,98 @@ def test_v2_edit_loss_wires_full_pool_decoder_once_and_balanced_ce_subset():
     assert info["num_keeps"] == 4
     assert info["num_dynamic_keeps"] == 2
     assert info["num_background_keeps"] == 2
+    assert info["num_pool_keeps"] == 8
+    assert info["num_pool_dynamic_keeps"] == 4
+    assert info["num_pool_background_keeps"] == 4
     assert info["num_supervised_voxels"] == 8
     assert info["num_lovasz_voxels"] == 12
     loss.backward()
     assert endpoint.grad is not None
     assert torch.isfinite(endpoint.grad).all()
+
+
+def test_validation_aggregation_uses_each_population_size():
+    infos = [
+        {
+            "num_supervised_voxels": 10,
+            "num_lovasz_voxels": 100,
+            "num_edits": 5,
+            "num_keeps": 5,
+            "num_dynamic_keeps": 3,
+            "num_background_keeps": 2,
+            "num_pool_keeps": 80,
+            "num_pool_dynamic_keeps": 20,
+            "num_pool_background_keeps": 60,
+            "num_moving_edits": 2,
+            "ce": 1.0,
+            "lovasz": 0.2,
+            "accuracy": 0.8,
+            "edit_accuracy": 0.6,
+            "balanced_false_edit_rate": 0.4,
+            "pool_false_edit_rate": 0.1,
+            "false_edit_rate": 0.1,
+        },
+        {
+            "num_supervised_voxels": 90,
+            "num_lovasz_voxels": 10,
+            "num_edits": 45,
+            "num_keeps": 45,
+            "num_dynamic_keeps": 20,
+            "num_background_keeps": 25,
+            "num_pool_keeps": 5,
+            "num_pool_dynamic_keeps": 2,
+            "num_pool_background_keeps": 3,
+            "num_moving_edits": 10,
+            "ce": 3.0,
+            "lovasz": 0.8,
+            "accuracy": 0.4,
+            "edit_accuracy": 0.2,
+            "balanced_false_edit_rate": 0.2,
+            "pool_false_edit_rate": 0.9,
+            "false_edit_rate": 0.9,
+        },
+    ]
+    out = aggregate_edit_validation_infos(infos, lovasz_weight=0.5)
+
+    expected_ce = (1.0 * 10 + 3.0 * 90) / 100
+    expected_lovasz = (0.2 * 100 + 0.8 * 10) / 110
+    expected_pool_false = (0.1 * 80 + 0.9 * 5) / 85
+    expected_balanced_false = (0.4 * 5 + 0.2 * 45) / 50
+
+    assert math.isclose(out["edit_ce"], expected_ce, rel_tol=0, abs_tol=1e-12)
+    assert math.isclose(
+        out["result_lovasz"], expected_lovasz, rel_tol=0, abs_tol=1e-12
+    )
+    assert math.isclose(
+        out["edit_loss"], expected_ce + 0.5 * expected_lovasz,
+        rel_tol=0,
+        abs_tol=1e-12,
+    )
+    assert math.isclose(
+        out["pool_false_edit_rate"], expected_pool_false,
+        rel_tol=0,
+        abs_tol=1e-12,
+    )
+    assert math.isclose(
+        out["balanced_false_edit_rate"], expected_balanced_false,
+        rel_tol=0,
+        abs_tol=1e-12,
+    )
+    assert out["num_supervised_voxels"] == 100
+    assert out["num_lovasz_voxels"] == 110
+    assert out["num_pool_keeps"] == 85
+
+
+def test_v2_fields_are_persisted_into_latest_training_record():
+    history = [{"step": 200, "train": {"objective": 1.0}, "val": {}}]
+    fields = {
+        "balanced_false_edit_rate": 0.2,
+        "pool_false_edit_rate": 0.1,
+        "dynamic_keep_fraction_realized": 0.5,
+        "num_lovasz_voxels": 123,
+        "num_dynamic_keeps": 10,
+        "num_background_keeps": 10,
+    }
+    _merge_latest_train_v2_fields(history, fields)
+    for key, value in fields.items():
+        assert history[-1]["train"][key] == value
