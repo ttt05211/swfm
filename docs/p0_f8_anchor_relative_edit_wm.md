@@ -1,8 +1,14 @@
-# P0-F8: True-Motion Anchor-Relative Edit World Model
+# P0-F8 v2: True-Motion Anchor-Relative Edit World Model
 
-P0-F8 does **not** add another external router.  Strong W2Det, frozen Real-Motion/MSP Top-2 routing, 15% write support, full 6-frame history, 40×40 context, frozen VAE, and NFE=10 remain unchanged.
+P0-F8 does **not** add another external router. Strong W2Det, frozen Real-Motion/MSP Top-2 routing, 15% write support, full 6-frame history, 40×40 context, frozen VAE, and NFE=10 remain unchanged.
 
-The change is the decoder-aware objective and deployment parameterization:
+Current training protocol:
+
+```text
+p0_f8_anchor_relative_edit_wm_v2
+```
+
+The decoder-aware deployment parameterization is:
 
 ```text
 Strong W2Det anchor + full-history World Model
@@ -20,7 +26,7 @@ Strong W2Det anchor + full-history World Model
 
 ## Why this is different from P0-F6/F7
 
-P0-F6 predicts absolute dynamic semantics.  Even when the anchor is already correct, the WM must generate the correct class again.  P0-F8 instead predicts the minimal action relative to the exact Strong-W2Det anchor:
+P0-F6 predicts absolute dynamic semantics. Even when the anchor is already correct, the WM must generate the correct class again. P0-F8 instead predicts the minimal action relative to the exact Strong-W2Det anchor:
 
 ```text
 anchor car / GT car  -> KEEP
@@ -31,19 +37,27 @@ anchor car / GT bus  -> WRITE bus
 
 The edit head starts with a positive KEEP bias, so untrained behavior is close to exact anchor preservation.
 
-## Class imbalance handling
+## Class imbalance handling in v2
 
-Every EDIT voxel is always retained.  KEEP examples are subsampled at a fixed ratio (default 1:1) with priority:
+Every EDIT voxel is always retained for action CE. The total KEEP budget remains controlled by `--keep-ratio` (default `EDIT:KEEP = 1:1`), but KEEP is now **stratified** so background/non-dynamic KEEP cannot disappear from training.
 
-1. correct dynamic anchor voxels on true-moving GT support;
-2. other correct dynamic anchor voxels;
-3. compact background KEEP examples near actual edits, then elsewhere in support.
+With the frozen default:
 
-True-motion GT is used only to prioritize training negatives.  It is never an inference input.
+```text
+KEEP budget
+├─ 50% correct dynamic KEEP
+│  ├─ true-moving correct dynamic KEEP first
+│  └─ other correct dynamic KEEP second
+└─ 50% background / non-dynamic KEEP
+```
 
-## Loss
+If one stratum does not contain enough candidates, the shortage is filled from the other stratum so the requested total KEEP budget is preserved exactly.
 
-The latent flow loss returns to the P0-F6 uniform MSE:
+True-motion GT is used only to prioritize hard dynamic KEEP examples during training. It is never an inference input.
+
+## Loss and population contract
+
+The latent flow loss is the P0-F6 uniform MSE. P0-F7 innovation-energy weighting is not used.
 
 ```text
 L = L_FM + lambda_edit * L_edit
@@ -52,24 +66,78 @@ L = L_FM + lambda_edit * L_edit
 with
 
 ```text
-L_edit = CE(KEEP/CLEAR/WRITE) + beta * Lovasz(result semantic)
+L_edit = CE_balanced(KEEP/CLEAR/WRITE)
+       + beta * Lovasz_full_pool(result semantic)
 ```
 
-Lovasz is not applied to action IDs directly.  Action probabilities are first marginalized through the anchor into the resulting 9-way semantic distribution:
+Default:
+
+```text
+beta = 0.5
+```
+
+The two edit terms intentionally use different populations:
+
+```text
+CE population:
+  all EDIT + stratified balanced KEEP
+
+Lovasz population:
+  complete compact sidecar pool
+  = all EDIT + all dynamic KEEP + bounded background KEEP
+```
+
+Lovasz is not applied to action IDs directly. Action probabilities are marginalized through the exact anchor into the resulting 9-way semantic distribution:
 
 ```text
 background + 8 dynamic classes
 ```
 
-so the IoU surrogate is closer to the occupancy that would exist after applying the edit.
+This makes the IoU surrogate closer to the occupancy produced after applying KEEP/CLEAR/WRITE.
 
-`lambda_edit` is gradient-calibrated once and then frozen.  Default `beta=0.5`.
+`lambda_edit` is gradient-calibrated once on shared transition parameters and then frozen.
+
+## Validation aggregation in v2
+
+Validation must respect the same population split. P0-F8 v2 therefore aggregates:
+
+```text
+CE                    weighted by balanced CE voxel count
+Lovasz                weighted by full compact-pool voxel count
+balanced false-edit   weighted by sampled KEEP count
+pool false-edit       weighted by full compact KEEP count
+```
+
+The validation edit objective is reconstructed as:
+
+```text
+val_edit = mean_balanced_CE + beta * mean_full_pool_Lovasz
+val_objective = mean_FM + lambda_edit * val_edit
+```
+
+`best.pt` is selected using this corrected `val_objective`. All scheduled step checkpoints are still saved, and final model selection should use deployment metrics rather than validation objective alone.
+
+Important v2 statistics retained in checkpoint/training history and validation records include:
+
+```text
+balanced_false_edit_rate
+pool_false_edit_rate
+dynamic_keep_fraction_realized
+num_lovasz_voxels
+num_dynamic_keeps
+num_background_keeps
+num_pool_keeps
+num_pool_dynamic_keeps
+num_pool_background_keeps
+```
+
+`false_edit_rate` is kept as a backward-compatible alias for the deployment-like `pool_false_edit_rate`.
 
 ---
 
 ## 1. Build the 4096-window training edit sidecar
 
-The expensive WM latent cache is reused.  Only exact Strong-W2Det / GT edit labels are rebuilt.
+The expensive WM latent cache is reused. Only exact Strong-W2Det / GT edit labels are built.
 
 ```bash
 cd /root/nas/occ/swfm
@@ -94,9 +162,9 @@ If interrupted, append:
 
 This step does **not** rebuild VAE latents and does not retrain MSP.
 
-## 2. Build the validation edit sidecar
+Existing P0-F8 v1-format edit sidecars are compatible with v2 sampling/validation logic and do not need to be rebuilt.
 
-The frozen 128-window validation cache already contains GT, exact Strong-W2Det anchor, and true-moving support, so no raw recomputation is needed:
+## 2. Build the validation edit sidecar
 
 ```bash
 python tools/real_motion/build_p0_f8_edit_targets_fast.py \
@@ -106,9 +174,7 @@ python tools/real_motion/build_p0_f8_edit_targets_fast.py \
   --prefetch-samples 32
 ```
 
-## 3. Train P0-F8
-
-Main run:
+## 3. Train P0-F8 v2
 
 ```bash
 python tools/real_motion/train_p0_f8_anchor_relative_edit_wm.py \
@@ -149,9 +215,9 @@ best.pt
 last.pt
 ```
 
-No manual checkpoint copy is needed.
+Do not resume a P0-F8 v1 checkpoint into v2. The protocol field is intentionally different.
 
-Important training logs:
+Important standard console logs remain:
 
 ```text
 edit_lambda_calibration ...
@@ -161,11 +227,14 @@ false_edit=...
 E/K=.../...
 ```
 
+At validation steps, the JSON record additionally exposes the v2 population statistics listed above. The same v2-only training statistics are persisted into the validation-step `training_history[*].train` record inside checkpoints and `training_report.json`.
+
 The intended behavior is:
 
 - `edit_accuracy` rises;
-- `false_edit_rate` stays low;
-- EDIT and KEEP counts remain approximately balanced;
+- `pool_false_edit_rate` stays low;
+- `dynamic_keep_fraction_realized` stays near 0.5 when both KEEP strata are sufficiently populated;
+- `num_lovasz_voxels >= num_supervised_voxels` in the usual case;
 - deployment metrics, not validation objective alone, choose the final checkpoint.
 
 ## 4. Evaluate 200–1200
@@ -185,7 +254,7 @@ for STEP in 200 400 600 800 1000 1200; do
 done
 ```
 
-Each report includes:
+Each deployment report includes:
 
 ```text
 Overall mIoU / delta Overall
@@ -197,11 +266,11 @@ changed fraction of causal support
 same-support GT oracle
 ```
 
-The success criterion remains:
+Success criterion:
 
 ```text
 Delta Overall >= 0
 Delta Moving  > 0
 ```
 
-and the main question is whether explicit KEEP/CLEAR/WRITE increases repair gain without recreating the 1s anchor harm seen in P0-F6/F7.
+The main question is whether explicit anchor-relative KEEP/CLEAR/WRITE increases repair gain without recreating the 1s anchor harm seen in P0-F6/F7.
