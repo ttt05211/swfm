@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 UP = ROOT / "upstream_occfm"
 sys.path[:0] = [str(ROOT), str(UP)]
 
-from tools.real_motion.p0_f8_train_impl import F8_PROTOCOL, main
+from tools.real_motion.p0_f8_train_impl_v2 import F8_PROTOCOL, main
 
 __all__ = ["F8_PROTOCOL", "main"]
 
