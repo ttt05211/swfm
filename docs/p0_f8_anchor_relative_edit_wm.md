@@ -1,5 +1,9 @@
 # P0-F8 v2: True-Motion Anchor-Relative Edit World Model
 
+Before the full 1200-step causal run, execute the real-GPU smoke and the
+non-causal teacher-endpoint decision gate documented in
+[`p0_f8_v2_smoke_and_teacher_ceiling.md`](p0_f8_v2_smoke_and_teacher_ceiling.md).
+
 P0-F8 does **not** add another external router. Strong W2Det, frozen Real-Motion/MSP Top-2 routing, 15% write support, full 6-frame history, 40×40 context, frozen VAE, and NFE=10 remain unchanged.
 
 Current training protocol:
