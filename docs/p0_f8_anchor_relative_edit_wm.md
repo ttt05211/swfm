@@ -266,9 +266,18 @@ Moving-mIoU / delta Moving
 Overall @1s/2s/3s
 Moving @1s/2s/3s
 action histogram
-changed fraction of causal support
+raw and effective action histograms
+raw edit and effective change fractions of causal support
+no-op CLEAR/WRITE counts
+effective false-edit rate on same-support target KEEP voxels
 same-support GT oracle
 ```
+
+`action_histogram` is retained as a backward-compatible alias for
+`raw_action_histogram`.  Raw `CLEAR` on a non-dynamic anchor and raw `WRITE`
+of the existing dynamic class are deployed no-ops, so use
+`effective_action_histogram` and `effective_edit_fraction_of_support` when
+interpreting how much the final occupancy actually changed.
 
 Success criterion:
 

@@ -468,6 +468,140 @@ def apply_anchor_relative_actions(
     return out
 
 
+def new_effective_action_stats() -> dict:
+    """Create an accumulator for raw actions and their deployed effects."""
+    return {
+        "raw_action_counts": np.zeros(NUM_ACTIONS, dtype=np.int64),
+        "effective_action_counts": np.zeros(NUM_ACTIONS, dtype=np.int64),
+        "support_voxels": 0,
+        "changed_voxels": 0,
+        "noop_clear_non_dynamic": 0,
+        "noop_write_same_class": 0,
+        "target_keep_voxels": 0,
+        "effective_false_edit_voxels": 0,
+    }
+
+
+def update_effective_action_stats(
+    state: dict,
+    *,
+    anchor_occ: np.ndarray,
+    final_occ: np.ndarray,
+    repair_target_occ: np.ndarray,
+    flat_indices: np.ndarray,
+    actions: np.ndarray,
+) -> None:
+    """Accumulate raw predictions and output-changing action statistics.
+
+    ``CLEAR`` on a non-dynamic anchor and ``WRITE`` of the existing dynamic
+    class are deployed no-ops.  They remain visible in the raw histogram but
+    are counted as ``UNCHANGED`` in the effective histogram.  Effective false
+    edits are output changes at support voxels where the same-support repair
+    target equals the Strong-W2Det anchor.
+    """
+    anchor = np.asarray(anchor_occ)
+    final = np.asarray(final_occ)
+    target = np.asarray(repair_target_occ)
+    if tuple(anchor.shape) != OCC_SHAPE:
+        raise ValueError(f"anchor must be {OCC_SHAPE}")
+    if final.shape != anchor.shape or target.shape != anchor.shape:
+        raise ValueError("final and repair target must match anchor shape")
+
+    idx = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    act = np.asarray(actions, dtype=np.int64).reshape(-1)
+    if idx.size != act.size:
+        raise ValueError("action index/value length mismatch")
+    if idx.size == 0:
+        return
+    if idx.min() < 0 or idx.max() >= anchor.size:
+        raise ValueError("action index out of range")
+    if act.min() < 0 or act.max() >= NUM_ACTIONS:
+        raise ValueError("action value out of range")
+
+    anchor_values = anchor.reshape(-1)[idx]
+    final_values = final.reshape(-1)[idx]
+    target_values = target.reshape(-1)[idx]
+    changed = final_values != anchor_values
+    if bool(np.any(changed & (act == KEEP))):
+        raise ValueError("KEEP action changed deployed occupancy")
+
+    raw_counts = np.bincount(act, minlength=NUM_ACTIONS).astype(np.int64)
+    state["raw_action_counts"] += raw_counts
+    state["effective_action_counts"][KEEP] += int((~changed).sum())
+    for action in range(CLEAR, NUM_ACTIONS):
+        state["effective_action_counts"][action] += int(
+            np.count_nonzero(changed & (act == action))
+        )
+
+    target_keep = target_values == anchor_values
+    state["support_voxels"] += int(idx.size)
+    state["changed_voxels"] += int(changed.sum())
+    state["noop_clear_non_dynamic"] += int(
+        np.count_nonzero((act == CLEAR) & ~changed)
+    )
+    state["noop_write_same_class"] += int(
+        np.count_nonzero((act >= WRITE_OFFSET) & ~changed)
+    )
+    state["target_keep_voxels"] += int(target_keep.sum())
+    state["effective_false_edit_voxels"] += int(
+        np.count_nonzero(changed & target_keep)
+    )
+
+
+def report_effective_action_stats(state: dict) -> dict:
+    """Return JSON-safe raw/effective action metrics with legacy aliases."""
+    names = ["KEEP", "CLEAR"] + [f"WRITE:{cid}" for cid in DYNAMIC_IDS]
+    raw = np.asarray(state["raw_action_counts"], dtype=np.int64)
+    effective = np.asarray(state["effective_action_counts"], dtype=np.int64)
+    support = int(state["support_voxels"])
+    changed = int(state["changed_voxels"])
+    target_keep = int(state["target_keep_voxels"])
+    false_edits = int(state["effective_false_edit_voxels"])
+    effective_clear = int(effective[CLEAR])
+    effective_write = int(effective[WRITE_OFFSET:].sum())
+    raw_histogram = {names[i]: int(raw[i]) for i in range(NUM_ACTIONS)}
+    effective_histogram = {
+        "UNCHANGED": int(effective[KEEP]),
+        **{names[i]: int(effective[i]) for i in range(CLEAR, NUM_ACTIONS)},
+    }
+    return {
+        # Backward-compatible alias.  This is intentionally the raw head output.
+        "action_histogram": raw_histogram,
+        "raw_action_histogram": raw_histogram,
+        "effective_action_histogram": effective_histogram,
+        "support_voxels": support,
+        "raw_edit_voxels": int(raw[CLEAR:].sum()),
+        "raw_edit_fraction_of_support": float(
+            raw[CLEAR:].sum() / max(support, 1)
+        ),
+        "effective_edit_voxels": changed,
+        "effective_edit_fraction_of_support": float(changed / max(support, 1)),
+        # Preserve historical names while making the effective meaning explicit.
+        "changed_voxels": changed,
+        "changed_fraction_of_support": float(changed / max(support, 1)),
+        "effective_clear_voxels": effective_clear,
+        "effective_clear_fraction_of_support": float(
+            effective_clear / max(support, 1)
+        ),
+        "effective_write_voxels": effective_write,
+        "effective_write_fraction_of_support": float(
+            effective_write / max(support, 1)
+        ),
+        "noop_clear_non_dynamic": int(state["noop_clear_non_dynamic"]),
+        "noop_write_same_class": int(state["noop_write_same_class"]),
+        "target_keep_voxels": target_keep,
+        "effective_false_edit_voxels": false_edits,
+        "effective_false_edit_rate": (
+            float(false_edits / target_keep) if target_keep > 0 else None
+        ),
+        "effective_action_semantics": (
+            "UNCHANGED includes raw KEEP plus deployed no-op CLEAR/WRITE; "
+            "effective false edits change voxels whose same-support repair "
+            "target equals the Strong-W2Det anchor"
+        ),
+    }
+
+
 class EditTargetCache:
     def __init__(self, path):
         self.path = Path(path)

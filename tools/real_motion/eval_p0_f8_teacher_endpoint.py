@@ -16,9 +16,11 @@ import torch
 
 from real_motion.edit_repair import (
     DYNAMIC_IDS,
-    NUM_ACTIONS,
     apply_anchor_relative_actions,
     horizon_from_flat_indices,
+    new_effective_action_stats,
+    report_effective_action_stats,
+    update_effective_action_stats,
 )
 from real_motion.msp import latent_support_to_bev
 from real_motion.msp_wm_cache import (
@@ -147,11 +149,9 @@ def main() -> None:
     anchor_state = common._new_metrics()
     teacher_state = common._new_metrics()
     oracle_state = common._new_metrics()
-    action_counts = np.zeros(NUM_ACTIONS, dtype=np.int64)
+    action_stats = new_effective_action_stats()
     write_ratios = []
     valid_windows = []
-    total_support_voxels = 0
-    changed_voxels = 0
 
     for i in range(len(ds)):
         sample = ds[i]
@@ -202,15 +202,19 @@ def main() -> None:
         final_all = apply_anchor_relative_actions(
             anchor_future, support_idx_np, actions_np, free_label=FREE
         )
-        for action in range(NUM_ACTIONS):
-            action_counts[action] += int((actions_np == action).sum())
-        total_support_voxels += int(actions_np.size)
-        changed_voxels += int(np.count_nonzero(final_all != anchor_future))
+        repair_target = sample["eval_repair_target_occ"].cpu().numpy()
+        update_effective_action_stats(
+            action_stats,
+            anchor_occ=anchor_future,
+            final_occ=final_all,
+            repair_target_occ=repair_target,
+            flat_indices=support_idx_np,
+            actions=actions_np,
+        )
         write_ratios.append(float(write_lat.float().mean().item()))
         valid_windows.append(int(sample["window_valid"].sum().item()))
 
         gt_future = sample["eval_future_gt_occ"].cpu().numpy()
-        repair_target = sample["eval_repair_target_occ"].cpu().numpy()
         moving_support = sample["eval_gt_moving_support"].cpu().numpy().astype(bool)
         for horizon, frame_index in common.REPORT.items():
             gt = gt_future[frame_index]
@@ -251,7 +255,7 @@ def main() -> None:
     oracle_moving = float(oracle_report["moving"]["mIoU"])
     anchor_overall = float(anchor_report["overall"]["mIoU"])
     teacher_overall = float(teacher_report["overall"]["mIoU"])
-    names = ["KEEP", "CLEAR"] + [f"WRITE:{cid}" for cid in DYNAMIC_IDS]
+    action_report = report_effective_action_stats(action_stats)
 
     report = {
         "protocol": {
@@ -271,15 +275,7 @@ def main() -> None:
                 "exact Strong W2Det default; KEEP/CLEAR/WRITE only inside "
                 "the identical causal MSP support"
             ),
-            "action_histogram": {
-                names[index]: int(action_counts[index])
-                for index in range(NUM_ACTIONS)
-            },
-            "support_voxels": int(total_support_voxels),
-            "changed_voxels": int(changed_voxels),
-            "changed_fraction_of_support": float(
-                changed_voxels / max(total_support_voxels, 1)
-            ),
+            **action_report,
             "endpoint_oracle_consistency": "bit-exact checked on reported horizons",
         },
         "strong_w2det_anchor": anchor_report,

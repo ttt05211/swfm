@@ -13,7 +13,10 @@ from real_motion.edit_repair import (
     build_anchor_relative_edit_record,
     horizon_from_flat_indices,
     lovasz_softmax_flat,
+    new_effective_action_stats,
+    report_effective_action_stats,
     select_balanced_edit_supervision,
+    update_effective_action_stats,
 )
 from real_motion.models.p0_f8 import AnchorRelativeEditHead
 
@@ -130,6 +133,48 @@ def test_apply_actions_changes_only_requested_voxels():
     changed = np.flatnonzero(flat_a != flat_o)
     assert set(changed.tolist()) == set(idx.tolist())
     assert np.all(flat_o[idx] != flat_a[idx])
+
+
+def test_effective_action_stats_separate_raw_noops_and_false_edits():
+    free = 17
+    dynamic = int(DYNAMIC_IDS[0])
+    anchor = np.full((6, 200, 200, 16), free, dtype=np.uint8)
+    anchor.reshape(-1)[[0, 3, 4]] = dynamic
+    idx = np.arange(5, dtype=np.int64)
+    actions = np.asarray(
+        [CLEAR, CLEAR, WRITE_OFFSET, WRITE_OFFSET, KEEP], dtype=np.int64
+    )
+    final = apply_anchor_relative_actions(anchor, idx, actions, free_label=free)
+    target = anchor.copy()
+    target.reshape(-1)[0] = free
+
+    state = new_effective_action_stats()
+    update_effective_action_stats(
+        state,
+        anchor_occ=anchor,
+        final_occ=final,
+        repair_target_occ=target,
+        flat_indices=idx,
+        actions=actions,
+    )
+    report = report_effective_action_stats(state)
+
+    assert report["action_histogram"] == report["raw_action_histogram"]
+    assert report["raw_action_histogram"]["KEEP"] == 1
+    assert report["raw_action_histogram"]["CLEAR"] == 2
+    assert report["raw_action_histogram"][f"WRITE:{dynamic}"] == 2
+    assert report["effective_action_histogram"]["UNCHANGED"] == 3
+    assert report["effective_action_histogram"]["CLEAR"] == 1
+    assert report["effective_action_histogram"][f"WRITE:{dynamic}"] == 1
+    assert report["noop_clear_non_dynamic"] == 1
+    assert report["noop_write_same_class"] == 1
+    assert report["effective_edit_voxels"] == 2
+    assert report["effective_edit_fraction_of_support"] == 0.4
+    assert report["effective_clear_fraction_of_support"] == 0.2
+    assert report["effective_write_fraction_of_support"] == 0.2
+    assert report["target_keep_voxels"] == 4
+    assert report["effective_false_edit_voxels"] == 1
+    assert report["effective_false_edit_rate"] == 0.25
 
 
 def test_horizon_from_flat_indices():
