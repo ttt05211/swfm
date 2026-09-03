@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from real_motion.edit_repair import (
@@ -19,6 +20,12 @@ from real_motion.edit_repair import (
     update_effective_action_stats,
 )
 from real_motion.models.p0_f8 import AnchorRelativeEditHead
+from tools.real_motion.eval_p0_f8_anchor_relative_edit_wm import (
+    actions_with_keep_margin,
+    margin_decision_gate,
+    normalize_keep_logit_margins,
+    select_passing_margin,
+)
 
 
 def _toy_record(easy_keep_limit=0):
@@ -181,3 +188,71 @@ def test_horizon_from_flat_indices():
     stride = 200 * 200 * 16
     idx = torch.tensor([0, stride - 1, stride, 5 * stride])
     assert horizon_from_flat_indices(idx).tolist() == [0, 0, 1, 5]
+
+
+def test_keep_logit_margin_conservatively_flips_borderline_edit_to_keep():
+    logits = torch.full((2, NUM_ACTIONS), -2.0)
+    logits[:, KEEP] = 0.0
+    logits[0, CLEAR] = 0.4
+    logits[1, CLEAR] = 0.6
+    assert actions_with_keep_margin(logits, 0.0).tolist() == [CLEAR, CLEAR]
+    assert actions_with_keep_margin(logits, 0.5).tolist() == [KEEP, CLEAR]
+    assert normalize_keep_logit_margins([0, 0.5, 1]) == [0.0, 0.5, 1.0]
+    with pytest.raises(ValueError):
+        normalize_keep_logit_margins([0.5, 0.5])
+    with pytest.raises(ValueError):
+        actions_with_keep_margin(logits, -0.1)
+
+
+def _metric_report(overall, moving, moving_1s):
+    return {
+        "overall": {"mIoU": float(overall)},
+        "moving": {
+            "mIoU": float(moving),
+            "per_horizon": {1.0: {"mIoU": float(moving_1s)}},
+        },
+    }
+
+
+def test_margin_gate_and_selection_never_select_a_gate_failure():
+    anchor = _metric_report(40.0, 20.0, 22.0)
+    failed_report = _metric_report(39.9, 22.0, 22.5)
+    passed_report = _metric_report(40.1, 21.0, 21.7)
+    failed_gate = margin_decision_gate(
+        anchor_report=anchor,
+        trained_report=failed_report,
+        min_delta_overall=0.0,
+        min_delta_moving=0.0,
+        min_delta_moving_1s=-0.5,
+    )
+    passed_gate = margin_decision_gate(
+        anchor_report=anchor,
+        trained_report=passed_report,
+        min_delta_overall=0.0,
+        min_delta_moving=0.0,
+        min_delta_moving_1s=-0.5,
+    )
+    assert failed_gate["status"] == "FAIL"
+    assert passed_gate["status"] == "PASS"
+    results = [
+        {
+            "keep_logit_margin": 0.0,
+            "delta_Overall_vs_strong_anchor": -0.1,
+            "delta_Moving_vs_strong_anchor": 2.0,
+            "action_statistics": {"effective_false_edit_rate": 0.1},
+            "decision_gate": failed_gate,
+        },
+        {
+            "keep_logit_margin": 0.5,
+            "delta_Overall_vs_strong_anchor": 0.1,
+            "delta_Moving_vs_strong_anchor": 1.0,
+            "action_statistics": {"effective_false_edit_rate": 0.02},
+            "decision_gate": passed_gate,
+        },
+    ]
+    selection = select_passing_margin(results)
+    assert selection["status"] == "PASS"
+    assert selection["selected_margin"] == 0.5
+    no_pass = select_passing_margin(results[:1])
+    assert no_pass["status"] == "FAIL"
+    assert no_pass["selected_margin"] is None

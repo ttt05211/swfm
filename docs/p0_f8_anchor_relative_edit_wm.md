@@ -282,6 +282,34 @@ for STEP in 200 400 600 800 1000 1200; do
 done
 ```
 
+### Diagnose edit calibration with a one-pass KEEP-margin sweep
+
+If a checkpoint predicts nonzero edits but harms the Strong-W2Det anchor, sweep
+an inference-only additive KEEP-logit margin before spending more training
+steps. The causal WM sample, sparse VAE decode, and edit-head logits are computed
+once per window and shared by every margin:
+
+```bash
+python tools/real_motion/eval_p0_f8_anchor_relative_edit_wm.py \
+  --cache "$VAL" \
+  --vae-ckpt "$VAE" \
+  --sparse-ckpt "$OUT/step_0200.pt" \
+  --output "$OUT/keep_margin_sweep_200.json" \
+  --keep-logit-margins 0 0.25 0.5 0.75 1.0 1.5 2.0 \
+  --min-delta-overall 0.0 \
+  --min-delta-moving 0.0 \
+  --min-delta-moving-1s -0.5 \
+  --amp
+```
+
+Each `margin_results` entry contains deployment metrics, raw/effective action
+statistics, and its point-estimate decision gate. `selection.selected_margin`
+is populated only when at least one margin satisfies all predeclared checks.
+Among passing margins, ranking is frozen to Moving delta, Overall delta, lower
+effective false-edit rate, then lower margin. Do not treat this validation-cache
+sweep as an unbiased final result: lock the selected margin before an independent
+evaluation or paired scene bootstrap.
+
 Each deployment report includes:
 
 ```text

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from real_motion.context import crop_prediction_and_context
 from real_motion.edit_repair import (
     DYNAMIC_IDS,
     DYNAMIC_TO_SLOT,
+    KEEP,
     apply_anchor_relative_actions,
     horizon_from_flat_indices,
     new_effective_action_stats,
@@ -49,6 +51,7 @@ EVAL_KEYS = (
     "eval_repair_target_occ",
     "eval_gt_moving_support",
 )
+SWEEP_PROTOCOL = "p0_f8_keep_logit_margin_sweep_v1"
 
 
 def _new_metrics():
@@ -87,6 +90,110 @@ def _support_flat_indices(write_bev: np.ndarray, depth: int = 16) -> np.ndarray:
     return np.flatnonzero(support.reshape(-1)).astype(np.int64, copy=False)
 
 
+def normalize_keep_logit_margins(values) -> list[float]:
+    margins = [float(x) for x in values]
+    if not margins:
+        raise ValueError("at least one keep-logit margin is required")
+    if any(not math.isfinite(x) or x < 0.0 for x in margins):
+        raise ValueError("keep-logit margins must be finite and non-negative")
+    if len(set(margins)) != len(margins):
+        raise ValueError("keep-logit margins must be unique")
+    return margins
+
+
+def actions_with_keep_margin(
+    action_logits: torch.Tensor,
+    keep_logit_margin: float,
+) -> torch.Tensor:
+    """Apply a conservative inference-only bias to KEEP before argmax."""
+    margin = float(keep_logit_margin)
+    if not math.isfinite(margin) or margin < 0.0:
+        raise ValueError("keep-logit margin must be finite and non-negative")
+    adjusted = action_logits.clone()
+    adjusted[:, KEEP] = adjusted[:, KEEP] + margin
+    return adjusted.argmax(dim=-1)
+
+
+def margin_decision_gate(
+    *,
+    anchor_report: dict,
+    trained_report: dict,
+    min_delta_overall: float,
+    min_delta_moving: float,
+    min_delta_moving_1s: float,
+) -> dict:
+    delta_overall = float(
+        trained_report["overall"]["mIoU"] - anchor_report["overall"]["mIoU"]
+    )
+    delta_moving = float(
+        trained_report["moving"]["mIoU"] - anchor_report["moving"]["mIoU"]
+    )
+    delta_moving_1s = float(
+        trained_report["moving"]["per_horizon"][1.0]["mIoU"]
+        - anchor_report["moving"]["per_horizon"][1.0]["mIoU"]
+    )
+    checks = {
+        "delta_Overall": {
+            "value": delta_overall,
+            "minimum": float(min_delta_overall),
+            "comparison": ">=",
+            "pass": bool(delta_overall >= float(min_delta_overall)),
+        },
+        "delta_Moving": {
+            "value": delta_moving,
+            "minimum_exclusive": float(min_delta_moving),
+            "comparison": ">",
+            "pass": bool(delta_moving > float(min_delta_moving)),
+        },
+        "delta_Moving_1s": {
+            "value": delta_moving_1s,
+            "minimum": float(min_delta_moving_1s),
+            "comparison": ">=",
+            "pass": bool(delta_moving_1s >= float(min_delta_moving_1s)),
+        },
+    }
+    return {
+        "status": "PASS" if all(x["pass"] for x in checks.values()) else "FAIL",
+        "checks": checks,
+    }
+
+
+def select_passing_margin(results: list[dict]) -> dict:
+    """Select only among predeclared gate passes, with deterministic ranking."""
+    passing = [item for item in results if item["decision_gate"]["status"] == "PASS"]
+    best_moving = max(results, key=lambda x: float(x["delta_Moving_vs_strong_anchor"]))
+    best_overall = max(results, key=lambda x: float(x["delta_Overall_vs_strong_anchor"]))
+    if not passing:
+        return {
+            "status": "FAIL",
+            "selected_margin": None,
+            "passing_margins": [],
+            "best_delta_moving_margin": float(best_moving["keep_logit_margin"]),
+            "best_delta_overall_margin": float(best_overall["keep_logit_margin"]),
+            "ranking": "no selection outside the predeclared gate",
+        }
+    selected = max(
+        passing,
+        key=lambda x: (
+            float(x["delta_Moving_vs_strong_anchor"]),
+            float(x["delta_Overall_vs_strong_anchor"]),
+            -float(x["action_statistics"]["effective_false_edit_rate"]),
+            -float(x["keep_logit_margin"]),
+        ),
+    )
+    return {
+        "status": "PASS",
+        "selected_margin": float(selected["keep_logit_margin"]),
+        "passing_margins": [float(x["keep_logit_margin"]) for x in passing],
+        "best_delta_moving_margin": float(best_moving["keep_logit_margin"]),
+        "best_delta_overall_margin": float(best_overall["keep_logit_margin"]),
+        "ranking": (
+            "among gate passes: delta Moving desc, delta Overall desc, "
+            "effective false-edit rate asc, margin asc"
+        ),
+    }
+
+
 @torch.no_grad()
 def main():
     p = argparse.ArgumentParser()
@@ -97,9 +204,25 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--action-chunk", type=int, default=65536)
+    p.add_argument(
+        "--keep-logit-margins",
+        type=float,
+        nargs="+",
+        default=[0.0],
+        help=(
+            "Inference-only margins added to the KEEP logit. Multiple values are "
+            "evaluated in one causal-WM/VAE forward pass."
+        ),
+    )
+    p.add_argument("--min-delta-overall", type=float, default=0.0)
+    p.add_argument("--min-delta-moving", type=float, default=0.0)
+    p.add_argument("--min-delta-moving-1s", type=float, default=-0.5)
+    p.add_argument("--fail-on-no-passing-margin", action="store_true")
     a = p.parse_args()
     if a.action_chunk <= 0:
         raise ValueError("action-chunk must be positive")
+    margins = normalize_keep_logit_margins(a.keep_logit_margins)
+    sweep_mode = len(margins) > 1
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
     ds = MSPWorldModelCacheDataset(a.cache)
@@ -139,11 +262,11 @@ def main():
     vae_model, _ = load_official_vae(UP, a.vae_ckpt, device)
     va = OccFMVAEAdapter(vae_model)
     anchor_state = _new_metrics()
-    model_state = _new_metrics()
     oracle_state = _new_metrics()
+    margin_states = [_new_metrics() for _ in margins]
     valid_windows = []
     write_ratios = []
-    action_stats = new_effective_action_stats()
+    margin_action_stats = [new_effective_action_stats() for _ in margins]
     use_amp = bool(a.amp and device.type == "cuda")
 
     for i in range(len(ds)):
@@ -199,31 +322,26 @@ def main():
         horizons = horizon_from_flat_indices(support_idx).to(device)
 
         sparse_semantic = va.decode_logits_at_flat_indices(fused.float(), [support_idx])[0]
-        action_parts = []
+        action_parts = [[] for _ in margins]
         for start in range(0, int(support_idx.numel()), int(a.action_chunk)):
             end = min(start + int(a.action_chunk), int(support_idx.numel()))
-            action_parts.append(model.edit_head(
+            action_logits = model.edit_head(
                 sparse_semantic[start:end],
                 anchor_slots[start:end],
                 horizons[start:end],
-            ).argmax(dim=-1))
-        actions = torch.cat(action_parts, dim=0) if action_parts else torch.empty(0, device=device, dtype=torch.long)
-        actions_np = actions.cpu().numpy().astype(np.int64, copy=False)
-        final_all = apply_anchor_relative_actions(
-            anchor_future,
-            support_idx_np,
-            actions_np,
-            free_label=FREE,
-        )
+            )
+            for margin_idx, margin in enumerate(margins):
+                action_parts[margin_idx].append(
+                    actions_with_keep_margin(action_logits, margin).cpu()
+                )
+        actions_by_margin = [
+            (
+                torch.cat(parts, dim=0).numpy().astype(np.int64, copy=False)
+                if parts else np.empty(0, dtype=np.int64)
+            )
+            for parts in action_parts
+        ]
         repair_target_future = s["eval_repair_target_occ"].cpu().numpy()
-        update_effective_action_stats(
-            action_stats,
-            anchor_occ=anchor_future,
-            final_occ=final_all,
-            repair_target_occ=repair_target_future,
-            flat_indices=support_idx_np,
-            actions=actions_np,
-        )
         valid_windows.append(int(valid.sum().item()))
         write_ratios.append(float(write_lat.float().mean().item()))
         gt_future = s["eval_future_gt_occ"].cpu().numpy()
@@ -233,7 +351,6 @@ def main():
             gt = gt_future[fi]
             anchor = anchor_future[fi]
             _update(anchor_state, h, anchor, gt, moving_support[fi])
-            _update(model_state, h, final_all[fi], gt, moving_support[fi])
             oracle = apply_dynamic_repair(
                 anchor,
                 gt,
@@ -247,54 +364,158 @@ def main():
                 )
             _update(oracle_state, h, oracle, gt, moving_support[fi])
 
+        for margin_idx, actions_np in enumerate(actions_by_margin):
+            final_all = apply_anchor_relative_actions(
+                anchor_future,
+                support_idx_np,
+                actions_np,
+                free_label=FREE,
+            )
+            update_effective_action_stats(
+                margin_action_stats[margin_idx],
+                anchor_occ=anchor_future,
+                final_occ=final_all,
+                repair_target_occ=repair_target_future,
+                flat_indices=support_idx_np,
+                actions=actions_np,
+            )
+            for h, fi in REPORT.items():
+                _update(
+                    margin_states[margin_idx],
+                    h,
+                    final_all[fi],
+                    gt_future[fi],
+                    moving_support[fi],
+                )
+
         if i % 8 == 0:
-            print("eval", i, s["sample_id"], "support_voxels", int(actions_np.size))
+            print(
+                "eval",
+                i,
+                s["sample_id"],
+                "support_voxels",
+                int(support_idx_np.size),
+                "keep_margins",
+                margins,
+            )
 
     anchor_report = _report(anchor_state)
-    trained_report = _report(model_state)
     oracle_report = _report(oracle_state)
-    am = float(anchor_report["moving"]["mIoU"])
-    mm = float(trained_report["moving"]["mIoU"])
-    om = float(oracle_report["moving"]["mIoU"])
-    ao = float(anchor_report["overall"]["mIoU"])
-    mo = float(trained_report["overall"]["mIoU"])
+    anchor_overall = float(anchor_report["overall"]["mIoU"])
+    anchor_moving = float(anchor_report["moving"]["mIoU"])
+    oracle_moving = float(oracle_report["moving"]["mIoU"])
+    margin_results = []
+    for margin, state, stats in zip(margins, margin_states, margin_action_stats):
+        trained_report = _report(state)
+        action_report = report_effective_action_stats(stats)
+        delta_overall = float(trained_report["overall"]["mIoU"] - anchor_overall)
+        delta_moving = float(trained_report["moving"]["mIoU"] - anchor_moving)
+        gate = margin_decision_gate(
+            anchor_report=anchor_report,
+            trained_report=trained_report,
+            min_delta_overall=float(a.min_delta_overall),
+            min_delta_moving=float(a.min_delta_moving),
+            min_delta_moving_1s=float(a.min_delta_moving_1s),
+        )
+        margin_results.append({
+            "keep_logit_margin": float(margin),
+            "trained_sparse_wm": trained_report,
+            "delta_Overall_vs_strong_anchor": delta_overall,
+            "delta_Moving_vs_strong_anchor": delta_moving,
+            "remaining_Moving_headroom_to_oracle": float(
+                oracle_moving - trained_report["moving"]["mIoU"]
+            ),
+            "action_statistics": action_report,
+            "decision_gate": gate,
+        })
 
-    action_report = report_effective_action_stats(action_stats)
-    report = {
-        "protocol": {
-            "name": "p0_f8_anchor_relative_edit_eval_v1",
-            "num_windows": len(ds),
-            "topk": 2,
-            "prediction_hw": list(PRED_HW),
-            "history_context_hw": list(CONTEXT_HW),
-            "slot_compute_ratio": float(np.mean(valid_windows) * 400.0 / 2500.0),
-            "mean_write_latent_ratio": float(np.mean(write_ratios)),
-            "write_budget_ratio": float(ds.metadata.get("write_budget_ratio", float("nan"))),
-            "anchor": "strong occupancy-only W2Det",
-            "history": "full occupancy history latent",
-            "training_objective": "uniform FM MSE + calibrated balanced action CE + result-semantic Lovasz",
-            "edit_lambda": float(edit_lambda),
-            "edit_lambda_calibration": ck.get("edit_lambda_calibration"),
-            "lovasz_weight": arch.get("lovasz_weight"),
-            "edit_sampling": arch.get("edit_sampling"),
-            "fusion": "exact Strong W2Det default; KEEP/CLEAR/WRITE only inside causal MSP support",
-            **action_report,
-            "endpoint_oracle_consistency": "bit-exact checked on reported horizons",
-        },
-        "strong_w2det_anchor": anchor_report,
-        "trained_sparse_wm": trained_report,
-        "same_support_gt_repair_oracle": oracle_report,
-        "delta_Overall_vs_strong_anchor": mo - ao,
-        "delta_Moving_vs_strong_anchor": mm - am,
-        "oracle_delta_Moving_vs_strong_anchor": om - am,
-        "remaining_Moving_headroom_to_oracle": om - mm,
-        "checkpoint": str(Path(a.sparse_ckpt).resolve()),
-        "best_val_objective": ck.get("best_val_objective"),
+    common_protocol = {
+        "num_windows": len(ds),
+        "topk": 2,
+        "prediction_hw": list(PRED_HW),
+        "history_context_hw": list(CONTEXT_HW),
+        "slot_compute_ratio": float(np.mean(valid_windows) * 400.0 / 2500.0),
+        "mean_write_latent_ratio": float(np.mean(write_ratios)),
+        "write_budget_ratio": float(ds.metadata.get("write_budget_ratio", float("nan"))),
+        "anchor": "strong occupancy-only W2Det",
+        "history": "full occupancy history latent",
+        "training_objective": (
+            "uniform FM MSE + calibrated balanced action CE + result-semantic Lovasz"
+        ),
+        "edit_lambda": float(edit_lambda),
+        "edit_lambda_calibration": ck.get("edit_lambda_calibration"),
+        "lovasz_weight": arch.get("lovasz_weight"),
+        "edit_sampling": arch.get("edit_sampling"),
+        "fusion": (
+            "exact Strong W2Det default; KEEP/CLEAR/WRITE only inside causal MSP support"
+        ),
+        "endpoint_oracle_consistency": "bit-exact checked on reported horizons",
     }
+    if sweep_mode:
+        selection = select_passing_margin(margin_results)
+        selection["statistical_note"] = (
+            "Diagnostic point-estimate selection on this validation cache; lock the margin "
+            "before evaluation on an independent split or paired scene bootstrap."
+        )
+        report = {
+            "protocol": {
+                "name": SWEEP_PROTOCOL,
+                **common_protocol,
+                "keep_logit_margins": margins,
+                "margin_application": "additive_to_KEEP_logit_before_argmax",
+                "shared_forward": (
+                    "one causal-WM sample and one sparse VAE decode per window; "
+                    "all margins reuse the same logits"
+                ),
+                "decision_gate": {
+                    "delta_Overall_minimum": float(a.min_delta_overall),
+                    "delta_Moving_minimum_exclusive": float(a.min_delta_moving),
+                    "delta_Moving_1s_minimum": float(a.min_delta_moving_1s),
+                },
+            },
+            "strong_w2det_anchor": anchor_report,
+            "same_support_gt_repair_oracle": oracle_report,
+            "oracle_delta_Moving_vs_strong_anchor": oracle_moving - anchor_moving,
+            "margin_results": margin_results,
+            "selection": selection,
+            "checkpoint": str(Path(a.sparse_ckpt).resolve()),
+            "best_val_objective": ck.get("best_val_objective"),
+        }
+    else:
+        result = margin_results[0]
+        report = {
+            "protocol": {
+                "name": "p0_f8_anchor_relative_edit_eval_v1",
+                **common_protocol,
+                "keep_logit_margin": float(margins[0]),
+                **result["action_statistics"],
+            },
+            "strong_w2det_anchor": anchor_report,
+            "trained_sparse_wm": result["trained_sparse_wm"],
+            "same_support_gt_repair_oracle": oracle_report,
+            "delta_Overall_vs_strong_anchor": result[
+                "delta_Overall_vs_strong_anchor"
+            ],
+            "delta_Moving_vs_strong_anchor": result["delta_Moving_vs_strong_anchor"],
+            "oracle_delta_Moving_vs_strong_anchor": oracle_moving - anchor_moving,
+            "remaining_Moving_headroom_to_oracle": result[
+                "remaining_Moving_headroom_to_oracle"
+            ],
+            "decision_gate": result["decision_gate"],
+            "checkpoint": str(Path(a.sparse_ckpt).resolve()),
+            "best_val_objective": ck.get("best_val_objective"),
+        }
     op = Path(a.output)
     op.parent.mkdir(parents=True, exist_ok=True)
     op.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
+    if a.fail_on_no_passing_margin:
+        gate_status = (
+            report["selection"]["status"]
+            if sweep_mode else report["decision_gate"]["status"]
+        )
+        if gate_status != "PASS":
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":
