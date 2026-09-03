@@ -24,13 +24,18 @@ def _population_fields():
         "num_pool_keeps": 30,
         "num_pool_dynamic_keeps": 10,
         "num_pool_background_keeps": 20,
+        "num_pool_predicted_edits": 4,
+        "pool_predicted_edit_fraction": 0.1,
     }
 
 
 def test_smoke_checkpoint_requires_saved_v2_population_contract():
     fields = _population_fields()
     ck = {
-        "architecture": {"protocol": F8_PROTOCOL},
+        "architecture": {
+            "protocol": F8_PROTOCOL,
+            "optimizer_groups": {"edit_head_lr": 1e-3},
+        },
         "step": 20,
         "edit_lambda": 0.5,
         "state_dict": {"edit_head.fc2.bias": torch.zeros(10)},

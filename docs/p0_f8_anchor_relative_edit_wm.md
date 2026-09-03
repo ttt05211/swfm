@@ -101,6 +101,15 @@ This makes the IoU surrogate closer to the occupancy produced after applying KEE
 
 `lambda_edit` is gradient-calibrated once on shared transition parameters and then frozen.
 
+The randomly initialized edit head has its own optimizer group. Its default
+learning rate is `1e-3`, while `--lr` remains the learning rate for new/unloaded
+transition parameters and `--backbone-lr-scale` controls reused transition
+parameters. This separation is required because using the causal WM rate
+(`2e-5`) for the edit head can leave the positive KEEP initialization unchanged.
+Because this changes the optimizer parameter-group topology, start this run in a
+new output directory; checkpoints created before the independent edit-head group
+are rejected by `--resume-from`.
+
 ## Validation aggregation in v2
 
 Validation must respect the same population split. P0-F8 v2 therefore aggregates:
@@ -126,6 +135,8 @@ Important v2 statistics retained in checkpoint/training history and validation r
 ```text
 balanced_false_edit_rate
 pool_false_edit_rate
+num_pool_predicted_edits
+pool_predicted_edit_fraction
 dynamic_keep_fraction_realized
 num_lovasz_voxels
 num_dynamic_keeps
@@ -193,6 +204,7 @@ python tools/real_motion/train_p0_f8_anchor_relative_edit_wm.py \
   --batch-size 8 \
   --num-workers 4 \
   --lr 2e-5 \
+  --edit-head-lr 1e-3 \
   --backbone-lr-scale 1.0 \
   --keep-ratio 1.0 \
   --keep-when-no-edit 64 \
@@ -202,6 +214,7 @@ python tools/real_motion/train_p0_f8_anchor_relative_edit_wm.py \
   --min-train-windows 4000 \
   --val-every 200 \
   --sample-steps 10 \
+  --collapse-check-step 200 \
   --amp
 ```
 
@@ -228,14 +241,25 @@ edit_lambda_calibration ...
 step=... fm=... edit=... ce=... lovasz=...
 edit_acc=...
 false_edit=...
+pred_edit=...
 E/K=.../...
 ```
+
+With `--collapse-check-step 200`, every due validation records an
+`all_keep_validation_gate_v1` block. If the complete compact validation pool
+contains zero predicted non-KEEP actions, the trainer first saves `latest.pt`,
+the scheduled `step_XXXX.pt`, and `best.pt` when applicable, then exits the loop
+cleanly. `training_report.json` records
+`EARLY_STOPPED_ALL_KEEP_COLLAPSE`; this prevents a known all-KEEP run from
+consuming the remainder of the 1200-step budget. Set the option to `0` to
+disable this guard.
 
 At validation steps, the JSON record additionally exposes the v2 population statistics listed above. The same v2-only training statistics are persisted into the validation-step `training_history[*].train` record inside checkpoints and `training_report.json`.
 
 The intended behavior is:
 
 - `edit_accuracy` rises;
+- `pool_predicted_edit_fraction` is nonzero by the step-200 gate;
 - `pool_false_edit_rate` stays low;
 - `dynamic_keep_fraction_realized` stays near 0.5 when both KEEP strata are sufficiently populated;
 - `num_lovasz_voxels >= num_supervised_voxels` in the usual case;

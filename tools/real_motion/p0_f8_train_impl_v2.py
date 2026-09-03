@@ -140,6 +140,10 @@ def edit_loss_for_endpoint_v2(
             "false_edit_rate": float("nan"),
             "balanced_false_edit_rate": float("nan"),
             "pool_false_edit_rate": float("nan"),
+            "num_ce_predicted_edits": 0,
+            "ce_predicted_edit_fraction": float("nan"),
+            "num_pool_predicted_edits": 0,
+            "pool_predicted_edit_fraction": float("nan"),
             "dynamic_keep_fraction_realized": float("nan"),
         }
         if not deterministic:
@@ -198,6 +202,10 @@ def _remember_train_v2_info(info: dict) -> None:
         "num_pool_keeps",
         "num_pool_dynamic_keeps",
         "num_pool_background_keeps",
+        "num_ce_predicted_edits",
+        "ce_predicted_edit_fraction",
+        "num_pool_predicted_edits",
+        "pool_predicted_edit_fraction",
     )
     _LAST_TRAIN_V2_INFO = {k: info.get(k) for k in keys}
 
@@ -228,6 +236,8 @@ def aggregate_edit_validation_infos(
     balanced_false_weight = 0
     pool_false_sum = 0.0
     pool_false_weight = 0
+    total_ce_predicted_edits = 0
+    total_pool_predicted_edits = 0
 
     total_edits = 0
     total_keeps = 0
@@ -291,6 +301,8 @@ def aggregate_edit_validation_infos(
             info.get("num_pool_background_keeps", info.get("num_background_keeps", 0))
         )
         total_moving_edits += int(info.get("num_moving_edits", 0))
+        total_ce_predicted_edits += int(info.get("num_ce_predicted_edits", 0))
+        total_pool_predicted_edits += int(info.get("num_pool_predicted_edits", 0))
 
     if ce_weight <= 0:
         raise RuntimeError("validation contains no P0-F8 balanced CE voxels")
@@ -324,6 +336,14 @@ def aggregate_edit_validation_infos(
             if balanced_false_weight else float("nan")
         ),
         "pool_false_edit_rate": pool_false_avg,
+        "num_ce_predicted_edits": int(total_ce_predicted_edits),
+        "ce_predicted_edit_fraction": float(
+            total_ce_predicted_edits / max(ce_weight, 1)
+        ),
+        "num_pool_predicted_edits": int(total_pool_predicted_edits),
+        "pool_predicted_edit_fraction": float(
+            total_pool_predicted_edits / max(lovasz_population, 1)
+        ),
         "num_supervised_voxels": int(ce_weight),
         "num_lovasz_voxels": int(lovasz_population),
         "num_edits": int(total_edits),
@@ -479,6 +499,12 @@ def _architecture_v2(args, edit_lambda, optimizer_summary, train_ds):
         "CE_weighted_by_balanced_voxels; Lovasz_weighted_by_full_pool_voxels; "
         "false_edit_weighted_by_full_pool_KEEP"
     )
+    arch["all_keep_collapse_gate"] = {
+        "protocol": "all_keep_validation_gate_v1",
+        "check_step": int(args.collapse_check_step),
+        "population": "complete_compact_sidecar_pool",
+        "failure": "zero_predicted_non_KEEP_actions",
+    }
     return arch
 
 

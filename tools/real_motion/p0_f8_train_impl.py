@@ -36,6 +36,7 @@ from tools.real_motion import train_p0_f6_decoder_aware_wm as f6
 
 F8_PROTOCOL = "p0_f8_anchor_relative_edit_wm_v1"
 EDIT_PROTOCOL = "p0_f8_anchor_relative_edit_targets_v1"
+OPTIMIZER_PROTOCOL = "p0_f8_independent_edit_head_lr_v1"
 
 
 def _validate_training_cache(train_ds, *, min_train_windows: int) -> None:
@@ -71,15 +72,29 @@ def _validate_edit_pair(train_edit, val_edit, train_ds, val_ds) -> None:
         raise RuntimeError("val edit sidecar sample set differs from val WM cache")
 
 
-def _build_optimizer(model, reuse, *, lr: float, backbone_lr_scale: float, weight_decay: float):
+def _build_optimizer(
+    model,
+    reuse,
+    *,
+    lr: float,
+    edit_head_lr: float,
+    backbone_lr_scale: float,
+    weight_decay: float,
+):
     if lr <= 0:
         raise ValueError("lr must be positive")
+    if edit_head_lr <= 0:
+        raise ValueError("edit-head-lr must be positive")
     if not 0.0 <= backbone_lr_scale <= 1.0:
         raise ValueError("backbone-lr-scale must be in [0,1]")
     loaded = set(reuse.get("loaded_keys", ()))
-    pretrained, new_params = [], []
-    pretrained_names, new_names = [], []
+    pretrained, new_transition, edit_head = [], [], []
+    pretrained_names, new_transition_names, edit_head_names = [], [], []
     for name, param in model.named_parameters():
+        if name.startswith("edit_head."):
+            edit_head.append(param)
+            edit_head_names.append(name)
+            continue
         transition_key = name[len("transition."):] if name.startswith("transition.") else name
         if transition_key in loaded:
             if backbone_lr_scale == 0.0:
@@ -88,10 +103,10 @@ def _build_optimizer(model, reuse, *, lr: float, backbone_lr_scale: float, weigh
                 pretrained.append(param)
                 pretrained_names.append(name)
         else:
-            new_params.append(param)
-            new_names.append(name)
-    if not new_params:
-        raise RuntimeError("P0-F8 found no new/unloaded trainable parameters")
+            new_transition.append(param)
+            new_transition_names.append(name)
+    if not edit_head:
+        raise RuntimeError("P0-F8 found no trainable edit-head parameters")
     groups = []
     if pretrained:
         groups.append({
@@ -99,21 +114,39 @@ def _build_optimizer(model, reuse, *, lr: float, backbone_lr_scale: float, weigh
             "lr": float(lr) * float(backbone_lr_scale),
             "group_name": "pretrained_backbone",
         })
+    if new_transition:
+        groups.append({
+            "params": new_transition,
+            "lr": float(lr),
+            "group_name": "new_or_unloaded_transition",
+        })
     groups.append({
-        "params": new_params,
-        "lr": float(lr),
-        "group_name": "new_or_unloaded",
+        "params": edit_head,
+        "lr": float(edit_head_lr),
+        "group_name": "edit_head",
     })
     optimizer = torch.optim.AdamW(groups, lr=float(lr), weight_decay=float(weight_decay))
+    new_names = new_transition_names + edit_head_names
+    new_params = new_transition + edit_head
     return optimizer, {
+        "protocol": OPTIMIZER_PROTOCOL,
         "base_lr": float(lr),
+        "edit_head_lr": float(edit_head_lr),
         "backbone_lr_scale": float(backbone_lr_scale),
         "backbone_lr": float(lr) * float(backbone_lr_scale),
         "num_pretrained_tensors": len(pretrained_names),
         "num_new_or_unloaded_tensors": len(new_names),
+        "num_new_or_unloaded_transition_tensors": len(new_transition_names),
+        "num_edit_head_tensors": len(edit_head_names),
         "num_pretrained_parameters": int(sum(p.numel() for p in pretrained)),
         "num_new_or_unloaded_parameters": int(sum(p.numel() for p in new_params)),
+        "num_new_or_unloaded_transition_parameters": int(
+            sum(p.numel() for p in new_transition)
+        ),
+        "num_edit_head_parameters": int(sum(p.numel() for p in edit_head)),
         "new_or_unloaded_names": new_names,
+        "new_or_unloaded_transition_names": new_transition_names,
+        "edit_head_names": edit_head_names,
     }
 
 
@@ -475,6 +508,11 @@ def _validate_resume(ck, args, train_ds, val_ds, train_edit, val_edit):
     arch = ck.get("architecture", {})
     if arch.get("protocol") != F8_PROTOCOL:
         raise RuntimeError("resume checkpoint is not P0-F8")
+    optimizer_groups = arch.get("optimizer_groups", {})
+    if optimizer_groups.get("protocol") != OPTIMIZER_PROTOCOL:
+        raise RuntimeError(
+            "resume checkpoint predates the independent edit-head optimizer group"
+        )
     checks = (
         (float(arch.get("lovasz_weight", -1.0)), float(args.lovasz_weight), "lovasz-weight"),
         (
@@ -483,9 +521,14 @@ def _validate_resume(ck, args, train_ds, val_ds, train_edit, val_edit):
             "keep-ratio",
         ),
         (
-            float(arch.get("optimizer_groups", {}).get("backbone_lr_scale", -1.0)),
+            float(optimizer_groups.get("backbone_lr_scale", -1.0)),
             float(args.backbone_lr_scale),
             "backbone-lr-scale",
+        ),
+        (
+            float(optimizer_groups.get("edit_head_lr", -1.0)),
+            float(args.edit_head_lr),
+            "edit-head-lr",
         ),
         (float(arch.get("keep_bias", -999.0)), float(args.keep_bias), "keep-bias"),
     )
@@ -498,6 +541,51 @@ def _validate_resume(ck, args, train_ds, val_ds, train_edit, val_edit):
         raise RuntimeError("resume training cache size differs")
     train_edit.validate_source_cache(train_ds.root)
     val_edit.validate_source_cache(val_ds.root)
+
+
+def assess_all_keep_collapse(val: dict, *, step: int, check_step: int) -> dict:
+    """Return the scheduled validation gate for an all-KEEP action collapse."""
+    gate = {
+        "name": "all_keep_validation_gate_v1",
+        "step": int(step),
+        "check_step": int(check_step),
+    }
+    if int(check_step) <= 0:
+        return {**gate, "status": "DISABLED", "stop": False}
+    if int(step) < int(check_step):
+        return {**gate, "status": "NOT_DUE", "stop": False}
+    predicted_edits = val.get("num_pool_predicted_edits")
+    pool_voxels = val.get("num_lovasz_voxels")
+    if predicted_edits is None or pool_voxels is None:
+        return {
+            **gate,
+            "status": "UNAVAILABLE",
+            "stop": False,
+            "reason": "validation lacks full-pool predicted-action counts",
+        }
+    predicted_edits = int(predicted_edits)
+    pool_voxels = int(pool_voxels)
+    if pool_voxels <= 0:
+        return {
+            **gate,
+            "status": "UNAVAILABLE",
+            "stop": False,
+            "reason": "validation full-pool population is empty",
+        }
+    fraction = float(predicted_edits / pool_voxels)
+    collapsed = predicted_edits == 0
+    return {
+        **gate,
+        "status": "FAIL" if collapsed else "PASS",
+        "stop": bool(collapsed),
+        "num_pool_predicted_edits": predicted_edits,
+        "num_pool_voxels": pool_voxels,
+        "pool_predicted_edit_fraction": fraction,
+        "reason": (
+            "all full-pool validation voxels predict KEEP"
+            if collapsed else "at least one full-pool validation voxel predicts an edit"
+        ),
+    }
 
 
 def main():
@@ -513,6 +601,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--edit-head-lr", type=float, default=1e-3)
     parser.add_argument("--backbone-lr-scale", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--min-train-windows", type=int, default=4000)
@@ -531,6 +620,15 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-from", default=None)
+    parser.add_argument(
+        "--collapse-check-step",
+        type=int,
+        default=0,
+        help=(
+            "At validation steps >= this value, stop cleanly after saving if the "
+            "complete compact pool predicts zero non-KEEP actions; 0 disables."
+        ),
+    )
     args = parser.parse_args()
 
     if min(args.steps, args.batch_size, args.val_every, args.min_train_windows) <= 0:
@@ -539,6 +637,10 @@ def main():
         raise ValueError("P0-F8 freezes source_noise_std=0")
     if not 0.0 <= args.backbone_lr_scale <= 1.0:
         raise ValueError("backbone-lr-scale must be in [0,1]")
+    if args.edit_head_lr <= 0:
+        raise ValueError("edit-head-lr must be positive")
+    if args.collapse_check_step < 0:
+        raise ValueError("collapse-check-step must be non-negative")
     if args.keep_ratio < 0 or args.keep_when_no_edit < 0 or args.lovasz_weight < 0:
         raise ValueError("keep/lovasz settings must be non-negative")
     if args.edit_lambda is not None and args.edit_lambda <= 0:
@@ -604,6 +706,7 @@ def main():
         model,
         reuse,
         lr=float(args.lr),
+        edit_head_lr=float(args.edit_head_lr),
         backbone_lr_scale=float(args.backbone_lr_scale),
         weight_decay=float(args.weight_decay),
     )
@@ -623,6 +726,10 @@ def main():
     skipped_train_batches = 0
     edit_lambda = float(args.edit_lambda) if args.edit_lambda is not None else None
     calibration = None
+    termination = {
+        "status": "COMPLETED",
+        "reason": "target_steps_reached",
+    }
 
     if args.resume_from:
         ck = torch.load(args.resume_from, map_location="cpu", weights_only=False)
@@ -732,6 +839,10 @@ def main():
             "action_accuracy": edit_info["accuracy"],
             "edit_accuracy": edit_info["edit_accuracy"],
             "false_edit_rate": edit_info["false_edit_rate"],
+            "num_pool_predicted_edits": edit_info.get("num_pool_predicted_edits"),
+            "pool_predicted_edit_fraction": edit_info.get(
+                "pool_predicted_edit_fraction"
+            ),
             "num_supervised_voxels": int(edit_info["num_supervised_voxels"]),
             "num_edits": int(edit_info["num_edits"]),
             "num_keeps": int(edit_info["num_keeps"]),
@@ -742,6 +853,12 @@ def main():
             "grad_norm_before_clip": float(torch.as_tensor(grad_norm).cpu()),
         }
         if step == 1 or step % 20 == 0:
+            predicted_edit_fraction = train_info.get("pool_predicted_edit_fraction")
+            predicted_edit_text = (
+                f" pred_edit={float(predicted_edit_fraction):.4f}"
+                if predicted_edit_fraction is not None
+                else ""
+            )
             print(
                 f"step={step} total={train_info['objective']:.6f} "
                 f"fm={train_info['fm_loss']:.6f} edit={train_info['edit_loss']:.6f} "
@@ -749,7 +866,7 @@ def main():
                 f"lambda={edit_lambda:.6g} edit_acc={train_info['edit_accuracy']:.4f} "
                 f"false_edit={train_info['false_edit_rate']:.4f} "
                 f"E/K={train_info['num_edits']}/{train_info['num_keeps']} "
-                f"cos={train_info['cosine']:.4f}"
+                f"cos={train_info['cosine']:.4f}{predicted_edit_text}"
             )
 
         if step % args.val_every == 0 or step == args.steps:
@@ -766,7 +883,17 @@ def main():
                 lovasz_weight=float(args.lovasz_weight),
                 seed=int(args.seed) + 90000000,
             )
-            row = {"step": step, "train": train_info, "val": val}
+            collapse_gate = assess_all_keep_collapse(
+                val,
+                step=step,
+                check_step=int(args.collapse_check_step),
+            )
+            row = {
+                "step": step,
+                "train": train_info,
+                "val": val,
+                "collapse_gate": collapse_gate,
+            }
             history.append(row)
             print("validation", json.dumps(row))
             state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
@@ -794,6 +921,15 @@ def main():
             if float(val["objective"]) < best_val:
                 best_val = float(val["objective"])
                 torch.save(payload, out / "best.pt")
+            if bool(collapse_gate["stop"]):
+                termination = {
+                    "status": "EARLY_STOPPED_ALL_KEEP_COLLAPSE",
+                    "reason": str(collapse_gate["reason"]),
+                    "step": int(step),
+                    "gate": collapse_gate,
+                }
+                print("P0_F8_ALL_KEEP_COLLAPSE", json.dumps(termination))
+                break
 
     if edit_lambda is None:
         raise RuntimeError("no edit-valid P0-F8 training batch was observed")
@@ -822,6 +958,8 @@ def main():
     report = {
         "protocol": F8_PROTOCOL,
         "steps": int(step),
+        "requested_steps": int(args.steps),
+        "termination": termination,
         "best_val_objective": float(best_val),
         "edit_lambda": float(edit_lambda),
         "keep_ratio": float(args.keep_ratio),

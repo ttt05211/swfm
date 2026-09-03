@@ -148,6 +148,10 @@ def test_full_pool_lovasz_penalizes_unsampled_background_false_write():
     assert good_info["pool_false_edit_rate"] == 0.0
     assert bad_info["pool_false_edit_rate"] > 0.0
     assert bad_info["balanced_false_edit_rate"] == 0.0
+    assert good_info["num_pool_predicted_edits"] == 4
+    assert bad_info["num_pool_predicted_edits"] == 5
+    assert math.isclose(good_info["pool_predicted_edit_fraction"], 4 / 12)
+    assert math.isclose(bad_info["pool_predicted_edit_fraction"], 5 / 12)
 
 
 class _FakeEditCache:
@@ -229,6 +233,8 @@ def test_validation_aggregation_uses_each_population_size():
             "balanced_false_edit_rate": 0.4,
             "pool_false_edit_rate": 0.1,
             "false_edit_rate": 0.1,
+            "num_ce_predicted_edits": 4,
+            "num_pool_predicted_edits": 10,
         },
         {
             "num_supervised_voxels": 90,
@@ -248,6 +254,8 @@ def test_validation_aggregation_uses_each_population_size():
             "balanced_false_edit_rate": 0.2,
             "pool_false_edit_rate": 0.9,
             "false_edit_rate": 0.9,
+            "num_ce_predicted_edits": 9,
+            "num_pool_predicted_edits": 2,
         },
     ]
     out = aggregate_edit_validation_infos(infos, lovasz_weight=0.5)
@@ -279,6 +287,10 @@ def test_validation_aggregation_uses_each_population_size():
     assert out["num_supervised_voxels"] == 100
     assert out["num_lovasz_voxels"] == 110
     assert out["num_pool_keeps"] == 85
+    assert out["num_ce_predicted_edits"] == 13
+    assert math.isclose(out["ce_predicted_edit_fraction"], 13 / 100)
+    assert out["num_pool_predicted_edits"] == 12
+    assert math.isclose(out["pool_predicted_edit_fraction"], 12 / 110)
 
 
 def test_v2_fields_are_persisted_into_latest_training_record():

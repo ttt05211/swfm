@@ -277,6 +277,10 @@ def split_population_edit_loss(
             "false_edit_rate": float("nan"),
             "balanced_false_edit_rate": float("nan"),
             "pool_false_edit_rate": float("nan"),
+            "num_ce_predicted_edits": 0,
+            "ce_predicted_edit_fraction": float("nan"),
+            "num_pool_predicted_edits": 0,
+            "pool_predicted_edit_fraction": float("nan"),
         }
     if int(ce_pool_positions.min()) < 0 or int(ce_pool_positions.max()) >= n:
         raise ValueError("balanced CE pool position out of range")
@@ -306,6 +310,8 @@ def split_population_edit_loss(
             (pool_pred[pool_keep] != KEEP).float().mean()
             if bool(pool_keep.any()) else torch.tensor(float("nan"), device=device)
         )
+        num_ce_predicted_edits = int((ce_pred != KEEP).sum().item())
+        num_pool_predicted_edits = int((pool_pred != KEEP).sum().item())
 
     return loss, {
         "ce": float(ce.detach().cpu()),
@@ -317,4 +323,12 @@ def split_population_edit_loss(
         "false_edit_rate": float(pool_false.detach().cpu()),
         "balanced_false_edit_rate": float(balanced_false.detach().cpu()),
         "pool_false_edit_rate": float(pool_false.detach().cpu()),
+        "num_ce_predicted_edits": num_ce_predicted_edits,
+        "ce_predicted_edit_fraction": float(
+            num_ce_predicted_edits / max(int(ce_pred.numel()), 1)
+        ),
+        "num_pool_predicted_edits": num_pool_predicted_edits,
+        "pool_predicted_edit_fraction": float(
+            num_pool_predicted_edits / max(int(pool_pred.numel()), 1)
+        ),
     }

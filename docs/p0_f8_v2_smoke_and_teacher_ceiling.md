@@ -30,6 +30,7 @@ python tools/real_motion/smoke_p0_f8_v2.py \
   --steps 20 \
   --batch-size 8 \
   --num-workers 4 \
+  --edit-head-lr 1e-3 \
   --amp
 ```
 

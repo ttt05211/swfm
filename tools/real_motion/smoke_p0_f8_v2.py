@@ -35,6 +35,8 @@ REQUIRED_V2_FIELDS = (
     "num_pool_keeps",
     "num_pool_dynamic_keeps",
     "num_pool_background_keeps",
+    "num_pool_predicted_edits",
+    "pool_predicted_edit_fraction",
 )
 
 
@@ -71,6 +73,13 @@ def validate_smoke_checkpoint(ck: dict, *, expected_steps: int) -> dict:
         raise RuntimeError("smoke checkpoint has no positive edit lambda")
     if not isinstance(ck.get("state_dict"), dict) or not ck["state_dict"]:
         raise RuntimeError("smoke checkpoint has no model state")
+    optimizer_groups = arch.get("optimizer_groups") or {}
+    edit_head_lr = float(optimizer_groups.get("edit_head_lr", 0.0))
+    if edit_head_lr <= 0.0:
+        raise RuntimeError("smoke checkpoint has no positive edit-head learning rate")
+    predicted_edit_fraction = float(val["pool_predicted_edit_fraction"])
+    if not 0.0 <= predicted_edit_fraction <= 1.0:
+        raise RuntimeError("invalid full-pool predicted edit fraction")
     return {
         "protocol": SMOKE_PROTOCOL,
         "status": "PASS",
@@ -82,6 +91,8 @@ def validate_smoke_checkpoint(ck: dict, *, expected_steps: int) -> dict:
         "num_pool_keeps": int(val["num_pool_keeps"]),
         "dynamic_keep_fraction_realized": dynamic_fraction,
         "pool_false_edit_rate": float(val["pool_false_edit_rate"]),
+        "pool_predicted_edit_fraction": predicted_edit_fraction,
+        "edit_head_lr": edit_head_lr,
         "checkpoint_reload": "pending_strict_model_load",
     }
 
@@ -126,6 +137,8 @@ def _training_command(args) -> list[str]:
         str(args.num_workers),
         "--lr",
         str(args.lr),
+        "--edit-head-lr",
+        str(args.edit_head_lr),
         "--backbone-lr-scale",
         str(args.backbone_lr_scale),
         "--weight-decay",
@@ -166,6 +179,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--edit-head-lr", type=float, default=1e-3)
     p.add_argument("--backbone-lr-scale", type=float, default=1.0)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--min-train-windows", type=int, default=4000)
