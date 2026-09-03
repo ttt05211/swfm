@@ -339,3 +339,102 @@ Delta Moving  > 0
 ```
 
 The main question is whether explicit anchor-relative KEEP/CLEAR/WRITE increases repair gain without recreating the 1s anchor harm seen in P0-F6/F7.
+
+---
+
+## 5. Frozen causal-endpoint head probe
+
+Run this diagnostic when the causal checkpoint predicts edits but every
+predeclared KEEP-margin fails the deployment gate.  It distinguishes an
+unusable causal representation from joint-training/edit-head optimization.
+
+The original joint trainer supervises the head on the endpoint estimate from a
+flow-matching interpolation state.  The deployed head instead receives the
+deterministic multi-step rollout that starts from the Strong-W2Det anchor.  This
+probe removes that input-distribution difference while keeping the causal WM
+representation fixed:
+
+```text
+cached history + Strong-W2Det anchor
+        -> frozen checkpoint transition
+        -> exact deterministic NFE=10 deployment rollout
+        -> frozen VAE sparse semantic evidence
+        -> fresh trainable edit head only
+```
+
+The rollout never reads `repair_target_latent` or future GT.  GT-derived edit
+targets remain ordinary training labels only.  The jointly trained edit head is
+discarded before the probe starts.
+
+Use the exact causal checkpoint that failed the margin sweep:
+
+```bash
+ROOT=/root/nas/occ/swfm
+TRAIN="$ROOT/data/p0_f7_wm_train_top2_4096"
+VAL="$ROOT/data/p0_f5_wm_val_top2"
+TRAIN_EDIT="$ROOT/data/p0_f8_edit_train_4096.pt"
+VAL_EDIT="$ROOT/data/p0_f8_edit_val.pt"
+VAE=/root/nas/occ/OccFM-NeurIPS2025-main/logs/occfm_vae/100ep_3docc_sem_voxel/ckpt/epoch=000100.ckpt
+CAUSAL_OUT="$ROOT/outputs/p0_f8_anchor_relative_edit_4096"
+CAUSAL="$CAUSAL_OUT/step_0200.pt"
+PROBE_OUT="$ROOT/outputs/p0_f8_frozen_causal_probe_step200"
+
+python tools/real_motion/train_p0_f8_frozen_causal_endpoint_probe.py \
+  --train-cache "$TRAIN" \
+  --val-cache "$VAL" \
+  --train-edit-targets "$TRAIN_EDIT" \
+  --val-edit-targets "$VAL_EDIT" \
+  --causal-ckpt "$CAUSAL" \
+  --vae-ckpt "$VAE" \
+  --output-dir "$PROBE_OUT" \
+  --steps 600 \
+  --val-every 200 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --lr 1e-3 \
+  --weight-decay 0.01 \
+  --min-train-windows 4000 \
+  --keep-ratio 1.0 \
+  --keep-when-no-edit 64 \
+  --keep-bias 2.0 \
+  --lovasz-weight 0.5 \
+  --collapse-check-step 200 \
+  --seed 20260903 \
+  --amp
+```
+
+The probe checkpoints contain only the edit head and are cryptographically
+bound to the exact causal checkpoint and VAE.  To limit storage it writes only:
+
+```text
+best.pt
+latest.pt
+last.pt
+training_report.json
+```
+
+There are no numbered probe checkpoints.  Evaluate `best.pt` with the same
+predeclared one-pass margin sweep:
+
+```bash
+python tools/real_motion/eval_p0_f8_anchor_relative_edit_wm.py \
+  --cache "$VAL" \
+  --vae-ckpt "$VAE" \
+  --sparse-ckpt "$CAUSAL" \
+  --edit-head-probe-ckpt "$PROBE_OUT/best.pt" \
+  --output "$PROBE_OUT/keep_margin_sweep_best.json" \
+  --keep-logit-margins 0 0.25 0.5 0.75 1.0 1.5 2.0 \
+  --min-delta-overall 0.0 \
+  --min-delta-moving 0.0 \
+  --min-delta-moving-1s -0.5 \
+  --amp
+```
+
+Interpretation is frozen before the run:
+
+- any predeclared margin passes: the frozen causal endpoint contains usable
+  action information; the original joint training/input mismatch is the main
+  suspect, and staged head training is justified;
+- no margin passes: a fresh head cannot recover useful edits from the fixed
+  causal endpoint, so change the representation/causal WM rather than tuning
+  KEEP bias or extending the same head objective.

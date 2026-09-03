@@ -38,6 +38,10 @@ from real_motion.occfm_io import OccFMVAEAdapter, file_sha256, load_official_vae
 from real_motion.repair_target import apply_dynamic_repair
 from real_motion.windows import WindowPlan, crop_windows, scatter_windows
 from tools.real_motion.train_p0_f8_anchor_relative_edit_wm import F8_PROTOCOL
+from tools.real_motion.train_p0_f8_frozen_causal_endpoint_probe import (
+    PROBE_PROTOCOL,
+    load_probe_head_into_model,
+)
 
 REPORT = {1.0: 1, 2.0: 3, 3.0: 5}
 PRED_HW = (20, 20)
@@ -200,6 +204,14 @@ def main():
     p.add_argument("--cache", required=True)
     p.add_argument("--vae-ckpt", required=True)
     p.add_argument("--sparse-ckpt", required=True)
+    p.add_argument(
+        "--edit-head-probe-ckpt",
+        default=None,
+        help=(
+            "Optional head-only checkpoint from the frozen causal-endpoint probe. "
+            "The causal transition still comes from --sparse-ckpt."
+        ),
+    )
     p.add_argument("--output", required=True)
     p.add_argument("--device", default="cuda")
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -236,8 +248,9 @@ def main():
         raise RuntimeError("cache repair endpoint contract mismatch")
     if not bool(ds.metadata.get("include_eval_payload", False)):
         raise RuntimeError("P0-F8 final evaluation requires validation eval payload")
+    vae_sha256 = file_sha256(a.vae_ckpt)
     expected_vae = ds.metadata.get("vae_checkpoint_sha256")
-    if expected_vae and file_sha256(a.vae_ckpt) != expected_vae:
+    if expected_vae and vae_sha256 != expected_vae:
         raise RuntimeError("VAE checkpoint differs from routed cache")
 
     ck = torch.load(a.sparse_ckpt, map_location="cpu", weights_only=False)
@@ -257,6 +270,33 @@ def main():
         keep_bias=float(arch.get("keep_bias", 2.0)),
     ).to(device)
     model.load_state_dict(ck["state_dict"], strict=True)
+    edit_head_overlay = None
+    if a.edit_head_probe_ckpt:
+        causal_sha256 = file_sha256(a.sparse_ckpt)
+        probe_ck = torch.load(
+            a.edit_head_probe_ckpt, map_location="cpu", weights_only=False
+        )
+        probe_arch = load_probe_head_into_model(
+            model,
+            probe_ck,
+            causal_sha256=causal_sha256,
+            vae_sha256=vae_sha256,
+        )
+        edit_head_overlay = {
+            "protocol": PROBE_PROTOCOL,
+            "checkpoint": str(Path(a.edit_head_probe_ckpt).resolve()),
+            "checkpoint_sha256": file_sha256(a.edit_head_probe_ckpt),
+            "step": int(probe_ck.get("step", 0)),
+            "best_val_objective": probe_ck.get("best_val_objective"),
+            "endpoint_source": probe_arch.get("endpoint_source"),
+            "source_causal_checkpoint_sha256": causal_sha256,
+            "source_causal_checkpoint_step": probe_arch.get(
+                "source_causal_checkpoint_step"
+            ),
+            "lovasz_weight": probe_arch.get("lovasz_weight"),
+            "edit_sampling": probe_arch.get("edit_sampling"),
+            "keep_bias": probe_arch.get("keep_bias"),
+        }
     model.eval()
 
     vae_model, _ = load_official_vae(UP, a.vae_ckpt, device)
@@ -440,12 +480,33 @@ def main():
         "anchor": "strong occupancy-only W2Det",
         "history": "full occupancy history latent",
         "training_objective": (
-            "uniform FM MSE + calibrated balanced action CE + result-semantic Lovasz"
+            "fresh edit head on frozen deterministic causal deployment endpoints; "
+            "balanced action CE + result-semantic Lovasz"
+            if edit_head_overlay is not None
+            else "uniform FM MSE + calibrated balanced action CE + result-semantic Lovasz"
         ),
-        "edit_lambda": float(edit_lambda),
-        "edit_lambda_calibration": ck.get("edit_lambda_calibration"),
-        "lovasz_weight": arch.get("lovasz_weight"),
-        "edit_sampling": arch.get("edit_sampling"),
+        "edit_head_source": (
+            PROBE_PROTOCOL if edit_head_overlay is not None else F8_PROTOCOL
+        ),
+        "edit_head_overlay": edit_head_overlay,
+        "edit_lambda": (
+            float(edit_lambda) if edit_head_overlay is None else None
+        ),
+        "edit_lambda_calibration": (
+            ck.get("edit_lambda_calibration")
+            if edit_head_overlay is None else None
+        ),
+        "source_causal_edit_lambda": float(edit_lambda),
+        "lovasz_weight": (
+            arch.get("lovasz_weight")
+            if edit_head_overlay is None
+            else edit_head_overlay["lovasz_weight"]
+        ),
+        "edit_sampling": (
+            arch.get("edit_sampling")
+            if edit_head_overlay is None
+            else edit_head_overlay["edit_sampling"]
+        ),
         "fusion": (
             "exact Strong W2Det default; KEEP/CLEAR/WRITE only inside causal MSP support"
         ),
@@ -479,7 +540,14 @@ def main():
             "margin_results": margin_results,
             "selection": selection,
             "checkpoint": str(Path(a.sparse_ckpt).resolve()),
-            "best_val_objective": ck.get("best_val_objective"),
+            "edit_head_probe_checkpoint": (
+                None if edit_head_overlay is None else edit_head_overlay["checkpoint"]
+            ),
+            "best_val_objective": (
+                ck.get("best_val_objective")
+                if edit_head_overlay is None
+                else edit_head_overlay["best_val_objective"]
+            ),
         }
     else:
         result = margin_results[0]
@@ -503,7 +571,14 @@ def main():
             ],
             "decision_gate": result["decision_gate"],
             "checkpoint": str(Path(a.sparse_ckpt).resolve()),
-            "best_val_objective": ck.get("best_val_objective"),
+            "edit_head_probe_checkpoint": (
+                None if edit_head_overlay is None else edit_head_overlay["checkpoint"]
+            ),
+            "best_val_objective": (
+                ck.get("best_val_objective")
+                if edit_head_overlay is None
+                else edit_head_overlay["best_val_objective"]
+            ),
         }
     op = Path(a.output)
     op.parent.mkdir(parents=True, exist_ok=True)
