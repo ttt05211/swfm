@@ -3,7 +3,7 @@
 The module borrows the *controlled condition injection* idea from strong
 forecasting/world-model systems: keep the pretrained transition exactly intact at
 initialization, then let training learn how much of the external physics prior to
-use.  The Strong-W2Det/KTA future latent is used only as conditioning evidence;
+use. The Strong-W2Det/KTA future latent is used only as conditioning evidence;
 it is never the flow source or the prediction target.
 """
 from __future__ import annotations
@@ -15,11 +15,15 @@ from einops import rearrange
 
 
 class GatedPhysicsCrossAttention(nn.Module):
-    """Per-future-frame cross-attention with an exact zero-impact initialization.
+    """Per-frame cross-attention with an exact zero-impact initialization.
 
     Query tokens come from the native WM bottleneck. Key/value tokens come from
     the Strong-W2Det future prior. ``gate`` starts at exactly zero, so adding this
     module cannot change the pretrained OccFM forward before optimization.
+
+    The aligned prior intentionally contains zero history slots. A bias-free
+    projection plus an explicit per-frame presence mask keeps those slots exact
+    no-ops even after attention biases and the gate have learned.
     """
 
     def __init__(
@@ -36,7 +40,7 @@ class GatedPhysicsCrossAttention(nn.Module):
         self.hidden_size = int(hidden_size)
         self.query_norm = nn.LayerNorm(self.hidden_size)
         self.prior_norm = nn.LayerNorm(self.hidden_size)
-        self.prior_proj = nn.Linear(self.prior_channels, self.hidden_size)
+        self.prior_proj = nn.Linear(self.prior_channels, self.hidden_size, bias=False)
         self.attn = nn.MultiheadAttention(
             self.hidden_size,
             int(num_heads),
@@ -64,9 +68,12 @@ class GatedPhysicsCrossAttention(nn.Module):
         if prior_future.shape[2] != self.prior_channels:
             raise ValueError("physics prior channel mismatch")
 
-        prior = prior_future.to(device=x.device, dtype=x.dtype)
+        prior_raw = prior_future.to(device=x.device, dtype=x.dtype)
+        # Presence is decided before projection. The aligned history slots are
+        # exactly zero tensors, while VAE-encoded future physics slots are not.
+        present = prior_raw.detach().abs().amax(dim=(2, 3, 4)) > 0  # [B,F]
         prior = F.interpolate(
-            prior.reshape(b * f, self.prior_channels, *prior.shape[-2:]),
+            prior_raw.reshape(b * f, self.prior_channels, *prior_raw.shape[-2:]),
             size=(h, w),
             mode="bilinear",
             align_corners=False,
@@ -81,6 +88,8 @@ class GatedPhysicsCrossAttention(nn.Module):
             prior,
             need_weights=False,
         )
+        active = rearrange(present.to(dtype=attn_out.dtype), "b f -> (b f) 1 1")
+        attn_out = attn_out * active
         fused = query + torch.tanh(self.gate).to(dtype=query.dtype) * attn_out
         return rearrange(fused, "(b f) (h w) c -> b c f h w", b=b, f=f, h=h, w=w)
 

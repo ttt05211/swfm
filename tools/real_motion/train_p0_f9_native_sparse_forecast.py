@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """Stage-1 training for P0-F9 physics-conditioned native sparse forecasting.
 
-P0-F9 deliberately stops training a KTA residual generator. The World Model is
-restored to the official OccFM task (Gaussian noise -> absolute GT future), while
-Strong-W2Det/KTA is only a causal physics condition and the exact deployment
-fallback outside frozen MSP write support.
+P0-F9 trains the World Model on the released OccFM task (Gaussian noise ->
+absolute future), while Strong-W2Det/KTA is a causal physics condition and exact
+deployment fallback outside frozen MSP write support.
 
-Stage-1 keeps the VAE frozen and makes decoded occupancy semantics the primary
-objective:
-
-    L = L_semantic + fm_weight * L_FM
-    L_semantic = weighted CE + lovasz_weight * Lovasz
-
-GenieDrive-inspired low-risk training infrastructure is enabled from the first
-run: scene-balanced sampling, AdamW, warmup+cosine LR, grad clipping, zero-gated
-physics injection, and ramped FP32 EMA.
+Audited v2 contracts:
+- deterministic posterior *samples* are cached to match the released OccFM-Fut
+  latent distribution (not VAE means);
+- the inherited backbone keeps official HIST_LAST=4, while the new context
+  branch still sees all six history frames;
+- semantic supervision is equal-weighted over all six future horizons;
+- one coherent global Gaussian z0 is cropped into Top-2 windows, so overlapping
+  latent cells never receive contradictory flow sources;
+- resume/evaluation provenance is fail-closed rather than best-effort.
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import random
@@ -35,7 +33,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from real_motion.checkpoint import load_shape_safe
+from real_motion.checkpoint import load_shape_safe, require_checkpoint_reuse
 from real_motion.context import crop_prediction_and_context
 from real_motion.edit_repair import DYNAMIC_IDS, EditTargetCache
 from real_motion.model_ema import ModelEMA
@@ -48,6 +46,7 @@ from real_motion.msp_wm_cache import (
 from real_motion.native_forecast import (
     absolute_future_semantic_loss,
     class_weights_from_edit_cache,
+    crop_coherent_source_noise,
     semantic_targets_for_sample,
 )
 from real_motion.occfm_io import OccFMVAEAdapter, file_sha256, load_official_vae
@@ -57,7 +56,10 @@ from tools.real_motion.build_p0_f9_cache_fast import P0_F9_CACHE_PROTOCOL
 PRED_HW = (20, 20)
 CONTEXT_HW = (40, 40)
 FULL_HW = (50, 50)
-OPTIMIZER_PROTOCOL = "p0_f9_loaded_vs_new_differential_lr_v1"
+HIST_LAST = 4
+OPTIMIZER_PROTOCOL = "p0_f9_loaded_vs_new_differential_lr_v2"
+P0_F8_SEMANTIC_PROTOCOL = "p0_f8_anchor_relative_edit_targets_v1"
+P0_F8_TARGET_CONTRACT = "exact_strong_anchor_relative_keep_clear_write_inside_causal_msp_support"
 
 
 def _seed_all(seed: int) -> None:
@@ -76,21 +78,31 @@ def _validate_cache_pair(train_ds, val_ds, *, min_train_windows: int) -> None:
     tm, vm = train_ds.metadata, val_ds.metadata
     for name, meta in (("train", tm), ("val", vm)):
         if meta.get("protocol") != P0_F9_CACHE_PROTOCOL:
-            raise RuntimeError(f"{name} cache is not a P0-F9 native-future cache")
+            raise RuntimeError(f"{name} cache is not the audited P0-F9 native-future cache")
         if meta.get("target") != "absolute_gt_future_vae_latent":
             raise RuntimeError(f"{name} cache target is not absolute GT future")
         if meta.get("flow_source") != "gaussian_noise_not_anchor":
             raise RuntimeError(f"{name} cache flow-source contract mismatch")
         if meta.get("history_contract") != "full_native_occ_history_6f":
             raise RuntimeError(f"{name} cache history contract mismatch")
+        if int(meta.get("native_backbone_hist_last", -1)) != HIST_LAST:
+            raise RuntimeError(f"{name} cache does not record native HIST_LAST={HIST_LAST}")
         if meta.get("anchor_contract") != "strong_w2det_occ_only_v1":
             raise RuntimeError(f"{name} cache physics-anchor contract mismatch")
         if int(meta.get("topk", -1)) != 2 or list(meta.get("window_hw", [])) != [20, 20]:
             raise RuntimeError(f"{name} cache routing contract mismatch")
         if list(meta.get("context_hw", [])) != [40, 40]:
             raise RuntimeError(f"{name} cache context contract mismatch")
-        if meta.get("vae_mode") != "mean":
-            raise RuntimeError(f"{name} cache must use deterministic VAE mean latents")
+        if meta.get("vae_mode") != "sample":
+            raise RuntimeError(
+                f"{name} cache must use posterior samples to match released OccFM-Fut training latents"
+            )
+        if not meta.get("vae_sample_seed_contract"):
+            raise RuntimeError(f"{name} cache lacks deterministic VAE sampling provenance")
+    if tm.get("source_msp_mode") != "train":
+        raise RuntimeError("P0-F9 train cache must come from the frozen MSP train split")
+    if vm.get("source_msp_mode") != "val":
+        raise RuntimeError("P0-F9 val cache must come from the frozen MSP val split")
     overlap = sorted(set(tm.get("scene_names", [])) & set(vm.get("scene_names", [])))
     if overlap:
         raise RuntimeError(f"train/val scene leakage ({len(overlap)}), e.g. {overlap[:3]}")
@@ -102,15 +114,20 @@ def _validate_cache_pair(train_ds, val_ds, *, min_train_windows: int) -> None:
 
 
 def _validate_semantic_sidecar(edit: EditTargetCache, ds, name: str) -> None:
+    meta = edit.metadata
+    if meta.get("protocol") != P0_F8_SEMANTIC_PROTOCOL:
+        raise RuntimeError(f"{name} semantic sidecar protocol mismatch")
+    if meta.get("target_contract") != P0_F8_TARGET_CONTRACT:
+        raise RuntimeError(f"{name} semantic sidecar target contract mismatch")
     expected = ds.metadata.get("source_v3_cache_index_sha256")
-    actual = edit.metadata.get("source_wm_cache_index_sha256")
+    actual = meta.get("source_wm_cache_index_sha256")
     if not expected or actual != expected:
         raise RuntimeError(f"{name} semantic sidecar was not built from the exact routed source cache")
     ids = {str(e["sample_id"]) for e in ds.entries}
     if set(edit.records) != ids:
         raise RuntimeError(f"{name} semantic sidecar sample set differs from P0-F9 cache")
-    dyn = tuple(int(x) for x in edit.metadata.get("dynamic_class_ids", []))
-    if dyn and dyn != tuple(DYNAMIC_IDS):
+    dyn = tuple(int(x) for x in meta.get("dynamic_class_ids", []))
+    if dyn != tuple(DYNAMIC_IDS):
         raise RuntimeError(f"{name} semantic sidecar dynamic-class mapping differs")
 
 
@@ -245,6 +262,8 @@ def _build_optimizer(model, reuse, *, wm_lr: float, new_lr: float, weight_decay:
     pretrained, new = [], []
     pretrained_names, new_names = [], []
     for name, p in model.transition.named_parameters():
+        if not p.requires_grad:
+            continue
         if name in loaded:
             pretrained.append(p)
             pretrained_names.append(name)
@@ -304,13 +323,17 @@ def _architecture(args):
         "context_hw": [40, 40],
         "topk": 2,
         "future_frames": 6,
+        "native_backbone_hist_last": HIST_LAST,
         "flow": "gaussian_noise_to_absolute_gt_future",
+        "flow_source_spatial_contract": "one_global_gaussian_field_cropped_into_top2_windows",
+        "latent_distribution": "deterministic_posterior_sample_matching_occfm_cache",
         "physics_prior": "strong_w2det_condition_and_fallback_not_flow_source",
-        "physics_fusion": "zero_gated_mid_cross_attention_plus_zero_init_token_condition",
+        "physics_fusion": "zero_gated_mid_cross_attention_plus_zero_init_bias_free_token_condition",
         "sample_steps": int(args.sample_steps),
         "unconditional_probability": float(args.uncond_prob),
         "guidance_scale": float(args.guidance_scale),
         "semantic_population": "p0_f8_full_compact_pool_reused_as_absolute_future_targets",
+        "semantic_horizon_weighting": "equal_over_six_future_frames",
         "loss": "weighted_dynamic_semantic_CE_plus_Lovasz_plus_small_FM_regularizer",
         "fm_weight": float(args.fm_weight),
         "lovasz_weight": float(args.lovasz_weight),
@@ -331,6 +354,8 @@ def _payload(
     args,
     train_ds,
     val_ds,
+    train_sem,
+    val_sem,
     reuse,
     optimizer_info,
     class_weights,
@@ -346,14 +371,75 @@ def _payload(
         "architecture": _architecture(args),
         "train_metadata": train_ds.metadata,
         "val_metadata": val_ds.metadata,
+        "train_cache_index_sha256": file_sha256(train_ds.root / "index.json"),
+        "val_cache_index_sha256": file_sha256(val_ds.root / "index.json"),
+        "train_semantic_metadata": train_sem.metadata,
+        "val_semantic_metadata": val_sem.metadata,
+        "train_semantic_sha256": file_sha256(train_sem.path),
+        "val_semantic_sha256": file_sha256(val_sem.path),
         "upstream_checkpoint": str(Path(args.upstream_ckpt).resolve()),
         "upstream_checkpoint_sha256": file_sha256(args.upstream_ckpt),
+        "vae_checkpoint_sha256": file_sha256(args.vae_ckpt),
         "upstream_reuse": reuse,
         "optimizer_contract": optimizer_info,
         "semantic_class_weights": class_weights.detach().cpu(),
         "skipped_empty_train_batches": int(skipped),
         "args": vars(args),
     }
+
+
+def _same_float(a, b, *, atol=1e-12):
+    return math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=float(atol))
+
+
+def _validate_resume_checkpoint(
+    ck,
+    args,
+    train_ds,
+    val_ds,
+    train_sem,
+    val_sem,
+    class_weights,
+):
+    arch = ck.get("architecture", {})
+    if arch.get("protocol") != P0_F9_PROTOCOL or int(arch.get("stage", -1)) != 1:
+        raise RuntimeError("resume checkpoint is not audited P0-F9 Stage-1")
+    if int(arch.get("native_backbone_hist_last", -1)) != HIST_LAST:
+        raise RuntimeError("resume checkpoint HIST_LAST contract differs")
+    if arch.get("flow_source_spatial_contract") != "one_global_gaussian_field_cropped_into_top2_windows":
+        raise RuntimeError("resume checkpoint source-noise spatial contract differs")
+    if ck.get("train_cache_index_sha256") != file_sha256(train_ds.root / "index.json"):
+        raise RuntimeError("resume train cache differs from checkpoint")
+    if ck.get("val_cache_index_sha256") != file_sha256(val_ds.root / "index.json"):
+        raise RuntimeError("resume val cache differs from checkpoint")
+    if ck.get("train_semantic_sha256") != file_sha256(train_sem.path):
+        raise RuntimeError("resume train semantic sidecar differs from checkpoint")
+    if ck.get("val_semantic_sha256") != file_sha256(val_sem.path):
+        raise RuntimeError("resume val semantic sidecar differs from checkpoint")
+    if ck.get("upstream_checkpoint_sha256") != file_sha256(args.upstream_ckpt):
+        raise RuntimeError("resume upstream OccFM checkpoint differs")
+    if ck.get("vae_checkpoint_sha256") != file_sha256(args.vae_ckpt):
+        raise RuntimeError("resume VAE checkpoint differs")
+
+    saved = ck.get("args", {})
+    exact_keys = ("steps", "batch_size", "sample_steps", "seed", "min_train_windows")
+    float_keys = (
+        "wm_lr", "new_lr", "weight_decay", "warmup_fraction", "min_lr_ratio",
+        "fm_weight", "lovasz_weight", "uncond_prob", "guidance_scale", "ema_decay",
+    )
+    for key in exact_keys:
+        if key not in saved or int(saved[key]) != int(getattr(args, key)):
+            raise RuntimeError(f"resume argument differs for {key}")
+    for key in float_keys:
+        if key not in saved or not _same_float(saved[key], getattr(args, key)):
+            raise RuntimeError(f"resume argument differs for {key}")
+
+    saved_weights = torch.as_tensor(ck.get("semantic_class_weights"), dtype=torch.float32)
+    if not torch.allclose(saved_weights, class_weights, atol=0, rtol=0):
+        raise RuntimeError("semantic class weights differ from resume checkpoint")
+    step = int(ck.get("step", -1))
+    if step < 0 or step > int(args.steps):
+        raise RuntimeError(f"resume step {step} incompatible with target steps={args.steps}")
 
 
 def validate(
@@ -374,10 +460,11 @@ def validate(
     fm_sum = 0.0
     fm_windows = 0
     sem_sum = 0.0
-    sem_voxels = 0
+    sem_weight = 0
     ce_sum = 0.0
     lovasz_sum = 0.0
     acc_sum = 0.0
+    acc_weight = 0
     dyn_acc_sum = 0.0
     dyn_acc_weight = 0
     bg_false_sum = 0.0
@@ -390,7 +477,10 @@ def validate(
         if prepared is None:
             skipped += 1
             continue
-        source_noise = _fixed_noise_like(prepared["target"], int(seed) + batch_idx)
+        global_noise = _fixed_noise_like(prepared["physics_full"], int(seed) + batch_idx)
+        source_noise = crop_coherent_source_noise(
+            global_noise, prepared["plan"], prepared["effective"]
+        )
         with torch.enable_grad():
             with torch.autocast(
                 device_type=device.type,
@@ -419,42 +509,51 @@ def validate(
                     lovasz_weight=lovasz_weight,
                 )
         nwin = int(prepared["history"].shape[0])
+        nsample = int(prepared["batch_size"])
         nvox = int(sem_info["num_supervised_voxels"])
+        ndyn = int(sem_info.get("num_dynamic_voxels", 0))
+        nbg = int(sem_info.get("num_background_voxels", 0))
         fm_sum += float(fm_loss.detach().item()) * nwin
         fm_windows += nwin
         cosine_sum += float(info["cosine"]) * nwin
         if nvox > 0:
-            sem_sum += float(sem_loss.detach().item()) * nvox
-            ce_sum += float(sem_info["ce"]) * nvox
-            lovasz_sum += float(sem_info["lovasz"]) * nvox
+            # The semantic objective is already equal-horizon inside each batch;
+            # aggregate batches by sample count rather than reintroducing voxel
+            # population weighting here.
+            sem_sum += float(sem_loss.detach().item()) * nsample
+            ce_sum += float(sem_info["ce"]) * nsample
+            lovasz_sum += float(sem_info["lovasz"]) * nsample
+            sem_weight += nsample
             acc_sum += float(sem_info["accuracy"]) * nvox
-            sem_voxels += nvox
-            if math.isfinite(float(sem_info["dynamic_accuracy"])):
-                dyn_acc_sum += float(sem_info["dynamic_accuracy"]) * nvox
-                dyn_acc_weight += nvox
-            if math.isfinite(float(sem_info["background_false_dynamic_rate"])):
-                bg_false_sum += float(sem_info["background_false_dynamic_rate"]) * nvox
-                bg_false_weight += nvox
+            acc_weight += nvox
+            if ndyn > 0 and math.isfinite(float(sem_info["dynamic_accuracy"])):
+                dyn_acc_sum += float(sem_info["dynamic_accuracy"]) * ndyn
+                dyn_acc_weight += ndyn
+            if nbg > 0 and math.isfinite(float(sem_info["background_false_dynamic_rate"])):
+                bg_false_sum += float(sem_info["background_false_dynamic_rate"]) * nbg
+                bg_false_weight += nbg
         del endpoint, sem_loss, fm_loss
     model.train(was_training)
-    if fm_windows <= 0 or sem_voxels <= 0:
+    if fm_windows <= 0 or sem_weight <= 0:
         raise RuntimeError("P0-F9 validation has no valid routed semantic windows")
     fm_avg = fm_sum / fm_windows
-    sem_avg = sem_sum / sem_voxels
+    sem_avg = sem_sum / sem_weight
     return {
         "objective": sem_avg + float(fm_weight) * fm_avg,
         "semantic_loss": sem_avg,
-        "semantic_ce": ce_sum / sem_voxels,
-        "semantic_lovasz": lovasz_sum / sem_voxels,
+        "semantic_ce": ce_sum / sem_weight,
+        "semantic_lovasz": lovasz_sum / sem_weight,
         "fm_loss": fm_avg,
         "fm_weight": float(fm_weight),
         "weighted_fm_loss": float(fm_weight) * fm_avg,
-        "semantic_accuracy": acc_sum / sem_voxels,
+        "semantic_accuracy": acc_sum / max(acc_weight, 1),
         "dynamic_accuracy": dyn_acc_sum / max(dyn_acc_weight, 1),
         "background_false_dynamic_rate": bg_false_sum / max(bg_false_weight, 1),
         "fm_cosine": cosine_sum / fm_windows,
         "num_windows": fm_windows,
-        "num_semantic_voxels": sem_voxels,
+        "num_semantic_voxels": acc_weight,
+        "num_dynamic_voxels": dyn_acc_weight,
+        "num_background_voxels": bg_false_weight,
         "skipped_empty_batches": skipped,
     }
 
@@ -481,7 +580,7 @@ def main():
     p.add_argument("--lovasz-weight", type=float, default=1.0)
     p.add_argument("--sample-steps", type=int, default=10)
     p.add_argument("--uncond-prob", type=float, default=0.0,
-                   help="Stage-1 semantic-primary default disables condition dropout")
+                   help="Stage-1 default disables condition dropout; nonzero values are honored")
     p.add_argument("--guidance-scale", type=float, default=1.0)
     p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--val-every", type=int, default=200)
@@ -497,6 +596,8 @@ def main():
         raise ValueError("invalid LR schedule")
     if a.fm_weight < 0 or a.lovasz_weight < 0:
         raise ValueError("loss weights must be non-negative")
+    if not 0.0 <= a.uncond_prob < 1.0:
+        raise ValueError("uncond-prob must be in [0,1)")
 
     _seed_all(a.seed)
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
@@ -538,14 +639,12 @@ def main():
         sample_steps=a.sample_steps,
         unconditional_probability=a.uncond_prob,
         guidance_scale=a.guidance_scale,
+        hist_last=HIST_LAST,
     ).to(device)
     reuse = load_shape_safe(model.transition, a.upstream_ckpt, verbose=True)
-    loaded = set(reuse.get("loaded_keys", ()))
-    if "traj_encoder.0.weight" not in loaded:
+    if "traj_encoder.0.weight" not in set(reuse.get("loaded_keys", ())):
         raise RuntimeError("P0-F9 requires the official OccFM-Fut epoch=000196 checkpoint")
-    official_reuse_fraction = float(reuse.get("loaded", 0)) / max(float(reuse.get("target_total", 1)), 1.0)
-    if official_reuse_fraction < 0.80:
-        raise RuntimeError(f"unexpectedly low official transition reuse {official_reuse_fraction:.3f}")
+    official_reuse_fraction = require_checkpoint_reuse(reuse, min_fraction=0.80)
 
     vae_model, _ = load_official_vae(UP, a.vae_ckpt, device)
     vae = OccFMVAEAdapter(vae_model)
@@ -571,18 +670,16 @@ def main():
     skipped = 0
     if a.resume_from:
         ck = torch.load(a.resume_from, map_location="cpu", weights_only=False)
-        if ck.get("architecture", {}).get("protocol") != P0_F9_PROTOCOL:
-            raise RuntimeError("resume checkpoint is not P0-F9")
+        _validate_resume_checkpoint(
+            ck, a, train_ds, val_ds, train_sem, val_sem, class_weights
+        )
         model.load_state_dict(ck["state_dict"], strict=True)
         ema.load_state_dict(ck["ema"])
         optimizer.load_state_dict(ck["optimizer_state_dict"])
-        step = int(ck.get("step", 0))
+        step = int(ck["step"])
         best_val = float(ck.get("best_val_objective", float("inf")))
         history = list(ck.get("training_history", []))
         skipped = int(ck.get("skipped_empty_train_batches", 0))
-        saved_weights = torch.as_tensor(ck.get("semantic_class_weights"), dtype=torch.float32)
-        if not torch.allclose(saved_weights, class_weights, atol=0, rtol=0):
-            raise RuntimeError("semantic class weights differ from resume checkpoint")
         print(f"resumed P0-F9 from {a.resume_from}: step={step} best={best_val:.6f}")
 
     iterator = iter(train_loader)
@@ -598,6 +695,12 @@ def main():
             skipped += 1
             continue
 
+        # Draw one full-grid source field, then crop it through the exact Top-2
+        # plan. Overlap cells now share the same z0 in both windows.
+        global_noise = torch.randn_like(prepared["physics_full"])
+        source_noise = crop_coherent_source_noise(
+            global_noise, prepared["plan"], prepared["effective"]
+        )
         lr_ratio = _lr_ratio(step, a.steps, a.warmup_fraction, a.min_lr_ratio)
         lrs = _set_lr(optimizer, lr_ratio)
         optimizer.zero_grad(set_to_none=True)
@@ -613,8 +716,11 @@ def main():
                 history_context=prepared["context"],
                 trajectory=prepared["trajectory"],
                 window_origins=prepared["origins"],
+                source_noise=source_noise,
                 return_endpoint=True,
-                force_conditioned=True,
+                # Do not force conditioned here: --uncond-prob must actually
+                # control training behavior. Default 0.0 remains fully conditioned.
+                force_conditioned=False,
             )
             endpoint = scatter_absolute_endpoint(info["predicted_endpoint"], prepared)
             sem_loss, sem_info = semantic_loss_for_endpoint(
@@ -646,9 +752,13 @@ def main():
             "dynamic_accuracy": float(sem_info["dynamic_accuracy"]),
             "background_false_dynamic_rate": float(sem_info["background_false_dynamic_rate"]),
             "num_semantic_voxels": int(sem_info["num_supervised_voxels"]),
+            "num_dynamic_voxels": int(sem_info.get("num_dynamic_voxels", 0)),
+            "num_background_voxels": int(sem_info.get("num_background_voxels", 0)),
+            "per_horizon_voxels": list(sem_info.get("per_horizon_voxels", [])),
             "fm_loss": float(fm_loss.detach().item()),
             "fm_weight": float(a.fm_weight),
             "fm_cosine": float(info["cosine"]),
+            "conditioned_fraction": float(info["conditioned_fraction"]),
             "physics_authority": authority,
             "grad_norm_before_clip": float(torch.as_tensor(grad_norm).detach().cpu()),
             "ema_decay": float(ema_decay_now),
@@ -662,6 +772,7 @@ def main():
                 f"lov={train_info['semantic_lovasz']:.6f} fm={train_info['fm_loss']:.6f} "
                 f"dyn_acc={train_info['dynamic_accuracy']:.4f} "
                 f"bg_false={train_info['background_false_dynamic_rate']:.4f} "
+                f"cond={train_info['conditioned_fraction']:.3f} "
                 f"phys={authority:+.5f} lr={lrs}"
             )
 
@@ -692,6 +803,8 @@ def main():
                 args=a,
                 train_ds=train_ds,
                 val_ds=val_ds,
+                train_sem=train_sem,
+                val_sem=val_sem,
                 reuse=reuse,
                 optimizer_info=optimizer_info,
                 class_weights=class_weights,
@@ -713,6 +826,8 @@ def main():
         args=a,
         train_ds=train_ds,
         val_ds=val_ds,
+        train_sem=train_sem,
+        val_sem=val_sem,
         reuse=reuse,
         optimizer_info=optimizer_info,
         class_weights=class_weights,

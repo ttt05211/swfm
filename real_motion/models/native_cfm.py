@@ -1,10 +1,15 @@
 """Native noise-to-future conditional flow matching for P0-F9.
 
-Unlike P0-F4..F8, the Strong-W2Det/KTA future is *not* the flow source.  P0-F9
+Unlike P0-F4..F8, the Strong-W2Det/KTA future is *not* the flow source. P0-F9
 restores the official OccFM task: Gaussian source -> absolute future latent,
-conditioned on history/trajectory.  The physics future is supplied only as an
+conditioned on history/trajectory. The physics future is supplied only as an
 additional condition and remains the exact deployment fallback outside MSP
 write support.
+
+The pretrained OccFM-Fut checkpoint was trained with six history slots but only
+the last four populated (HIST_LAST=4). P0-F9 preserves that native backbone
+contract on the inherited path while the separate full-history context branch is
+still allowed to see all six history frames.
 """
 from __future__ import annotations
 
@@ -22,6 +27,7 @@ class NativeFutureWindowCFM(nn.Module):
         alpha_shift: float = 3.0,
         unconditional_probability: float = 0.2,
         guidance_scale: float = 2.0,
+        hist_last: int = 4,
     ) -> None:
         super().__init__()
         self.transition = transition
@@ -30,6 +36,7 @@ class NativeFutureWindowCFM(nn.Module):
         self.alpha_shift = float(alpha_shift)
         self.unconditional_probability = float(unconditional_probability)
         self.guidance_scale = float(guidance_scale)
+        self.hist_last = int(hist_last)
         self.time_scalar = 1000.0
         if self.sample_steps <= 0:
             raise ValueError("sample_steps must be positive")
@@ -37,6 +44,8 @@ class NativeFutureWindowCFM(nn.Module):
             raise ValueError("unconditional_probability must be in [0,1)")
         if self.guidance_scale < 0:
             raise ValueError("guidance_scale must be non-negative")
+        if self.hist_last <= 0:
+            raise ValueError("hist_last must be positive")
 
     @staticmethod
     def _sample_t(bs: int, device, dtype):
@@ -50,6 +59,42 @@ class NativeFutureWindowCFM(nn.Module):
             raise ValueError("history_context must be [B,T,C,H,W]")
         if history_context.shape[:3] != history.shape[:3]:
             raise ValueError("history_context B/T/C must match history")
+
+    def _native_backbone_condition(
+        self,
+        history: torch.Tensor,
+        trajectory: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Match the released OccFM-Fut HIST_LAST contract on loaded weights.
+
+        The official dataset keeps six condition slots but zeros the first
+        ``6-HIST_LAST`` slots and the matching trajectory rows. The new 40x40
+        context branch receives the untouched six-frame history separately.
+        """
+        if history.ndim != 5:
+            raise ValueError("history must be [B,T,C,H,W]")
+        hist_frames = int(history.shape[1])
+        if self.hist_last > hist_frames:
+            raise ValueError(
+                f"hist_last={self.hist_last} exceeds history frames={hist_frames}"
+            )
+        repeat = hist_frames - self.hist_last
+        if repeat <= 0:
+            native_history = history
+        else:
+            native_history = history.clone()
+            native_history[:, :repeat] = 0
+
+        native_trajectory = trajectory
+        if trajectory is not None:
+            if trajectory.ndim != 3 or trajectory.shape[0] != history.shape[0]:
+                raise ValueError("trajectory must be [B,L,2]")
+            if trajectory.shape[-1] != 2 or trajectory.shape[1] < repeat:
+                raise ValueError("trajectory shape is incompatible with HIST_LAST masking")
+            native_trajectory = trajectory.clone()
+            if repeat > 0:
+                native_trajectory[:, :repeat] = 0
+        return native_history, native_trajectory
 
     @staticmethod
     def _align_prior(physics_future: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
@@ -90,10 +135,13 @@ class NativeFutureWindowCFM(nn.Module):
         if history.shape[0] != target_future.shape[0] or history.shape[2:] != target_future.shape[2:]:
             raise ValueError("history and future B/C/H/W must match")
         self._validate_context(history_context, history)
+        native_history, native_trajectory = self._native_backbone_condition(history, trajectory)
 
-        hist = history * self.rescale_factor
+        hist = native_history * self.rescale_factor
         target = target_future * self.rescale_factor
         physics = physics_future * self.rescale_factor
+        # Keep the new context path full-history; only the inherited native path
+        # obeys HIST_LAST=4.
         ctx = None if history_context is None else history_context * self.rescale_factor
         if source_noise is None:
             source = torch.randn_like(target)
@@ -136,7 +184,7 @@ class NativeFutureWindowCFM(nn.Module):
         batch = {
             "noised_sequence": seq,
             "timesteps": t[:, 0, 0, 0, 0] * self.time_scalar,
-            "trajectory": trajectory,
+            "trajectory": native_trajectory,
             "prior_condition": prior,
             "history_context": ctx_cond,
             "window_origins": window_origins,
@@ -164,6 +212,7 @@ class NativeFutureWindowCFM(nn.Module):
             "pred_rms": float(pred_rms.detach().cpu()),
             "cosine": float(cosine.mean().detach().cpu()),
             "conditioned_fraction": conditioned_fraction,
+            "hist_last": self.hist_last,
         }
         if return_endpoint:
             # Auxiliary x1 reconstruction from the sampled FM state. This is a
@@ -191,8 +240,9 @@ class NativeFutureWindowCFM(nn.Module):
         if history.shape[0] != physics_future.shape[0] or history.shape[2:] != physics_future.shape[2:]:
             raise ValueError("history and physics B/C/H/W must match")
         self._validate_context(history_context, history)
+        native_history, native_trajectory = self._native_backbone_condition(history, trajectory)
 
-        hist = history * self.rescale_factor
+        hist = native_history * self.rescale_factor
         physics = physics_future * self.rescale_factor
         ctx = None if history_context is None else history_context * self.rescale_factor
         if initial_noise is None:
@@ -216,7 +266,7 @@ class NativeFutureWindowCFM(nn.Module):
                 seq = cond_seq
                 prior = self._align_prior(physics, hist)
                 ctx_batch = ctx
-                traj_batch = trajectory
+                traj_batch = native_trajectory
                 origins_batch = window_origins
             else:
                 uncond_seq = torch.cat([torch.zeros_like(hist), future], dim=1)
@@ -224,7 +274,10 @@ class NativeFutureWindowCFM(nn.Module):
                 prior_cond = self._align_prior(physics, hist)
                 prior = torch.cat([torch.zeros_like(prior_cond), prior_cond], dim=0)
                 ctx_batch = None if ctx is None else torch.cat([torch.zeros_like(ctx), ctx], dim=0)
-                traj_batch = None if trajectory is None else torch.cat([trajectory, trajectory], dim=0)
+                traj_batch = (
+                    None if native_trajectory is None
+                    else torch.cat([native_trajectory, native_trajectory], dim=0)
+                )
                 origins_batch = (
                     None if window_origins is None
                     else torch.cat([window_origins, window_origins], dim=0)

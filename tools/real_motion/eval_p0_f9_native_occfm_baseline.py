@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Evaluate the frozen official dense OccFM-Fut checkpoint on the P0-F9 split.
 
-This is a paper baseline, not a diagnostic: it answers how strong the native
-History->Future pretrained World Model is under exactly the same 128-window
-Overall/Moving protocol used for Strong-W2Det and P0-F9.
+This is a paper baseline, not a diagnostic. The audited P0-F9 cache stores
+posterior-sampled history latents, matching the distribution used by the released
+OccFM-Fut cache. ``run_frozen_occfm_forecast`` then applies the official
+HIST_LAST=4 condition masking and released sampler.
 """
 from __future__ import annotations
 
@@ -25,10 +26,12 @@ from real_motion.metrics.moving_miou_v2 import (
     SemanticIoUAccumulator,
 )
 from real_motion.msp_wm_cache import MSP_WM_CACHE_VERSION_V2, MSPWorldModelCacheDataset
-from real_motion.occfm_io import load_official_wm, run_frozen_occfm_forecast
+from real_motion.native_forecast import deterministic_sample_seed
+from real_motion.occfm_io import file_sha256, load_official_wm, run_frozen_occfm_forecast
 from tools.real_motion.build_p0_f9_cache_fast import P0_F9_CACHE_PROTOCOL
 
 REPORT = {1.0: 1, 2.0: 3, 3.0: 5}
+HIST_LAST = 4
 
 
 def _new_metrics():
@@ -64,24 +67,33 @@ def main():
         raise RuntimeError("the pinned official OccFM sampler requires CUDA")
     ds = MSPWorldModelCacheDataset(a.cache)
     if ds.version != MSP_WM_CACHE_VERSION_V2 or ds.metadata.get("protocol") != P0_F9_CACHE_PROTOCOL:
-        raise RuntimeError("native OccFM baseline requires a P0-F9 validation cache")
+        raise RuntimeError("native OccFM baseline requires the audited P0-F9 validation cache")
+    if ds.metadata.get("vae_mode") != "sample":
+        raise RuntimeError("native OccFM baseline requires posterior-sampled P0-F9 latents")
+    if int(ds.metadata.get("native_backbone_hist_last", -1)) != HIST_LAST:
+        raise RuntimeError("native OccFM baseline requires HIST_LAST=4 cache provenance")
     if not bool(ds.metadata.get("include_eval_payload", False)):
         raise RuntimeError("native OccFM baseline requires validation eval payload")
 
     wm, cfg = load_official_wm(UP, a.occfm_ckpt, device)
+    if int(cfg.DATA_CONFIG.HIST_LAST) != HIST_LAST:
+        raise RuntimeError(f"official OccFM config HIST_LAST changed: {cfg.DATA_CONFIG.HIST_LAST}")
     state = _new_metrics()
     for i in range(len(ds)):
         s = ds[i]
         for key in ("eval_future_gt_occ", "eval_gt_moving_support"):
             if key not in s:
                 raise RuntimeError(f"{s['sample_id']}: missing {key}")
+        sample_seed = deterministic_sample_seed(
+            str(s["sample_id"]), a.seed, stream="forecast"
+        )
         pred = run_frozen_occfm_forecast(
             wm,
             s["full_history_latent"],
             s["gt_future_latent"],
             trajectory=s["trajectory"],
-            seed=int(a.seed) + i,
-            hist_last=4,
+            seed=sample_seed,
+            hist_last=HIST_LAST,
         ).numpy()
         gt = s["eval_future_gt_occ"].numpy()
         moving = s["eval_gt_moving_support"].numpy().astype(bool)
@@ -92,11 +104,16 @@ def main():
             print("native_occfm_eval", i, s["sample_id"])
 
     report = {
-        "protocol": "p0_f9_official_occfm_native_baseline_v1",
+        "protocol": "p0_f9_official_occfm_native_baseline_v2",
         "num_windows": len(ds),
         "checkpoint": str(Path(a.occfm_ckpt).resolve()),
+        "checkpoint_sha256": file_sha256(a.occfm_ckpt),
+        "cache_index_sha256": file_sha256(ds.root / "index.json"),
+        "latent_distribution": "posterior_sample",
+        "hist_last": HIST_LAST,
         "sample_steps": int(cfg.LOSS.SAMPLE_STEP),
         "seed": int(a.seed),
+        "sample_seed_contract": "sha256(base,forecast,sample_id)",
         "metrics": _report(state),
     }
     out = Path(a.output)

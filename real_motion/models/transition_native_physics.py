@@ -1,6 +1,8 @@
 """P0-F9 native OccFM transition with gated Strong-W2Det physics conditioning."""
 from __future__ import annotations
 
+import torch.nn as nn
+
 from .physics_prior import GatedPhysicsCrossAttention
 from .transition_full_context import MotionWindowFlowMatchingFullContext
 
@@ -13,6 +15,11 @@ class MotionWindowNativePhysicsTransition(MotionWindowFlowMatchingFullContext):
     at the bottleneck. The gate is initialized to zero, so a freshly constructed
     P0-F9 model remains numerically identical to the parent transition before
     training (apart from the native flow source handled outside this module).
+
+    P0-F9 also removes the bias from the token-wise physics projection. The
+    aligned prior intentionally contains zero history slots; a learnable bias
+    would otherwise turn those zeros into a non-physics condition after the
+    first updates.
     """
 
     def __init__(
@@ -24,6 +31,8 @@ class MotionWindowNativePhysicsTransition(MotionWindowFlowMatchingFullContext):
         **kwargs,
     ) -> None:
         super().__init__(*args, prior_channels=prior_channels, **kwargs)
+        self.prior_proj = nn.Linear(int(prior_channels), self.model_channels, bias=False)
+        nn.init.zeros_(self.prior_proj.weight)
         self.physics_fusion = GatedPhysicsCrossAttention(
             prior_channels=int(prior_channels),
             hidden_size=int(physics_mid_channels),
