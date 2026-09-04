@@ -11,6 +11,8 @@ Audited v2 contracts:
 - the inherited backbone keeps official HIST_LAST=4, while the new context
   branch still sees all six history frames;
 - semantic supervision is equal-weighted over all six future horizons;
+- one coherent global Gaussian z0 is cropped into Top-2 windows, so overlapping
+  latent cells never receive contradictory flow sources;
 - resume/evaluation provenance is fail-closed rather than best-effort.
 """
 from __future__ import annotations
@@ -44,6 +46,7 @@ from real_motion.msp_wm_cache import (
 from real_motion.native_forecast import (
     absolute_future_semantic_loss,
     class_weights_from_edit_cache,
+    crop_coherent_source_noise,
     semantic_targets_for_sample,
 )
 from real_motion.occfm_io import OccFMVAEAdapter, file_sha256, load_official_vae
@@ -322,6 +325,7 @@ def _architecture(args):
         "future_frames": 6,
         "native_backbone_hist_last": HIST_LAST,
         "flow": "gaussian_noise_to_absolute_gt_future",
+        "flow_source_spatial_contract": "one_global_gaussian_field_cropped_into_top2_windows",
         "latent_distribution": "deterministic_posterior_sample_matching_occfm_cache",
         "physics_prior": "strong_w2det_condition_and_fallback_not_flow_source",
         "physics_fusion": "zero_gated_mid_cross_attention_plus_zero_init_bias_free_token_condition",
@@ -402,6 +406,8 @@ def _validate_resume_checkpoint(
         raise RuntimeError("resume checkpoint is not audited P0-F9 Stage-1")
     if int(arch.get("native_backbone_hist_last", -1)) != HIST_LAST:
         raise RuntimeError("resume checkpoint HIST_LAST contract differs")
+    if arch.get("flow_source_spatial_contract") != "one_global_gaussian_field_cropped_into_top2_windows":
+        raise RuntimeError("resume checkpoint source-noise spatial contract differs")
     if ck.get("train_cache_index_sha256") != file_sha256(train_ds.root / "index.json"):
         raise RuntimeError("resume train cache differs from checkpoint")
     if ck.get("val_cache_index_sha256") != file_sha256(val_ds.root / "index.json"):
@@ -471,7 +477,10 @@ def validate(
         if prepared is None:
             skipped += 1
             continue
-        source_noise = _fixed_noise_like(prepared["target"], int(seed) + batch_idx)
+        global_noise = _fixed_noise_like(prepared["physics_full"], int(seed) + batch_idx)
+        source_noise = crop_coherent_source_noise(
+            global_noise, prepared["plan"], prepared["effective"]
+        )
         with torch.enable_grad():
             with torch.autocast(
                 device_type=device.type,
@@ -686,6 +695,12 @@ def main():
             skipped += 1
             continue
 
+        # Draw one full-grid source field, then crop it through the exact Top-2
+        # plan. Overlap cells now share the same z0 in both windows.
+        global_noise = torch.randn_like(prepared["physics_full"])
+        source_noise = crop_coherent_source_noise(
+            global_noise, prepared["plan"], prepared["effective"]
+        )
         lr_ratio = _lr_ratio(step, a.steps, a.warmup_fraction, a.min_lr_ratio)
         lrs = _set_lr(optimizer, lr_ratio)
         optimizer.zero_grad(set_to_none=True)
@@ -701,6 +716,7 @@ def main():
                 history_context=prepared["context"],
                 trajectory=prepared["trajectory"],
                 window_origins=prepared["origins"],
+                source_noise=source_noise,
                 return_endpoint=True,
                 # Do not force conditioned here: --uncond-prob must actually
                 # control training behavior. Default 0.0 remains fully conditioned.
