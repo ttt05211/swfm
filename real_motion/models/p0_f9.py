@@ -7,7 +7,7 @@ from .native_cfm import NativeFutureWindowCFM
 from .transition_native_physics import MotionWindowNativePhysicsTransition
 
 
-P0_F9_PROTOCOL = "p0_f9_physics_conditioned_native_sparse_forecast_v1"
+P0_F9_PROTOCOL = "p0_f9_physics_conditioned_native_sparse_forecast_v2"
 
 
 def make_p0_f9_model(
@@ -16,6 +16,7 @@ def make_p0_f9_model(
     sample_steps: int = 10,
     unconditional_probability: float = 0.2,
     guidance_scale: float = 2.0,
+    hist_last: int = 4,
 ):
     patch_occfm_flash_attention_backward_dtype()
     tr = MotionWindowNativePhysicsTransition(
@@ -43,4 +44,5 @@ def make_p0_f9_model(
         alpha_shift=3.0,
         unconditional_probability=float(unconditional_probability),
         guidance_scale=float(guidance_scale),
+        hist_last=int(hist_last),
     )
