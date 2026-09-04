@@ -1,43 +1,84 @@
-# P0-F9 Frozen Sparse OccFM Diagnostic
+# P0-F9 Frozen Sparse OccFM + Safe-Fusion Diagnostic
 
 ## Purpose
 
-P0-F9 Stage-1 fails the deployment criterion badly. Before designing another training objective, this no-training diagnostic locates where the loss is introduced.
+P0-F9 Stage-1 fails the deployment criterion badly. The first controlled diagnostic already localized the loss into destructive takeover fusion, sparse 20x20 adaptation, CFG, and finetuning. The dominant Moving loss came from the takeover fusion itself.
 
-A direct comparison between raw dense OccFM and a sparse P0-F9 deployment is not sufficient, because the sparse result uses Strong-W2Det fallback plus dynamic-only fusion. The controlled diagnostic therefore evaluates the dense OccFM proposal under the exact same MSP support and fusion rule before comparing it to the sparse crop.
+The next no-training ablation therefore asks a narrower question:
 
-## Controlled states
+> Does the same dense/frozen-sparse OccFM proposal contain useful motion innovation if it is forbidden from erasing Strong-W2Det dynamic predictions?
 
-`tools/real_motion/eval_p0_f9_frozen_sparse_occfm.py` reports six states on the exact same validation split:
+No new model is trained. The exact same proposal predictions and MSP support are evaluated under multiple fusion contracts.
+
+## Proposal sources
+
+`tools/real_motion/eval_p0_f9_frozen_sparse_occfm.py` evaluates:
 
 1. `strong_anchor`: frozen Strong-W2Det;
 2. `dense_official_raw`: released dense OccFM prediction;
-3. `dense_official_same_support_fusion`: released dense OccFM used only as the proposal inside the exact P0-F9 MSP write support and dynamic-only fusion;
-4. `frozen_sparse_official_cfg`: released OccFM transition weights in the current Top-2 20x20 sparse geometry, no new condition paths, CFG=2;
-5. `frozen_sparse_p0f9_cfg`: the same frozen sparse model/noise, but CFG=1;
-6. `same_support_gt_oracle`: exact GT proposal under the same support/fusion.
+3. released dense OccFM as a proposal inside the P0-F9 MSP support;
+4. frozen Top-2 20x20 OccFM with released CFG=2;
+5. frozen Top-2 20x20 OccFM with P0-F9 CFG=1;
+6. GT as the proposal, to measure fusion-specific oracle headroom.
 
-No P0-F9 trained checkpoint is loaded.
+The sparse proposal branches still use released weights only: no P0-F9 trained checkpoint, no full-history context branch, and no physics-condition branch.
 
-## Frozen sparse contract
+## Three fusion rules
 
-The sparse branches:
+For every proposal source, the exact same support is fused in three ways.
 
-- use the audited P0-F9 v2 validation cache;
-- keep official `HIST_LAST=4`;
-- keep native Gaussian -> absolute-future flow;
-- use one global 50x50 Gaussian source field and crop it through the frozen Top-2 plan;
-- keep absolute 50x50 coordinates for each 20x20 window;
-- disable the new full-history context path;
-- pass an all-zero physics prior;
-- fail if token-prior projection, context projection, or the physics gate is not an exact no-op;
-- load only shape-compatible released OccFM transition weights and keep the checkpoint-reuse gate;
-- scatter sparse predictions back into the Strong-W2Det latent fallback;
-- decode with the frozen official VAE;
-- apply the same dynamic-only deployment fusion as P0-F9;
-- verify the same-support GT oracle remains bit-exact with the cached repair target.
+### 1. `takeover`
 
-The two sparse variants use the same source noise. `CFG=2` matches the released OccFM config (`UNCOND_P=0.2`, `UNCOND_SCALE=2`); `CFG=1` matches the P0-F9 Stage-1 deployment choice.
+Legacy P0-F9 behavior:
+
+```text
+inside support:
+    clear every anchor dynamic voxel
+    write every proposal dynamic voxel
+```
+
+This is the existing `apply_dynamic_repair` contract and remains unchanged for provenance compatibility.
+
+### 2. `write_only`
+
+Most conservative innovation rule:
+
+```text
+inside support:
+    if anchor is dynamic:
+        keep anchor bit-exact
+    elif proposal is dynamic:
+        write proposal dynamic
+    else:
+        keep anchor
+```
+
+The learned model can add missing dynamic evidence, but it cannot delete or relabel any Strong-W2Det dynamic prediction.
+
+### 3. `dynamic_union`
+
+Non-destructive dynamic union:
+
+```text
+inside support:
+    if proposal is dynamic:
+        write proposal dynamic
+    else:
+        keep anchor
+```
+
+Therefore proposal dynamic semantics may add a missing dynamic voxel or relabel an existing dynamic class, but proposal free/background/non-dynamic semantics can never erase anchor dynamic presence.
+
+## Why both safe variants are needed
+
+`write_only` answers whether missing dynamic evidence alone is useful.
+
+`dynamic_union` additionally tests whether the proposal has useful dynamic-class corrections. Their difference is diagnostic:
+
+- `write_only > dynamic_union`: proposal class corrections are harmful; Strong dynamic semantics should remain authoritative;
+- `dynamic_union > write_only`: proposal contributes useful class corrections in addition to new dynamic evidence.
+
+GT is evaluated with all three rules as well. This tells us whether a non-destructive innovation design still has enough theoretical headroom before any new model is trained.
 
 ## Full run
 
@@ -52,39 +93,58 @@ CUDA_VISIBLE_DEVICES=0 \
   --occfm-ckpt "$OCCFM/logs/occfm_fut/2s_3s_nusc_fut_traj/ckpt/epoch=000196.ckpt" \
   --vae-ckpt "$OCCFM/logs/occfm_vae/100ep_3docc_sem_voxel/ckpt/epoch=000100.ckpt" \
   --dense-baseline-json "$ROOT/outputs/p0_f9_v2_official_occfm_native_128.json" \
-  --output "$ROOT/outputs/p0_f9_v2_frozen_sparse_occfm_128.json" \
+  --output "$ROOT/outputs/p0_f9_v3_safe_fusion_ablation_128.json" \
   --seed 20260904 \
   --amp
 ```
 
-For a GPU execution smoke first, add `--max-windows 2` and use a separate output path. The existing 128-window dense-baseline JSON is not compared to a partial smoke run.
+For a GPU execution smoke first, add `--max-windows 2` and use a separate output path.
 
-## Four controlled deltas
+## Main output table
 
-The key outputs are:
+The terminal prints:
 
 ```text
-fusion_effect_dense_same_support_minus_strong
-    = dense OccFM proposal under the exact P0-F9 fusion - Strong
+strong_anchor
 
-sparse_geometry_effect_cfg2_minus_dense_same_support
-    = frozen 20x20 sparse CFG2 - dense OccFM under the same fusion
+dense_official_raw
+dense_official_same_support_fusion       # takeover
+dense_official_write_only
+dense_official_dynamic_union
 
-guidance_effect_cfg1_minus_cfg2
-    = frozen sparse CFG1 - frozen sparse CFG2
+frozen_sparse_official_cfg               # takeover, CFG=2
+frozen_sparse_official_cfg_write_only
+frozen_sparse_official_cfg_dynamic_union
 
-frozen_sparse_cfg1_minus_strong
-    = the complete frozen P0-F9-style sparse deployment - Strong
+frozen_sparse_p0f9_cfg                    # takeover, CFG=1
+frozen_sparse_p0f9_cfg_write_only
+frozen_sparse_p0f9_cfg_dynamic_union
+
+same_support_gt_oracle                    # takeover GT oracle
+same_support_gt_write_only_oracle
+same_support_gt_dynamic_union_oracle
 ```
 
-The script also reports `oracle_headroom_minus_strong`.
+The old takeover state names are intentionally preserved so the result remains directly comparable with the previous P0-F9 diagnostic.
 
-## Interpretation
+## Key deltas
 
-- If `dense_official_same_support_fusion` is already clearly below Strong, the current dynamic takeover fusion is unsafe even with a full dense OccFM proposal. The next method should not simply let a weaker WM erase Strong dynamics inside MSP.
-- If dense same-support is acceptable but `frozen_sparse_official_cfg` drops strongly, the Top-2 20x20 sparse geometry/adaptation is losing native OccFM capability before any finetuning.
-- If CFG2 is acceptable but CFG1 drops, changing the released OccFM inference policy contributes materially.
-- If both frozen sparse variants are reasonable but trained P0-F9 is much worse, Stage-1 finetuning/objective is the main additional failure source.
-- Compare trained P0-F9 step1200 against `frozen_sparse_p0f9_cfg` to isolate the finetuning contribution directly.
+For each proposal source the report records:
 
-Do not launch another long training run before this controlled diagnostic is resolved.
+```text
+takeover_minus_strong
+write_only_minus_strong
+dynamic_union_minus_strong
+write_only_minus_takeover
+dynamic_union_minus_takeover
+```
+
+Interpretation:
+
+- real proposal `write_only` or `dynamic_union` > Strong: learned WM contains useful sparse innovation once destructive clear authority is removed;
+- GT safe oracle > Strong but real safe fusion <= Strong: the fusion principle is viable, but proposal quality is still insufficient;
+- even GT safe oracle <= Strong: purely additive/non-destructive innovation is insufficient, so future work needs selective learned clear/correction authority rather than unconditional takeover;
+- `write_only > dynamic_union`: preserve Strong dynamic class semantics;
+- `dynamic_union > write_only`: proposal contributes useful dynamic class correction.
+
+Do not launch another long training run until this safe-fusion result is known.
