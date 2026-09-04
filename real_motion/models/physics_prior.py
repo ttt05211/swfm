@@ -21,10 +21,9 @@ class GatedPhysicsCrossAttention(nn.Module):
     the Strong-W2Det future prior. ``gate`` starts at exactly zero, so adding this
     module cannot change the pretrained OccFM forward before optimization.
 
-    ``prior_proj`` deliberately has no bias. The aligned prior contains zero
-    history slots; keeping zero input exactly zero prevents those history slots
-    from turning into a learned constant pseudo-physics condition once the gate
-    becomes nonzero.
+    The aligned prior intentionally contains zero history slots. A bias-free
+    projection plus an explicit per-frame presence mask keeps those slots exact
+    no-ops even after attention biases and the gate have learned.
     """
 
     def __init__(
@@ -69,9 +68,12 @@ class GatedPhysicsCrossAttention(nn.Module):
         if prior_future.shape[2] != self.prior_channels:
             raise ValueError("physics prior channel mismatch")
 
-        prior = prior_future.to(device=x.device, dtype=x.dtype)
+        prior_raw = prior_future.to(device=x.device, dtype=x.dtype)
+        # Presence is decided before projection. The aligned history slots are
+        # exactly zero tensors, while VAE-encoded future physics slots are not.
+        present = prior_raw.detach().abs().amax(dim=(2, 3, 4)) > 0  # [B,F]
         prior = F.interpolate(
-            prior.reshape(b * f, self.prior_channels, *prior.shape[-2:]),
+            prior_raw.reshape(b * f, self.prior_channels, *prior_raw.shape[-2:]),
             size=(h, w),
             mode="bilinear",
             align_corners=False,
@@ -86,6 +88,8 @@ class GatedPhysicsCrossAttention(nn.Module):
             prior,
             need_weights=False,
         )
+        active = rearrange(present.to(dtype=attn_out.dtype), "b f -> (b f) 1 1")
+        attn_out = attn_out * active
         fused = query + torch.tanh(self.gate).to(dtype=query.dtype) * attn_out
         return rearrange(fused, "(b f) (h w) c -> b c f h w", b=b, f=f, h=h, w=w)
 
