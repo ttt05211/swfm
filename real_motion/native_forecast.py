@@ -1,16 +1,30 @@
 """Deployment-aligned semantic supervision utilities for P0-F9."""
 from __future__ import annotations
 
-import math
+import hashlib
 
 import torch
 import torch.nn.functional as F
 
-from .edit_repair import DYNAMIC_IDS, NUM_RESULT_CLASSES, lovasz_softmax_flat
+from .edit_repair import (
+    DYNAMIC_IDS,
+    NUM_RESULT_CLASSES,
+    horizon_from_flat_indices,
+    lovasz_softmax_flat,
+)
 from .edit_repair_v2 import full_edit_supervision
 
 NUM_SEMANTIC_CLASSES = 18
+NUM_FUTURE_FRAMES = 6
 NON_DYNAMIC_IDS = tuple(i for i in range(NUM_SEMANTIC_CLASSES) if i not in set(DYNAMIC_IDS))
+
+
+def deterministic_sample_seed(sample_id: str, base: int, *, stream: str = "forecast") -> int:
+    """Stable per-sample seed shared by cache/evaluation paths."""
+    digest = hashlib.sha256(
+        f"{int(base)}:{stream}:{str(sample_id)}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "little", signed=False) % (2**31 - 1)
 
 
 def collapse_occ_logits_to_dynamic(logits: torch.Tensor) -> torch.Tensor:
@@ -70,6 +84,13 @@ def absolute_future_semantic_loss(
     class_weights: torch.Tensor | None = None,
     lovasz_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
+    """Absolute future semantic loss with explicit equal horizon authority.
+
+    Each of the six future frames contributes one equally weighted semantic
+    objective, independent of how many EDIT/KEEP voxels happen to be present at
+    that horizon. This matches the P0-F9 contract that long horizons are not
+    silently down/up-weighted by target population size.
+    """
     if lovasz_weight < 0:
         raise ValueError("lovasz_weight must be non-negative")
     if len(sparse_logits_per_sample) != len(records):
@@ -77,14 +98,20 @@ def absolute_future_semantic_loss(
 
     logits_rows = []
     target_rows = []
+    horizon_rows = []
     for logits, rec in zip(sparse_logits_per_sample, records):
-        _, target = semantic_targets_for_sample(rec)
+        indices, target = semantic_targets_for_sample(rec)
         if int(logits.shape[0]) != int(target.numel()):
             raise ValueError("sparse decoder logits/targets length mismatch")
         if target.numel() == 0:
             continue
-        logits_rows.append(collapse_occ_logits_to_dynamic(logits))
+        collapsed = collapse_occ_logits_to_dynamic(logits)
+        horizon = horizon_from_flat_indices(indices).long()
+        if horizon.numel() and (int(horizon.min()) < 0 or int(horizon.max()) >= NUM_FUTURE_FRAMES):
+            raise ValueError("semantic target horizon out of range")
+        logits_rows.append(collapsed)
         target_rows.append(target.to(device=logits.device, dtype=torch.long))
+        horizon_rows.append(horizon.to(device=logits.device, dtype=torch.long))
 
     if not logits_rows:
         if sparse_logits_per_sample:
@@ -98,32 +125,59 @@ def absolute_future_semantic_loss(
             "dynamic_accuracy": float("nan"),
             "background_false_dynamic_rate": float("nan"),
             "num_supervised_voxels": 0,
+            "num_dynamic_voxels": 0,
+            "num_background_voxels": 0,
+            "per_horizon_voxels": [0] * NUM_FUTURE_FRAMES,
         }
 
     logits = torch.cat(logits_rows, dim=0)
     target = torch.cat(target_rows, dim=0)
+    horizon = torch.cat(horizon_rows, dim=0)
     weight = None
     if class_weights is not None:
         weight = class_weights.to(device=logits.device, dtype=torch.float32)
         if tuple(weight.shape) != (NUM_RESULT_CLASSES,):
             raise ValueError("class_weights must have background+8 dynamic entries")
-    ce = F.cross_entropy(logits.float(), target, weight=weight)
-    probs = F.softmax(logits.float(), dim=-1)
-    lovasz = lovasz_softmax_flat(probs, target)
-    loss = ce + float(lovasz_weight) * lovasz
+
+    per_horizon_losses = []
+    ce_rows = []
+    lovasz_rows = []
+    per_horizon_voxels = []
+    for h in range(NUM_FUTURE_FRAMES):
+        mask = horizon == h
+        nh = int(mask.sum().item())
+        per_horizon_voxels.append(nh)
+        if nh == 0:
+            continue
+        lh = logits[mask]
+        th = target[mask]
+        ce_h = F.cross_entropy(lh.float(), th, weight=weight)
+        probs_h = F.softmax(lh.float(), dim=-1)
+        lovasz_h = lovasz_softmax_flat(probs_h, th)
+        per_horizon_losses.append(ce_h + float(lovasz_weight) * lovasz_h)
+        ce_rows.append(ce_h)
+        lovasz_rows.append(lovasz_h)
+    if not per_horizon_losses:
+        raise RuntimeError("semantic supervision contains no valid future horizon")
+
+    loss = torch.stack(per_horizon_losses).mean()
+    ce = torch.stack(ce_rows).mean()
+    lovasz = torch.stack(lovasz_rows).mean()
 
     with torch.no_grad():
         pred = logits.argmax(dim=-1)
         acc = (pred == target).float().mean()
         dyn = target > 0
         bg = ~dyn
+        dyn_count = int(dyn.sum().item())
+        bg_count = int(bg.sum().item())
         dyn_acc = (
             (pred[dyn] == target[dyn]).float().mean()
-            if bool(dyn.any()) else torch.tensor(float("nan"), device=logits.device)
+            if dyn_count > 0 else torch.tensor(float("nan"), device=logits.device)
         )
         bg_false = (
             (pred[bg] > 0).float().mean()
-            if bool(bg.any()) else torch.tensor(float("nan"), device=logits.device)
+            if bg_count > 0 else torch.tensor(float("nan"), device=logits.device)
         )
     return loss, {
         "ce": float(ce.detach().cpu()),
@@ -132,4 +186,7 @@ def absolute_future_semantic_loss(
         "dynamic_accuracy": float(dyn_acc.detach().cpu()),
         "background_false_dynamic_rate": float(bg_false.detach().cpu()),
         "num_supervised_voxels": int(target.numel()),
+        "num_dynamic_voxels": dyn_count,
+        "num_background_voxels": bg_count,
+        "per_horizon_voxels": per_horizon_voxels,
     }
