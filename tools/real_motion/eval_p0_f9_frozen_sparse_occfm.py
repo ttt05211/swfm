@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Deployment-controlled frozen sparse OccFM + safe-fusion diagnostic for P0-F9.
+"""Deployment-controlled P0-F9 sparse-geometry and safe-fusion diagnostic.
 
-This evaluator locates P0-F9 failure sources without new training and, after the
-P0-F9 takeover failure, tests whether the same learned proposals contain useful
-motion innovation when they are not allowed to destructively erase Strong-W2Det.
+No new training is performed. The evaluator reuses the exact 128-window P0-F9
+validation protocol and tests whether dense/frozen/trained World-Model proposals
+contain useful motion innovation once destructive CLEAR authority is removed.
 
-For dense OccFM, frozen sparse CFG=2, frozen sparse CFG=1, and GT proposals, the
-same MSP support is evaluated with three fusion rules:
+Proposal sources:
+- released dense OccFM;
+- frozen Top-2 20x20 OccFM, official CFG=2;
+- frozen Top-2 20x20 OccFM, P0-F9 CFG=1;
+- optional trained P0-F9 checkpoint (EMA by default);
+- GT oracle.
 
-1. takeover: clear anchor dynamics in support, then write proposal dynamics;
-2. write_only: keep existing anchor dynamics bit-exact and only add proposal
-   dynamics where the anchor is currently non-dynamic;
-3. dynamic_union: never clear anchor dynamic presence, but allow proposal dynamic
-   semantics to add new dynamics or relabel an existing dynamic class.
+Every proposal is evaluated on the same frozen MSP support with three rules:
+1. takeover: clear anchor dynamics, then write proposal dynamics;
+2. write_only: preserve existing anchor dynamics bit-exact, add only missing
+   proposal dynamics on non-dynamic anchor voxels;
+3. dynamic_union: never clear anchor dynamic presence, but allow proposal
+   dynamic semantics to add or relabel.
 
-The original P0-F9 metric keys are preserved as the takeover states so previous
-reports remain directly comparable.
+Legacy takeover metric names are preserved for direct comparison with previous
+P0-F9 reports.
 """
 from __future__ import annotations
 
@@ -33,13 +38,14 @@ import numpy as np
 import torch
 
 from real_motion.checkpoint import load_shape_safe, require_checkpoint_reuse
+from real_motion.context import crop_prediction_and_context
 from real_motion.metrics.moving_miou_v2 import (
     DYNAMIC_CLASS_IDS,
     MovingMIoUV2MultiHorizon,
     REPORT_HORIZONS_S,
     SemanticIoUAccumulator,
 )
-from real_motion.models.p0_f9 import make_p0_f9_model
+from real_motion.models.p0_f9 import P0_F9_PROTOCOL, make_p0_f9_model
 from real_motion.msp import latent_support_to_bev
 from real_motion.msp_wm_cache import MSP_WM_CACHE_VERSION_V2, MSPWorldModelCacheDataset
 from real_motion.native_forecast import crop_coherent_source_noise, deterministic_sample_seed
@@ -61,12 +67,14 @@ from tools.real_motion.build_p0_f9_cache_fast import P0_F9_CACHE_PROTOCOL
 
 REPORT = {1.0: 1, 2.0: 3, 3.0: 5}
 PRED_HW = (20, 20)
+CONTEXT_HW = (40, 40)
 FULL_HW = (50, 50)
 FREE = 17
 HIST_LAST = 4
 OFFICIAL_CFG = 2.0
 P0_F9_CFG = 1.0
-PROTOCOL = "p0_f9_frozen_sparse_safe_fusion_diagnostic_v3"
+SOURCE_SPATIAL_CONTRACT = "one_global_gaussian_field_cropped_into_top2_windows"
+PROTOCOL = "p0_f9_safe_fusion_ablation_v4"
 FUSIONS = ("takeover", "write_only", "dynamic_union")
 
 
@@ -130,31 +138,50 @@ def _apply_fusion(mode, anchor, proposal, write_bev):
 
 
 def _source_state_names(source):
-    if source == "dense_official":
-        return {
+    mappings = {
+        "dense_official": {
             "takeover": "dense_official_same_support_fusion",
             "write_only": "dense_official_write_only",
             "dynamic_union": "dense_official_dynamic_union",
-        }
-    if source == "frozen_sparse_official_cfg":
-        return {
+        },
+        "frozen_sparse_official_cfg": {
             "takeover": "frozen_sparse_official_cfg",
             "write_only": "frozen_sparse_official_cfg_write_only",
             "dynamic_union": "frozen_sparse_official_cfg_dynamic_union",
-        }
-    if source == "frozen_sparse_p0f9_cfg":
-        return {
+        },
+        "frozen_sparse_p0f9_cfg": {
             "takeover": "frozen_sparse_p0f9_cfg",
             "write_only": "frozen_sparse_p0f9_cfg_write_only",
             "dynamic_union": "frozen_sparse_p0f9_cfg_dynamic_union",
-        }
-    if source == "gt":
-        return {
+        },
+        "trained_p0f9": {
+            "takeover": "trained_p0f9_takeover",
+            "write_only": "trained_p0f9_write_only",
+            "dynamic_union": "trained_p0f9_dynamic_union",
+        },
+        "gt": {
             "takeover": "same_support_gt_oracle",
             "write_only": "same_support_gt_write_only_oracle",
             "dynamic_union": "same_support_gt_dynamic_union_oracle",
-        }
-    raise ValueError(source)
+        },
+    }
+    if source not in mappings:
+        raise ValueError(source)
+    return mappings[source]
+
+
+def _new_source_states(source):
+    return {name: _new_metrics() for name in _source_state_names(source).values()}
+
+
+def _update_source_fusions(states, source, horizon, anchor, proposal, gt, moving, write_bev):
+    names = _source_state_names(source)
+    outputs = {}
+    for mode in FUSIONS:
+        fused = _apply_fusion(mode, anchor, proposal, write_bev)
+        outputs[mode] = fused
+        _update(states[names[mode]], horizon, fused, gt, moving)
+    return outputs
 
 
 def _official_seeded_noise_like(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -172,7 +199,7 @@ def _official_seeded_noise_like(x: torch.Tensor, seed: int) -> torch.Tensor:
 
 def _validate_cache(ds: MSPWorldModelCacheDataset, vae_ckpt: str) -> None:
     if ds.version != MSP_WM_CACHE_VERSION_V2:
-        raise RuntimeError("frozen sparse diagnostic requires a v2 absolute-future cache")
+        raise RuntimeError("safe-fusion diagnostic requires a v2 absolute-future cache")
     meta = ds.metadata
     if meta.get("protocol") != P0_F9_CACHE_PROTOCOL:
         raise RuntimeError("cache is not audited P0-F9 v2")
@@ -198,12 +225,7 @@ def _assert_new_conditioning_is_noop(model) -> None:
         "context_proj_bias": tr.context_proj.bias,
         "physics_gate": tr.physics_fusion.gate,
     }
-    bad = []
-    for name, tensor in checks.items():
-        if tensor is None:
-            continue
-        if bool((tensor.detach() != 0).any()):
-            bad.append(name)
+    bad = [name for name, tensor in checks.items() if tensor is not None and bool((tensor.detach() != 0).any())]
     if bad:
         raise RuntimeError(
             "frozen sparse diagnostic requires exact zero-impact new conditioning; "
@@ -236,18 +258,42 @@ def _assert_dense_replay_matches(reference, dense_report) -> dict | None:
     ref_o = float(reference["metrics"]["overall"]["mIoU"])
     ref_m = float(reference["metrics"]["moving"]["mIoU"])
     got_o, got_m = _metric_pair(dense_report)
-    diff_o = got_o - ref_o
-    diff_m = got_m - ref_m
+    diff_o, diff_m = got_o - ref_o, got_m - ref_m
     if abs(diff_o) > 1e-9 or abs(diff_m) > 1e-9:
         raise RuntimeError(
-            "official dense replay does not reproduce the existing baseline: "
+            "official dense replay does not reproduce existing baseline: "
             f"dOverall={diff_o:.12g} dMoving={diff_m:.12g}"
         )
-    return {
-        "status": "bit_metric_exact",
-        "overall_difference": diff_o,
-        "moving_difference": diff_m,
-    }
+    return {"status": "bit_metric_exact", "overall_difference": diff_o, "moving_difference": diff_m}
+
+
+def _require_trained_checkpoint_match(ck: dict, ds: MSPWorldModelCacheDataset, vae_ckpt: str) -> dict:
+    arch = ck.get("architecture", {})
+    if arch.get("protocol") != P0_F9_PROTOCOL or int(arch.get("stage", -1)) != 1:
+        raise RuntimeError("trained checkpoint is not audited P0-F9 Stage-1")
+    if int(arch.get("native_backbone_hist_last", -1)) != HIST_LAST:
+        raise RuntimeError("trained checkpoint HIST_LAST contract differs")
+    if arch.get("flow_source_spatial_contract") != SOURCE_SPATIAL_CONTRACT:
+        raise RuntimeError("trained checkpoint source-noise spatial contract differs")
+    if ck.get("val_cache_index_sha256") != file_sha256(ds.root / "index.json"):
+        raise RuntimeError("trained checkpoint was validated against a different cache index")
+    if ck.get("vae_checkpoint_sha256") != file_sha256(vae_ckpt):
+        raise RuntimeError("trained checkpoint VAE provenance differs")
+    ckmeta = ck.get("val_metadata") or {}
+    for key in (
+        "protocol",
+        "source_v3_cache_index_sha256",
+        "source_msp_cache_sha256",
+        "msp_checkpoint_sha256",
+        "vae_checkpoint_sha256",
+        "vae_mode",
+        "native_backbone_hist_last",
+        "anchor_contract",
+        "write_budget_ratio",
+    ):
+        if ckmeta.get(key) != ds.metadata.get(key):
+            raise RuntimeError(f"trained checkpoint/eval-cache metadata mismatch for {key}")
+    return arch
 
 
 def _sample_payload(s, device):
@@ -273,16 +319,73 @@ def _sample_payload(s, device):
     }
 
 
-def _new_source_states(source):
-    return {name: _new_metrics() for name in _source_state_names(source).values()}
+def _prepare_sparse_sample(s, device, *, with_context: bool):
+    origins = s["window_origins"].unsqueeze(0).long().to(device)
+    valid = s["window_valid"].unsqueeze(0).bool().to(device)
+    plan = WindowPlan(origins, valid, PRED_HW, FULL_HW)
+    hist_full = s["full_history_latent"].unsqueeze(0).to(device)
+    physics_full = s["anchor_future_latent"].unsqueeze(0).to(device)
+    if with_context:
+        hist_w, hist_context, _ = crop_prediction_and_context(hist_full, plan, context_hw=CONTEXT_HW)
+    else:
+        hist_w = crop_windows(hist_full, plan)
+        hist_context = None
+    physics_w = crop_windows(physics_full, plan)
+    B, K = hist_w.shape[:2]
+    flat_valid = plan.valid.reshape(-1)
+
+    def flat(x):
+        return x.reshape(B * K, *x.shape[2:])[flat_valid]
+
+    out = {
+        "plan": plan,
+        "physics_full": physics_full,
+        "flat_valid": flat_valid,
+        "B": B,
+        "K": K,
+    }
+    if bool(flat_valid.any()):
+        out["history"] = flat(hist_w)
+        out["physics"] = flat(physics_w)
+        out["context"] = None if hist_context is None else flat(hist_context)
+        out["origins"] = plan.origins.reshape(B * K, 2)[flat_valid]
+        traj = s["trajectory"].to(device).unsqueeze(0)
+        out["trajectory"] = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[flat_valid]
+    return out
 
 
-def _update_source_fusions(states, source, horizon, anchor, proposal, gt, moving, write_bev):
-    names = _source_state_names(source)
-    for mode in FUSIONS:
-        fused = _apply_fusion(mode, anchor, proposal, write_bev)
-        _update(states[names[mode]], horizon, fused, gt, moving)
-    return _apply_fusion("takeover", anchor, proposal, write_bev)
+def _decode_sparse_prediction(model, vae, s, prepared, *, seed, use_amp, guidance_scale, physics_condition, context_condition):
+    flat_valid = prepared["flat_valid"]
+    if not bool(flat_valid.any()):
+        return s["eval_strong_anchor_occ"].cpu().numpy()
+    sample_seed = deterministic_sample_seed(str(s["sample_id"]), seed, stream="forecast")
+    global_noise = _official_seeded_noise_like(prepared["physics_full"], sample_seed)
+    initial_noise = crop_coherent_source_noise(global_noise, prepared["plan"], flat_valid)
+    physics = prepared["physics"] if physics_condition else torch.zeros_like(prepared["physics"])
+    context = prepared["context"] if context_condition else None
+    with torch.autocast(
+        device_type=prepared["physics_full"].device.type,
+        dtype=torch.bfloat16,
+        enabled=use_amp,
+    ):
+        pred = model.sample(
+            prepared["history"],
+            physics,
+            history_context=context,
+            trajectory=prepared["trajectory"],
+            window_origins=prepared["origins"],
+            initial_noise=initial_noise,
+            guidance_scale=guidance_scale,
+        )
+    B, K = prepared["B"], prepared["K"]
+    padded = torch.zeros(B * K, *pred.shape[1:], device=pred.device, dtype=pred.dtype)
+    padded[flat_valid] = pred
+    fused_latent = scatter_windows(
+        padded.reshape(B, K, *pred.shape[1:]),
+        prepared["plan"],
+        base=prepared["physics_full"],
+    )
+    return vae.decode_labels(fused_latent.float())[0].cpu().numpy()
 
 
 @torch.no_grad()
@@ -293,6 +396,9 @@ def main():
     p.add_argument("--vae-ckpt", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--dense-baseline-json", default=None)
+    p.add_argument("--trained-sparse-ckpt", default=None,
+                   help="optional P0-F9 Stage-1 checkpoint; step_1200.pt is recommended")
+    p.add_argument("--use-ema", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=20260904)
     p.add_argument("--device", default="cuda")
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -302,8 +408,7 @@ def main():
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
-        raise RuntimeError("frozen sparse OccFM diagnostic requires CUDA")
-
+        raise RuntimeError("safe-fusion diagnostic requires CUDA")
     ds = MSPWorldModelCacheDataset(a.cache)
     _validate_cache(ds, a.vae_ckpt)
     n_eval = len(ds) if int(a.max_windows) <= 0 else min(len(ds), int(a.max_windows))
@@ -317,10 +422,7 @@ def main():
     if float(cfg.LOSS.UNCOND_SCALE) != OFFICIAL_CFG:
         raise RuntimeError("pinned official OccFM guidance scale changed")
 
-    # ------------------------------------------------------------------
-    # Pass A: exact released dense OccFM proposal, evaluated raw and under all
-    # three fusion rules on the same frozen MSP support.
-    # ------------------------------------------------------------------
+    # Pass A: dense official proposal under all fusion contracts.
     dense_wm, dense_cfg = load_official_wm(UP, a.occfm_ckpt, device)
     if int(dense_cfg.DATA_CONFIG.HIST_LAST) != HIST_LAST:
         raise RuntimeError("loaded official OccFM config HIST_LAST mismatch")
@@ -329,7 +431,6 @@ def main():
         "dense_official_raw": _new_metrics(),
         **_new_source_states("dense_official"),
     }
-
     for i in range(n_eval):
         s = ds[i]
         payload = _sample_payload(s, device)
@@ -342,56 +443,40 @@ def main():
             seed=sample_seed,
             hist_last=HIST_LAST,
         ).numpy()
-
         for horizon, fi in REPORT.items():
-            gt = payload["gt"][fi]
-            anchor = payload["anchor"][fi]
-            moving = payload["moving"][fi]
-            write_bev = payload["write_bev"][fi]
+            gt, anchor, moving = payload["gt"][fi], payload["anchor"][fi], payload["moving"][fi]
             _update(dense_states["strong_anchor"], horizon, anchor, gt, moving)
             _update(dense_states["dense_official_raw"], horizon, dense_pred[fi], gt, moving)
             _update_source_fusions(
-                dense_states,
-                "dense_official",
-                horizon,
-                anchor,
-                dense_pred[fi],
-                gt,
-                moving,
-                write_bev,
+                dense_states, "dense_official", horizon, anchor, dense_pred[fi], gt, moving, payload["write_bev"][fi]
             )
         if i % 8 == 0:
             print("dense_safe_fusion_eval", i, s["sample_id"])
-
     dense_reports = {name: _report(state) for name, state in dense_states.items()}
-    dense_reproduction = _assert_dense_replay_matches(
-        dense_reference, dense_reports["dense_official_raw"]
-    )
-
+    dense_reproduction = _assert_dense_replay_matches(dense_reference, dense_reports["dense_official_raw"])
     del dense_wm
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ------------------------------------------------------------------
-    # Pass B: frozen 20x20 sparse adaptation. Released weights only, no new
-    # physics/context condition. Both CFG settings share exactly the same z0.
-    # ------------------------------------------------------------------
-    model = make_p0_f9_model(
+    # Shared frozen VAE for sparse branches.
+    vae_model, _ = load_official_vae(UP, a.vae_ckpt, device)
+    vae = OccFMVAEAdapter(vae_model)
+    use_amp = bool(a.amp and device.type == "cuda")
+
+    # Pass B: frozen 20x20 sparse official weights, no new condition paths.
+    frozen_model = make_p0_f9_model(
         20,
         sample_steps=int(cfg.LOSS.SAMPLE_STEP),
         unconditional_probability=0.0,
         guidance_scale=OFFICIAL_CFG,
         hist_last=HIST_LAST,
     ).to(device)
-    reuse = load_shape_safe(model.transition, a.occfm_ckpt, verbose=True)
+    reuse = load_shape_safe(frozen_model.transition, a.occfm_ckpt, verbose=True)
     if "traj_encoder.0.weight" not in set(reuse.get("loaded_keys", ())):
-        raise RuntimeError("diagnostic requires the official OccFM-Fut epoch=000196 checkpoint")
+        raise RuntimeError("diagnostic requires official OccFM-Fut epoch=000196 checkpoint")
     reuse_fraction = require_checkpoint_reuse(reuse, min_fraction=0.80)
-    _assert_new_conditioning_is_noop(model)
-    model.eval().requires_grad_(False)
-
-    vae_model, _ = load_official_vae(UP, a.vae_ckpt, device)
-    vae = OccFMVAEAdapter(vae_model)
+    _assert_new_conditioning_is_noop(frozen_model)
+    frozen_model.eval().requires_grad_(False)
 
     sparse_states = {
         **_new_source_states("frozen_sparse_official_cfg"),
@@ -401,109 +486,113 @@ def main():
     oracle_checks = 0
     valid_windows = []
     write_ratios = []
-    use_amp = bool(a.amp and device.type == "cuda")
-
     for i in range(n_eval):
         s = ds[i]
         payload = _sample_payload(s, device)
-        origins = s["window_origins"].unsqueeze(0).long().to(device)
-        valid = s["window_valid"].unsqueeze(0).bool().to(device)
-        plan = WindowPlan(origins, valid, PRED_HW, FULL_HW)
-        hist_full = s["full_history_latent"].unsqueeze(0).to(device)
-        physics_full = s["anchor_future_latent"].unsqueeze(0).to(device)
-        hist_w = crop_windows(hist_full, plan)
-        physics_w = crop_windows(physics_full, plan)
-        B, K = hist_w.shape[:2]
-        flat_valid = plan.valid.reshape(-1)
-        valid_windows.append(int(valid.sum().item()))
+        prepared = _prepare_sparse_sample(s, device, with_context=False)
+        valid_windows.append(int(prepared["plan"].valid.sum().item()))
         write_ratios.append(payload["write_ratio"])
-
-        predictions = {}
-        if bool(flat_valid.any()):
-            def flat(x):
-                return x.reshape(B * K, *x.shape[2:])[flat_valid]
-
-            fh = flat(hist_w)
-            fp_zero = torch.zeros_like(flat(physics_w))
-            orig = plan.origins.reshape(B * K, 2)[flat_valid]
-            traj = payload["trajectory"].unsqueeze(0)
-            traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[flat_valid]
-
-            sample_seed = deterministic_sample_seed(str(s["sample_id"]), a.seed, stream="forecast")
-            global_noise = _official_seeded_noise_like(physics_full, sample_seed)
-            initial_noise = crop_coherent_source_noise(global_noise, plan, flat_valid)
-
-            for name, scale in (
-                ("frozen_sparse_official_cfg", OFFICIAL_CFG),
-                ("frozen_sparse_p0f9_cfg", P0_F9_CFG),
-            ):
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=use_amp,
-                ):
-                    pred = model.sample(
-                        fh,
-                        fp_zero,
-                        history_context=None,
-                        trajectory=traj,
-                        window_origins=orig,
-                        initial_noise=initial_noise,
-                        guidance_scale=scale,
-                    )
-                padded = torch.zeros(B * K, *pred.shape[1:], device=device, dtype=pred.dtype)
-                padded[flat_valid] = pred
-                fused_latent = scatter_windows(
-                    padded.reshape(B, K, *pred.shape[1:]),
-                    plan,
-                    base=physics_full,
-                )
-                predictions[name] = vae.decode_labels(fused_latent.float())[0].cpu().numpy()
-        else:
-            predictions["frozen_sparse_official_cfg"] = payload["anchor"]
-            predictions["frozen_sparse_p0f9_cfg"] = payload["anchor"]
-
+        pred_cfg2 = _decode_sparse_prediction(
+            frozen_model, vae, s, prepared,
+            seed=a.seed, use_amp=use_amp, guidance_scale=OFFICIAL_CFG,
+            physics_condition=False, context_condition=False,
+        )
+        pred_cfg1 = _decode_sparse_prediction(
+            frozen_model, vae, s, prepared,
+            seed=a.seed, use_amp=use_amp, guidance_scale=P0_F9_CFG,
+            physics_condition=False, context_condition=False,
+        )
         for horizon, fi in REPORT.items():
-            gt = payload["gt"][fi]
-            anchor = payload["anchor"][fi]
-            moving = payload["moving"][fi]
+            gt, anchor, moving = payload["gt"][fi], payload["anchor"][fi], payload["moving"][fi]
             write_bev = payload["write_bev"][fi]
-
-            for source in ("frozen_sparse_official_cfg", "frozen_sparse_p0f9_cfg"):
-                _update_source_fusions(
-                    sparse_states,
-                    source,
-                    horizon,
-                    anchor,
-                    predictions[source][fi],
-                    gt,
-                    moving,
-                    write_bev,
-                )
-
-            gt_takeover = _update_source_fusions(
-                sparse_states,
-                "gt",
-                horizon,
-                anchor,
-                gt,
-                gt,
-                moving,
-                write_bev,
+            _update_source_fusions(
+                sparse_states, "frozen_sparse_official_cfg", horizon, anchor, pred_cfg2[fi], gt, moving, write_bev
             )
-            if not np.array_equal(gt_takeover, payload["repair_target"][fi]):
+            _update_source_fusions(
+                sparse_states, "frozen_sparse_p0f9_cfg", horizon, anchor, pred_cfg1[fi], gt, moving, write_bev
+            )
+            gt_outputs = _update_source_fusions(
+                sparse_states, "gt", horizon, anchor, gt, gt, moving, write_bev
+            )
+            if not np.array_equal(gt_outputs["takeover"], payload["repair_target"][fi]):
                 raise RuntimeError(
-                    f"{s['sample_id']} horizon={horizon}: same-support GT takeover oracle differs "
-                    "from cached repair target"
+                    f"{s['sample_id']} horizon={horizon}: GT takeover oracle differs from cached repair target"
                 )
             oracle_checks += 1
-
         if i % 8 == 0:
             print("frozen_sparse_safe_fusion_eval", i, s["sample_id"])
-
     sparse_reports = {name: _report(state) for name, state in sparse_states.items()}
-    metrics = {**dense_reports, **sparse_reports}
+    del frozen_model
+    gc.collect()
+    torch.cuda.empty_cache()
 
+    # Pass C (optional): trained P0-F9 proposal, replayed with its exact cache/
+    # architecture provenance, then fused under the same three rules.
+    trained_reports = {}
+    trained_meta = None
+    if a.trained_sparse_ckpt:
+        ck = torch.load(a.trained_sparse_ckpt, map_location="cpu", weights_only=False)
+        arch = _require_trained_checkpoint_match(ck, ds, a.vae_ckpt)
+        trained_model = make_p0_f9_model(
+            20,
+            sample_steps=int(arch.get("sample_steps", 10)),
+            unconditional_probability=float(arch.get("unconditional_probability", 0.0)),
+            guidance_scale=float(arch.get("guidance_scale", 1.0)),
+            hist_last=HIST_LAST,
+        ).to(device)
+        if a.use_ema:
+            ema = ck.get("ema")
+            if not ema or "state_dict" not in ema:
+                raise RuntimeError("trained P0-F9 checkpoint lacks EMA state")
+            trained_model.load_state_dict(ema["state_dict"], strict=True)
+            weight_source = "ema"
+        else:
+            trained_model.load_state_dict(ck["state_dict"], strict=True)
+            weight_source = "raw"
+        trained_model.eval().requires_grad_(False)
+        trained_states = _new_source_states("trained_p0f9")
+        for i in range(n_eval):
+            s = ds[i]
+            payload = _sample_payload(s, device)
+            prepared = _prepare_sparse_sample(s, device, with_context=True)
+            trained_pred = _decode_sparse_prediction(
+                trained_model,
+                vae,
+                s,
+                prepared,
+                seed=a.seed,
+                use_amp=use_amp,
+                guidance_scale=float(arch.get("guidance_scale", 1.0)),
+                physics_condition=True,
+                context_condition=True,
+            )
+            for horizon, fi in REPORT.items():
+                _update_source_fusions(
+                    trained_states,
+                    "trained_p0f9",
+                    horizon,
+                    payload["anchor"][fi],
+                    trained_pred[fi],
+                    payload["gt"][fi],
+                    payload["moving"][fi],
+                    payload["write_bev"][fi],
+                )
+            if i % 8 == 0:
+                print("trained_p0f9_safe_fusion_eval", i, s["sample_id"])
+        trained_reports = {name: _report(state) for name, state in trained_states.items()}
+        trained_meta = {
+            "checkpoint": str(Path(a.trained_sparse_ckpt).resolve()),
+            "checkpoint_sha256": file_sha256(a.trained_sparse_ckpt),
+            "step": int(ck.get("step", -1)),
+            "weight_source": weight_source,
+            "guidance_scale": float(arch.get("guidance_scale", 1.0)),
+            "sample_steps": int(arch.get("sample_steps", 10)),
+        }
+        del trained_model, ck
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    metrics = {**dense_reports, **sparse_reports, **trained_reports}
     controlled_deltas = {
         "fusion_effect_dense_same_support_minus_strong": _delta(
             metrics["dense_official_same_support_fusion"], metrics["strong_anchor"]
@@ -517,18 +606,18 @@ def main():
         "frozen_sparse_cfg1_minus_strong": _delta(
             metrics["frozen_sparse_p0f9_cfg"], metrics["strong_anchor"]
         ),
-        "oracle_headroom_minus_strong": _delta(
-            metrics["same_support_gt_oracle"], metrics["strong_anchor"]
-        ),
+        "oracle_headroom_minus_strong": _delta(metrics["same_support_gt_oracle"], metrics["strong_anchor"]),
     }
 
-    safe_fusion_deltas = {}
     source_keys = {
         "dense_official": _source_state_names("dense_official"),
         "frozen_sparse_official_cfg": _source_state_names("frozen_sparse_official_cfg"),
         "frozen_sparse_p0f9_cfg": _source_state_names("frozen_sparse_p0f9_cfg"),
         "gt": _source_state_names("gt"),
     }
+    if trained_reports:
+        source_keys["trained_p0f9"] = _source_state_names("trained_p0f9")
+    safe_fusion_deltas = {}
     for source, names in source_keys.items():
         takeover = metrics[names["takeover"]]
         safe_fusion_deltas[source] = {
@@ -537,6 +626,7 @@ def main():
             "dynamic_union_minus_strong": _delta(metrics[names["dynamic_union"]], metrics["strong_anchor"]),
             "write_only_minus_takeover": _delta(metrics[names["write_only"]], takeover),
             "dynamic_union_minus_takeover": _delta(metrics[names["dynamic_union"]], takeover),
+            "union_minus_write_only": _delta(metrics[names["dynamic_union"]], metrics[names["write_only"]]),
         }
 
     report = {
@@ -546,6 +636,7 @@ def main():
         "official_occfm_checkpoint": str(Path(a.occfm_ckpt).resolve()),
         "official_occfm_checkpoint_sha256": file_sha256(a.occfm_ckpt),
         "vae_checkpoint_sha256": file_sha256(a.vae_ckpt),
+        "trained_p0f9": trained_meta,
         "latent_distribution": "posterior_sample",
         "hist_last": HIST_LAST,
         "sample_steps": int(cfg.LOSS.SAMPLE_STEP),
@@ -554,7 +645,7 @@ def main():
         "sample_seed_contract": "sha256(base,forecast,sample_id)",
         "source_noise_contract": "official-first-global-randn-50x50_then_crop_same_top2_plan",
         "window_contract": "top2_20x20_absolute_50x50_position_coordinates",
-        "conditioning_contract": "no_full_context_no_physics_condition_no_finetuning",
+        "frozen_conditioning_contract": "no_full_context_no_physics_condition_no_finetuning",
         "fusion_contracts": {
             "takeover": "clear_anchor_dynamic_then_write_proposal_dynamic_inside_support",
             "write_only": "keep_anchor_dynamic_bit_exact_and_only_add_proposal_dynamic_on_non_dynamic_anchor",
@@ -574,21 +665,11 @@ def main():
         "controlled_deltas": controlled_deltas,
         "safe_fusion_deltas": safe_fusion_deltas,
         "interpretation_contract": {
-            "write_only_or_union_beats_strong_with_real_proposal": (
-                "the WM contains useful sparse innovation once destructive clear authority is removed"
-            ),
-            "safe_gt_oracle_beats_strong_but_real_safe_fusion_does_not": (
-                "safe fusion has headroom but proposal quality is still insufficient"
-            ),
-            "safe_gt_oracle_not_above_strong": (
-                "purely non-destructive innovation is insufficient and selective clear/correction needs a learned confidence gate"
-            ),
-            "write_only_above_union": (
-                "proposal dynamic class corrections are harmful; preserve existing Strong dynamic semantics"
-            ),
-            "union_above_write_only": (
-                "proposal has useful dynamic class corrections in addition to new dynamic evidence"
-            ),
+            "real_safe_fusion_beats_strong": "proposal contains useful sparse innovation once destructive clear is removed",
+            "safe_gt_beats_strong_but_real_does_not": "safe fusion has headroom but proposal quality is insufficient",
+            "safe_gt_not_above_strong": "pure additive innovation is insufficient; selective learned clear/correction is required",
+            "write_only_above_union": "proposal dynamic relabels are harmful; preserve Strong dynamic semantics",
+            "union_above_write_only": "proposal contributes useful dynamic class corrections",
         },
     }
 
@@ -610,10 +691,10 @@ def main():
         "frozen_sparse_p0f9_cfg",
         "frozen_sparse_p0f9_cfg_write_only",
         "frozen_sparse_p0f9_cfg_dynamic_union",
-        "same_support_gt_oracle",
-        "same_support_gt_write_only_oracle",
-        "same_support_gt_dynamic_union_oracle",
     ]
+    if trained_reports:
+        order += ["trained_p0f9_takeover", "trained_p0f9_write_only", "trained_p0f9_dynamic_union"]
+    order += ["same_support_gt_oracle", "same_support_gt_write_only_oracle", "same_support_gt_dynamic_union_oracle"]
     for name in order:
         o, m = _metric_pair(metrics[name])
         print(f"{name:48s} {o:10.4f} {m:10.4f}")
