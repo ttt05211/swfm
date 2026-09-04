@@ -1,4 +1,4 @@
-"""Deployment-aligned semantic supervision utilities for P0-F9."""
+"""Deployment-aligned semantic and native-flow utilities for P0-F9."""
 from __future__ import annotations
 
 import hashlib
@@ -13,6 +13,7 @@ from .edit_repair import (
     lovasz_softmax_flat,
 )
 from .edit_repair_v2 import full_edit_supervision
+from .windows import WindowPlan, crop_windows
 
 NUM_SEMANTIC_CLASSES = 18
 NUM_FUTURE_FRAMES = 6
@@ -25,6 +26,30 @@ def deterministic_sample_seed(sample_id: str, base: int, *, stream: str = "forec
         f"{int(base)}:{stream}:{str(sample_id)}".encode("utf-8")
     ).digest()
     return int.from_bytes(digest[:8], "little", signed=False) % (2**31 - 1)
+
+
+def crop_coherent_source_noise(
+    global_noise: torch.Tensor,
+    plan: WindowPlan,
+    effective: torch.Tensor,
+) -> torch.Tensor:
+    """Crop one global Gaussian field into routed windows.
+
+    Native CFM has a spatially coherent source field. If Top-2 windows overlap,
+    the same latent cell must therefore see the same z0 value in both windows.
+    Sampling each window independently would assign contradictory source values
+    to the overlap and then average incompatible predictions during scatter.
+    """
+    if global_noise.ndim != 5:
+        raise ValueError("global native source noise must be [B,T,C,H,W]")
+    if global_noise.shape[0] != plan.valid.shape[0] or tuple(global_noise.shape[-2:]) != plan.full_hw:
+        raise ValueError("global source noise and WindowPlan shape mismatch")
+    effective = effective.to(device=global_noise.device, dtype=torch.bool).reshape(-1)
+    B, K = plan.valid.shape
+    if int(effective.numel()) != int(B * K):
+        raise ValueError("effective routed-slot mask must have B*K entries")
+    windows = crop_windows(global_noise, plan)
+    return windows.reshape(B * K, *windows.shape[2:])[effective]
 
 
 def collapse_occ_logits_to_dynamic(logits: torch.Tensor) -> torch.Tensor:
