@@ -24,7 +24,10 @@ from real_motion.metrics.moving_miou_v2 import (
 from real_motion.models.p0_f9 import P0_F9_PROTOCOL, make_p0_f9_model
 from real_motion.msp import latent_support_to_bev
 from real_motion.msp_wm_cache import MSP_WM_CACHE_VERSION_V2, MSPWorldModelCacheDataset
-from real_motion.native_forecast import deterministic_sample_seed
+from real_motion.native_forecast import (
+    crop_coherent_source_noise,
+    deterministic_sample_seed,
+)
 from real_motion.occfm_io import OccFMVAEAdapter, file_sha256, load_official_vae
 from real_motion.repair_target import apply_dynamic_repair
 from real_motion.windows import WindowPlan, crop_windows, scatter_windows
@@ -36,6 +39,7 @@ CONTEXT_HW = (40, 40)
 FULL_HW = (50, 50)
 FREE = 17
 HIST_LAST = 4
+SOURCE_SPATIAL_CONTRACT = "one_global_gaussian_field_cropped_into_top2_windows"
 
 
 def _new_metrics():
@@ -131,6 +135,8 @@ def main():
         raise RuntimeError("checkpoint is not audited P0-F9 Stage-1")
     if int(arch.get("native_backbone_hist_last", -1)) != HIST_LAST:
         raise RuntimeError("checkpoint HIST_LAST contract differs")
+    if arch.get("flow_source_spatial_contract") != SOURCE_SPATIAL_CONTRACT:
+        raise RuntimeError("checkpoint source-noise spatial contract differs")
     _require_checkpoint_cache_match(ck, ds, a.vae_ckpt)
 
     model = make_p0_f9_model(
@@ -195,12 +201,16 @@ def main():
             orig = plan.origins.reshape(B * K, 2)[flat_valid]
             traj = s["trajectory"].to(device).unsqueeze(0)
             traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[flat_valid]
-            initial_noise = _noise(
-                fp.shape,
+
+            # Native source is one coherent 50x50 Gaussian field. Crop it with
+            # the same Top-2 plan so overlap cells share exactly one z0 value.
+            global_noise = _noise(
+                physics_full.shape,
                 device,
-                fp.dtype,
+                physics_full.dtype,
                 deterministic_sample_seed(str(s["sample_id"]), a.seed, stream="forecast"),
             )
+            initial_noise = crop_coherent_source_noise(global_noise, plan, flat_valid)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -279,6 +289,7 @@ def main():
             "history_context_hw": [40, 40],
             "native_backbone_hist_last": HIST_LAST,
             "latent_distribution": "posterior_sample",
+            "flow_source_spatial_contract": SOURCE_SPATIAL_CONTRACT,
             "slot_compute_ratio": float(np.mean(valid_windows) * 400.0 / 2500.0),
             "mean_write_latent_ratio": float(np.mean(write_ratios)),
             "write_budget_ratio": float(meta.get("write_budget_ratio", float("nan"))),
