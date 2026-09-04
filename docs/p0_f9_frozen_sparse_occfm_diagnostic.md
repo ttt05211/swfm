@@ -2,34 +2,42 @@
 
 ## Purpose
 
-P0-F9 Stage-1 fails the deployment criterion badly, while the released dense OccFM baseline is also substantially weaker than Strong-W2Det on the frozen 128-window split. Before designing another training objective, run one no-training diagnostic to locate where native OccFM capability is lost.
+P0-F9 Stage-1 fails the deployment criterion badly. Before designing another training objective, this no-training diagnostic locates where the loss is introduced.
 
-The diagnostic asks:
+A direct comparison between raw dense OccFM and a sparse P0-F9 deployment is not sufficient, because the sparse result uses Strong-W2Det fallback plus dynamic-only fusion. The controlled diagnostic therefore evaluates the dense OccFM proposal under the exact same MSP support and fusion rule before comparing it to the sparse crop.
 
-> Does the current Top-2 20x20 sparse adaptation already lose the released OccFM-Fut function before finetuning, or does the major loss appear after P0-F9 Stage-1 training?
+## Controlled states
 
-## Frozen protocol
+`tools/real_motion/eval_p0_f9_frozen_sparse_occfm.py` reports six states on the exact same validation split:
 
-`tools/real_motion/eval_p0_f9_frozen_sparse_occfm.py`:
+1. `strong_anchor`: frozen Strong-W2Det;
+2. `dense_official_raw`: released dense OccFM prediction;
+3. `dense_official_same_support_fusion`: released dense OccFM used only as the proposal inside the exact P0-F9 MSP write support and dynamic-only fusion;
+4. `frozen_sparse_official_cfg`: released OccFM transition weights in the current Top-2 20x20 sparse geometry, no new condition paths, CFG=2;
+5. `frozen_sparse_p0f9_cfg`: the same frozen sparse model/noise, but CFG=1;
+6. `same_support_gt_oracle`: exact GT proposal under the same support/fusion.
 
-- loads only the released OccFM-Fut epoch=000196 transition weights;
-- never loads a P0-F9 trained checkpoint;
-- uses the audited P0-F9 v2 validation cache;
-- keeps official `HIST_LAST=4`;
-- keeps the native Gaussian -> absolute-future flow;
-- uses a single global 50x50 Gaussian source field and crops it through the frozen Top-2 plan;
-- keeps absolute 50x50 coordinates for each 20x20 window;
-- disables the new full-context path;
-- passes an all-zero physics prior and verifies the token prior projection, context projection, and physics gate are exact no-ops;
-- scatters sparse predictions back into the Strong-W2Det latent fallback;
-- applies the exact same dynamic-only deployment fusion and same-support GT-oracle check as P0-F9 evaluation.
+No P0-F9 trained checkpoint is loaded.
 
-The same frozen weights/noise are evaluated twice:
+## Frozen sparse contract
 
-1. `frozen_sparse_official_cfg`: guidance scale `2.0`, matching released OccFM (`UNCOND_P=0.2`, `UNCOND_SCALE=2`);
-2. `frozen_sparse_p0f9_cfg`: guidance scale `1.0`, matching P0-F9 Stage-1 deployment.
+The sparse branches:
 
-This separation is important: if CFG=2 preserves dense OccFM but CFG=1 drops, the inference-policy change is material and the result should not be blamed on sparse cropping alone.
+- use the audited P0-F9 v2 validation cache;
+- keep official `HIST_LAST=4`;
+- keep native Gaussian -> absolute-future flow;
+- use one global 50x50 Gaussian source field and crop it through the frozen Top-2 plan;
+- keep absolute 50x50 coordinates for each 20x20 window;
+- disable the new full-history context path;
+- pass an all-zero physics prior;
+- fail if token-prior projection, context projection, or the physics gate is not an exact no-op;
+- load only shape-compatible released OccFM transition weights and keep the checkpoint-reuse gate;
+- scatter sparse predictions back into the Strong-W2Det latent fallback;
+- decode with the frozen official VAE;
+- apply the same dynamic-only deployment fusion as P0-F9;
+- verify the same-support GT oracle remains bit-exact with the cached repair target.
+
+The two sparse variants use the same source noise. `CFG=2` matches the released OccFM config (`UNCOND_P=0.2`, `UNCOND_SCALE=2`); `CFG=1` matches the P0-F9 Stage-1 deployment choice.
 
 ## Full run
 
@@ -49,24 +57,34 @@ CUDA_VISIBLE_DEVICES=0 \
   --amp
 ```
 
-For a quick execution smoke first, add `--max-windows 2` and use a separate output path. Dense-baseline comparison is intentionally skipped for partial runs.
+For a GPU execution smoke first, add `--max-windows 2` and use a separate output path. The existing 128-window dense-baseline JSON is not compared to a partial smoke run.
 
-## Readout
+## Four controlled deltas
 
-The report contains:
+The key outputs are:
 
-- Strong-W2Det Overall / Moving;
-- frozen sparse official-CFG Overall / Moving;
-- frozen sparse P0-F9-CFG Overall / Moving;
-- same-support GT oracle;
-- delta of each sparse variant versus Strong;
-- when the full dense-baseline JSON is supplied, delta of each sparse variant versus the exact dense official OccFM run;
-- `CFG1 - CFG2` deltas.
+```text
+fusion_effect_dense_same_support_minus_strong
+    = dense OccFM proposal under the exact P0-F9 fusion - Strong
 
-Interpretation:
+sparse_geometry_effect_cfg2_minus_dense_same_support
+    = frozen 20x20 sparse CFG2 - dense OccFM under the same fusion
 
-- large negative `frozen_sparse_official_cfg - dense_official`: sparse geometry/adaptation already loses native OccFM capability before finetuning;
-- official-CFG near dense, but P0-F9-CFG much worse: guidance-policy change is a material source of loss;
-- both frozen sparse variants near dense, while trained P0-F9 is much worse: Stage-1 finetuning/objective is the primary failure source.
+guidance_effect_cfg1_minus_cfg2
+    = frozen sparse CFG1 - frozen sparse CFG2
 
-Do not launch another long training run before this diagnostic is resolved.
+frozen_sparse_cfg1_minus_strong
+    = the complete frozen P0-F9-style sparse deployment - Strong
+```
+
+The script also reports `oracle_headroom_minus_strong`.
+
+## Interpretation
+
+- If `dense_official_same_support_fusion` is already clearly below Strong, the current dynamic takeover fusion is unsafe even with a full dense OccFM proposal. The next method should not simply let a weaker WM erase Strong dynamics inside MSP.
+- If dense same-support is acceptable but `frozen_sparse_official_cfg` drops strongly, the Top-2 20x20 sparse geometry/adaptation is losing native OccFM capability before any finetuning.
+- If CFG2 is acceptable but CFG1 drops, changing the released OccFM inference policy contributes materially.
+- If both frozen sparse variants are reasonable but trained P0-F9 is much worse, Stage-1 finetuning/objective is the main additional failure source.
+- Compare trained P0-F9 step1200 against `frozen_sparse_p0f9_cfg` to isolate the finetuning contribution directly.
+
+Do not launch another long training run before this controlled diagnostic is resolved.
