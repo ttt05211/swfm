@@ -1,6 +1,11 @@
 import numpy as np
 
-from real_motion.repair_target import apply_dynamic_repair, build_dynamic_repair_endpoint
+from real_motion.repair_target import (
+    apply_dynamic_repair,
+    apply_dynamic_union,
+    apply_dynamic_write_only,
+    build_dynamic_repair_endpoint,
+)
 
 DYN = (2, 3, 4, 5, 6, 7, 9, 10)
 FREE = 17
@@ -46,10 +51,12 @@ def test_empty_write_support_is_bit_exact_anchor():
     anchor = rng.integers(0, 18, size=(3, 5, 6, 2), dtype=np.uint8)
     proposal = rng.integers(0, 18, size=anchor.shape, dtype=np.uint8)
     write = np.zeros(anchor.shape[:-1], dtype=bool)
-    out = apply_dynamic_repair(
-        anchor, proposal, write, dynamic_class_ids=DYN, free_label=FREE
-    )
-    assert np.array_equal(out, anchor)
+    for fn in (apply_dynamic_repair, apply_dynamic_write_only, apply_dynamic_union):
+        kwargs = {"dynamic_class_ids": DYN}
+        if fn is apply_dynamic_repair:
+            kwargs["free_label"] = FREE
+        out = fn(anchor, proposal, write, **kwargs)
+        assert np.array_equal(out, anchor)
 
 
 def test_single_horizon_contract_matches_temporal_contract():
@@ -60,10 +67,58 @@ def test_single_horizon_contract_matches_temporal_contract():
     write = np.zeros((4, 4), dtype=bool)
     write[1:3, 1] = True
 
-    single = apply_dynamic_repair(
-        anchor, proposal, write, dynamic_class_ids=DYN, free_label=FREE
-    )
-    stacked = apply_dynamic_repair(
-        anchor[None], proposal[None], write[None], dynamic_class_ids=DYN, free_label=FREE
-    )[0]
-    assert np.array_equal(single, stacked)
+    for fn in (apply_dynamic_repair, apply_dynamic_write_only, apply_dynamic_union):
+        kwargs = {"dynamic_class_ids": DYN}
+        if fn is apply_dynamic_repair:
+            kwargs["free_label"] = FREE
+        single = fn(anchor, proposal, write, **kwargs)
+        stacked = fn(anchor[None], proposal[None], write[None], **kwargs)[0]
+        assert np.array_equal(single, stacked)
+
+
+def test_write_only_adds_new_dynamic_but_never_changes_existing_dynamic():
+    anchor = np.full((1, 3, 3, 2), FREE, dtype=np.uint8)
+    proposal = anchor.copy()
+    write = np.ones((1, 3, 3), dtype=bool)
+
+    # Existing anchor dynamic must survive even when proposal says free.
+    anchor[0, 0, 0, 0] = 2
+    proposal[0, 0, 0, 0] = FREE
+
+    # Existing anchor dynamic class must not be relabelled by proposal.
+    anchor[0, 0, 1, 0] = 2
+    proposal[0, 0, 1, 0] = 3
+
+    # Proposal may add dynamics over free and static/non-dynamic anchor semantics.
+    proposal[0, 1, 0, 0] = 4
+    anchor[0, 1, 1, 0] = 11
+    proposal[0, 1, 1, 0] = 5
+
+    out = apply_dynamic_write_only(anchor, proposal, write, dynamic_class_ids=DYN)
+    assert out[0, 0, 0, 0] == 2
+    assert out[0, 0, 1, 0] == 2
+    assert out[0, 1, 0, 0] == 4
+    assert out[0, 1, 1, 0] == 5
+
+
+def test_dynamic_union_preserves_presence_but_allows_dynamic_class_correction():
+    anchor = np.full((1, 3, 3, 2), FREE, dtype=np.uint8)
+    proposal = anchor.copy()
+    write = np.ones((1, 3, 3), dtype=bool)
+
+    # Proposal background cannot erase anchor dynamic presence.
+    anchor[0, 0, 0, 0] = 2
+    proposal[0, 0, 0, 0] = FREE
+
+    # Proposal dynamic may relabel an existing anchor dynamic class.
+    anchor[0, 0, 1, 0] = 2
+    proposal[0, 0, 1, 0] = 3
+
+    # Proposal dynamic may also add a missing dynamic voxel.
+    anchor[0, 1, 0, 0] = 11
+    proposal[0, 1, 0, 0] = 4
+
+    out = apply_dynamic_union(anchor, proposal, write, dynamic_class_ids=DYN)
+    assert out[0, 0, 0, 0] == 2
+    assert out[0, 0, 1, 0] == 3
+    assert out[0, 1, 0, 0] == 4
