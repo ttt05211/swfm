@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
-"""Deployment-controlled frozen sparse OccFM diagnostic for P0-F9.
+"""Deployment-controlled frozen sparse OccFM + safe-fusion diagnostic for P0-F9.
 
-The goal is to locate the failure source without any new training. A direct
-comparison between a sparse deployment result and the raw dense OccFM baseline
-is confounded because the former uses Strong-W2Det fallback plus dynamic-only
-fusion. This evaluator therefore measures six states on the exact same split:
+This evaluator locates P0-F9 failure sources without new training and, after the
+P0-F9 takeover failure, tests whether the same learned proposals contain useful
+motion innovation when they are not allowed to destructively erase Strong-W2Det.
 
-1. Strong-W2Det anchor;
-2. released dense OccFM raw prediction;
-3. released dense OccFM used only as the proposal under the exact P0-F9
-   same-support dynamic fusion;
-4. frozen 20x20 sparse OccFM with official CFG=2 under the same fusion;
-5. frozen 20x20 sparse OccFM with P0-F9 CFG=1 under the same fusion;
-6. same-support GT oracle.
+For dense OccFM, frozen sparse CFG=2, frozen sparse CFG=1, and GT proposals, the
+same MSP support is evaluated with three fusion rules:
 
-This isolates:
-- fusion effect: dense-same-support minus Strong;
-- sparse-geometry/adaptation effect: sparse-CFG2 minus dense-same-support;
-- guidance-policy effect: sparse-CFG1 minus sparse-CFG2;
-- finetuning effect: compare trained P0-F9 externally against sparse-CFG1.
+1. takeover: clear anchor dynamics in support, then write proposal dynamics;
+2. write_only: keep existing anchor dynamics bit-exact and only add proposal
+   dynamics where the anchor is currently non-dynamic;
+3. dynamic_union: never clear anchor dynamic presence, but allow proposal dynamic
+   semantics to add new dynamics or relabel an existing dynamic class.
 
-No P0-F9 checkpoint, optimizer, EMA, semantic loss, physics condition, or new
-full-context condition is used in the frozen sparse branches.
+The original P0-F9 metric keys are preserved as the takeover states so previous
+reports remain directly comparable.
 """
 from __future__ import annotations
 
@@ -57,7 +51,11 @@ from real_motion.occfm_io import (
     load_official_wm,
     run_frozen_occfm_forecast,
 )
-from real_motion.repair_target import apply_dynamic_repair
+from real_motion.repair_target import (
+    apply_dynamic_repair,
+    apply_dynamic_union,
+    apply_dynamic_write_only,
+)
 from real_motion.windows import WindowPlan, crop_windows, scatter_windows
 from tools.real_motion.build_p0_f9_cache_fast import P0_F9_CACHE_PROTOCOL
 
@@ -68,7 +66,8 @@ FREE = 17
 HIST_LAST = 4
 OFFICIAL_CFG = 2.0
 P0_F9_CFG = 1.0
-PROTOCOL = "p0_f9_frozen_sparse_occfm_diagnostic_v2"
+PROTOCOL = "p0_f9_frozen_sparse_safe_fusion_diagnostic_v3"
+FUSIONS = ("takeover", "write_only", "dynamic_union")
 
 
 def _new_metrics():
@@ -102,6 +101,60 @@ def _delta(a, b):
     ao, am = _metric_pair(a)
     bo, bm = _metric_pair(b)
     return {"overall": ao - bo, "moving": am - bm}
+
+
+def _apply_fusion(mode, anchor, proposal, write_bev):
+    if mode == "takeover":
+        return apply_dynamic_repair(
+            anchor,
+            proposal,
+            write_bev,
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
+            free_label=FREE,
+        )
+    if mode == "write_only":
+        return apply_dynamic_write_only(
+            anchor,
+            proposal,
+            write_bev,
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
+        )
+    if mode == "dynamic_union":
+        return apply_dynamic_union(
+            anchor,
+            proposal,
+            write_bev,
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
+        )
+    raise ValueError(f"unknown fusion mode: {mode}")
+
+
+def _source_state_names(source):
+    if source == "dense_official":
+        return {
+            "takeover": "dense_official_same_support_fusion",
+            "write_only": "dense_official_write_only",
+            "dynamic_union": "dense_official_dynamic_union",
+        }
+    if source == "frozen_sparse_official_cfg":
+        return {
+            "takeover": "frozen_sparse_official_cfg",
+            "write_only": "frozen_sparse_official_cfg_write_only",
+            "dynamic_union": "frozen_sparse_official_cfg_dynamic_union",
+        }
+    if source == "frozen_sparse_p0f9_cfg":
+        return {
+            "takeover": "frozen_sparse_p0f9_cfg",
+            "write_only": "frozen_sparse_p0f9_cfg_write_only",
+            "dynamic_union": "frozen_sparse_p0f9_cfg_dynamic_union",
+        }
+    if source == "gt":
+        return {
+            "takeover": "same_support_gt_oracle",
+            "write_only": "same_support_gt_write_only_oracle",
+            "dynamic_union": "same_support_gt_dynamic_union_oracle",
+        }
+    raise ValueError(source)
 
 
 def _official_seeded_noise_like(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -220,6 +273,18 @@ def _sample_payload(s, device):
     }
 
 
+def _new_source_states(source):
+    return {name: _new_metrics() for name in _source_state_names(source).values()}
+
+
+def _update_source_fusions(states, source, horizon, anchor, proposal, gt, moving, write_bev):
+    names = _source_state_names(source)
+    for mode in FUSIONS:
+        fused = _apply_fusion(mode, anchor, proposal, write_bev)
+        _update(states[names[mode]], horizon, fused, gt, moving)
+    return _apply_fusion("takeover", anchor, proposal, write_bev)
+
+
 @torch.no_grad()
 def main():
     p = argparse.ArgumentParser()
@@ -253,8 +318,8 @@ def main():
         raise RuntimeError("pinned official OccFM guidance scale changed")
 
     # ------------------------------------------------------------------
-    # Pass A: replay the exact released dense OccFM and apply the *same*
-    # P0-F9 dynamic fusion. This is the proper control for sparse geometry.
+    # Pass A: exact released dense OccFM proposal, evaluated raw and under all
+    # three fusion rules on the same frozen MSP support.
     # ------------------------------------------------------------------
     dense_wm, dense_cfg = load_official_wm(UP, a.occfm_ckpt, device)
     if int(dense_cfg.DATA_CONFIG.HIST_LAST) != HIST_LAST:
@@ -262,15 +327,13 @@ def main():
     dense_states = {
         "strong_anchor": _new_metrics(),
         "dense_official_raw": _new_metrics(),
-        "dense_official_same_support_fusion": _new_metrics(),
+        **_new_source_states("dense_official"),
     }
 
     for i in range(n_eval):
         s = ds[i]
         payload = _sample_payload(s, device)
-        sample_seed = deterministic_sample_seed(
-            str(s["sample_id"]), a.seed, stream="forecast"
-        )
+        sample_seed = deterministic_sample_seed(str(s["sample_id"]), a.seed, stream="forecast")
         dense_pred = run_frozen_occfm_forecast(
             dense_wm,
             s["full_history_latent"],
@@ -284,24 +347,21 @@ def main():
             gt = payload["gt"][fi]
             anchor = payload["anchor"][fi]
             moving = payload["moving"][fi]
+            write_bev = payload["write_bev"][fi]
             _update(dense_states["strong_anchor"], horizon, anchor, gt, moving)
             _update(dense_states["dense_official_raw"], horizon, dense_pred[fi], gt, moving)
-            dense_fused = apply_dynamic_repair(
+            _update_source_fusions(
+                dense_states,
+                "dense_official",
+                horizon,
                 anchor,
                 dense_pred[fi],
-                payload["write_bev"][fi],
-                dynamic_class_ids=DYNAMIC_CLASS_IDS,
-                free_label=FREE,
-            )
-            _update(
-                dense_states["dense_official_same_support_fusion"],
-                horizon,
-                dense_fused,
                 gt,
                 moving,
+                write_bev,
             )
         if i % 8 == 0:
-            print("dense_control_eval", i, s["sample_id"])
+            print("dense_safe_fusion_eval", i, s["sample_id"])
 
     dense_reports = {name: _report(state) for name, state in dense_states.items()}
     dense_reproduction = _assert_dense_replay_matches(
@@ -313,8 +373,8 @@ def main():
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # Pass B: frozen 20x20 sparse adaptation. Only released transition
-    # weights are loaded. All new P0-F9 condition paths remain exact no-ops.
+    # Pass B: frozen 20x20 sparse adaptation. Released weights only, no new
+    # physics/context condition. Both CFG settings share exactly the same z0.
     # ------------------------------------------------------------------
     model = make_p0_f9_model(
         20,
@@ -334,9 +394,9 @@ def main():
     vae = OccFMVAEAdapter(vae_model)
 
     sparse_states = {
-        "frozen_sparse_official_cfg": _new_metrics(),
-        "frozen_sparse_p0f9_cfg": _new_metrics(),
-        "same_support_gt_oracle": _new_metrics(),
+        **_new_source_states("frozen_sparse_official_cfg"),
+        **_new_source_states("frozen_sparse_p0f9_cfg"),
+        **_new_source_states("gt"),
     }
     oracle_checks = 0
     valid_windows = []
@@ -369,9 +429,7 @@ def main():
             traj = payload["trajectory"].unsqueeze(0)
             traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[flat_valid]
 
-            sample_seed = deterministic_sample_seed(
-                str(s["sample_id"]), a.seed, stream="forecast"
-            )
+            sample_seed = deterministic_sample_seed(str(s["sample_id"]), a.seed, stream="forecast")
             global_noise = _official_seeded_noise_like(physics_full, sample_seed)
             initial_noise = crop_coherent_source_noise(global_noise, plan, flat_valid)
 
@@ -409,36 +467,77 @@ def main():
             gt = payload["gt"][fi]
             anchor = payload["anchor"][fi]
             moving = payload["moving"][fi]
-            for name in ("frozen_sparse_official_cfg", "frozen_sparse_p0f9_cfg"):
-                final = apply_dynamic_repair(
-                    anchor,
-                    predictions[name][fi],
-                    payload["write_bev"][fi],
-                    dynamic_class_ids=DYNAMIC_CLASS_IDS,
-                    free_label=FREE,
-                )
-                _update(sparse_states[name], horizon, final, gt, moving)
+            write_bev = payload["write_bev"][fi]
 
-            oracle = apply_dynamic_repair(
+            for source in ("frozen_sparse_official_cfg", "frozen_sparse_p0f9_cfg"):
+                _update_source_fusions(
+                    sparse_states,
+                    source,
+                    horizon,
+                    anchor,
+                    predictions[source][fi],
+                    gt,
+                    moving,
+                    write_bev,
+                )
+
+            gt_takeover = _update_source_fusions(
+                sparse_states,
+                "gt",
+                horizon,
                 anchor,
                 gt,
-                payload["write_bev"][fi],
-                dynamic_class_ids=DYNAMIC_CLASS_IDS,
-                free_label=FREE,
+                gt,
+                moving,
+                write_bev,
             )
-            if not np.array_equal(oracle, payload["repair_target"][fi]):
+            if not np.array_equal(gt_takeover, payload["repair_target"][fi]):
                 raise RuntimeError(
-                    f"{s['sample_id']} horizon={horizon}: same-support GT oracle differs "
+                    f"{s['sample_id']} horizon={horizon}: same-support GT takeover oracle differs "
                     "from cached repair target"
                 )
             oracle_checks += 1
-            _update(sparse_states["same_support_gt_oracle"], horizon, oracle, gt, moving)
 
         if i % 8 == 0:
-            print("frozen_sparse_occfm_eval", i, s["sample_id"])
+            print("frozen_sparse_safe_fusion_eval", i, s["sample_id"])
 
     sparse_reports = {name: _report(state) for name, state in sparse_states.items()}
     metrics = {**dense_reports, **sparse_reports}
+
+    controlled_deltas = {
+        "fusion_effect_dense_same_support_minus_strong": _delta(
+            metrics["dense_official_same_support_fusion"], metrics["strong_anchor"]
+        ),
+        "sparse_geometry_effect_cfg2_minus_dense_same_support": _delta(
+            metrics["frozen_sparse_official_cfg"], metrics["dense_official_same_support_fusion"]
+        ),
+        "guidance_effect_cfg1_minus_cfg2": _delta(
+            metrics["frozen_sparse_p0f9_cfg"], metrics["frozen_sparse_official_cfg"]
+        ),
+        "frozen_sparse_cfg1_minus_strong": _delta(
+            metrics["frozen_sparse_p0f9_cfg"], metrics["strong_anchor"]
+        ),
+        "oracle_headroom_minus_strong": _delta(
+            metrics["same_support_gt_oracle"], metrics["strong_anchor"]
+        ),
+    }
+
+    safe_fusion_deltas = {}
+    source_keys = {
+        "dense_official": _source_state_names("dense_official"),
+        "frozen_sparse_official_cfg": _source_state_names("frozen_sparse_official_cfg"),
+        "frozen_sparse_p0f9_cfg": _source_state_names("frozen_sparse_p0f9_cfg"),
+        "gt": _source_state_names("gt"),
+    }
+    for source, names in source_keys.items():
+        takeover = metrics[names["takeover"]]
+        safe_fusion_deltas[source] = {
+            "takeover_minus_strong": _delta(takeover, metrics["strong_anchor"]),
+            "write_only_minus_strong": _delta(metrics[names["write_only"]], metrics["strong_anchor"]),
+            "dynamic_union_minus_strong": _delta(metrics[names["dynamic_union"]], metrics["strong_anchor"]),
+            "write_only_minus_takeover": _delta(metrics[names["write_only"]], takeover),
+            "dynamic_union_minus_takeover": _delta(metrics[names["dynamic_union"]], takeover),
+        }
 
     report = {
         "protocol": PROTOCOL,
@@ -456,6 +555,11 @@ def main():
         "source_noise_contract": "official-first-global-randn-50x50_then_crop_same_top2_plan",
         "window_contract": "top2_20x20_absolute_50x50_position_coordinates",
         "conditioning_contract": "no_full_context_no_physics_condition_no_finetuning",
+        "fusion_contracts": {
+            "takeover": "clear_anchor_dynamic_then_write_proposal_dynamic_inside_support",
+            "write_only": "keep_anchor_dynamic_bit_exact_and_only_add_proposal_dynamic_on_non_dynamic_anchor",
+            "dynamic_union": "never_clear_anchor_dynamic_presence_but_proposal_dynamic_may_add_or_relabel",
+        },
         "official_guidance_scale": OFFICIAL_CFG,
         "p0_f9_guidance_scale": P0_F9_CFG,
         "official_transition_reuse_fraction": float(reuse_fraction),
@@ -467,40 +571,23 @@ def main():
         "dense_baseline_reference": dense_reference,
         "dense_baseline_reproduction": dense_reproduction,
         "metrics": metrics,
-        "controlled_deltas": {
-            "fusion_effect_dense_same_support_minus_strong": _delta(
-                metrics["dense_official_same_support_fusion"],
-                metrics["strong_anchor"],
-            ),
-            "sparse_geometry_effect_cfg2_minus_dense_same_support": _delta(
-                metrics["frozen_sparse_official_cfg"],
-                metrics["dense_official_same_support_fusion"],
-            ),
-            "guidance_effect_cfg1_minus_cfg2": _delta(
-                metrics["frozen_sparse_p0f9_cfg"],
-                metrics["frozen_sparse_official_cfg"],
-            ),
-            "frozen_sparse_cfg1_minus_strong": _delta(
-                metrics["frozen_sparse_p0f9_cfg"],
-                metrics["strong_anchor"],
-            ),
-            "oracle_headroom_minus_strong": _delta(
-                metrics["same_support_gt_oracle"],
-                metrics["strong_anchor"],
-            ),
-        },
+        "controlled_deltas": controlled_deltas,
+        "safe_fusion_deltas": safe_fusion_deltas,
         "interpretation_contract": {
-            "dense_same_support_below_strong": (
-                "the dynamic takeover fusion is unsafe even when the proposal comes from full dense OccFM"
+            "write_only_or_union_beats_strong_with_real_proposal": (
+                "the WM contains useful sparse innovation once destructive clear authority is removed"
             ),
-            "sparse_cfg2_below_dense_same_support": (
-                "20x20 sparse geometry/adaptation loses additional native OccFM capability before finetuning"
+            "safe_gt_oracle_beats_strong_but_real_safe_fusion_does_not": (
+                "safe fusion has headroom but proposal quality is still insufficient"
             ),
-            "sparse_cfg1_below_sparse_cfg2": (
-                "changing released OccFM guidance scale 2 -> 1 adds further degradation"
+            "safe_gt_oracle_not_above_strong": (
+                "purely non-destructive innovation is insufficient and selective clear/correction needs a learned confidence gate"
             ),
-            "trained_p0f9_below_frozen_sparse_cfg1": (
-                "Stage-1 finetuning/objective adds degradation beyond the frozen sparse adaptation"
+            "write_only_above_union": (
+                "proposal dynamic class corrections are harmful; preserve existing Strong dynamic semantics"
+            ),
+            "union_above_write_only": (
+                "proposal has useful dynamic class corrections in addition to new dynamic evidence"
             ),
         },
     }
@@ -509,20 +596,36 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print("\n=== P0-F9 FROZEN SPARSE CONTROLLED DIAGNOSTIC ===")
-    print(f"{'state':42s} {'Overall':>10s} {'Moving':>10s}")
-    for name in (
+    print("\n=== P0-F9 SAFE-FUSION ABLATION ===")
+    print(f"{'state':48s} {'Overall':>10s} {'Moving':>10s}")
+    order = [
         "strong_anchor",
         "dense_official_raw",
         "dense_official_same_support_fusion",
+        "dense_official_write_only",
+        "dense_official_dynamic_union",
         "frozen_sparse_official_cfg",
+        "frozen_sparse_official_cfg_write_only",
+        "frozen_sparse_official_cfg_dynamic_union",
         "frozen_sparse_p0f9_cfg",
+        "frozen_sparse_p0f9_cfg_write_only",
+        "frozen_sparse_p0f9_cfg_dynamic_union",
         "same_support_gt_oracle",
-    ):
+        "same_support_gt_write_only_oracle",
+        "same_support_gt_dynamic_union_oracle",
+    ]
+    for name in order:
         o, m = _metric_pair(metrics[name])
-        print(f"{name:42s} {o:10.4f} {m:10.4f}")
-    print("\ncontrolled_deltas")
-    for name, d in report["controlled_deltas"].items():
+        print(f"{name:48s} {o:10.4f} {m:10.4f}")
+
+    print("\n=== SAFE FUSION DELTAS ===")
+    for source, rows in safe_fusion_deltas.items():
+        print(f"[{source}]")
+        for name, d in rows.items():
+            print(f"  {name:30s} Overall={d['overall']:+.4f} Moving={d['moving']:+.4f}")
+
+    print("\n=== ORIGINAL CONTROLLED DELTAS ===")
+    for name, d in controlled_deltas.items():
         print(f"{name:52s} Overall={d['overall']:+.4f} Moving={d['moving']:+.4f}")
     print("saved", out)
 
