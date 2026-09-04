@@ -3,7 +3,7 @@
 The module borrows the *controlled condition injection* idea from strong
 forecasting/world-model systems: keep the pretrained transition exactly intact at
 initialization, then let training learn how much of the external physics prior to
-use.  The Strong-W2Det/KTA future latent is used only as conditioning evidence;
+use. The Strong-W2Det/KTA future latent is used only as conditioning evidence;
 it is never the flow source or the prediction target.
 """
 from __future__ import annotations
@@ -15,11 +15,16 @@ from einops import rearrange
 
 
 class GatedPhysicsCrossAttention(nn.Module):
-    """Per-future-frame cross-attention with an exact zero-impact initialization.
+    """Per-frame cross-attention with an exact zero-impact initialization.
 
     Query tokens come from the native WM bottleneck. Key/value tokens come from
     the Strong-W2Det future prior. ``gate`` starts at exactly zero, so adding this
     module cannot change the pretrained OccFM forward before optimization.
+
+    ``prior_proj`` deliberately has no bias. The aligned prior contains zero
+    history slots; keeping zero input exactly zero prevents those history slots
+    from turning into a learned constant pseudo-physics condition once the gate
+    becomes nonzero.
     """
 
     def __init__(
@@ -36,7 +41,7 @@ class GatedPhysicsCrossAttention(nn.Module):
         self.hidden_size = int(hidden_size)
         self.query_norm = nn.LayerNorm(self.hidden_size)
         self.prior_norm = nn.LayerNorm(self.hidden_size)
-        self.prior_proj = nn.Linear(self.prior_channels, self.hidden_size)
+        self.prior_proj = nn.Linear(self.prior_channels, self.hidden_size, bias=False)
         self.attn = nn.MultiheadAttention(
             self.hidden_size,
             int(num_heads),
