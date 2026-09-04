@@ -104,6 +104,10 @@ class MotionWindowFlowMatchingFullContext(FLOW_MATCHING_DOWN_X4_DiT):
         c = rearrange(c, "b d h w -> (b h w) d")
         return repeat(c, "bn d -> bn f d", f=frames)
 
+    def _mid_physics_fusion(self, x, prior_future):
+        """Extension hook used by P0-F9; legacy transitions are exact no-ops."""
+        return x
+
     def _spatial_cond(self, emb, prior, hw, context_base=None):
         p = self._resize_prior(prior, hw)
         p = rearrange(p, "b f c h w -> (b f) (h w) c")
@@ -211,6 +215,7 @@ class MotionWindowFlowMatchingFullContext(FLOW_MATCHING_DOWN_X4_DiT):
             x = downsample(x)
 
         x = self.mid_block1(x, emb)
+        x = self._mid_physics_fusion(x, prior_condition)
         x = self.mid_spatial_attn(x)
         x = self.mid_temporal_attn(x, pos_bias=time_rel_pos_bias)
         x = self.mid_block2(x, emb)
