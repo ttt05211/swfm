@@ -9,8 +9,10 @@ from real_motion.models.physics_prior import GatedPhysicsCrossAttention
 from real_motion.native_forecast import (
     absolute_future_semantic_loss,
     collapse_occ_logits_to_dynamic,
+    crop_coherent_source_noise,
     deterministic_sample_seed,
 )
+from real_motion.windows import WindowPlan
 
 
 class _CaptureTransition(nn.Module):
@@ -108,6 +110,22 @@ def test_native_sampler_starts_from_explicit_noise_not_physics():
     out = model.sample(history, physics, initial_noise=initial)
     # Fake transition predicts zero velocity, so ODE leaves the noise untouched.
     assert torch.allclose(out, initial / 10.0)
+
+
+def test_global_source_noise_is_identical_in_overlapping_window_cells():
+    # Unique deterministic values make overlap equality easy to verify.
+    global_noise = torch.arange(25, dtype=torch.float32).reshape(1, 1, 1, 5, 5)
+    plan = WindowPlan(
+        origins=torch.tensor([[[0, 0], [1, 1]]], dtype=torch.long),
+        valid=torch.tensor([[True, True]]),
+        window_hw=(3, 3),
+        full_hw=(5, 5),
+    )
+    local = crop_coherent_source_noise(global_noise, plan, plan.valid.reshape(-1))
+    # Global (1,1) is local (1,1) in window0 and local (0,0) in window1.
+    assert local[0, 0, 0, 1, 1].item() == local[1, 0, 0, 0, 0].item()
+    # Global (2,2) is local (2,2) in window0 and local (1,1) in window1.
+    assert local[0, 0, 0, 2, 2].item() == local[1, 0, 0, 1, 1].item()
 
 
 def test_zero_gated_physics_cross_attention_is_exact_noop_and_gate_learns():
