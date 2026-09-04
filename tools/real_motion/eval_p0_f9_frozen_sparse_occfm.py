@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""Frozen sparse OccFM diagnostic for P0-F9.
+"""Deployment-controlled frozen sparse OccFM diagnostic for P0-F9.
 
-This evaluator answers one narrow question before any new training:
+The goal is to locate the failure source without any new training. A direct
+comparison between a sparse deployment result and the raw dense OccFM baseline
+is confounded because the former uses Strong-W2Det fallback plus dynamic-only
+fusion. This evaluator therefore measures six states on the exact same split:
 
-    Does the current Top-2 20x20 sparse adaptation already destroy the released
-    OccFM-Fut forecasting function, or does the damage mainly appear after
-    P0-F9 finetuning?
+1. Strong-W2Det anchor;
+2. released dense OccFM raw prediction;
+3. released dense OccFM used only as the proposal under the exact P0-F9
+   same-support dynamic fusion;
+4. frozen 20x20 sparse OccFM with official CFG=2 under the same fusion;
+5. frozen 20x20 sparse OccFM with P0-F9 CFG=1 under the same fusion;
+6. same-support GT oracle.
 
-Protocol:
-- load the released OccFM-Fut epoch=000196 transition weights;
-- construct the current P0-F9 20x20 sparse transition geometry;
-- do NOT load any trained P0-F9 checkpoint;
-- disable the new full-context and physics-conditioning paths;
-- use one global 50x50 Gaussian source field and crop it with the frozen Top-2
-  WindowPlan, preserving overlap coherence;
-- run two frozen samplers on the exact same source noise:
-    1) official OccFM CFG scale = 2;
-    2) P0-F9 Stage-1 deployment CFG scale = 1;
-- scatter sparse future latents into the exact Strong-W2Det fallback latent;
-- decode with the frozen VAE and apply the same dynamic-only deployment fusion;
-- report Overall / Moving and the same-support GT oracle.
+This isolates:
+- fusion effect: dense-same-support minus Strong;
+- sparse-geometry/adaptation effect: sparse-CFG2 minus dense-same-support;
+- guidance-policy effect: sparse-CFG1 minus sparse-CFG2;
+- finetuning effect: compare trained P0-F9 externally against sparse-CFG1.
 
-The two CFG settings separate sparse-geometry loss from the inference-policy
-change made by P0-F9. No optimizer, EMA, semantic loss, or finetuning is used.
+No P0-F9 checkpoint, optimizer, EMA, semantic loss, physics condition, or new
+full-context condition is used in the frozen sparse branches.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 import sys
@@ -54,6 +54,8 @@ from real_motion.occfm_io import (
     file_sha256,
     load_occfm_config,
     load_official_vae,
+    load_official_wm,
+    run_frozen_occfm_forecast,
 )
 from real_motion.repair_target import apply_dynamic_repair
 from real_motion.windows import WindowPlan, crop_windows, scatter_windows
@@ -66,7 +68,7 @@ FREE = 17
 HIST_LAST = 4
 OFFICIAL_CFG = 2.0
 P0_F9_CFG = 1.0
-PROTOCOL = "p0_f9_frozen_sparse_occfm_diagnostic_v1"
+PROTOCOL = "p0_f9_frozen_sparse_occfm_diagnostic_v2"
 
 
 def _new_metrics():
@@ -94,6 +96,12 @@ def _report(state):
 
 def _metric_pair(report):
     return float(report["overall"]["mIoU"]), float(report["moving"]["mIoU"])
+
+
+def _delta(a, b):
+    ao, am = _metric_pair(a)
+    bo, bm = _metric_pair(b)
+    return {"overall": ao - bo, "moving": am - bm}
 
 
 def _official_seeded_noise_like(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -156,10 +164,9 @@ def _load_dense_reference(path: str | None, ds: MSPWorldModelCacheDataset, n_eva
     if n_eval != len(ds):
         return {
             "status": "skipped_for_partial_run",
-            "reason": "dense baseline comparison is only valid for the full validation set",
+            "reason": "baseline reproduction check is only valid for the full validation set",
         }
-    p = Path(path)
-    data = json.loads(p.read_text())
+    data = json.loads(Path(path).read_text())
     if data.get("protocol") != "p0_f9_official_occfm_native_baseline_v2":
         raise RuntimeError("dense reference is not the audited official OccFM baseline")
     if int(data.get("num_windows", -1)) != len(ds):
@@ -168,6 +175,49 @@ def _load_dense_reference(path: str | None, ds: MSPWorldModelCacheDataset, n_eva
     if data.get("cache_index_sha256") != expected_sha:
         raise RuntimeError("dense reference was evaluated on a different cache index")
     return data
+
+
+def _assert_dense_replay_matches(reference, dense_report) -> dict | None:
+    if not reference or reference.get("status") == "skipped_for_partial_run":
+        return None
+    ref_o = float(reference["metrics"]["overall"]["mIoU"])
+    ref_m = float(reference["metrics"]["moving"]["mIoU"])
+    got_o, got_m = _metric_pair(dense_report)
+    diff_o = got_o - ref_o
+    diff_m = got_m - ref_m
+    if abs(diff_o) > 1e-9 or abs(diff_m) > 1e-9:
+        raise RuntimeError(
+            "official dense replay does not reproduce the existing baseline: "
+            f"dOverall={diff_o:.12g} dMoving={diff_m:.12g}"
+        )
+    return {
+        "status": "bit_metric_exact",
+        "overall_difference": diff_o,
+        "moving_difference": diff_m,
+    }
+
+
+def _sample_payload(s, device):
+    required = (
+        "eval_future_gt_occ",
+        "eval_strong_anchor_occ",
+        "eval_repair_target_occ",
+        "eval_gt_moving_support",
+    )
+    missing = [k for k in required if k not in s]
+    if missing:
+        raise RuntimeError(f"{s['sample_id']}: eval payload missing {missing}")
+    write_lat = s["msp_write_support_latent"].bool()
+    write_bev = latent_support_to_bev(write_lat, (200, 200)).cpu().numpy().astype(bool)
+    return {
+        "gt": s["eval_future_gt_occ"].cpu().numpy(),
+        "anchor": s["eval_strong_anchor_occ"].cpu().numpy(),
+        "repair_target": s["eval_repair_target_occ"].cpu().numpy(),
+        "moving": s["eval_gt_moving_support"].cpu().numpy().astype(bool),
+        "write_bev": write_bev,
+        "write_ratio": float(write_lat.float().mean().item()),
+        "trajectory": s["trajectory"].to(device),
+    }
 
 
 @torch.no_grad()
@@ -191,6 +241,8 @@ def main():
 
     ds = MSPWorldModelCacheDataset(a.cache)
     _validate_cache(ds, a.vae_ckpt)
+    n_eval = len(ds) if int(a.max_windows) <= 0 else min(len(ds), int(a.max_windows))
+    dense_reference = _load_dense_reference(a.dense_baseline_json, ds, n_eval)
 
     cfg = load_occfm_config(UP, "tools/cfgs/occfm_fut.yaml")
     if int(cfg.DATA_CONFIG.HIST_LAST) != HIST_LAST:
@@ -200,6 +252,70 @@ def main():
     if float(cfg.LOSS.UNCOND_SCALE) != OFFICIAL_CFG:
         raise RuntimeError("pinned official OccFM guidance scale changed")
 
+    # ------------------------------------------------------------------
+    # Pass A: replay the exact released dense OccFM and apply the *same*
+    # P0-F9 dynamic fusion. This is the proper control for sparse geometry.
+    # ------------------------------------------------------------------
+    dense_wm, dense_cfg = load_official_wm(UP, a.occfm_ckpt, device)
+    if int(dense_cfg.DATA_CONFIG.HIST_LAST) != HIST_LAST:
+        raise RuntimeError("loaded official OccFM config HIST_LAST mismatch")
+    dense_states = {
+        "strong_anchor": _new_metrics(),
+        "dense_official_raw": _new_metrics(),
+        "dense_official_same_support_fusion": _new_metrics(),
+    }
+
+    for i in range(n_eval):
+        s = ds[i]
+        payload = _sample_payload(s, device)
+        sample_seed = deterministic_sample_seed(
+            str(s["sample_id"]), a.seed, stream="forecast"
+        )
+        dense_pred = run_frozen_occfm_forecast(
+            dense_wm,
+            s["full_history_latent"],
+            s["gt_future_latent"],
+            trajectory=s["trajectory"],
+            seed=sample_seed,
+            hist_last=HIST_LAST,
+        ).numpy()
+
+        for horizon, fi in REPORT.items():
+            gt = payload["gt"][fi]
+            anchor = payload["anchor"][fi]
+            moving = payload["moving"][fi]
+            _update(dense_states["strong_anchor"], horizon, anchor, gt, moving)
+            _update(dense_states["dense_official_raw"], horizon, dense_pred[fi], gt, moving)
+            dense_fused = apply_dynamic_repair(
+                anchor,
+                dense_pred[fi],
+                payload["write_bev"][fi],
+                dynamic_class_ids=DYNAMIC_CLASS_IDS,
+                free_label=FREE,
+            )
+            _update(
+                dense_states["dense_official_same_support_fusion"],
+                horizon,
+                dense_fused,
+                gt,
+                moving,
+            )
+        if i % 8 == 0:
+            print("dense_control_eval", i, s["sample_id"])
+
+    dense_reports = {name: _report(state) for name, state in dense_states.items()}
+    dense_reproduction = _assert_dense_replay_matches(
+        dense_reference, dense_reports["dense_official_raw"]
+    )
+
+    del dense_wm
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Pass B: frozen 20x20 sparse adaptation. Only released transition
+    # weights are loaded. All new P0-F9 condition paths remain exact no-ops.
+    # ------------------------------------------------------------------
     model = make_p0_f9_model(
         20,
         sample_steps=int(cfg.LOSS.SAMPLE_STEP),
@@ -217,8 +333,7 @@ def main():
     vae_model, _ = load_official_vae(UP, a.vae_ckpt, device)
     vae = OccFMVAEAdapter(vae_model)
 
-    states = {
-        "strong_anchor": _new_metrics(),
+    sparse_states = {
         "frozen_sparse_official_cfg": _new_metrics(),
         "frozen_sparse_p0f9_cfg": _new_metrics(),
         "same_support_gt_oracle": _new_metrics(),
@@ -227,20 +342,10 @@ def main():
     valid_windows = []
     write_ratios = []
     use_amp = bool(a.amp and device.type == "cuda")
-    n_eval = len(ds) if int(a.max_windows) <= 0 else min(len(ds), int(a.max_windows))
 
     for i in range(n_eval):
         s = ds[i]
-        required = (
-            "eval_future_gt_occ",
-            "eval_strong_anchor_occ",
-            "eval_repair_target_occ",
-            "eval_gt_moving_support",
-        )
-        missing = [k for k in required if k not in s]
-        if missing:
-            raise RuntimeError(f"{s['sample_id']}: eval payload missing {missing}")
-
+        payload = _sample_payload(s, device)
         origins = s["window_origins"].unsqueeze(0).long().to(device)
         valid = s["window_valid"].unsqueeze(0).bool().to(device)
         plan = WindowPlan(origins, valid, PRED_HW, FULL_HW)
@@ -251,6 +356,7 @@ def main():
         B, K = hist_w.shape[:2]
         flat_valid = plan.valid.reshape(-1)
         valid_windows.append(int(valid.sum().item()))
+        write_ratios.append(payload["write_ratio"])
 
         predictions = {}
         if bool(flat_valid.any()):
@@ -260,7 +366,7 @@ def main():
             fh = flat(hist_w)
             fp_zero = torch.zeros_like(flat(physics_w))
             orig = plan.origins.reshape(B * K, 2)[flat_valid]
-            traj = s["trajectory"].to(device).unsqueeze(0)
+            traj = payload["trajectory"].unsqueeze(0)
             traj = traj[:, None].expand(B, K, 12, 2).reshape(B * K, 12, 2)[flat_valid]
 
             sample_seed = deterministic_sample_seed(
@@ -289,81 +395,50 @@ def main():
                     )
                 padded = torch.zeros(B * K, *pred.shape[1:], device=device, dtype=pred.dtype)
                 padded[flat_valid] = pred
-                fused = scatter_windows(
+                fused_latent = scatter_windows(
                     padded.reshape(B, K, *pred.shape[1:]),
                     plan,
                     base=physics_full,
                 )
-                predictions[name] = vae.decode_labels(fused.float())[0].cpu().numpy()
+                predictions[name] = vae.decode_labels(fused_latent.float())[0].cpu().numpy()
         else:
-            anchor_labels = s["eval_strong_anchor_occ"].cpu().numpy()
-            predictions["frozen_sparse_official_cfg"] = anchor_labels
-            predictions["frozen_sparse_p0f9_cfg"] = anchor_labels
-
-        write_lat = s["msp_write_support_latent"].bool()
-        write_bev = latent_support_to_bev(write_lat, (200, 200)).cpu().numpy().astype(bool)
-        write_ratios.append(float(write_lat.float().mean().item()))
-
-        gt_future = s["eval_future_gt_occ"].cpu().numpy()
-        anchor_future = s["eval_strong_anchor_occ"].cpu().numpy()
-        repair_target = s["eval_repair_target_occ"].cpu().numpy()
-        moving = s["eval_gt_moving_support"].cpu().numpy().astype(bool)
+            predictions["frozen_sparse_official_cfg"] = payload["anchor"]
+            predictions["frozen_sparse_p0f9_cfg"] = payload["anchor"]
 
         for horizon, fi in REPORT.items():
-            gt = gt_future[fi]
-            anchor = anchor_future[fi]
-            _update(states["strong_anchor"], horizon, anchor, gt, moving[fi])
-
+            gt = payload["gt"][fi]
+            anchor = payload["anchor"][fi]
+            moving = payload["moving"][fi]
             for name in ("frozen_sparse_official_cfg", "frozen_sparse_p0f9_cfg"):
                 final = apply_dynamic_repair(
                     anchor,
                     predictions[name][fi],
-                    write_bev[fi],
+                    payload["write_bev"][fi],
                     dynamic_class_ids=DYNAMIC_CLASS_IDS,
                     free_label=FREE,
                 )
-                _update(states[name], horizon, final, gt, moving[fi])
+                _update(sparse_states[name], horizon, final, gt, moving)
 
             oracle = apply_dynamic_repair(
                 anchor,
                 gt,
-                write_bev[fi],
+                payload["write_bev"][fi],
                 dynamic_class_ids=DYNAMIC_CLASS_IDS,
                 free_label=FREE,
             )
-            if not np.array_equal(oracle, repair_target[fi]):
+            if not np.array_equal(oracle, payload["repair_target"][fi]):
                 raise RuntimeError(
                     f"{s['sample_id']} horizon={horizon}: same-support GT oracle differs "
                     "from cached repair target"
                 )
             oracle_checks += 1
-            _update(states["same_support_gt_oracle"], horizon, oracle, gt, moving[fi])
+            _update(sparse_states["same_support_gt_oracle"], horizon, oracle, gt, moving)
 
         if i % 8 == 0:
             print("frozen_sparse_occfm_eval", i, s["sample_id"])
 
-    metrics = {name: _report(state) for name, state in states.items()}
-    anchor_o, anchor_m = _metric_pair(metrics["strong_anchor"])
-    off_o, off_m = _metric_pair(metrics["frozen_sparse_official_cfg"])
-    p9_o, p9_m = _metric_pair(metrics["frozen_sparse_p0f9_cfg"])
-    oracle_o, oracle_m = _metric_pair(metrics["same_support_gt_oracle"])
-
-    dense_reference = _load_dense_reference(a.dense_baseline_json, ds, n_eval)
-    dense_comparison = None
-    if dense_reference and dense_reference.get("status") != "skipped_for_partial_run":
-        dense_metrics = dense_reference["metrics"]
-        dense_o = float(dense_metrics["overall"]["mIoU"])
-        dense_m = float(dense_metrics["moving"]["mIoU"])
-        dense_comparison = {
-            "dense_official_overall": dense_o,
-            "dense_official_moving": dense_m,
-            "frozen_sparse_official_cfg_minus_dense_overall": off_o - dense_o,
-            "frozen_sparse_official_cfg_minus_dense_moving": off_m - dense_m,
-            "frozen_sparse_p0f9_cfg_minus_dense_overall": p9_o - dense_o,
-            "frozen_sparse_p0f9_cfg_minus_dense_moving": p9_m - dense_m,
-            "cfg1_minus_cfg2_overall": p9_o - off_o,
-            "cfg1_minus_cfg2_moving": p9_m - off_m,
-        }
+    sparse_reports = {name: _report(state) for name, state in sparse_states.items()}
+    metrics = {**dense_reports, **sparse_reports}
 
     report = {
         "protocol": PROTOCOL,
@@ -389,26 +464,43 @@ def main():
         "oracle_bit_exact_checks": int(oracle_checks),
         "mean_valid_top2_windows": float(np.mean(valid_windows)) if valid_windows else 0.0,
         "mean_write_support_ratio": float(np.mean(write_ratios)) if write_ratios else 0.0,
+        "dense_baseline_reference": dense_reference,
+        "dense_baseline_reproduction": dense_reproduction,
         "metrics": metrics,
-        "deltas_vs_strong_anchor": {
-            "frozen_sparse_official_cfg_overall": off_o - anchor_o,
-            "frozen_sparse_official_cfg_moving": off_m - anchor_m,
-            "frozen_sparse_p0f9_cfg_overall": p9_o - anchor_o,
-            "frozen_sparse_p0f9_cfg_moving": p9_m - anchor_m,
-            "same_support_gt_oracle_overall": oracle_o - anchor_o,
-            "same_support_gt_oracle_moving": oracle_m - anchor_m,
+        "controlled_deltas": {
+            "fusion_effect_dense_same_support_minus_strong": _delta(
+                metrics["dense_official_same_support_fusion"],
+                metrics["strong_anchor"],
+            ),
+            "sparse_geometry_effect_cfg2_minus_dense_same_support": _delta(
+                metrics["frozen_sparse_official_cfg"],
+                metrics["dense_official_same_support_fusion"],
+            ),
+            "guidance_effect_cfg1_minus_cfg2": _delta(
+                metrics["frozen_sparse_p0f9_cfg"],
+                metrics["frozen_sparse_official_cfg"],
+            ),
+            "frozen_sparse_cfg1_minus_strong": _delta(
+                metrics["frozen_sparse_p0f9_cfg"],
+                metrics["strong_anchor"],
+            ),
+            "oracle_headroom_minus_strong": _delta(
+                metrics["same_support_gt_oracle"],
+                metrics["strong_anchor"],
+            ),
         },
-        "dense_reference": dense_reference,
-        "dense_comparison": dense_comparison,
         "interpretation_contract": {
-            "large_negative_frozen_sparse_official_cfg_vs_dense": (
-                "sparse geometry/adaptation already loses released OccFM capability before finetuning"
+            "dense_same_support_below_strong": (
+                "the dynamic takeover fusion is unsafe even when the proposal comes from full dense OccFM"
             ),
-            "official_cfg_near_dense_but_p0f9_cfg_worse": (
-                "guidance-policy change contributes materially to the loss"
+            "sparse_cfg2_below_dense_same_support": (
+                "20x20 sparse geometry/adaptation loses additional native OccFM capability before finetuning"
             ),
-            "both_frozen_sparse_variants_near_dense_but_trained_p0f9_worse": (
-                "Stage-1 finetuning/objective is the primary failure source"
+            "sparse_cfg1_below_sparse_cfg2": (
+                "changing released OccFM guidance scale 2 -> 1 adds further degradation"
+            ),
+            "trained_p0f9_below_frozen_sparse_cfg1": (
+                "Stage-1 finetuning/objective adds degradation beyond the frozen sparse adaptation"
             ),
         },
     }
@@ -416,7 +508,23 @@ def main():
     out = Path(a.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(report, indent=2))
+
+    print("\n=== P0-F9 FROZEN SPARSE CONTROLLED DIAGNOSTIC ===")
+    print(f"{'state':42s} {'Overall':>10s} {'Moving':>10s}")
+    for name in (
+        "strong_anchor",
+        "dense_official_raw",
+        "dense_official_same_support_fusion",
+        "frozen_sparse_official_cfg",
+        "frozen_sparse_p0f9_cfg",
+        "same_support_gt_oracle",
+    ):
+        o, m = _metric_pair(metrics[name])
+        print(f"{name:42s} {o:10.4f} {m:10.4f}")
+    print("\ncontrolled_deltas")
+    for name, d in report["controlled_deltas"].items():
+        print(f"{name:52s} Overall={d['overall']:+.4f} Moving={d['moving']:+.4f}")
+    print("saved", out)
 
 
 if __name__ == "__main__":
