@@ -2,23 +2,23 @@
 """Measure how P0-F9's MSP/Top-2 training population differs from native OccFM.
 
 This is a CPU / I/O diagnostic; it does not run a neural network or train
-anything.  It compares four semantic populations under the exact 6-history +
+anything. It compares four semantic populations under the exact 6-history +
 6-future OccFM temporal protocol:
 
 1. ``native_full_future``: every eligible training window from the supplied
-   temporal-info split, full 200x200x16 future occupancy.  This is the native
-   raw-window reference population.
+   temporal-info split, full future occupancy. This is the native raw-window
+   reference population.
 2. ``selected_full_future``: the exact P0-F9/MSP selected windows, still counted
-   on the full future occupancy grid.  This isolates *window-selection* bias.
-3. ``selected_top2_union``: only spatial cells covered by the selected Top-2
-   latent windows, with overlap counted once per training sample.  This isolates
-   *spatial routing* bias.
-4. ``selected_top2_effective``: the actual two crop slots seen by the sparse WM;
-   Top-2 overlap is counted twice, matching the effective training population.
+   on the full future occupancy grid. This isolates window-selection bias.
+3. ``selected_top2_union``: only cells covered by valid Top-2 latent windows,
+   with overlap counted once per selected sample. This isolates routing bias.
+4. ``selected_top2_effective``: the actual valid crop slots seen by the sparse
+   WM; overlap is counted twice, matching crop-slot exposure.
 
-The script also reports the compact background+8-dynamic semantic sidecar that
-P0-F9 Stage-1 currently optimizes, making the 18->9 supervision collapse visible
-next to the raw Occ3D distribution.
+A selected MSP sample is allowed to have zero valid routed slots. That is a real
+property of the frozen cache/training protocol, not a malformed sample. Such a
+sample contributes to ``selected_full_future`` but contributes no Top-2 crop
+population; the zero-route rate is reported explicitly.
 """
 from __future__ import annotations
 
@@ -71,9 +71,8 @@ COMPACT_NAMES = (
 
 
 def _add_hist(dst: np.ndarray, labels, multiplier: int = 1) -> None:
-    if int(multiplier) <= 0:
-        return
-    dst += class_histogram(labels) * int(multiplier)
+    if int(multiplier) > 0:
+        dst += class_histogram(labels) * int(multiplier)
 
 
 def _occupied_only(counts: np.ndarray) -> np.ndarray:
@@ -137,20 +136,14 @@ def _latent_to_occ_crop(occ: np.ndarray, origin, *, latent_hw, window_hw):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--train-cache", required=True,
-                   help="audited P0-F9 v2 train cache (e.g. 4096 selected windows)")
-    p.add_argument("--msp-cache", required=True,
-                   help="exact MSP probe cache carrying selected window tokens/config")
-    p.add_argument("--semantic-targets", required=True,
-                   help="P0-F8 semantic sidecar used by current P0-F9 Stage-1")
+    p.add_argument("--train-cache", required=True)
+    p.add_argument("--msp-cache", required=True)
+    p.add_argument("--semantic-targets", required=True)
     p.add_argument("--dataroot", required=True)
-    p.add_argument("--info-pkl", required=True,
-                   help="same nuScenes temporal train info used by OccFM/P0-F9")
+    p.add_argument("--info-pkl", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--max-selected", type=int, default=None,
-                   help="optional smoke cap; omit for the full selected cache")
-    p.add_argument("--reference-stride", type=int, default=1,
-                   help="native reference temporal stride; formal diagnostic uses 1")
+    p.add_argument("--max-selected", type=int, default=None)
+    p.add_argument("--reference-stride", type=int, default=1)
     a = p.parse_args()
     if a.max_selected is not None and a.max_selected <= 0:
         raise ValueError("max-selected must be positive or omitted")
@@ -167,7 +160,7 @@ def main():
     if list(ds.metadata.get("window_hw", [])) != [20, 20] or int(ds.metadata.get("topk", -1)) != 2:
         raise RuntimeError("diagnostic expects frozen Top-2 20x20 routing")
 
-    probe_meta, records, cfg = _load_probe(a.msp_cache)
+    _, records, cfg = _load_probe(a.msp_cache)
     pcfg = make_prepare_config(cfg)
     if int(pcfg.history_frames) != 6 or int(pcfg.future_frames) != 6:
         raise RuntimeError("formal OccFM distribution diagnostic requires 6+6 windows")
@@ -178,11 +171,13 @@ def main():
     source = CachedNuScenesWindowSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     selected_n = len(ds) if a.max_selected is None else min(len(ds), int(a.max_selected))
 
-    # key=(scene_name, future_token) -> list of Top-2 origin lists, one entry
-    # per selected training sample that sees this frame at a future horizon.
+    # key=(scene_name, future_token) -> one origin-list per selected sample that
+    # sees that frame. Empty origin-lists are deliberately retained so the full
+    # selected-window population remains exact even for zero-route samples.
     selected_frame_instances = defaultdict(list)
-    selected_sample_ids = []
     selected_scenes = set()
+    route_slot_hist = Counter()
+    zero_route_sample_ids = []
     for i in range(selected_n):
         sample = ds[i]
         sid = str(sample["sample_id"])
@@ -193,16 +188,18 @@ def main():
             raise RuntimeError(f"{sid}: P0-F9/MSP scene mismatch")
         origins = sample["window_origins"].long().cpu().numpy()
         valid = sample["window_valid"].bool().cpu().numpy()
-        valid_origins = [tuple(int(x) for x in origins[k]) for k in range(len(valid)) if bool(valid[k])]
+        valid_origins = [
+            tuple(int(x) for x in origins[k]) for k in range(len(valid)) if bool(valid[k])
+        ]
+        route_slot_hist[len(valid_origins)] += 1
         if not valid_origins:
-            raise RuntimeError(f"{sid}: selected training sample has no valid routed window")
-        selected_sample_ids.append(sid)
+            zero_route_sample_ids.append(sid)
         selected_scenes.add(w.scene_name)
         for tok in w.future_tokens:
             selected_frame_instances[(w.scene_name, str(tok))].append(valid_origins)
 
-    # Native OccFM raw-window reference.  Count token multiplicity first so each
-    # Occ3D frame is read from disk only once even though windows overlap.
+    # Native OccFM raw-window reference. Count token multiplicity first so each
+    # Occ3D frame is read only once even though chronological windows overlap.
     native_frame_multiplicity = Counter()
     native_windows = 0
     native_scenes = set()
@@ -225,35 +222,32 @@ def main():
     h_top2_effective = np.zeros(18, dtype=np.int64)
 
     all_frame_keys = sorted(set(native_frame_multiplicity) | set(selected_frame_instances))
+    lh, lw = (int(x) for x in ds.metadata["latent_hw"])
+    wh, ww = (int(x) for x in ds.metadata["window_hw"])
     for n, key in enumerate(all_frame_keys, 1):
         scene, token = key
         occ = np.asarray(source.load_semantics(scene, token), dtype=np.int64)
-        native_mult = int(native_frame_multiplicity.get(key, 0))
-        _add_hist(h_native, occ, native_mult)
+        _add_hist(h_native, occ, int(native_frame_multiplicity.get(key, 0)))
 
         instances = selected_frame_instances.get(key, ())
         if instances:
+            # Includes zero-route selected samples by design: selection bias and
+            # routing bias are separate populations.
             _add_hist(h_selected_full, occ, len(instances))
-            lh, lw = (int(x) for x in ds.metadata["latent_hw"])
-            wh, ww = (int(x) for x in ds.metadata["window_hw"])
             sy, sx = occ.shape[0] // lh, occ.shape[1] // lw
             for origins in instances:
-                # Effective crop population: overlap between Top-2 slots is seen
-                # twice by the model and is therefore intentionally double-counted.
                 for origin in origins:
                     _add_hist(
                         h_top2_effective,
                         _latent_to_occ_crop(
-                            occ, origin,
-                            latent_hw=(lh, lw),
-                            window_hw=(wh, ww),
+                            occ, origin, latent_hw=(lh, lw), window_hw=(wh, ww)
                         ),
                     )
-                # Union view: same selected sample, but overlap counted once.
-                mask = np.zeros(occ.shape[:2], dtype=bool)
-                for y0, x0 in origins:
-                    mask[y0 * sy:(y0 + wh) * sy, x0 * sx:(x0 + ww) * sx] = True
-                _add_hist(h_top2_union, occ[mask])
+                if origins:
+                    mask = np.zeros(occ.shape[:2], dtype=bool)
+                    for y0, x0 in origins:
+                        mask[y0 * sy:(y0 + wh) * sy, x0 * sx:(x0 + ww) * sx] = True
+                    _add_hist(h_top2_union, occ[mask])
         if n == 1 or n % 500 == 0 or n == len(all_frame_keys):
             print(f"semantic frames {n}/{len(all_frame_keys)}")
 
@@ -263,8 +257,13 @@ def main():
         "selected_top2_union": h_top2_union,
         "selected_top2_effective": h_top2_effective,
     }
+    for name, hist in populations.items():
+        if int(hist.sum()) <= 0:
+            raise RuntimeError(f"population {name} is empty; cannot compute distribution statistics")
+
+    zero_n = len(zero_route_sample_ids)
     report = {
-        "protocol": "p0_f9_training_distribution_diagnostic_v1",
+        "protocol": "p0_f9_training_distribution_diagnostic_v2",
         "provenance": {
             "train_cache": str(Path(a.train_cache).resolve()),
             "train_cache_index_sha256": file_sha256(Path(a.train_cache) / "index.json"),
@@ -284,6 +283,11 @@ def main():
             "native_unique_scenes": len(native_scenes),
             "selected_windows": selected_n,
             "selected_unique_scenes": len(selected_scenes),
+            "selected_routed_windows": selected_n - zero_n,
+            "selected_zero_route_windows": zero_n,
+            "selected_zero_route_fraction": float(zero_n / selected_n) if selected_n else float("nan"),
+            "valid_route_slot_histogram": {str(k): int(v) for k, v in sorted(route_slot_hist.items())},
+            "zero_route_sample_ids_preview": zero_route_sample_ids[:20],
             "selected_unique_future_frames": len(selected_frame_instances),
         },
         "populations": {
@@ -294,11 +298,14 @@ def main():
             for name, hist in populations.items()
             if name != "native_full_future"
         },
-        "current_compact_semantic_objective": _compact_semantic_report(EditTargetCache(a.semantic_targets)),
+        "current_compact_semantic_objective": _compact_semantic_report(
+            EditTargetCache(a.semantic_targets)
+        ),
         "notes": [
             "selected_full_future vs native_full_future isolates MSP/window-selection bias",
             "selected_top2_union vs selected_full_future adds spatial-routing bias",
-            "selected_top2_effective additionally counts Top-2 overlap twice, matching actual crop-slot exposure",
+            "selected_top2_effective additionally counts overlap twice, matching valid crop-slot exposure",
+            "zero-route MSP-selected samples are retained in selected_full_future but contribute no Top-2 crop voxels",
             "the native reference is a raw-window population comparison, not a claim about optimizer sampling weights",
         ],
     }
@@ -308,7 +315,11 @@ def main():
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("\n=== P0-F9 TRAINING DISTRIBUTION ===")
-    print(f"native_windows={native_windows} selected_windows={selected_n}")
+    print(
+        f"native_windows={native_windows} selected_windows={selected_n} "
+        f"routed={selected_n-zero_n} zero_route={zero_n} "
+        f"({100.0*zero_n/max(selected_n,1):.3f}%) slots={dict(sorted(route_slot_hist.items()))}"
+    )
     print(f"{'population':30s} {'occ%':>9s} {'dyn/all%':>10s} {'dyn/occ%':>10s} {'JS(native)':>11s}")
     for name, hist in populations.items():
         s = report["populations"][name]
