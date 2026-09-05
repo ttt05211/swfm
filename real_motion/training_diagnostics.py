@@ -171,6 +171,7 @@ def gradient_pair_stats(
         "norm_a": norm_a,
         "norm_b": norm_b,
         "cosine": cosine,
+        "opposite_sign_elements": conflict,
         "opposite_sign_fraction_on_joint_nonzero": (
             float(conflict / both_nonzero) if both_nonzero > 0 else float("nan")
         ),
