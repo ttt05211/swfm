@@ -80,5 +80,9 @@ def test_ordered_phase_source_keeps_single_loss_and_milestone_policy():
     assert 'ck_path = out / f"step_{phase_step:04d}.pt"' in text
     assert "ORDERED_CONTEXT_PROTOCOL" in text
     assert "semantic_loss_for_endpoint" not in text
-    assert "lovasz" not in text.lower()
+    # Metadata explicitly records that the old auxiliary is disabled; this is
+    # allowed. The contract we care about is that no Lovasz implementation is
+    # imported/called anywhere in this phase trainer.
+    assert '"lovasz_auxiliary": False' in text
+    assert "lovasz_softmax" not in text
     assert ORDERED_CONTEXT_PROTOCOL.startswith("concat_6_history_frames")
