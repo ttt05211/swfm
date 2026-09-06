@@ -5,6 +5,7 @@ from real_motion.flash_attention_compat import patch_occfm_flash_attention_backw
 
 from .native_cfm import NativeFutureWindowCFM
 from .transition_native_physics import MotionWindowNativePhysicsTransition
+from .transition_ordered_context import MotionWindowNativePhysicsOrderedContextTransition
 
 
 P0_F9_PROTOCOL = "p0_f9_physics_conditioned_native_sparse_forecast_v2"
@@ -17,9 +18,11 @@ def make_p0_f9_model(
     unconditional_probability: float = 0.2,
     guidance_scale: float = 2.0,
     hist_last: int = 4,
+    ordered_context: bool = False,
+    ordered_context_enabled: bool = True,
 ):
     patch_occfm_flash_attention_backward_dtype()
-    tr = MotionWindowNativePhysicsTransition(
+    common = dict(
         in_channels=16,
         out_channels=16,
         model_channels=128,
@@ -37,6 +40,14 @@ def make_p0_f9_model(
         physics_mid_channels=256,
         physics_heads=8,
     )
+    if bool(ordered_context):
+        tr = MotionWindowNativePhysicsOrderedContextTransition(
+            **common,
+            ordered_history_frames=6,
+            ordered_context_enabled=bool(ordered_context_enabled),
+        )
+    else:
+        tr = MotionWindowNativePhysicsTransition(**common)
     return NativeFutureWindowCFM(
         tr,
         rescale_factor=10.0,
