@@ -40,7 +40,14 @@ def _aabb_flat_indices(source,delta_np,h,future_pose,t0_pose,grid,halo):
     xx,yy,zz=np.meshgrid(np.arange(ilo[0],ihi[0]+1),np.arange(ilo[1],ihi[1]+1),np.arange(ilo[2],ihi[2]+1),indexing='ij');_,Y,Z=grid.shape_hwd;return ((xx.reshape(-1)*Y+yy.reshape(-1))*Z+zz.reshape(-1)).astype(np.int64)
 def _hard_source_dest_flats(source,h,future_pose,t0_pose,grid):
     pw=predicted_source_points_world(source,h,(0,0,0),t0_pose);pf=transform_points(np.linalg.inv(np.asarray(future_pose,float)),pw);idx=metric_to_floor_index(pf,grid);idx=idx[in_grid(idx,grid)];_,Y,Z=grid.shape_hwd;return np.unique((idx[:,0]*Y+idx[:,1])*Z+idx[:,2])
-def render_soft_ordered(causal,decomp,deltas,selected_source_ids,*,grid,class_count=18,halo_voxels=2,query_chunk=65536):
+def _query_domain_flats(selected,by,pos,deltas,hi,h,Th,T0,grid,halo_voxels,full_grid_reference):
+    if full_grid_reference:return np.arange(int(np.prod(grid.shape_hwd)),dtype=np.int64)
+    parts=[]
+    for sid in selected:
+        src=by[sid];parts.append(_hard_source_dest_flats(src,float(h),Th,T0,grid));parts.append(_aabb_flat_indices(src,deltas[pos[sid],hi].detach().float().cpu().numpy(),float(h),Th,T0,grid,halo_voxels))
+    parts=[p for p in parts if len(p)]
+    return np.unique(np.concatenate(parts)) if parts else np.zeros((0,),np.int64)
+def render_soft_ordered(causal,decomp,deltas,selected_source_ids,*,grid,class_count=18,halo_voxels=2,query_chunk=65536,full_grid_reference=False):
     selected=list(map(int,selected_source_ids))
     if tuple(deltas.shape)!=(len(selected),len(decomp.horizons_s),3):raise ValueError('delta shape mismatch')
     by={int(s.source_id):s for s in decomp.sources};pos={sid:i for i,sid in enumerate(selected)};T0=np.asarray(causal.history_ego_to_world[-1],float);hard=hard_kta_identity(causal,decomp,grid=grid);cache={}
@@ -49,7 +56,7 @@ def render_soft_ordered(causal,decomp,deltas,selected_source_ids,*,grid,class_co
     for hi,(h,Th) in enumerate(zip(decomp.horizons_s,causal.future_ego_to_world)):
         if not selected:
             soft.append(SoftHorizon(torch.zeros(0,dtype=torch.long,device=deltas.device),torch.zeros((0,class_count),device=deltas.device),torch.zeros(0,dtype=torch.long,device=deltas.device)));continue
-        U=np.unique(np.concatenate([_aabb_flat_indices(by[sid],deltas[pos[sid],hi].detach().float().cpu().numpy(),float(h),Th,T0,grid,halo_voxels) for sid in selected]));uf=torch.as_tensor(U,device=deltas.device,dtype=torch.long);bg=np.asarray(decomp.background_future[hi]).reshape(-1)[U];P=F.one_hot(torch.as_tensor(bg,device=deltas.device,dtype=torch.long),num_classes=class_count).float()
+        U=_query_domain_flats(selected,by,pos,deltas,hi,h,Th,T0,grid,halo_voxels,full_grid_reference);uf=torch.as_tensor(U,device=deltas.device,dtype=torch.long);bg=np.asarray(decomp.background_future[hi]).reshape(-1)[U];P=F.one_hot(torch.as_tensor(bg,device=deltas.device,dtype=torch.long),num_classes=class_count).float()
         for s in decomp.sources:
             sid=int(s.source_id);a=_torch_rigid_inverse_sample(s,deltas[pos[sid],hi],float(h),Th,uf,grid=grid,template_cache=cache,query_chunk=query_chunk) if sid in pos else torch.as_tensor(np.isin(U,_hard_source_dest_flats(s,float(h),Th,T0,grid)),device=deltas.device,dtype=torch.float32)
             if len(U):cls=F.one_hot(torch.tensor(int(s.class_id),device=deltas.device),num_classes=class_count).float();P=(1-a[:,None])*P+a[:,None]*cls[None]
