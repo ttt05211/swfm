@@ -114,6 +114,8 @@ loss:
   motion_distance_scale_m: 1.0
   lambda_reference: null
   lambda_calibration_batches: 8
+  gradient_calibration:
+    max_ce_antagonistic_fraction_of_motion: 0.5
   relative_motion_weight_schedule:
     - {progress: 0.0, ratio: 1.0}
     - {progress: 0.1, ratio: 1.0}
