@@ -1,0 +1,185 @@
+spec_version: MT-V1-SPEC-2
+method: motion_transport_v1
+status: executable_requires_runtime_paths
+paths:
+  dataroot: null
+  info_pkl: null
+  manifest: null
+  msp_checkpoint: null
+  output_root: outputs/motion_transport_v1
+input:
+  history_frames: 6
+  future_frames: 6
+  dt_seconds: 0.5
+  timestamp_tolerance_seconds: 0.05
+  shape_xyz: [200, 200, 16]
+  class_count: 18
+  free_label: 17
+  movable_classes: [2, 3, 4, 5, 6, 7, 9, 10]
+  future_ego: protocol_provided
+  future_objects_as_input: false
+  new_sensor_inputs: false
+  map: false
+grid:
+  occ_range: [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+  voxel_size: [0.4, 0.4, 0.4]
+kta:
+  reference_commit: d2805ddb89d9b62f7745341e853fb69a200b7295
+  min_component_voxels: 6
+  connectivity: 2
+  max_match_speed_mps: 25.0
+  fill_kernel: [5, 5, 1]
+  fill_min_fraction: 0.3
+  preserve_all_fallbacks: true
+msp:
+  static_min_persistence: 0.8
+  moving_max_persistence: 0.5
+  min_static_observations: 3
+  component_max_step_m: 4.0
+  moving_speed_mps: 0.5
+  static_speed_mps: 0.2
+  min_track_frames: 2
+  min_component_bev_cells: 1
+  kta_max_match_distance_m: 6.0
+crop:
+  center: causal_kta_backtrace
+  frame: gravity_aligned_t0_heading
+  shape_xyz: [64, 64, 16]
+  xy_resolution_m: 0.4
+  max_source_xy_radius_about_centroid_m: 11.2
+  category_query: nearest
+  embedding_dim: 4
+  embedding_tokens: 19
+  input_channels: 84
+  per_height_valid_mask: true
+network:
+  backbone: stpn_adapted
+  channels: [32, 64, 128, 256]
+  temporal_kernel: [3, 1, 1]
+  temporal_lengths: [6, 4, 2]
+  norm: group_norm
+  max_groups: 8
+  activation: relu
+  source_pool: [masked_mean, masked_max, crop_mean]
+  metadata_dim: 19
+  metadata_embedding_dim: 32
+  head: [128, 128, 18]
+  zero_init_last_layer: true
+  output: cumulative_kta_residual_xy_yaw
+  output_hard_clip: false
+  autoregressive: false
+  activation_checkpointing: false
+  vae: false
+  pretrained_occfm: false
+  pretrained_motionnet: false
+  shape_head: false
+  birth_head: false
+  visibility_head: false
+  utility_gate: false
+routing:
+  frozen_msp: true
+  preserve_original_msp_candidates_and_features: true
+  source_mapping: same_class_t0_voxel_overlap_weighted_probability
+  unmapped_probability: 0.0
+  score: max_future_activation
+  train_budget: all_warmup_then_uniform_budget_mix
+  train_all_source_warmup_fraction: 0.2
+  train_later_all_source_probability: 0.5
+  train_later_sparse_budget: 16
+  train_sparse_selection: uniform_without_replacement_no_gt_no_msp
+  main_eval_budget_sources: 16
+  eval_budgets_sources: [0, 4, 8, 16, 32, all]
+  threshold_gate: false
+  tie_break: source_id
+renderer:
+  hard: exact_kta_stable_forward_floor
+  soft: inverse_trilinear_ordered_alpha
+  align_corners: false
+  probability_epsilon: 1.0e-6
+  query_bbox_halo_voxels: 2
+  query_chunk: 65536
+  soft_hard_metrics_required: true
+targets:
+  best_box_source_coverage_min: 0.8
+  second_box_source_coverage_max: 0.2
+  motion_points_per_source_max: 64
+  missing_future_annotation: ignore_motion_label
+loss:
+  occupancy: categorical_ce_full_valid_scene
+  occupancy_weight: 1.0
+  occupancy_class_weights: uniform
+  horizons: uniform
+  motion: source_point_xy_smooth_l1
+  motion_beta: 1.0
+  motion_distance_scale_m: 1.0
+  lambda_reference: null
+  lambda_calibration_batches: 8
+  relative_motion_weight_schedule:
+    - {progress: 0.0, ratio: 1.0}
+    - {progress: 0.1, ratio: 1.0}
+    - {progress: 0.3, ratio: 0.25}
+    - {progress: 1.0, ratio: 0.25}
+  fm: 0.0
+  overlap: 0.0
+  moving_extra_weight: 0.0
+  temporal_smoothness: 0.0
+  volume: 0.0
+training:
+  gpus: 2
+  gpu_type: L40S_48GB
+  ddp: true
+  scenes_per_gpu: 1
+  accumulation_steps: 4
+  nominal_effective_scene_batch: 8
+  source_microbatch: 16
+  optimizer: adamw
+  peak_lr: 3.0e-4
+  end_lr: 3.0e-6
+  weight_decay: 1.0e-2
+  exclude_bias_and_norm_from_weight_decay: true
+  lr_warmup_fraction: 0.05
+  scheduler: cosine
+  cnn_precision: bf16
+  renderer_precision: fp32
+  gradient_clip_norm: 1.0
+  initial_epoch_estimate: 5
+  fixed_epoch_cap: null
+  epochs_locked: null
+  epochs_lock_rule: profile_before_run
+  target_hours: 3
+  max_hours: 4
+  initial_seed: 3407
+  confirmation_seed: 3408
+  checkpoint_fraction_epoch: 0.25
+  profile_warmup_microsteps: 50
+  profile_measure_microsteps: 200
+  checkpoint_max_memory_without_recompute_gib: 40
+  ema:
+    enabled: true
+    start_progress: 0.05
+    half_life_optimizer_steps: 100
+    update: successful_optimizer_step_only
+    storage_precision: fp32
+  augmentation:
+    type: local_F_y_coordinate_mirror
+    probability: 0.5
+    same_transform_per_scene: true
+    restore_delta_y_and_yaw_before_losses: true
+    transform_frozen_msp_inputs: false
+  scene_split_required: true
+  replacement_sampling: false
+data:
+  dev_scene_fraction: 0.1
+  supervision_valid_mask: occ3d_mask_lidar
+evaluation:
+  weight_branch: ema
+  deployment_renderer: hard
+  headline_horizons_s: [1.0, 2.0, 3.0]
+  moving_metric: existing_moving_miou_v2
+  bootstrap_unit: scene
+  bootstrap_repeats: 2000
+  main_budget_sources: 16
+  overall_noninferiority_pp: -0.10
+  stationary_movable_noninferiority_pp: -0.20
+  engineering_moving_gain_target_pp: 0.50
+  engineering_latency_reduction_vs_all_target: 0.20
