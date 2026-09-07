@@ -45,9 +45,11 @@ class TrainingTargets:
     future_semantics:np.ndarray
     future_valid:np.ndarray
     motion_targets:Mapping[int,MotionTarget]=field(default_factory=dict)
+    future_observed:np.ndarray|None=None
     def __post_init__(self):
         f=np.asarray(self.future_semantics);v=np.asarray(self.future_valid)
         if f.ndim!=4 or v.shape!=f.shape: raise ValueError('future target shape mismatch')
+        if self.future_observed is not None and np.asarray(self.future_observed).shape!=f.shape:raise ValueError('future_observed shape mismatch')
 
 @dataclass
 class SourceRecord:
