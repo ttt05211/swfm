@@ -38,7 +38,7 @@ def bootstrap_delta(per_scene,*,baseline='hard:0',candidate='hard:16',repeats=20
                 for h in ('1.0','2.0','3.0'):
                     inter=_sum_mapping([per_scene[s][key][metric][h]['inter'] for s in sample]);union=_sum_mapping([per_scene[s][key][metric][h]['union'] for s in sample]);hs.append(_miou(inter,union))
                 vals.append(float(np.nanmean(hs)))
-            out[metric].append(vals[1]-vals[0])
+            out[metric].append(100.0*(vals[1]-vals[0]))
     return {m:{'mean_pp':float(np.mean(v)),'ci95_pp':[float(np.quantile(v,.025)),float(np.quantile(v,.975))],'p_gt_0':float(np.mean(np.asarray(v)>0))} for m,v in out.items()}
 @torch.no_grad()
 def latency_profile(pipe,src,ds,cfg,budgets,*,warmup=100,windows=500,seed=3407):
@@ -72,7 +72,7 @@ def main():
     else:
         st=pipe.source_network.state_dict()
         for k,v in ck['ema_state_dict']['shadow'].items():
-            if k in st:st[k].copy_(v.to(st[k].dtype))
+            if k in st:st[k].copy_(v.to(dtype=st[k].dtype,device=st[k].device))
     pipe.source_network.eval();budgets=_budgets(a.budgets);out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True);allrep={}
     for strategy in [x.strip() for x in a.strategies.split(',') if x.strip()]:
         rep=evaluate(pipe,src,ds,cfg,budgets=budgets,strategy=strategy,include_soft_main=(16 in budgets),seed=seed,max_windows=a.max_windows)
