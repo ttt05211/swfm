@@ -94,6 +94,7 @@ routing:
 renderer:
   hard: exact_kta_stable_forward_floor
   soft: inverse_trilinear_ordered_alpha
+  soft_query_domain: predicted_aabb_union_old_kta_support
   align_corners: false
   probability_epsilon: 1.0e-6
   query_bbox_halo_voxels: 2
@@ -172,7 +173,9 @@ training:
   replacement_sampling: false
 data:
   dev_scene_fraction: 0.1
-  supervision_valid_mask: occ3d_mask_lidar
+  history_observation_mask: occ3d_mask_lidar
+  supervision_valid_mask: semantic_label_range_0_17
+  future_observation_mask: occ3d_mask_lidar_audit_only
 evaluation:
   weight_branch: ema
   deployment_renderer: hard
