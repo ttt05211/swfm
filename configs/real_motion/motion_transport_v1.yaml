@@ -116,7 +116,9 @@ loss:
   lambda_reference: null
   lambda_calibration_batches: 8
   gradient_calibration:
+    probe_epsilon: 0.001
     max_ce_antagonistic_fraction_of_motion: 0.5
+    active_motion_grad_rel: 0.0001
   relative_motion_weight_schedule:
     - {progress: 0.0, ratio: 1.0}
     - {progress: 0.1, ratio: 1.0}
