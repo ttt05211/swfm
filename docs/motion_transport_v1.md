@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0 python tools/real_motion/eval_motion_transport_v1.py --co
 
 ## Formal profile 合同
 
-`profile_motion_transport_v1.py` 固定使用 50 warmup + 200 measured microsteps；先以 8 个 batch 计算 `lambda_ref=median(G_occ/G_mot)`，再测显存、吞吐和完整 dev。若代表性峰值超过 40 GiB，`auto` 重跑 non-reentrant activation checkpointing。只有完整 dev profile 才写入 `loss.lambda_reference` 和 `training.epochs_locked`；formal train 不会重新校准。
+`profile_motion_transport_v1.py` 固定使用 50 warmup + 200 measured microsteps。先在 8 个 batch 上测 `G_occ`、`G_mot` 和 head-gradient cosine；基础比例为 `G_occ/G_mot`。如果两项梯度相互对抗，则启用 anti-cancellation guard，使 CE 在 motion 方向上的反向投影最多等于加权 motion norm 的 50%，然后对各 batch 的 safe ratio 取 median 作为 `lambda_ref`。这避免 soft CE 在恰好落于 voxel 边界时把用于恢复的 GT motion auxiliary 精确抵消。随后才测显存、吞吐和完整 dev。若代表性峰值超过 40 GiB，`auto` 重跑 non-reentrant activation checkpointing。只有完整 dev profile 才写入 `loss.lambda_reference` 和 `training.epochs_locked`；formal train 不会重新校准。
 
 ## 训练与恢复合同
 
@@ -58,7 +58,7 @@ EMA 在 5% LR warmup 后复制 raw 开始，随后只按 successful optimizer st
 PYTHONPATH="$PWD:$PWD/upstream_occfm" pytest -q tests/real_motion/test_motion_transport_v1_*.py
 ```
 
-依赖轻测试覆盖 Strong-W2Det zero-delta identity、F/world 坐标、future-GT 字段隔离、MSP/source 显式 overlap mapping、随机 budget、STPN chunk/empty/mirror/checkpoint gradient、soft probability/gradient/query chunk/full-scene CE/reachability、EMA、DDP 归一化代数和 checkpoint resume。
+依赖轻测试覆盖 Strong-W2Det zero-delta identity、F/world 坐标、future-GT 字段隔离、MSP/source 显式 overlap mapping、随机 budget、STPN chunk/empty/mirror/checkpoint gradient、soft probability/gradient/query chunk/full-scene CE/reachability、anti-cancellation calibration、EMA、DDP 归一化代数、checkpoint resume，以及所有 MT-V1 CLI 的 `--help` import smoke test。
 
 真实 2×GPU optimizer-step 对照、L40S BF16/checkpointing、nuScenes provenance 和最终 hard improvement 必须在目标服务器执行 preflight/profile/train/eval；CI 不能替代这些数据与硬件实验，因此在完成服务器运行前不得声称性能改善。
 
@@ -68,3 +68,4 @@ PYTHONPATH="$PWD:$PWD/upstream_occfm" pytest -q tests/real_motion/test_motion_tr
 2. 使用独立 config loader，因为旧 `runtime_config.py` 强制 OccFM/VAE/WM 合同，与本路线冲突。
 3. `latest.pt` 为可精确恢复的完整 checkpoint，不是删减 optimizer/EMA/RNG 的轻量文件；这是为了优先满足 SPEC-2 resume 完整性。
 4. soft inverse-trilinear renderer 只提供训练梯度，与 hard forward-floor 本来就不要求逐点数学等价；模型有效性只由 hard 指标判断。
+5. gradient calibration 仍以 norm ratio 为基准，但在 CE 与 motion 梯度对抗时使用显式 0.5 anti-cancellation guard；该规则只影响 profile 锁定的 `lambda_ref`，formal train 不会动态改变它。
