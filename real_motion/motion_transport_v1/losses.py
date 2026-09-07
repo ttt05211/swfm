@@ -25,6 +25,21 @@ def motion_loss_sum(deltas,selected_source_ids,decomp,targets,t0_pose):
             pred=_pred_points(by[sid],deltas[mi,hi],float(h),t0_pose,t.point_indices);gt=torch.as_tensor(t.gt_xy_world[hi],device=deltas.device,dtype=torch.float32);one=.5*F.smooth_l1_loss(pred,gt,beta=1.,reduction='none').sum(1).mean();num=num+one;count+=1;rows.append(float(one.detach()))
     return num,count,{'motion_pairs':count,'motion_mean_local':float(np.mean(rows)) if rows else 0.}
 def motion_pair_count(selected_source_ids,targets):return int(sum(int(np.asarray(targets.motion_targets[int(s)].valid,bool).sum()) for s in selected_source_ids if int(s) in targets.motion_targets))
+def calibrated_gradient_ratio(g_occ_norm,g_motion_norm,cosine,*,max_ce_antagonistic_fraction_of_motion=.5):
+    """Norm calibration with a recovery guard for antagonistic CE/motion gradients.
+
+    The soft occupancy renderer can have a misleading one-sided coordinate gradient at an
+    exact hard-voxel boundary.  When the CE gradient opposes the GT rigid-motion auxiliary,
+    the auxiliary must remain the recovery signal instead of being exactly cancelled by
+    equal-norm calibration.  We therefore require the antagonistic CE projection to be at
+    most ``max_ce_antagonistic_fraction_of_motion`` of the weighted motion norm.
+    """
+    go=float(g_occ_norm);gm=float(g_motion_norm);c=float(cosine);f=float(max_ce_antagonistic_fraction_of_motion)
+    if not (np.isfinite(go) and np.isfinite(gm) and np.isfinite(c)) or go<=0 or gm<=0:return float('nan')
+    if not 0<f<=1:raise ValueError('max_ce_antagonistic_fraction_of_motion must be in (0,1]')
+    c=float(np.clip(c,-1.,1.));base=go/gm
+    if c<0:base*=max(1.,(-c)/f)
+    return float(base)
 def lambda_ratio(progress):
     p=float(progress)
     if p<=.1:return 1.
