@@ -1,5 +1,5 @@
 from __future__ import annotations
-import contextlib,copy,hashlib,json,math,os,random
+import contextlib,copy,hashlib,json,math,os,random,time
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np,torch,torch.distributed as dist
@@ -10,7 +10,7 @@ from .routing import training_budget_selection,scene_mirror_flag,sha256_file
 from .targets import build_training_targets
 from .crop_history import build_history_crops
 from .compositor import render_soft_ordered,compose_hard
-from .losses import occupancy_ce_full,motion_loss_sum,motion_pair_count,lambda_at
+from .losses import occupancy_ce_full,motion_loss_sum,motion_pair_count,lambda_at,calibration_probe_like,calibrated_gradient_ratio,output_gradient_lambda_floor,gradient_summary
 from .ema import WarmupEMA
 
 @dataclass
@@ -33,6 +33,10 @@ def all_sum(x,ctx):
     y=x.clone()
     if ctx.world_size>1:dist.all_reduce(y,op=dist.ReduceOp.SUM)
     return y
+def all_max_float(v,ctx):
+    t=torch.tensor(float(v),device=ctx.device,dtype=torch.float64)
+    if ctx.world_size>1:dist.all_reduce(t,op=dist.ReduceOp.MAX)
+    return float(t.item())
 def seed_all(seed):
     random.seed(seed);np.random.seed(seed%(2**32-1));torch.manual_seed(seed)
     if torch.cuda.is_available():torch.cuda.manual_seed_all(seed)
@@ -70,27 +74,43 @@ def rank_epoch_indices(n,ctx,epoch,seed):
 class PreparedScene:
     window:object;causal:object;decomp:object;targets:object;selected:tuple;mirror:bool;budget_mode:str
 def prepare_scene(pipe,source,window,causal,cfg,*,progress,epoch,seed):
-    d=decompose_strong_sources(causal,grid=pipe.grid,cfg=pipe.strong_cfg,frame_dt_s=float(get(cfg,'input.dt_seconds',.5)),crop_radius_limit_m=float(get(cfg,'crop.max_source_xy_radius_about_centroid_m',11.2)));cand=extract_original_msp_candidates(causal,grid=pipe.grid,motion_cfg=pipe.motion_cfg,kta_cfg=pipe.msp_kta_cfg);map_msp_to_sources(d,cand,shape_xyz=tuple(pipe.grid.shape_hwd));key=f'{causal.sample_id}:epoch{epoch}';selected,mode=training_budget_selection(d.sources,progress,seed=seed,sample_id=key,warmup_fraction=float(get(cfg,'routing.train_all_source_warmup_fraction',.2)),later_all_probability=float(get(cfg,'routing.train_later_all_source_probability',.5)),sparse_budget=int(get(cfg,'routing.train_later_sparse_budget',16)));mirror=scene_mirror_flag(seed=seed,sample_id=key,probability=float(get(cfg,'training.augmentation.probability',.5)));targets=build_training_targets(source,window,d,best_coverage_min=float(get(cfg,'targets.best_box_source_coverage_min',.8)),second_coverage_max=float(get(cfg,'targets.second_box_source_coverage_max',.2)),max_points=int(get(cfg,'targets.motion_points_per_source_max',64)));return PreparedScene(window,causal,d,targets,selected,mirror,mode)
+    d=decompose_strong_sources(causal,grid=pipe.grid,cfg=pipe.strong_cfg,frame_dt_s=float(get(cfg,'input.dt_seconds',.5)),crop_radius_limit_m=float(get(cfg,'crop.max_source_xy_radius_about_centroid_m',11.2)));cand=extract_original_msp_candidates(causal,grid=pipe.grid,motion_cfg=pipe.motion_cfg,kta_cfg=pipe.msp_kta_cfg);map_msp_to_sources(d,cand,shape_xyz=tuple(pipe.grid.shape_hwd));key=f'{causal.sample_id}:epoch{epoch}';selected,mode=training_budget_selection(d.sources,progress,seed=seed,sample_id=key,warmup_fraction=float(get(cfg,'routing.train_all_source_warmup_fraction',.2)),later_all_probability=float(get(cfg,'routing.train_later_all_source_probability',.5)),sparse_budget=int(get(cfg,'routing.train_later_sparse_budget',16)));mirror=scene_mirror_flag(seed=seed,sample_id=key,probability=float(get(cfg,'training.augmentation.probability',.5)));targets=build_training_targets(source,window,d,best_coverage_min=float(get(cfg,'targets.best_box_source_coverage_min',.8)),second_coverage_max=float(get(cfg,'targets.second_box_source_coverage_max',.2)),max_points=int(get(cfg,'targets.motion_points_per_source_max',64)),class_count=int(get(cfg,'input.class_count',18)));return PreparedScene(window,causal,d,targets,selected,mirror,mode)
+def _losses_for_delta(pipe,rec,cfg,delta):
+    soft=render_soft_ordered(rec.causal,rec.decomp,delta,rec.selected,grid=pipe.grid,class_count=int(get(cfg,'input.class_count',18)),halo_voxels=int(get(cfg,'renderer.query_bbox_halo_voxels',2)),query_chunk=int(get(cfg,'renderer.query_chunk',65536)));occ,olog=occupancy_ce_full(soft,rec.targets,eps=float(get(cfg,'renderer.probability_epsilon',1e-6)));mnum,mcount,mlog=motion_loss_sum(delta,rec.selected,rec.decomp,rec.targets,np.asarray(rec.causal.history_ego_to_world[-1]));return occ,mnum,mcount,soft,{**olog,**mlog}
 def forward_losses(pipe,rec,cfg,*,use_amp=True,need_hard=False):
     crops=build_history_crops(rec.causal,rec.decomp.sources,rec.selected,grid=pipe.grid,crop_shape_xyz=tuple(get(cfg,'crop.shape_xyz',[64,64,16])),xy_resolution_m=float(get(cfg,'crop.xy_resolution_m',.4)),mirror=rec.mirror,device=pipe.device);enabled=bool(use_amp and pipe.device.type=='cuda')
     with torch.autocast(device_type=pipe.device.type,dtype=torch.bfloat16,enabled=enabled):delta,zero=pipe.source_network(crops,source_microbatch=int(get(cfg,'training.source_microbatch',16)))
-    delta=delta.float();soft=render_soft_ordered(rec.causal,rec.decomp,delta,rec.selected,grid=pipe.grid,class_count=int(get(cfg,'input.class_count',18)),halo_voxels=int(get(cfg,'renderer.query_bbox_halo_voxels',2)),query_chunk=int(get(cfg,'renderer.query_chunk',65536)));occ,olog=occupancy_ce_full(soft,rec.targets,eps=float(get(cfg,'renderer.probability_epsilon',1e-6)));mot,mn,mlog=motion_loss_sum(delta,rec.selected,rec.decomp,rec.targets,np.asarray(rec.causal.history_ego_to_world[-1]));hard=compose_hard(rec.causal,rec.decomp,delta,rec.selected,grid=pipe.grid) if need_hard else None;return occ,mot,mn,zero,delta,soft,hard,{**olog,**mlog,'selected_sources':len(rec.selected),'budget_mode':rec.budget_mode}
+    delta=delta.float();occ,mn,mcount,soft,ll=_losses_for_delta(pipe,rec,cfg,delta);hard=compose_hard(rec.causal,rec.decomp,delta,rec.selected,grid=pipe.grid) if need_hard else None;return occ,mn,mcount,zero,delta,soft,hard,{**ll,'selected_sources':len(rec.selected),'budget_mode':rec.budget_mode}
 def _global_grad(loss,params,ctx):
     gs=torch.autograd.grad(loss,params,retain_graph=True,allow_unused=True);flat=torch.cat([torch.zeros_like(p).reshape(-1) if g is None else g.reshape(-1) for p,g in zip(params,gs)]).detach()
     if ctx.world_size>1:dist.all_reduce(flat,op=dist.ReduceOp.SUM);flat/=ctx.world_size
     return flat
+def _cosine(a,b):return float(torch.dot(a,b)/(torch.linalg.vector_norm(a)*torch.linalg.vector_norm(b)).clamp_min(1e-12)) if a.numel() and b.numel() else float('nan')
 def calibrate_lambda(pipe,source,dataset,cfg,ctx,*,batches=8,seed=3407):
-    raw=pipe.source_network;params=list(raw.head2.parameters());ratios=[];rows=[];raw.train();idxs,_=rank_epoch_indices(len(dataset),ctx,0,seed)
+    raw=pipe.source_network;params=list(raw.head2.parameters());head_refs=[];floors=[];rows=[];raw.train();idxs,_=rank_epoch_indices(len(dataset),ctx,0,seed);eps=float(get(cfg,'loss.gradient_calibration.probe_epsilon',1e-3));frac=float(get(cfg,'loss.gradient_calibration.max_ce_antagonistic_fraction_of_motion',.5));active_rel=float(get(cfg,'loss.gradient_calibration.active_motion_grad_rel',1e-4))
     for bi in range(int(batches)):
-        w,c=dataset[idxs[bi%len(idxs)]];rec=prepare_scene(pipe,source,w,c,cfg,progress=0.,epoch=0,seed=seed);occ,mnum,mcount,zero,delta,_,_,_=forward_losses(pipe,rec,cfg,use_amp=False);scenes=all_sum(torch.tensor(1.,device=ctx.device),ctx);pairs=all_sum(torch.tensor(float(mcount),device=ctx.device),ctx);os=occ*ctx.world_size/scenes;ms=mnum*ctx.world_size/pairs.clamp_min(1) if float(pairs)>0 else mnum*0;go=_global_grad(os+zero,params,ctx);gm=_global_grad(ms+zero,params,ctx);Go=float(torch.linalg.vector_norm(go));Gm=float(torch.linalg.vector_norm(gm));ratio=Go/Gm if Go>0 and Gm>0 else float('nan');rows.append({'batch':bi,'G_occ':Go,'G_mot':Gm,'head_grad_cosine':float(torch.dot(go,gm)/(torch.linalg.vector_norm(go)*torch.linalg.vector_norm(gm)).clamp_min(1e-12)),'ratio':ratio,'motion_pairs_global':float(pairs)});ratios.extend([ratio] if np.isfinite(ratio) else [])
-    if not ratios:raise RuntimeError('lambda calibration has no batch with both non-zero gradients')
-    return float(np.median(ratios)),rows
-def save_checkpoint(path,*,raw,ema,opt,cfg,ctx,epoch,next_group,global_step,lambda_ref,manifest_path,msp_path,selection_state=None):
+        w,c=dataset[idxs[bi%len(idxs)]];rec=prepare_scene(pipe,source,w,c,cfg,progress=0.,epoch=0,seed=seed);_,_,_,zero,delta,_,_,_=forward_losses(pipe,rec,cfg,use_amp=False);probe=calibration_probe_like(delta,eps);occ,mnum,mcount,_,_= _losses_for_delta(pipe,rec,cfg,probe);scenes=all_sum(torch.tensor(1.,device=ctx.device),ctx);pairs=all_sum(torch.tensor(float(mcount),device=ctx.device),ctx);os=occ*ctx.world_size/scenes;ms=mnum*ctx.world_size/pairs.clamp_min(1) if float(pairs)>0 else mnum*0;go=_global_grad(os+zero,params,ctx);gm=_global_grad(ms+zero,params,ctx);Go=float(torch.linalg.vector_norm(go));Gm=float(torch.linalg.vector_norm(gm));cos=_cosine(go,gm);head=calibrated_gradient_ratio(Go,Gm,cos,max_ce_antagonistic_fraction_of_motion=frac)
+        floor_local=0.;go_out=gm_out=None
+        if delta.numel() and delta.requires_grad and float(pairs)>0:
+            go_out=torch.autograd.grad(os+zero,delta,retain_graph=True,allow_unused=True)[0];gm_out=torch.autograd.grad(ms+zero,delta,retain_graph=True,allow_unused=True)[0]
+            if go_out is not None and gm_out is not None:floor_local=output_gradient_lambda_floor(go_out,gm_out,max_ce_antagonistic_fraction_of_motion=frac,active_motion_grad_rel=active_rel)
+        floor=all_max_float(floor_local,ctx);ratio=max(head if np.isfinite(head) else 0.,floor)
+        row={'batch':bi,'probe_epsilon':eps,'G_occ_head':Go,'G_mot_head':Gm,'head_grad_cosine':cos,'head_ratio':head,'output_conflict_floor':floor,'ratio':ratio,'motion_pairs_global':float(pairs),'head_occ_abs':gradient_summary(go),'head_motion_abs':gradient_summary(gm)}
+        if go_out is not None:row['output_occ_abs']=gradient_summary(go_out)
+        if gm_out is not None:row['output_motion_abs']=gradient_summary(gm_out)
+        rows.append(row)
+        if np.isfinite(head):head_refs.append(float(head))
+        floors.append(float(floor))
+    if not head_refs and not any(x>0 for x in floors):raise RuntimeError('lambda calibration has no batch with usable motion gradient')
+    ref=max(float(np.median(head_refs)) if head_refs else 0.,max(floors) if floors else 0.)
+    if not np.isfinite(ref) or ref<=0:raise RuntimeError('lambda calibration produced invalid reference')
+    return ref,rows
+def save_checkpoint(path,*,raw,ema,opt,cfg,ctx,epoch,next_group,global_step,lambda_ref,manifest_path,msp_path,selection_state=None,phase='train'):
     local=rng_state();states=[None]*ctx.world_size
     if ctx.world_size>1:dist.all_gather_object(states,local)
     else:states=[local]
     if not ctx.is_main:return
-    payload={'version':'motion_transport_v1_checkpoint_v1','spec_version':'MT-V1-SPEC-2','model_state_dict':raw.state_dict(),'ema_state_dict':ema.state_dict(),'optimizer_state_dict':opt.state_dict(),'amp_scaler_state_dict':None,'config':cfg,'config_hash':_hash_json(_stable_config(cfg)),'epoch':int(epoch),'next_group':int(next_group),'global_step':int(global_step),'lambda_ref':float(lambda_ref),'world_size':ctx.world_size,'rank_rng_states':states,'manifest_sha256':sha256_file(manifest_path),'msp_sha256':sha256_file(msp_path),'selection_state':selection_state or {}}
+    payload={'version':'motion_transport_v1_checkpoint_v2','spec_version':'MT-V1-SPEC-2','model_state_dict':raw.state_dict(),'ema_state_dict':ema.state_dict(),'optimizer_state_dict':opt.state_dict(),'amp_scaler_state_dict':None,'config':cfg,'config_hash':_hash_json(_stable_config(cfg)),'epoch':int(epoch),'next_group':int(next_group),'phase':str(phase),'global_step':int(global_step),'lambda_ref':float(lambda_ref),'world_size':ctx.world_size,'rank_rng_states':states,'manifest_sha256':sha256_file(manifest_path),'msp_sha256':sha256_file(msp_path),'selection_state':selection_state or {}}
     p=Path(path);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_suffix(p.suffix+'.tmp');torch.save(payload,tmp);os.replace(tmp,p)
 def load_resume(path,*,raw,ema,opt,cfg,ctx,manifest_path,msp_path):
     ck=torch.load(path,map_location='cpu',weights_only=False)
@@ -98,6 +118,8 @@ def load_resume(path,*,raw,ema,opt,cfg,ctx,manifest_path,msp_path):
     if ck.get('manifest_sha256')!=sha256_file(manifest_path) or ck.get('msp_sha256')!=sha256_file(msp_path):raise RuntimeError('resume data/MSP provenance mismatch')
     if ck.get('config_hash')!=_hash_json(_stable_config(cfg)):raise RuntimeError('resume resolved-config contract mismatch')
     raw.load_state_dict(ck['model_state_dict'],strict=True);ema.load_state_dict(ck['ema_state_dict']);opt.load_state_dict(ck['optimizer_state_dict']);restore_rng(ck['rank_rng_states'][ctx.rank]);return ck
+def _budget_should_stop(started,cfg,ctx):
+    max_s=float(get(cfg,'training.max_hours',4))*3600.;reserve=float(get(cfg,'training.wall_clock_final_reserve_seconds',0));next_guard=float(get(cfg,'training.wall_clock_next_group_guard_seconds',0));elapsed=all_max_float(time.monotonic()-started,ctx);return bool(elapsed+reserve+next_guard>=max_s),elapsed
 def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_dir,resume=None):
     epochs=get(cfg,'training.epochs_locked')
     if epochs is None:raise RuntimeError('run formal profile first')
@@ -108,20 +130,24 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
         if locked is None:raise RuntimeError('loss.lambda_reference is null; run formal profile first')
         lambda_ref=float(locked)
         if not np.isfinite(lambda_ref) or lambda_ref<=0:raise RuntimeError('locked lambda_reference invalid')
-    ddp=DDP(raw,device_ids=[ctx.local_rank] if ctx.device.type=='cuda' else None,broadcast_buffers=False,find_unused_parameters=False) if ctx.world_size>1 else raw;pipe.source_network=ddp;n=len(train_ds);local_len=int(math.ceil(n/ctx.world_size));groups=int(math.ceil(local_len/acc));total=epochs*groups;start_epoch=start_group=global_step=0;selection={'best_moving':-float('inf'),'best_epoch':None}
+    ddp=DDP(raw,device_ids=[ctx.local_rank] if ctx.device.type=='cuda' else None,broadcast_buffers=False,find_unused_parameters=False) if ctx.world_size>1 else raw;pipe.source_network=ddp;n=len(train_ds);local_len=int(math.ceil(n/ctx.world_size));groups=int(math.ceil(local_len/acc));total=epochs*groups;start_epoch=start_group=global_step=0;selection={'best_moving':-float('inf'),'best_epoch':None};resume_phase='train'
     if resume:
-        ck=load_resume(resume,raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,manifest_path=manifest_path,msp_path=msp_path);start_epoch=int(ck['epoch']);start_group=int(ck['next_group']);global_step=int(ck['global_step']);selection=dict(ck.get('selection_state') or selection)
-    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True);warm=max(1,int(round(total*float(get(cfg,'training.lr_warmup_fraction',.05)))));logp=out/'train.jsonl'
+        ck=load_resume(resume,raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,manifest_path=manifest_path,msp_path=msp_path);start_epoch=int(ck['epoch']);start_group=int(ck['next_group']);global_step=int(ck['global_step']);selection=dict(ck.get('selection_state') or selection);resume_phase=str(ck.get('phase','train'))
+    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True);warm=max(1,int(round(total*float(get(cfg,'training.lr_warmup_fraction',.05)))));logp=out/'train.jsonl';started=time.monotonic();termination='planned_complete';budget_stop=False
     for epoch in range(start_epoch,epochs):
         indices,padded=rank_epoch_indices(n,ctx,epoch,seed);g0=start_group if epoch==start_epoch else 0
+        if epoch==start_epoch and resume_phase=='dev_pending':g0=groups
         for gi in range(g0,groups):
+            stop,elapsed=_budget_should_stop(started,cfg,ctx)
+            if stop:
+                save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch,next_group=gi,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='budget_stop');termination='wall_clock_budget';budget_stop=True;break
             chunk=indices[gi*acc:min((gi+1)*acc,len(indices))];progress=min(1.,global_step/max(1,total-1));records=[]
             for idx in chunk:w,c=train_ds[idx];records.append(prepare_scene(pipe,source,w,c,cfg,progress=progress,epoch=epoch,seed=seed))
             global_scenes=all_sum(torch.tensor(float(len(records)),device=ctx.device),ctx);global_pairs=all_sum(torch.tensor(float(sum(motion_pair_count(r.selected,r.targets) for r in records)),device=ctx.device),ctx);opt.zero_grad(set_to_none=True);logs=[]
             for mi,r in enumerate(records):
                 cm=contextlib.nullcontext() if ctx.world_size==1 or mi==len(records)-1 else ddp.no_sync()
                 with cm:
-                    occ,mnum,_,zero,delta,_,_,ll=forward_losses(pipe,r,cfg,use_amp=True);lam=lambda_at(progress,lambda_ref);loss=occ*ctx.world_size/global_scenes+(lam*mnum*ctx.world_size/global_pairs if float(global_pairs)>0 else mnum*0)+zero;loss.backward();ll.update({'lambda':lam,'delta_abs_p95':float(delta.detach().abs().quantile(.95)) if delta.numel() else 0.});logs.append(ll)
+                    occ,mnum,_,zero,delta,_,_,ll=forward_losses(pipe,r,cfg,use_amp=True);lam=lambda_at(progress,lambda_ref);loss=occ*ctx.world_size/global_scenes+(lam*mnum*ctx.world_size/global_pairs if float(global_pairs)>0 else mnum*0)+zero;loss.backward();absd=delta.detach().abs().reshape(-1,3) if delta.numel() else None;ll.update({'lambda':lam,'delta_abs_p95':float(delta.detach().abs().quantile(.95)) if delta.numel() else 0.,'delta_xyyaw_abs':{k:(gradient_summary(absd[:,j]) if absd is not None else {'p50':0.,'p95':0.,'p99':0.,'max':0.}) for j,k in enumerate(('dx','dy','yaw'))}});logs.append(ll)
             norm=torch.nn.utils.clip_grad_norm_(raw.parameters(),float(get(cfg,'training.gradient_clip_norm',1.)))
             if not torch.isfinite(torch.as_tensor(norm)):raise FloatingPointError('NaN/Inf gradient norm')
             lr=lr_for_step(global_step,total,cfg);set_lr(opt,lr);opt.step();global_step+=1
@@ -133,7 +159,10 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
                 with open(logp,'a') as f:f.write(json.dumps(row)+'\n')
             quarter=max(1,int(math.ceil(groups/4)))
             if (gi+1)%quarter==0 or gi+1==groups:
-                ne,ng=(epoch+1,0) if gi+1>=groups else (epoch,gi+1);save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=ne,next_group=ng,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection)
+                if gi+1>=groups:ne,ng,phase=epoch,groups,'dev_pending'
+                else:ne,ng,phase=epoch,gi+1,'train'
+                save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=ne,next_group=ng,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase=phase)
+        if budget_stop:break
         barrier(ctx);save_best=False
         if ctx.is_main:
             if not ema.started:raise RuntimeError('EMA unavailable for checkpoint selection')
@@ -142,11 +171,11 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
             if eligible and moving>float(selection.get('best_moving',-float('inf'))):selection={'best_moving':moving,'best_epoch':epoch+1};save_best=True
         if ctx.world_size>1:
             obj=[selection,save_best] if ctx.is_main else [None,None];dist.broadcast_object_list(obj,src=0);selection,save_best=obj
-        barrier(ctx);save_checkpoint(out/f'epoch_{epoch+1:04d}.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection)
-        if save_best:save_checkpoint(out/'best.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection)
-        barrier(ctx);start_group=0
+        barrier(ctx);save_checkpoint(out/f'epoch_{epoch+1:04d}.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='epoch_complete')
+        if save_best:save_checkpoint(out/'best.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='epoch_complete')
+        save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='epoch_complete');barrier(ctx);start_group=0;resume_phase='train'
     barrier(ctx)
     if ctx.is_main:
         from .evaluation import evaluate
         old=pipe.source_network;pipe.source_network=raw;raw.eval();Path(out,'final_raw_dev.json').write_text(json.dumps(evaluate(pipe,source,dev_ds,cfg,budgets=(0,16,'all'),strategy='msp',include_soft_main=True,seed=seed),indent=2));pipe.source_network=old;raw.train()
-    barrier(ctx);save_checkpoint(out/'last.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epochs,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection);return {'epochs':epochs,'global_step':global_step,'lambda_ref':lambda_ref,'selection_state':selection}
+    barrier(ctx);last_epoch=epochs if not budget_stop else min(epochs,start_epoch if global_step==0 else epoch);save_checkpoint(out/'last.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=last_epoch,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='finished' if not budget_stop else 'budget_stop');return {'epochs_locked':epochs,'global_step':global_step,'lambda_ref':lambda_ref,'selection_state':selection,'termination_reason':termination,'elapsed_s':all_max_float(time.monotonic()-started,ctx)}
