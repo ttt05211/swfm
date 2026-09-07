@@ -21,10 +21,10 @@ def _sample_points(p,max_points=64):
         if int(i) not in chosen:chosen.append(int(i))
         if len(chosen)>=max_points:break
     return np.asarray(sorted(chosen[:max_points]),np.int64)
-def build_training_targets(source,window,decomp:SourceDecomposition,*,best_coverage_min=.8,second_coverage_max=.2,max_points=64):
-    fs=[];fv=[]
+def build_training_targets(source,window,decomp:SourceDecomposition,*,best_coverage_min=.8,second_coverage_max=.2,max_points=64,class_count=18):
+    fs=[];fv=[];fo=[]
     for tok in window.future_tokens:
-        s,v=source.load_occ3d(window.scene_name,tok,require_lidar_mask=True);fs.append(np.asarray(s));fv.append(np.asarray(v,bool))
+        s,obs=source.load_occ3d(window.scene_name,tok,require_lidar_mask=True);s=np.asarray(s);fs.append(s);fo.append(np.asarray(obs,bool));fv.append((s>=0)&(s<int(class_count)))
     t0=_ann_map(source.nusc,window.t0_token);fmap=[_ann_map(source.nusc,t) for t in window.future_tokens];dyn=[]
     for token,ann in t0.items():
         cid=category_to_dynamic_class(ann['category_name'])
@@ -44,7 +44,7 @@ def build_training_targets(source,window,decomp:SourceDecomposition,*,best_cover
                 except Exception:continue
                 bt=np.asarray(ann['translation'],float);dyaw=float(yaw-yaw0);c,ss=math.cos(dyaw),math.sin(dyaw);d=pts[:,:2]-b0[None,:2];rot=np.stack([c*d[:,0]-ss*d[:,1],ss*d[:,0]+c*d[:,1]],1);gt[hi]=(bt[None,:2]+rot).astype(np.float32);dt=float(decomp.horizons_s[hi]);speed[hi]=float(np.linalg.norm(bt[:2]-b0[:2])/dt) if dt>0 else np.nan;valid[hi]=True
         mt[int(s.source_id)]=MotionTarget(int(s.source_id),valid,pi,gt,token,float(best),float(second),speed)
-    return TrainingTargets(np.stack(fs),np.stack(fv),mt)
+    return TrainingTargets(np.stack(fs),np.stack(fv),mt,np.stack(fo))
 def gt_moving_source_ids(targets,threshold_mps=.5):
     out=[]
     for sid,t in targets.motion_targets.items():
