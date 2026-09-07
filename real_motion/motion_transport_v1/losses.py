@@ -35,13 +35,14 @@ def calibrated_gradient_ratio(g_occ_norm,g_motion_norm,cosine,*,max_ce_antagonis
     """Global recovery calibration.
 
     ``f`` means the CE gradient norm may be at most ``f`` times the weighted
-    GT-motion gradient norm during calibration.  This is intentionally stronger
-    than equal-norm calibration and remains defined even when the global cosine
-    hides coordinate-wise conflicts.
+    GT-motion gradient norm during calibration.  A zero CE gradient contributes
+    a zero ratio rather than invalidating the batch; a zero motion gradient is
+    unusable for calibration.
     """
     go=float(g_occ_norm);gm=float(g_motion_norm);c=float(cosine);f=float(max_ce_antagonistic_fraction_of_motion)
-    if not (np.isfinite(go) and np.isfinite(gm) and np.isfinite(c)) or go<=0 or gm<=0:return float('nan')
+    if not (np.isfinite(go) and np.isfinite(gm) and np.isfinite(c)) or gm<=0:return float('nan')
     if not 0<f<=1:raise ValueError('max_ce_antagonistic_fraction_of_motion must be in (0,1]')
+    if go<=0:return 0.0
     return float(go/(gm*f))
 def output_gradient_lambda_floor(g_occ,g_motion,*,max_ce_antagonistic_fraction_of_motion=.5,active_motion_grad_rel=1e-4):
     """Minimum lambda that keeps every active conflicting output coordinate motion-directed."""
