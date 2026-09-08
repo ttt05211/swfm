@@ -18,8 +18,8 @@ def test_bootstrap_reports_percentage_points():
     def row(n):return {m:{h:{'inter':{4:n},'union':{4:100}} for h in ('1.0','2.0','3.0')} for m in ('overall','moving')}
     got=ev.bootstrap_delta({'scene0':{'hard:0':row(50),'hard:16':row(60)}},repeats=20,seed=1)
     for m in ('overall','moving'):
-        assert got[m]['mean_pp']==10.0
-        assert got[m]['ci95_pp']==[10.0,10.0]
+        assert np.isclose(got[m]['mean_pp'],10.0,atol=1e-12,rtol=0)
+        assert np.allclose(got[m]['ci95_pp'],[10.0,10.0],atol=1e-12,rtol=0)
         assert got[m]['p_gt_0']==1.0
 
 def test_profile_group_timing_includes_deliberately_slow_data_preparation():
@@ -100,8 +100,10 @@ def test_soft_q16_keeps_empty_source_windows_in_same_sample_set():
             rows=[SoftHorizon(torch.zeros(0,dtype=torch.long),torch.zeros((0,18)),torch.zeros(0,dtype=torch.long)) for _ in range(6)];soft=SoftScene(rows,free.copy(),shape);return None,None,free.copy(),soft,{}
     targets=TrainingTargets(free.copy(),np.ones_like(free,bool),{})
     groups=lambda: {n:np.zeros(shape,bool) for n in ev.GROUP_NAMES}
-    with patch.object(ev,'build_training_targets',lambda *a,**kw:targets),patch.object(ev,'route_sources',lambda sources,*a,**kw:() if not sources else (0,)),patch.object(ev,'hard_kta_identity',lambda *a,**kw:free.copy()),patch.object(ev,'gt_moving_support_for_horizon',lambda *a,**kw:(np.zeros(shape,bool),[],{})),patch.object(ev,'stationary_movable_support',lambda *a,**kw:np.zeros(shape,bool)),patch.object(ev,'_groups',lambda *a,**kw:groups()):
+    def route(sources,budget,*a,**kw):return () if (not sources or budget==0) else (0,)
+    with patch.object(ev,'build_training_targets',lambda *a,**kw:targets),patch.object(ev,'route_sources',route),patch.object(ev,'hard_kta_identity',lambda *a,**kw:free.copy()),patch.object(ev,'gt_moving_support_for_horizon',lambda *a,**kw:(np.zeros(shape,bool),[],{})),patch.object(ev,'stationary_movable_support',lambda *a,**kw:np.zeros(shape,bool)),patch.object(ev,'_groups',lambda *a,**kw:groups()):
         rep=ev.evaluate(Pipe(),SimpleNamespace(nusc=object()),DS(),{'targets':{'best_box_source_coverage_min':.8,'second_box_source_coverage_max':.2,'motion_points_per_source_max':64},'input':{'class_count':18},'evaluation':{'main_budget_sources':16}},budgets=(0,16),strategy='msp',include_soft_main=True)
     assert rep['protocol']['hard_windows']==2
     assert rep['protocol']['soft_main_windows']==2
+    assert rep['source_calls']['0']==0
     assert rep['source_calls']['16']==1
