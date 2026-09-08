@@ -135,7 +135,7 @@ training:
   ddp: true
   scenes_per_gpu: 1
   accumulation_steps: 4
-  nominal_effective_scene_batch: 8
+  nominal_effective_scene_batch: 4
   source_microbatch: 16
   optimizer: adamw
   peak_lr: 3.0e-4
