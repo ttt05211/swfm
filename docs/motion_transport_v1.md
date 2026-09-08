@@ -2,15 +2,25 @@
 
 本分支实现独立的 occupancy-space future transport 路线，不加载 VAE、OccFM 或 FM 权重。它复用 `real_motion/strong_w2det.py` 作为 Strong-W2Det/KTA 几何基准，冻结现有 MSP activation checkpoint，仅对路由选中的 Strong-W2Det source 运行 STPN。
 
-## 运行顺序
+## 硬件与时间约定
 
-正式训练前必须依次通过三道目标服务器 gate；**本轮验收到 formal profile 为止，不启动完整训练**：
+- **调试、缓存、preflight、普通评估默认单 GPU**。没有必要为了这些步骤占两张卡。
+- 正式训练支持 **1 GPU 或 2 GPU**。如果单卡显存和吞吐足够，直接单卡训练；只有决定使用双卡正式训练时，才需要跑 true 2-GPU DDP acceptance。
+- formal profile 必须和最终训练的 GPU 数一致：单卡训练就用单卡 formal profile；双卡训练前重新用双卡 formal profile。这样显存、吞吐、checkpointing 和 epoch 时间估计才有效。
+- `training.gpu_type` 只是运行记录/建议，不再作为固定 L40S 型号门槛。
+- `training.max_hours` 是**可选** wall-clock 预算。默认 `null` 表示不启用按小时强制停止；显式设置任意正数（如 4、6、10）后，才启用 F2/F3 那套安全停机与 reserve 逻辑。不存在“必须 4 小时”的方法合同。
+
+## 推荐运行顺序
 
 ```bash
 CFG=configs/real_motion/motion_transport_v1.yaml
-python tools/real_motion/build_motion_transport_v1_manifest.py --config "$CFG" --output data/motion_transport_v1/manifest.json
 
-# Gate A: 真实数据 / provenance / Strong-KTA identity；正式服务器禁止 CUDA→CPU 静默回退。
+# 1) manifest / cache / debug：单卡即可
+python tools/real_motion/build_motion_transport_v1_manifest.py \
+  --config "$CFG" \
+  --output data/motion_transport_v1/manifest.json
+
+# 2) real-data preflight：单卡 CUDA
 CUDA_VISIBLE_DEVICES=0 python tools/real_motion/preflight_motion_transport_v1.py \
   --config "$CFG" \
   --output outputs/motion_transport_v1/preflight.json \
@@ -18,156 +28,159 @@ CUDA_VISIBLE_DEVICES=0 python tools/real_motion/preflight_motion_transport_v1.py
   --device cuda \
   --require-cuda \
   --identity-scan all
+```
 
-# Gate B: 真 2-GPU optimizer-step 等价，不是单卡 DDP 代数测试。
+如果最终准备**单卡正式训练**：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/real_motion/profile_motion_transport_v1.py \
+  --config "$CFG" \
+  --output-dir outputs/motion_transport_v1/profile_1gpu \
+  --formal-server-gate
+
+LOCKED=outputs/motion_transport_v1/profile_1gpu/resolved_profile_config.yaml
+OUT=outputs/motion_transport_v1/run_seed3407
+
+CUDA_VISIBLE_DEVICES=0 python tools/real_motion/train_motion_transport_v1.py \
+  --config "$LOCKED" \
+  --output-dir "$OUT"
+```
+
+如果最终准备**双卡正式训练**，先额外跑 DDP acceptance，再用同样两张卡 profile：
+
+```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   tools/real_motion/accept_motion_transport_v1_ddp.py \
   --config "$CFG" \
   --output outputs/motion_transport_v1/ddp_acceptance.json \
   --scan-windows 256
 
-# Gate C: 仅 strict formal-server profile 才允许锁 epochs。
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   tools/real_motion/profile_motion_transport_v1.py \
   --config "$CFG" \
-  --output-dir outputs/motion_transport_v1/profile \
+  --output-dir outputs/motion_transport_v1/profile_2gpu \
   --formal-server-gate
-```
 
-三道 gate 的 JSON / profile 输出复核通过后，才允许使用：
-
-```bash
-LOCKED=outputs/motion_transport_v1/profile/resolved_profile_config.yaml
+LOCKED=outputs/motion_transport_v1/profile_2gpu/resolved_profile_config.yaml
 OUT=outputs/motion_transport_v1/run_seed3407
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 tools/real_motion/train_motion_transport_v1.py --config "$LOCKED" --output-dir "$OUT"
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tools/real_motion/train_motion_transport_v1.py \
+  --config "$LOCKED" \
+  --output-dir "$OUT"
 ```
 
-`train_motion_transport_v1.py` 会再次 fail-closed：要求 CUDA、配置指定的 2×L40S、BF16、NCCL、`runtime.profile_formal_server_gate=true`、完整 dev profile、相同 profile WORLD_SIZE，以及非空 `lambda_reference/epochs_locked`。普通单卡/CPU profile 不能生成可启动正式训练的配置。
-
-恢复训练：
+恢复训练时必须使用与原 profile/checkpoint 相同的 `WORLD_SIZE`：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 tools/real_motion/train_motion_transport_v1.py --config "$OUT/resolved_train_config.yaml" --output-dir "$OUT" --resume "$OUT/latest.pt"
+# 单卡示例
+CUDA_VISIBLE_DEVICES=0 python tools/real_motion/train_motion_transport_v1.py \
+  --config "$OUT/resolved_train_config.yaml" \
+  --output-dir "$OUT" \
+  --resume "$OUT/latest.pt"
 ```
 
-EMA hard 主评估、bootstrap 与 Q 曲线：
+## 方法结构
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python tools/real_motion/eval_motion_transport_v1.py --config "$OUT/resolved_train_config.yaml" --checkpoint "$OUT/best.pt" --output-dir "$OUT/eval_dev" --split dev --weights ema --budgets 0,4,8,16,32,all --strategies msp,uniform,speed
+```text
+history occupancy (6 frames)
+        ↓
+causal Strong-W2Det / KTA source decomposition
+        ↓
+frozen MSP candidates + explicit same-class t0 voxel-overlap mapping
+        ↓
+budget routing (route before heavy network)
+        ↓
+only selected sources → KTA-backtraced 64×64×16 local history crops
+        ↓
+STPN
+        ↓
+6-horizon cumulative residual (dx, dy, dyaw) relative to KTA
+        ↓
+transport raw 3D source shapes
+        ↓
+hard compositor for deployment/eval
+soft anti-aliased compositor only for training gradients
+        ↓
+full 18-class future occupancy
 ```
 
-GT future-moving routing 只允许作为诊断：
-
-```bash
-python tools/real_motion/eval_motion_transport_v1.py --config "$OUT/resolved_train_config.yaml" --checkpoint "$OUT/best.pt" --output-dir "$OUT/eval_gt_route_diag" --split dev --weights ema --budgets 16 --strategies gt_moving
-```
-
-Latency：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python tools/real_motion/eval_motion_transport_v1.py --config "$OUT/resolved_train_config.yaml" --checkpoint "$OUT/best.pt" --output-dir "$OUT/eval_latency" --split dev --weights ema --budgets 0,4,8,16,32,all --latency --latency-warmup 100 --latency-windows 500
-```
+不使用 VAE、FM 或 OccFM pretrained world model。未来 semantic、future box、future instance ID 不进入 causal inference；future ego pose 仅按数据协议使用。
 
 ## Soft renderer 与监督域
 
-正式部署与 checkpoint selection 始终使用 hard forward-floor compositor。soft renderer 只提供训练梯度，**不参与 hard 指标**。
+正式部署与 checkpoint selection 始终使用 hard forward-floor compositor。soft renderer 只提供训练梯度，不参与 hard 指标。
 
-PyTorch 2.6 在恰好落于 trilinear lattice knot 时会选取单边导数；当 CE 目标概率接近 epsilon 时，这会在 zero-initialized motion head 的第一步制造远大于局部有限差分斜率的梯度，并污染 Adam 二阶矩。MT-V1 因此把训练 soft occupancy 定义为一个真正 forward/backward 一致的 anti-aliased surrogate：对每个 XY voxel footprint 采用四个 `(+/-0.25, +/-0.25)` voxel 的对称 quadrature，四个 trilinear probability 的平均值同时作为 forward probability 与 autograd 对象。它不是 straight-through gradient replacement。`compose_hard()` 完全不使用该 surrogate，所以 zero-delta hard KTA identity、部署与指标口径保持不变。
+PyTorch 2.6 在 trilinear lattice knot 上的单边导数曾导致 zero-initialized motion head 出现异常 CE 梯度并污染 Adam 二阶矩。当前训练 soft occupancy 使用 forward/backward 一致的 quarter-voxel anti-alias surrogate：对 XY footprint 的 `(+/-0.25, +/-0.25)` 四个位置做 trilinear probability quadrature，四个 probability 的平均值同时作为 forward probability 与 autograd 对象。它不是 straight-through gradient replacement。
 
-对任一 selected source，soft 查询/替换域 `U` 至少是 **当前预测 support AABB 与该 source 原 KTA support 的并集**。因此 source 大位移或完全移出网格时，旧 KTA 占据仍处于替换域中，会先恢复 background，再按 Strong-W2Det 原 writer 顺序重合成所有 source 与 rest；不会在旧位置留下 ghost。代码同时保留 `full_grid_reference=True` 作为合成回归对照，不用于正式训练。
+`compose_hard()` 完全不使用该 surrogate，因此 `selected + delta=0` 与 Strong/KTA hard identity 保持逐体素一致。
 
-历史 `mask_lidar` 仍是 causal motion decomposition 的真实观测 mask。未来 CE 的 supervision validity **不再由 `mask_lidar` 决定**：当前 Occ3D 合同下，合法 semantic label `0..17` 为可监督域；future `mask_lidar` 只作为 `future_observed` audit 字段，用于统计 observed/unobserved、free/non-free 与 Moving support 覆盖。冻结的 Overall / Moving-mIoU v2 口径不修改。
+soft 查询/替换域 `U` 至少包含 predicted support AABB 与 old KTA support 的并集，因此 source 大位移或移出网格后不会在旧位置留下 ghost。代码保留 full-grid soft reference 作为回归对照。
 
-## Formal gradient calibration
+历史 `mask_lidar` 仅用于 causal motion decomposition 的 observation。future CE supervision validity 使用合法 semantic label `0..17`；future `mask_lidar` 仅作为 observed/unobserved audit，不决定 CE 是否监督。冻结的 Overall / Moving-mIoU v2 口径不修改。
 
-`profile_motion_transport_v1.py` 固定运行 8 个 calibration batch，并调用与正式代码相同的 `engine.calibrate_lambda()`：
+## Loss 与 gradient calibration
 
-1. STPN 仍从 zero-initialized output 开始；校准图使用 GT-independent、direction-neutral 的 `1e-3` probe family，覆盖 `(±dx, ±dy, ±yaw)` 全 8 个符号象限，避免单一 checkerboard probe 偶然采到 benign octant。
-2. 分别计算 occupancy 与 GT rigid-motion auxiliary 对共享 final head 的梯度，以及对六 horizon `(dx,dy,yaw)` 输出的梯度。
-3. head 级 recovery-dominance 约束为 `||g_occ|| <= 0.5 * ||lambda * g_motion||`。
-4. 另外逐输出坐标检查 gradient conflict；若全局 cosine 掩盖局部反向冲突，用 `output_gradient_lambda_floor` 抬高安全下界。
-5. 每个 calibration batch 取 8 个 probe 的安全 envelope；最终 `lambda_ref = max(median(head safe ratios), max(output conflict floors))`，写入 locked config。formal train 不重新校准。
-6. 正式 `lambda_at()` schedule 保持原合同：前 10% 使用 `1.0 * lambda_ref`，10%–30% 线性衰减到 `0.25 * lambda_ref`，30% 后保持 `0.25 * lambda_ref`。
+训练目标保持简单：
 
-profile JSON 会记录 head/output gradient cosine、p50/p95/p99/max、probe index 与每 batch safe ratio，便于复查优化路径。
+```text
+L = L_occ + lambda(t) * L_motion
+```
 
-## Formal profile 与 4 小时预算
+- `L_occ`：完整有效 future occupancy categorical CE。
+- `L_motion`：GT rigid source-point XY SmoothL1，仅作为训练辅助监督。
+- 不启用 FM / overlap / temporal smoothness / volume / moving extra weight。
 
-只有带 `--formal-server-gate` 的 profile 才能写入非空 `epochs_locked`。该模式严格要求：配置指定的 `WORLD_SIZE=2`、每 rank 为 CUDA、NCCL、BF16 支持、GPU 名包含 `training.gpu_type` 的型号 token（当前为 `L40S`）、完整 dev，以及恰好 50 warmup + 200 measured microsteps。普通 CPU / 单卡 / partial-dev profile 仍可用于调试，但不会解锁训练。
+formal profile 固定调用与正式代码相同的 `engine.calibrate_lambda()`，用 8 个 GT-independent `(±dx, ±dy, ±yaw)` probe envelope 检查 occupancy 与 motion 对 final head 和输出坐标的梯度，得到 `lambda_reference`。正式 schedule 仍为前 10% `1.0×lambda_ref`，10%–30% 衰减到 `0.25×lambda_ref`，之后保持 `0.25×lambda_ref`。
 
-50 warmup + 200 measured microsteps 的计时从 **dataset 取样之前**开始，因此包含磁盘读取、Strong-W2Det/source decomposition、MSP candidate/mapping、future target 准备、crop、STPN、renderer、backward 和 optimizer step。DDP 用跨 rank 的最慢 wall time。
+F1 已在 PyTorch 2.6 CPU 和真实 PyTorch 2.6 CUDA strict gate 中验证：完整 8-direction、±pure-yaw、actual lambda schedule、soft probability/gradient finite-difference consistency、query chunk consistency、hard zero-delta KTA identity 均保留原严格断言。
 
-profile 另外使用真实 `save_checkpoint()` payload 测完整 optimizer/EMA/RNG/provenance 保存时间，并把 quarter saves、epoch dev、最终 raw/dev/save 预算计入 `epochs_locked`。locked config 写入 `wall_clock_final_reserve_seconds`、`wall_clock_next_group_guard_seconds`、实测 `runtime.profile_dev_s` 和实际 GPU/CUDA/NCCL/BF16 环境。
+## Formal profile 与可选 wall-clock 预算
 
-formal train 在每个 accumulation group 的一致边界检查跨 rank 最大 wall time。如果下一 group 会侵犯 4 小时预算，所有 rank 停在同一边界，写 `phase=budget_stop` 的可恢复 `latest.pt`。epoch train groups 完成后，在启动 dev 前还会单独检查 `estimated_dev + final_reserve`；若预算不足，停在 `(epoch, groups, phase=dev_pending)`，不会先进入不可中断 dev 再超预算。若首轮 profile 本身 OOM，明确失败并要求所有 rank 使用 `--force-checkpointing on` 重跑，不把单 rank OOM 当成可自动继续的状态。
+formal profile 仍使用 50 warmup + 200 measured microsteps，计时从 dataset 取样前开始，包含：disk/data loading、Strong-W2Det/source decomposition、MSP candidate/mapping、future target preparation、crop、STPN BF16 forward、FP32 renderer、backward/optimizer、peak memory、full checkpoint save 与 full dev timing。
 
-## DDP、EMA 与恢复合同
+`--formal-server-gate` 现在表示：**对本次实际 launch 的 1 或 2 张 CUDA/BF16 GPU 做正式 full-dev profile**。它不再要求固定 2×L40S。profile 会把实际 `profile_world_size` 与 GPU 名称写入 locked config；正式训练必须使用相同 `WORLD_SIZE`。
 
-每卡 1 scene、4 micro-step 累积，nominal global scene batch=8。DDP 会平均 rank 梯度，因此每个 rank 使用 `world_size * local_numerator / global_denominator`，不再额外除 accumulation steps。空 source scene 仍走 parameter-connected zero，保持 collective 节奏。
+epoch lock 的来源按以下优先级：
 
-`accept_motion_transport_v1_ddp.py` 是服务器级真两卡验收，不以代数推导代替实际 optimizer step。它从真实 train windows 中寻找 empty-source window 和 source 数不同的 motion-valid nonempty windows；分别跑 full accumulation、empty-source rank、tail accumulation、activation checkpointing（若扫描到 nonempty zero-motion-pair window 还会额外运行）场景。每个场景先用各 rank local gradient 手工 SUM 得到全局 reference AdamW step，再从同一初始权重运行正式 DDP `world_size * numerator / global denominator` 路径，逐项比较未裁剪梯度、step 后模型参数和 AdamW optimizer tensor state，并把 source/motion-pair 分布与最大误差写入 JSON。任何 required scenario 不 allclose 都直接失败。
+1. 如果显式给 `training.fixed_epoch_cap`，直接使用它；
+2. 否则如果显式给 `training.max_hours`，根据实测 train/dev/checkpoint 时间估算可完成 epoch 数；
+3. 否则使用 `training.initial_epoch_estimate` 作为初始正式训练 epoch 数。
 
-前 20% progress 使用 all sources；之后每 scene 50% all / 50% fixed-seed uniform Q16。随机 budget 不依赖 MSP/GT。镜像只改变 F 局部表示，raw source/MSP/ego/GT 不变。
+当 `max_hours: null` 时，训练完全不做 wall-clock stop；F2/F3 的 `dev_pending / budget_stop / latest.pt / last.pt` 安全恢复代码仍保留，并在用户显式设置时间预算时启用。
 
-EMA 在 5% LR warmup 后复制 raw，之后只在 successful optimizer step 更新。`latest.pt` 保存完整 optimizer/EMA/RNG/provenance。epoch 最后一组完成后先写 `phase=dev_pending`；只有 dev evaluation 与 best selection 完成后才原子刷新为 `phase=epoch_complete`。中途 wall-clock budget stop 时，`last.pt` 不再把 `next_group` 重置为 0，而是保留与 `latest.pt` 相同的真实 `(epoch,next_group,phase,global_step)` cursor；从二者恢复必须产生相同剩余样本顺序、global_step 与最终参数。
+## 单卡与双卡合同
+
+单卡训练直接使用 raw module，不经过 DDP collective；其它 loss、EMA、checkpoint、hard eval 合同完全相同。
+
+双卡训练时 DDP 使用 `world_size * local_numerator / global_denominator`。因为 PyTorch DDP 会平均 rank gradient，所以不能额外按 accumulation steps 再除一次。empty-source rank 使用 parameter-connected zero 保持 collective 节奏。
+
+`accept_motion_transport_v1_ddp.py` 是**双卡正式训练的条件性准入**，不是所有调试流程的前置条件。只有最终决定用两张卡训练时才跑。它比较 manual globally-summed reference 与真实 DDP optimizer step，覆盖 heterogeneous source/motion count、empty-source rank、tail accumulation 和 activation checkpointing，要求 gradient/model/optimizer state allclose。
+
+## EMA、checkpoint 与恢复
+
+EMA 在 warmup 后启动，之后只在 successful optimizer step 更新。`latest.pt` 保存完整 raw/EMA/optimizer/RNG/provenance。
+
+checkpoint phase：`train / dev_pending / epoch_complete / budget_stop`。
+
+F2/F3 回归仍保留：时间预算启用时，进入 dev 前会检查剩余时间；budget stop 时 `latest.pt` 与 `last.pt` 保留同一真实 `(epoch,next_group,phase,global_step)` cursor，从二者恢复必须产生相同剩余样本顺序、global step 和最终参数。
 
 ## 评估
 
-部署指标始终来自 hard compositor。已有 Overall / Moving-mIoU v2 不修改；`stationary_movable` 与 motion groups 为附加 target-only 诊断。未匹配 moving instance 被拆成 `ambiguous-causal-source` 与真正 `no-causal-source`，避免把 association 不确定误解释成 causal representation 缺失。
+部署指标始终来自 hard compositor。已有 Overall / Moving-mIoU v2 不修改；`stationary_movable` 与 motion groups 只是附加 target-only 诊断。
 
-Q16 没有选中 source 时，soft diagnostic 退化为相同的 KTA 结果，并仍计入同一窗口集合；输出显式记录 `hard_windows` 与 `soft_main_windows`。完整 dev 的 Q16 vs KTA 使用 scene bootstrap 2000 次，`mean_pp/ci95_pp` 使用百分点单位，例如 50%→60% 为 `+10 pp`。
+评估预算：`Q=0/4/8/16/32/all`。Q16 没选中 source 时 soft diagnostic 退化为同一 KTA 结果但仍计入相同窗口集合。完整 dev Q16 vs KTA 使用 scene bootstrap 2000 次；delta 使用 percentage points，例如 50%→60% 为 `+10 pp`。
 
-## Preflight 与回归测试
+## 当前训练前准入
 
-普通依赖轻回归：
+已完成：R1–R7 代码级修复与回归、F1 PyTorch 2.6 CPU/CUDA、F2/F3 budget/resume、hard-zero KTA identity synthetic regression、dependency-light CI 与 PyTorch 2.6 CI。
 
-```bash
-PYTHONPATH="$PWD:$PWD/upstream_occfm" pytest -q tests/real_motion/test_motion_transport_v1_*.py
-```
+仍需真实服务器完成，但按实际卡数选择：
 
-PyTorch 2.6 CUDA 正式验收必须在真实 CUDA runner 上显式开启 fail-fast，不能把 CPU skip 当作通过：
+1. **单卡** real-data preflight + full Strong/KTA identity/provenance scan；
+2. 如果最终双卡训练，再跑 **2-GPU DDP acceptance**；如果单卡训练则跳过；
+3. 在最终训练准备使用的 **1 或 2 张 GPU** 上跑 formal 50+200 full-dev profile；
+4. 检查 profile 生成的 lambda、显存、checkpointing、epoch lock 与可选时间预算；
+5. 这些通过后才启动完整训练。
 
-```bash
-export MT_V1_REQUIRE_CUDA=1
-PYTHONPATH="$PWD:$PWD/upstream_occfm" \
-pytest -q tests/real_motion/test_motion_transport_v1_cuda_acceptance.py::test_pytorch26_cuda_complete_acceptance
-```
-
-该 CUDA gate 会先要求 `torch.cuda.is_available()==True`，正式模式还要求 `torch.__version__` 以 `2.6.0` 开头；随后在 CUDA 上执行 soft probability 范围/归一化、zero-point CE autograd vs central finite difference、query-chunk probability/gradient 等价、hard zero-selected-delta KTA exact identity，以及完整 8-direction + ±pure-yaw + actual-λ-schedule hard reachability。没有 CUDA 时普通 CI 显式 `skip`；设置 `MT_V1_REQUIRE_CUDA=1` 时则直接失败。
-
-真实数据 preflight 的正式命令必须同时使用 `--require-cuda --identity-scan all`。`--require-cuda` 禁止 CUDA 不可用时静默落到 CPU；`--identity-scan all` 会对 manifest 的 train + dev 全窗口比较新 source decomposition 的 zero-delta hard transport 与冻结 `strong_w2det_sequence` reference，并在 JSON 记录扫描窗口数、失败窗口数、总 diff voxels 和前 20 个失败样本。Q0/Q16 heavy-network 稀疏执行、zero-init routed identity 和 gradient probe 仍在指定 `--samples` 子集上执行。
-
-回归覆盖包括：
-
-- Strong-W2Det zero-delta exact identity；empty/no-dynamic/small/unmatched/conflict source。
-- F/world/ego geometry roundtrip、STPN chunk/empty/mirror/checkpoint gradient。
-- MSP↔source explicit overlap mapping、random budget 与 future-GT isolation。
-- soft probability、zero/nonzero finite difference、局部 U vs full-grid reference、4 m 大位移与 20 m 完全出界旧 support 清除。
-- hard `selected + delta=0` 与 KTA 逐体素 exact identity。
-- 原验收 `dx=0.35 m, yaw=0.08 rad` 的 48-error synthetic case、完整 8-direction reachability matrix、±0.8 rad pure-yaw，以及 actual λ schedule，均要求 hard error 严格下降，不能只看 soft loss。
-- future `mask_lidar` audit-only supervision regression。
-- formal `engine.calibrate_lambda()` 的 8-probe/head/output gradient 路径。
-- profile 故意慢 data preparation 必须计入 wall time；epoch dev 前预算 guard 必须阻止预算不足时进入 dev。
-- mid-epoch budget-stop 的 `latest.pt` / `last.pt` 必须保留同一真实 cursor，分别恢复后剩余样本顺序/global_step/最终参数一致。
-- `10→12→11` best-selection 的 dev 前/后 resume 回归。
-- bootstrap `+10 pp` 单位与 Q16 empty-source soft sample-set 一致性。
-- strict server gate 必须对错误 WORLD_SIZE / CPU fail closed，不能生成 formal training lock。
-
-## 仍需目标服务器完成的训练准入
-
-PyTorch 2.6 CUDA F1 strict gate 已有单 GPU CUDA 证据后，下一轮不再重复修改 F1；正式长训练前剩余的是：
-
-1. **Gate A**：真实 nuScenes/Occ3D + frozen MSP 的 `--require-cuda --identity-scan all` preflight，要求 provenance 无泄漏、train/dev identity scan 0 diff、Q0/Q16 稀疏执行正确、gradient probe 通过；
-2. **Gate B**：2×L40S NCCL/BF16 `accept_motion_transport_v1_ddp.py`，required scenarios 全部 `gradient/model/optimizer_state_allclose=true`；
-3. **Gate C**：2×L40S `--formal-server-gate` 50+200 profile + 完整 dev timing，显存/checkpointing 决策完成，`epochs_locked > 0` 且 4h reserve 合法；
-4. 三个证据文件复核通过后，才允许启动 formal training。
-
-在这些服务器检查完成之前，代码回归通过只代表 **实现准入条件已修复**，不代表模型已经证明超过 KTA，也不声称真实 Moving-mIoU 改善。
-
-## 工程适配/偏差
-
-1. 不修改旧 `MSPCandidate` dataclass；新 adapter 重建原候选与 19-d feature，同时保存 `comp.voxel_indices`，Strong source 与 MSP candidate 通过同类 t0 3D voxel overlap 显式映射。
-2. 使用独立 config loader，因为旧 `runtime_config.py` 强制 OccFM/VAE/WM 合同，与本路线冲突。
-3. `latest.pt` 是完整可恢复 checkpoint，不是裁剪 optimizer/EMA/RNG 的轻量版本；优先满足 SPEC-2 resume 完整性。
-4. 原 SPEC-2 对 soft `U` 的文字没有明确写出旧 KTA support，并已在本实现合同中澄清为 predicted support 与 old KTA support 的并集。
-5. soft renderer 的 quarter-voxel anti-alias 仅为训练 surrogate 的数值稳定化；hard compositor 与 headline metric 路径不改变。
+在真实服务器准入完成前，代码回归通过只代表实现已经准备好，不代表模型已经证明超过 KTA，也不声称真实 Moving-mIoU 改善。
