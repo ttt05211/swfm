@@ -118,8 +118,16 @@ def load_resume(path,*,raw,ema,opt,cfg,ctx,manifest_path,msp_path):
     if ck.get('manifest_sha256')!=sha256_file(manifest_path) or ck.get('msp_sha256')!=sha256_file(msp_path):raise RuntimeError('resume data/MSP provenance mismatch')
     if ck.get('config_hash')!=_hash_json(_stable_config(cfg)):raise RuntimeError('resume resolved-config contract mismatch')
     raw.load_state_dict(ck['model_state_dict'],strict=True);ema.load_state_dict(ck['ema_state_dict']);opt.load_state_dict(ck['optimizer_state_dict']);restore_rng(ck['rank_rng_states'][ctx.rank]);return ck
+def _wall_clock_limit_s(cfg):return float(get(cfg,'training.max_hours',4))*3600.
+def _final_reserve_s(cfg):return max(0.,float(get(cfg,'training.wall_clock_final_reserve_seconds',0)))
+def _estimated_dev_s(cfg):
+    value=get(cfg,'runtime.profile_dev_s')
+    return _final_reserve_s(cfg) if value is None else max(0.,float(value))
+def _estimated_save_s(cfg):return max(0.,float(get(cfg,'runtime.profile_full_checkpoint_s',0)))
+def _phase_budget_should_stop(started,cfg,ctx,*,current_phase_s=0.,post_phase_reserve_s=0.,next_guard_s=0.):
+    elapsed=all_max_float(time.monotonic()-started,ctx);required=max(0.,float(current_phase_s))+max(0.,float(post_phase_reserve_s))+max(0.,float(next_guard_s));return bool(elapsed+required>=_wall_clock_limit_s(cfg)),elapsed,required
 def _budget_should_stop(started,cfg,ctx):
-    max_s=float(get(cfg,'training.max_hours',4))*3600.;reserve=float(get(cfg,'training.wall_clock_final_reserve_seconds',0));next_guard=float(get(cfg,'training.wall_clock_next_group_guard_seconds',0));elapsed=all_max_float(time.monotonic()-started,ctx);return bool(elapsed+reserve+next_guard>=max_s),elapsed
+    stop,elapsed,_=_phase_budget_should_stop(started,cfg,ctx,post_phase_reserve_s=_final_reserve_s(cfg),next_guard_s=float(get(cfg,'training.wall_clock_next_group_guard_seconds',0)));return stop,elapsed
 def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_dir,resume=None):
     epochs=get(cfg,'training.epochs_locked')
     if epochs is None:raise RuntimeError('run formal profile first')
@@ -133,14 +141,14 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
     ddp=DDP(raw,device_ids=[ctx.local_rank] if ctx.device.type=='cuda' else None,broadcast_buffers=False,find_unused_parameters=False) if ctx.world_size>1 else raw;pipe.source_network=ddp;n=len(train_ds);local_len=int(math.ceil(n/ctx.world_size));groups=int(math.ceil(local_len/acc));total=epochs*groups;start_epoch=start_group=global_step=0;selection={'best_moving':-float('inf'),'best_epoch':None};resume_phase='train'
     if resume:
         ck=load_resume(resume,raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,manifest_path=manifest_path,msp_path=msp_path);start_epoch=int(ck['epoch']);start_group=int(ck['next_group']);global_step=int(ck['global_step']);selection=dict(ck.get('selection_state') or selection);resume_phase=str(ck.get('phase','train'))
-    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True);warm=max(1,int(round(total*float(get(cfg,'training.lr_warmup_fraction',.05)))));logp=out/'train.jsonl';started=time.monotonic();termination='planned_complete';budget_stop=False
+    out=Path(output_dir);out.mkdir(parents=True,exist_ok=True);warm=max(1,int(round(total*float(get(cfg,'training.lr_warmup_fraction',.05)))));logp=out/'train.jsonl';started=time.monotonic();termination='planned_complete';budget_stop=False;stop_stage=None;stop_epoch=epochs;stop_group=0;stop_phase='finished';final_raw_completed=False
     for epoch in range(start_epoch,epochs):
         indices,padded=rank_epoch_indices(n,ctx,epoch,seed);g0=start_group if epoch==start_epoch else 0
         if epoch==start_epoch and resume_phase=='dev_pending':g0=groups
         for gi in range(g0,groups):
             stop,elapsed=_budget_should_stop(started,cfg,ctx)
             if stop:
-                save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch,next_group=gi,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='budget_stop');termination='wall_clock_budget';budget_stop=True;break
+                save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch,next_group=gi,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='budget_stop');termination='wall_clock_budget';budget_stop=True;stop_stage='train_group';stop_epoch=epoch;stop_group=gi;stop_phase='budget_stop';break
             chunk=indices[gi*acc:min((gi+1)*acc,len(indices))];progress=min(1.,global_step/max(1,total-1));records=[]
             for idx in chunk:w,c=train_ds[idx];records.append(prepare_scene(pipe,source,w,c,cfg,progress=progress,epoch=epoch,seed=seed))
             global_scenes=all_sum(torch.tensor(float(len(records)),device=ctx.device),ctx);global_pairs=all_sum(torch.tensor(float(sum(motion_pair_count(r.selected,r.targets) for r in records)),device=ctx.device),ctx);opt.zero_grad(set_to_none=True);logs=[]
@@ -163,6 +171,9 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
                 else:ne,ng,phase=epoch,gi+1,'train'
                 save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=ne,next_group=ng,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase=phase)
         if budget_stop:break
+        stop_dev,elapsed,_=_phase_budget_should_stop(started,cfg,ctx,current_phase_s=_estimated_dev_s(cfg),post_phase_reserve_s=_final_reserve_s(cfg))
+        if stop_dev:
+            save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch,next_group=groups,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='dev_pending');termination='wall_clock_budget';budget_stop=True;stop_stage='epoch_dev';stop_epoch=epoch;stop_group=groups;stop_phase='dev_pending';break
         barrier(ctx);save_best=False
         if ctx.is_main:
             if not ema.started:raise RuntimeError('EMA unavailable for checkpoint selection')
@@ -175,7 +186,18 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
         if save_best:save_checkpoint(out/'best.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='epoch_complete')
         save_checkpoint(out/'latest.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=epoch+1,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='epoch_complete');barrier(ctx);start_group=0;resume_phase='train'
     barrier(ctx)
-    if ctx.is_main:
-        from .evaluation import evaluate
-        old=pipe.source_network;pipe.source_network=raw;raw.eval();Path(out,'final_raw_dev.json').write_text(json.dumps(evaluate(pipe,source,dev_ds,cfg,budgets=(0,16,'all'),strategy='msp',include_soft_main=True,seed=seed),indent=2));pipe.source_network=old;raw.train()
-    barrier(ctx);last_epoch=epochs if not budget_stop else min(epochs,start_epoch if global_step==0 else epoch);save_checkpoint(out/'last.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=last_epoch,next_group=0,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase='finished' if not budget_stop else 'budget_stop');return {'epochs_locked':epochs,'global_step':global_step,'lambda_ref':lambda_ref,'selection_state':selection,'termination_reason':termination,'elapsed_s':all_max_float(time.monotonic()-started,ctx)}
+    if not budget_stop:
+        stop_raw,elapsed,_=_phase_budget_should_stop(started,cfg,ctx,current_phase_s=_estimated_dev_s(cfg),post_phase_reserve_s=_estimated_save_s(cfg))
+        if stop_raw:
+            termination='wall_clock_budget';stop_stage='final_raw'
+        else:
+            if ctx.is_main:
+                from .evaluation import evaluate
+                old=pipe.source_network;pipe.source_network=raw;raw.eval();Path(out,'final_raw_dev.json').write_text(json.dumps(evaluate(pipe,source,dev_ds,cfg,budgets=(0,16,'all'),strategy='msp',include_soft_main=True,seed=seed),indent=2));pipe.source_network=old;raw.train()
+            barrier(ctx);final_raw_completed=True
+            if all_max_float(time.monotonic()-started,ctx)>=_wall_clock_limit_s(cfg):termination='wall_clock_budget';stop_stage='final_raw_overrun'
+    barrier(ctx)
+    if budget_stop:last_epoch,last_group,last_phase=stop_epoch,stop_group,stop_phase
+    else:last_epoch,last_group,last_phase=epochs,0,'finished'
+    save_checkpoint(out/'last.pt',raw=raw,ema=ema,opt=opt,cfg=cfg,ctx=ctx,epoch=last_epoch,next_group=last_group,global_step=global_step,lambda_ref=lambda_ref,manifest_path=manifest_path,msp_path=msp_path,selection_state=selection,phase=last_phase)
+    return {'epochs_locked':epochs,'global_step':global_step,'lambda_ref':lambda_ref,'selection_state':selection,'termination_reason':termination,'stop_stage':stop_stage,'final_raw_completed':final_raw_completed,'resume_cursor':{'epoch':last_epoch,'next_group':last_group,'phase':last_phase},'elapsed_s':all_max_float(time.monotonic()-started,ctx)}
