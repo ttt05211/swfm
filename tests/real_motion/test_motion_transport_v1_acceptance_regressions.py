@@ -43,6 +43,12 @@ def test_profile_group_timing_includes_deliberately_slow_data_preparation():
 def _train_cfg(epochs=3,max_hours=4.):
     return {'spec_version':'MT-V1-SPEC-2','training':{'epochs_locked':epochs,'accumulation_steps':1,'initial_seed':3407,'peak_lr':1e-3,'end_lr':1e-5,'weight_decay':0.,'gradient_clip_norm':1.,'lr_warmup_fraction':.05,'max_hours':max_hours,'wall_clock_final_reserve_seconds':0.,'wall_clock_next_group_guard_seconds':0.,'ema':{'enabled':True,'half_life_optimizer_steps':100}},'loss':{'lambda_reference':1.},'evaluation':{'overall_noninferiority_pp':-.1,'stationary_movable_noninferiority_pp':-.2}}
 
+def test_null_wall_clock_budget_disables_budget_stop_even_with_large_elapsed_time():
+    cfg=_train_cfg(max_hours=None);ctx=engine.DistContext()
+    with patch.object(engine.time,'monotonic',return_value=1e9):
+        stop,elapsed,required=engine._phase_budget_should_stop(0.,cfg,ctx,current_phase_s=123.,post_phase_reserve_s=456.,next_guard_s=789.)
+    assert stop is False and elapsed==1e9 and required==1368.
+
 def _fake_pipe():return SimpleNamespace(source_network=torch.nn.Linear(1,1),device=torch.device('cpu'))
 def _fake_prepare(*a,**kw):return SimpleNamespace(selected=(0,),targets=None)
 def _fake_forward(pipe,rec,cfg,**kw):
@@ -70,7 +76,7 @@ def test_latest_selection_survives_resume_before_and_after_dev(tmp_path):
     assert r['selection_state']['best_moving']==12.
 
 def test_short_wall_clock_budget_exits_with_recoverable_checkpoint(tmp_path):
-    cfg=_train_cfg(epochs=2,max_hours=0.);ctx=engine.DistContext();manifest=tmp_path/'manifest.json';manifest.write_text('{}');msp=tmp_path/'msp.pt';msp.write_bytes(b'x');out=tmp_path/'budget'
+    cfg=_train_cfg(epochs=2,max_hours=1e-9);ctx=engine.DistContext();manifest=tmp_path/'manifest.json';manifest.write_text('{}');msp=tmp_path/'msp.pt';msp.write_bytes(b'x');out=tmp_path/'budget'
     with patch('real_motion.motion_transport_v1.evaluation.evaluate',lambda *a,**kw:{}):
         r=engine.train(_fake_pipe(),None,[(None,None)],[(None,None)],cfg,ctx,manifest_path=manifest,msp_path=msp,output_dir=out)
     assert r['termination_reason']=='wall_clock_budget'
