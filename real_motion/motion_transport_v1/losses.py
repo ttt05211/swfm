@@ -35,8 +35,8 @@ def calibration_probe_family_like(delta,epsilon=1e-3):
     """GT-independent, direction-neutral probe envelope for formal calibration.
 
     A single checkerboard perturbation can accidentally sample a benign octant of
-    the piecewise-trilinear renderer.  We therefore probe all 8 signed (x,y,yaw)
-    octants with the same sub-voxel magnitude and take the safe envelope.  The
+    the piecewise-trilinear renderer. We therefore probe all 8 signed (x,y,yaw)
+    octants with the same sub-voxel magnitude and take the safe envelope. The
     probes are deterministic and do not inspect future GT direction.
     """
     eps=float(epsilon)
@@ -46,20 +46,14 @@ def calibration_probe_family_like(delta,epsilon=1e-3):
         p=torch.zeros_like(delta);p[:,:,0]=sx*eps;p[:,:,1]=sy*eps;p[:,:,2]=sw*eps;out.append(delta+p)
     return tuple(out)
 def calibrated_gradient_ratio(g_occ_norm,g_motion_norm,cosine,*,max_ce_antagonistic_fraction_of_motion=.5):
-    """Global recovery calibration.
-
-    ``f`` means the CE gradient norm may be at most ``f`` times the weighted
-    GT-motion gradient norm during calibration.  A zero CE gradient contributes
-    a zero ratio rather than invalidating the batch; a zero motion gradient is
-    unusable for calibration.
-    """
+    """Safe instantaneous CE/motion gradient ratio at the calibration point."""
     go=float(g_occ_norm);gm=float(g_motion_norm);c=float(cosine);f=float(max_ce_antagonistic_fraction_of_motion)
     if not (np.isfinite(go) and np.isfinite(gm) and np.isfinite(c)) or gm<=0:return float('nan')
     if not 0<f<=1:raise ValueError('max_ce_antagonistic_fraction_of_motion must be in (0,1]')
     if go<=0:return 0.0
     return float(go/(gm*f))
 def output_gradient_lambda_floor(g_occ,g_motion,*,max_ce_antagonistic_fraction_of_motion=.5,active_motion_grad_rel=1e-4):
-    """Minimum lambda that keeps every active conflicting output coordinate motion-directed."""
+    """Instantaneous lambda floor that keeps active conflicting output coordinates motion-directed."""
     go=torch.as_tensor(g_occ).detach().float().reshape(-1);gm=torch.as_tensor(g_motion).detach().float().reshape(-1);f=float(max_ce_antagonistic_fraction_of_motion);rel=float(active_motion_grad_rel)
     if not 0<f<=1:raise ValueError('max_ce_antagonistic_fraction_of_motion must be in (0,1]')
     if not 0<=rel<1:raise ValueError('active_motion_grad_rel must be in [0,1)')
@@ -79,4 +73,14 @@ def lambda_ratio(progress):
     if p<=.1:return 1.
     if p<.3:return 1.-(p-.1)/.2*.75
     return .25
-def lambda_at(progress,lambda_ref):return float(lambda_ref)*lambda_ratio(progress)
+def lambda_at(progress,lambda_ref):
+    """Actual scheduled motion weight with ``lambda_ref`` as the recovery floor.
+
+    Formal calibration produces the minimum safe instantaneous weight. The schedule
+    still decays by 4x (1.0 -> 0.25 in ``lambda_ratio``), but is normalized so its
+    weakest point equals that calibrated floor instead of violating it. Therefore
+    the early weight is 4*lambda_ref and the post-30% weight is lambda_ref.
+    """
+    floor=lambda_ratio(1.0)
+    if not np.isfinite(floor) or floor<=0:raise RuntimeError('lambda schedule has no positive floor')
+    return float(lambda_ref)*lambda_ratio(progress)/floor
