@@ -2,18 +2,21 @@ import numpy as np,torch
 from real_motion.geometry import OccupancyGrid
 from real_motion.motion_transport_v1.contracts import CausalInputs,SourceRecord,SourceDecomposition,TrainingTargets,MotionTarget
 from real_motion.motion_transport_v1.compositor import render_soft_ordered,compose_hard,soft_argmax_scene,predicted_source_points_world
-from real_motion.motion_transport_v1.losses import occupancy_ce_full,motion_loss_sum,calibration_probe_like,calibrated_gradient_ratio,output_gradient_lambda_floor
+from real_motion.motion_transport_v1.losses import occupancy_ce_full,motion_loss_sum,calibration_probe_like,calibration_probe_family_like,calibrated_gradient_ratio,output_gradient_lambda_floor,lambda_at
 from real_motion.motion_transport_v1.geometry import index_to_metric_center
 def fixture(shape=(10,10,4),origin=(-2,-2,-.8),source_origin=(4,4)):
     g=OccupancyGrid(origin[0],origin[1],origin[2],(.4,.4,.4),shape);T=np.eye(4);hist=np.full((6,*g.shape_hwd),17,np.uint8);x,y=source_origin;idx=np.array([[x,y,1],[x,y+1,1],[x+1,y,1],[x+1,y+1,1],[x,y,2],[x+1,y+1,2]]);hist[-1][tuple(idx.T)]=4;hist[-2]=hist[-1];c=CausalInputs('s','s',hist,np.ones_like(hist,bool),tuple([T]*6),tuple([T]*6),np.arange(6)*.5,2.5+np.arange(1,7)*.5);p=index_to_metric_center(idx,g);s=SourceRecord(0,4,idx,p,p.mean(0),np.zeros(3),True,np.array([[-.4,-.4],[.4,.4]]),len(idx));d=SourceDecomposition([s],np.full((6,*g.shape_hwd),17,np.uint8),np.zeros((0,3),int),np.zeros(0,np.uint8),np.zeros((0,3)),np.arange(1,7)*.5);return g,c,d
 def _targets_for_delta(g,c,d,td):
     gt=compose_hard(c,d,td,[0],grid=g);src=d.sources[0];ids=np.arange(len(src.points_world));gxy=np.stack([predicted_source_points_world(src,float(h),td[0,i].numpy(),c.history_ego_to_world[-1])[:,:2] for i,h in enumerate(d.horizons_s)]);return gt,TrainingTargets(gt,np.ones_like(gt,bool),{0:MotionTarget(0,np.ones(6,bool),ids,gxy)})
 def _calibrated_lambda(g,c,d,targets):
-    base=torch.zeros((1,6,3),requires_grad=True);probe=calibration_probe_like(base,1e-3);scene=render_soft_ordered(c,d,probe,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(probe,[0],d,targets,c.history_ego_to_world[-1]);mot=mn/n;go=torch.autograd.grad(occ,base,retain_graph=True)[0];gm=torch.autograd.grad(mot,base)[0];Go=float(go.norm());Gm=float(gm.norm());cos=float(torch.dot(go.reshape(-1),gm.reshape(-1))/(go.norm()*gm.norm()).clamp_min(1e-12));head=calibrated_gradient_ratio(Go,Gm,cos,max_ce_antagonistic_fraction_of_motion=.5);floor=output_gradient_lambda_floor(go,gm,max_ce_antagonistic_fraction_of_motion=.5,active_motion_grad_rel=1e-4);lam=max(head if np.isfinite(head) else 0.,floor);return lam,go,gm
-def _optimize(g,c,d,targets,lam,steps=100):
+    base=torch.zeros((1,6,3),requires_grad=True);ratios=[];rows=[]
+    for probe in calibration_probe_family_like(base,1e-3):
+        scene=render_soft_ordered(c,d,probe,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(probe,[0],d,targets,c.history_ego_to_world[-1]);mot=mn/n;go=torch.autograd.grad(occ,base,retain_graph=True)[0];gm=torch.autograd.grad(mot,base)[0];Go=float(go.norm());Gm=float(gm.norm());cos=float(torch.dot(go.reshape(-1),gm.reshape(-1))/(go.norm()*gm.norm()).clamp_min(1e-12));head=calibrated_gradient_ratio(Go,Gm,cos,max_ce_antagonistic_fraction_of_motion=.5);floor=output_gradient_lambda_floor(go,gm,max_ce_antagonistic_fraction_of_motion=.5,active_motion_grad_rel=1e-4);ratios.append(max(head if np.isfinite(head) else 0.,floor));rows.append((go,gm))
+    k=int(np.argmax(ratios));return float(ratios[k]),rows[k][0],rows[k][1]
+def _optimize(g,c,d,targets,lam,steps=100,use_schedule=False):
     delta=torch.zeros((1,6,3),requires_grad=True);opt=torch.optim.Adam([delta],lr=.01);gt=targets.future_semantics;before=np.count_nonzero(compose_hard(c,d,delta,[0],grid=g)!=gt)
-    for _ in range(steps):
-        opt.zero_grad();scene=render_soft_ordered(c,d,delta,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(delta,[0],d,targets,c.history_ego_to_world[-1]);(occ+lam*mn/n).backward();opt.step()
+    for step in range(steps):
+        opt.zero_grad();scene=render_soft_ordered(c,d,delta,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(delta,[0],d,targets,c.history_ego_to_world[-1]);weight=lambda_at(step/max(1,steps-1),lam) if use_schedule else lam;(occ+weight*mn/n).backward();opt.step()
     after=np.count_nonzero(compose_hard(c,d,delta,[0],grid=g)!=gt);return before,after,delta.detach(),scene
 def _loss_grads(g,c,d,targets,v):
     x=v.detach().clone().requires_grad_(True);scene=render_soft_ordered(c,d,x,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(x,[0],d,targets,c.history_ego_to_world[-1]);mot=mn/n;go=torch.autograd.grad(occ,x,retain_graph=True)[0];gm=torch.autograd.grad(mot,x)[0]
@@ -54,3 +57,7 @@ def test_eight_direction_reachability_matrix_hard_trend():
         after=int(np.count_nonzero(compose_hard(c,d,delta,[0],grid=g)!=gt));state=opt.state[delta];row={'target':[dx,dy,yaw],'before':before,'after':after,'lambda':lam,'zero':zero_diag,'probe':probe_diag,'one_sided_dx':_one_sided_ce(g,c,d,targets,0),'one_sided_dy':_one_sided_ce(g,c,d,targets,1),'snapshots':snap,'adam_exp_avg_h0':state['exp_avg'][0,0].tolist(),'adam_exp_avg_sq_h0':state['exp_avg_sq'][0,0].tolist()};rows.append(row)
         if not (before>0 and after<before):failed.append(row)
     assert not failed,{'failed':failed,'all':rows}
+def test_pure_yaw_and_actual_lambda_schedule_reach_hard_improvement():
+    g,c,d=fixture();cases=[(0.,0.,.14),(0.,0.,-.14),(-.35,.35,0.)]
+    for dx,dy,yaw in cases:
+        td=torch.zeros((1,6,3));td[:,:,0]=dx;td[:,:,1]=dy;td[:,:,2]=yaw;_,targets=_targets_for_delta(g,c,d,td);lam,_,_=_calibrated_lambda(g,c,d,targets);before,after,delta,_=_optimize(g,c,d,targets,lam,100,use_schedule=True);assert before>0 and after<before,(dx,dy,yaw,before,after,lam,delta[0,0].tolist())
