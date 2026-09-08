@@ -75,6 +75,33 @@ def test_short_wall_clock_budget_exits_with_recoverable_checkpoint(tmp_path):
         r=engine.train(_fake_pipe(),None,[(None,None)],[(None,None)],cfg,ctx,manifest_path=manifest,msp_path=msp,output_dir=out)
     assert r['termination_reason']=='wall_clock_budget'
     ck=torch.load(out/'latest.pt',weights_only=False);assert ck['phase']=='budget_stop' and ck['next_group']==0
-    # Resume provenance/state is loadable even though no optimizer step occurred.
     m=_fake_pipe().source_network;o=engine.optimizer_for(m,cfg);from real_motion.motion_transport_v1.ema import WarmupEMA
     e=WarmupEMA(m,100);loaded=engine.load_resume(out/'latest.pt',raw=m,ema=e,opt=o,cfg=cfg,ctx=ctx,manifest_path=manifest,msp_path=msp);assert loaded['phase']=='budget_stop'
+
+def test_soft_q16_keeps_empty_source_windows_in_same_sample_set():
+    import real_motion.motion_transport_v1.evaluation as ev
+    from real_motion.motion_transport_v1.contracts import TrainingTargets,SourceDecomposition,SoftScene,SoftHorizon
+    shape=(2,2,1);free=np.full((6,*shape),17,np.uint8);empty_rest=np.zeros((0,3));h=np.arange(1,7)*.5
+    class DS:
+        def __len__(self):return 2
+        def __getitem__(self,i):
+            w=SimpleNamespace(scene_name=f'scene{i}',t0_token='t0',future_tokens=tuple(f'f{j}' for j in range(6)))
+            c=SimpleNamespace(sample_id=f's{i}',scene_name=f'scene{i}',future_ego_to_world=tuple(np.eye(4) for _ in range(6)))
+            return w,c
+    class Net:
+        def eval(self):return self
+    class Pipe:
+        def __init__(self):
+            self.source_network=Net();self.grid=SimpleNamespace(shape_hwd=shape,x_min=0.,y_min=0.,z_min=0.,voxel_size=(.4,.4,.4))
+        def prepare_scene(self,c):
+            sources=[] if c.sample_id=='s0' else [SimpleNamespace(source_id=0,class_id=4,crop_eligible=True,fallback_reason='',mapping_coverage=1.,velocity_world=np.zeros(3),dormant_fraction=0.,observed_moving_fraction=1.,points_world=np.zeros((1,3)))]
+            return SourceDecomposition(sources,free.copy(),np.zeros((0,3),int),np.zeros(0,np.uint8),empty_rest.copy(),h),[],{}
+        def forward_selected(self,c,d,sel,**kw):
+            rows=[SoftHorizon(torch.zeros(0,dtype=torch.long),torch.zeros((0,18)),torch.zeros(0,dtype=torch.long)) for _ in range(6)];soft=SoftScene(rows,free.copy(),shape);return None,None,free.copy(),soft,{}
+    targets=TrainingTargets(free.copy(),np.ones_like(free,bool),{})
+    groups=lambda: {n:np.zeros(shape,bool) for n in ev.GROUP_NAMES}
+    with patch.object(ev,'build_training_targets',lambda *a,**kw:targets),patch.object(ev,'route_sources',lambda sources,*a,**kw:() if not sources else (0,)),patch.object(ev,'hard_kta_identity',lambda *a,**kw:free.copy()),patch.object(ev,'gt_moving_support_for_horizon',lambda *a,**kw:(np.zeros(shape,bool),[],{})),patch.object(ev,'stationary_movable_support',lambda *a,**kw:np.zeros(shape,bool)),patch.object(ev,'_groups',lambda *a,**kw:groups()):
+        rep=ev.evaluate(Pipe(),SimpleNamespace(nusc=object()),DS(),{'targets':{'best_box_source_coverage_min':.8,'second_box_source_coverage_max':.2,'motion_points_per_source_max':64},'input':{'class_count':18},'evaluation':{'main_budget_sources':16}},budgets=(0,16),strategy='msp',include_soft_main=True)
+    assert rep['protocol']['hard_windows']==2
+    assert rep['protocol']['soft_main_windows']==2
+    assert rep['source_calls']['16']==1
