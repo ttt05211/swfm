@@ -6,6 +6,7 @@ ROOT=Path(__file__).resolve().parents[2]
 TOOLS=(
     'build_motion_transport_v1_manifest.py',
     'preflight_motion_transport_v1.py',
+    'accept_motion_transport_v1_ddp.py',
     'profile_motion_transport_v1.py',
     'train_motion_transport_v1.py',
     'eval_motion_transport_v1.py',
