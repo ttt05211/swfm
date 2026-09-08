@@ -53,17 +53,26 @@ def calibrated_gradient_ratio(g_occ_norm,g_motion_norm,cosine,*,max_ce_antagonis
     if go<=0:return 0.0
     return float(go/(gm*f))
 def output_gradient_lambda_floor(g_occ,g_motion,*,max_ce_antagonistic_fraction_of_motion=.5,active_motion_grad_rel=1e-4):
-    """Instantaneous lambda floor that keeps active conflicting output coordinates motion-directed."""
+    """Coordinate-wise recovery-dominance floor for the mixed-unit motion head.
+
+    Global gradient norms can hide a weak dx/dy/yaw coordinate because meters and
+    radians share one output head. For every coordinate with a non-negligible
+    motion gradient we require ``|g_ce_i| <= f * |lambda * g_motion_i|`` regardless
+    of whether CE currently agrees or conflicts with motion. This preserves the
+    same ``f`` safety standard while preventing one strong axis from masking a weak
+    recovery axis. Tiny motion coordinates are excluded by ``active_motion_grad_rel``.
+    """
     go=torch.as_tensor(g_occ).detach().float().reshape(-1);gm=torch.as_tensor(g_motion).detach().float().reshape(-1);f=float(max_ce_antagonistic_fraction_of_motion);rel=float(active_motion_grad_rel)
     if not 0<f<=1:raise ValueError('max_ce_antagonistic_fraction_of_motion must be in (0,1]')
     if not 0<=rel<1:raise ValueError('active_motion_grad_rel must be in [0,1)')
     if gm.numel()==0:return 0.0
     mx=float(gm.abs().max())
     if not np.isfinite(mx) or mx<=0:return 0.0
-    active=gm.abs()>=max(1e-12,mx*rel);conflict=active&(go*gm<0)
-    if not bool(conflict.any()):return 0.0
-    need=(go[conflict].abs()/gm[conflict].abs().clamp_min(1e-12))/f
-    return float(need.max())
+    active=gm.abs()>=max(1e-12,mx*rel)
+    if not bool(active.any()):return 0.0
+    need=(go[active].abs()/gm[active].abs().clamp_min(1e-12))/f
+    finite=need[torch.isfinite(need)]
+    return float(finite.max()) if finite.numel() else 0.0
 def gradient_summary(g):
     x=torch.as_tensor(g).detach().float().abs().reshape(-1)
     if x.numel()==0:return {'p50':0.0,'p95':0.0,'p99':0.0,'max':0.0}
