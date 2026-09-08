@@ -13,7 +13,9 @@ def test_lambda_schedule():assert lambda_ratio(0)==1 and lambda_ratio(.1)==1 and
 def test_gradient_calibration_recovery_dominance_and_coordinate_floor():
     # f=.5 means ||g_ce|| <= .5 * ||lambda*g_motion||, hence lambda=10 here
     for cosine in (.3,-1.,-.25):assert calibrated_gradient_ratio(10,2,cosine,max_ce_antagonistic_fraction_of_motion=.5)==10
-    assert calibrated_gradient_ratio(0,2,-1)!=calibrated_gradient_ratio(0,2,-1)
+    # A zero CE gradient is a valid motion-only calibration batch; zero motion is unusable.
+    assert calibrated_gradient_ratio(0,2,-1)==0.0
+    assert calibrated_gradient_ratio(2,0,-1)!=calibrated_gradient_ratio(2,0,-1)
     go=torch.tensor([4.,-8.,1.]);gm=torch.tensor([-1.,2.,1.]);assert output_gradient_lambda_floor(go,gm,max_ce_antagonistic_fraction_of_motion=.5)==8.
 def test_wall_clock_guard_includes_reserve_and_next_group(monkeypatch):
     c={'training':{'max_hours':1/3600,'wall_clock_final_reserve_seconds':.4,'wall_clock_next_group_guard_seconds':.4}};ctx=DistContext();
