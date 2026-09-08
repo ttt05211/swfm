@@ -130,7 +130,7 @@ loss:
   temporal_smoothness: 0.0
   volume: 0.0
 training:
-  gpus: 2
+  gpus: 1
   gpu_type: L40S_48GB
   ddp: true
   scenes_per_gpu: 1
@@ -151,8 +151,8 @@ training:
   fixed_epoch_cap: null
   epochs_locked: null
   epochs_lock_rule: profile_before_run
-  target_hours: 3
-  max_hours: 4
+  target_hours: null
+  max_hours: null
   initial_seed: 3407
   confirmation_seed: 3408
   checkpoint_fraction_epoch: 0.25
