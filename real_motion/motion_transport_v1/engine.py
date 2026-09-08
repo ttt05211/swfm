@@ -119,16 +119,22 @@ def load_resume(path,*,raw,ema,opt,cfg,ctx,manifest_path,msp_path):
     if ck.get('manifest_sha256')!=sha256_file(manifest_path) or ck.get('msp_sha256')!=sha256_file(msp_path):raise RuntimeError('resume data/MSP provenance mismatch')
     if ck.get('config_hash')!=_hash_json(_stable_config(cfg)):raise RuntimeError('resume resolved-config contract mismatch')
     raw.load_state_dict(ck['model_state_dict'],strict=True);ema.load_state_dict(ck['ema_state_dict']);opt.load_state_dict(ck['optimizer_state_dict']);restore_rng(ck['rank_rng_states'][ctx.rank]);return ck
-def _wall_clock_limit_s(cfg):return float(get(cfg,'training.max_hours',4))*3600.
-def _final_reserve_s(cfg):return max(0.,float(get(cfg,'training.wall_clock_final_reserve_seconds',0)))
+def _wall_clock_limit_s(cfg):
+    value=get(cfg,'training.max_hours')
+    if value is None:return None
+    value=float(value)
+    return value*3600. if value>0 else None
+def _final_reserve_s(cfg):return max(0.,float(get(cfg,'training.wall_clock_final_reserve_seconds',0) or 0))
 def _estimated_dev_s(cfg):
     value=get(cfg,'runtime.profile_dev_s')
     return _final_reserve_s(cfg) if value is None else max(0.,float(value))
-def _estimated_save_s(cfg):return max(0.,float(get(cfg,'runtime.profile_full_checkpoint_s',0)))
+def _estimated_save_s(cfg):return max(0.,float(get(cfg,'runtime.profile_full_checkpoint_s',0) or 0))
 def _phase_budget_should_stop(started,cfg,ctx,*,current_phase_s=0.,post_phase_reserve_s=0.,next_guard_s=0.):
-    elapsed=all_max_float(time.monotonic()-started,ctx);required=max(0.,float(current_phase_s))+max(0.,float(post_phase_reserve_s))+max(0.,float(next_guard_s));return bool(elapsed+required>=_wall_clock_limit_s(cfg)),elapsed,required
+    elapsed=all_max_float(time.monotonic()-started,ctx);required=max(0.,float(current_phase_s))+max(0.,float(post_phase_reserve_s))+max(0.,float(next_guard_s));limit=_wall_clock_limit_s(cfg)
+    if limit is None:return False,elapsed,required
+    return bool(elapsed+required>=limit),elapsed,required
 def _budget_should_stop(started,cfg,ctx):
-    stop,elapsed,_=_phase_budget_should_stop(started,cfg,ctx,post_phase_reserve_s=_final_reserve_s(cfg),next_guard_s=float(get(cfg,'training.wall_clock_next_group_guard_seconds',0)));return stop,elapsed
+    stop,elapsed,_=_phase_budget_should_stop(started,cfg,ctx,post_phase_reserve_s=_final_reserve_s(cfg),next_guard_s=float(get(cfg,'training.wall_clock_next_group_guard_seconds',0) or 0));return stop,elapsed
 def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_dir,resume=None):
     epochs=get(cfg,'training.epochs_locked')
     if epochs is None:raise RuntimeError('run formal profile first')
@@ -195,8 +201,8 @@ def train(pipe,source,train_ds,dev_ds,cfg,ctx,*,manifest_path,msp_path,output_di
             if ctx.is_main:
                 from .evaluation import evaluate
                 old=pipe.source_network;pipe.source_network=raw;raw.eval();Path(out,'final_raw_dev.json').write_text(json.dumps(evaluate(pipe,source,dev_ds,cfg,budgets=(0,16,'all'),strategy='msp',include_soft_main=True,seed=seed),indent=2));pipe.source_network=old;raw.train()
-            barrier(ctx);final_raw_completed=True
-            if all_max_float(time.monotonic()-started,ctx)>=_wall_clock_limit_s(cfg):termination='wall_clock_budget';stop_stage='final_raw_overrun'
+            barrier(ctx);final_raw_completed=True;limit=_wall_clock_limit_s(cfg)
+            if limit is not None and all_max_float(time.monotonic()-started,ctx)>=limit:termination='wall_clock_budget';stop_stage='final_raw_overrun'
     barrier(ctx)
     if budget_stop:last_epoch,last_group,last_phase=stop_epoch,stop_group,stop_phase
     else:last_epoch,last_group,last_phase=epochs,0,'finished'
