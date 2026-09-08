@@ -4,15 +4,45 @@
 
 ## 运行顺序
 
+正式训练前必须依次通过三道目标服务器 gate；**本轮验收到 formal profile 为止，不启动完整训练**：
+
 ```bash
 CFG=configs/real_motion/motion_transport_v1.yaml
 python tools/real_motion/build_motion_transport_v1_manifest.py --config "$CFG" --output data/motion_transport_v1/manifest.json
-CUDA_VISIBLE_DEVICES=0 python tools/real_motion/preflight_motion_transport_v1.py --config "$CFG" --output outputs/motion_transport_v1/preflight.json --samples 16
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 tools/real_motion/profile_motion_transport_v1.py --config "$CFG" --output-dir outputs/motion_transport_v1/profile
+
+# Gate A: 真实数据 / provenance / Strong-KTA identity；正式服务器禁止 CUDA→CPU 静默回退。
+CUDA_VISIBLE_DEVICES=0 python tools/real_motion/preflight_motion_transport_v1.py \
+  --config "$CFG" \
+  --output outputs/motion_transport_v1/preflight.json \
+  --samples 16 \
+  --device cuda \
+  --require-cuda \
+  --identity-scan all
+
+# Gate B: 真 2-GPU optimizer-step 等价，不是单卡 DDP 代数测试。
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tools/real_motion/accept_motion_transport_v1_ddp.py \
+  --config "$CFG" \
+  --output outputs/motion_transport_v1/ddp_acceptance.json \
+  --scan-windows 256
+
+# Gate C: 仅 strict formal-server profile 才允许锁 epochs。
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tools/real_motion/profile_motion_transport_v1.py \
+  --config "$CFG" \
+  --output-dir outputs/motion_transport_v1/profile \
+  --formal-server-gate
+```
+
+三道 gate 的 JSON / profile 输出复核通过后，才允许使用：
+
+```bash
 LOCKED=outputs/motion_transport_v1/profile/resolved_profile_config.yaml
 OUT=outputs/motion_transport_v1/run_seed3407
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 tools/real_motion/train_motion_transport_v1.py --config "$LOCKED" --output-dir "$OUT"
 ```
+
+`train_motion_transport_v1.py` 会再次 fail-closed：要求 CUDA、配置指定的 2×L40S、BF16、NCCL、`runtime.profile_formal_server_gate=true`、完整 dev profile、相同 profile WORLD_SIZE，以及非空 `lambda_reference/epochs_locked`。普通单卡/CPU profile 不能生成可启动正式训练的配置。
 
 恢复训练：
 
@@ -63,15 +93,19 @@ profile JSON 会记录 head/output gradient cosine、p50/p95/p99/max、probe ind
 
 ## Formal profile 与 4 小时预算
 
+只有带 `--formal-server-gate` 的 profile 才能写入非空 `epochs_locked`。该模式严格要求：配置指定的 `WORLD_SIZE=2`、每 rank 为 CUDA、NCCL、BF16 支持、GPU 名包含 `training.gpu_type` 的型号 token（当前为 `L40S`）、完整 dev，以及恰好 50 warmup + 200 measured microsteps。普通 CPU / 单卡 / partial-dev profile 仍可用于调试，但不会解锁训练。
+
 50 warmup + 200 measured microsteps 的计时从 **dataset 取样之前**开始，因此包含磁盘读取、Strong-W2Det/source decomposition、MSP candidate/mapping、future target 准备、crop、STPN、renderer、backward 和 optimizer step。DDP 用跨 rank 的最慢 wall time。
 
-profile 另外使用真实 `save_checkpoint()` payload 测完整 optimizer/EMA/RNG/provenance 保存时间，并把 quarter saves、epoch dev、最终 raw/dev/save 预算计入 `epochs_locked`。locked config 写入 `wall_clock_final_reserve_seconds`、`wall_clock_next_group_guard_seconds` 与实测 `runtime.profile_dev_s`。
+profile 另外使用真实 `save_checkpoint()` payload 测完整 optimizer/EMA/RNG/provenance 保存时间，并把 quarter saves、epoch dev、最终 raw/dev/save 预算计入 `epochs_locked`。locked config 写入 `wall_clock_final_reserve_seconds`、`wall_clock_next_group_guard_seconds`、实测 `runtime.profile_dev_s` 和实际 GPU/CUDA/NCCL/BF16 环境。
 
 formal train 在每个 accumulation group 的一致边界检查跨 rank 最大 wall time。如果下一 group 会侵犯 4 小时预算，所有 rank 停在同一边界，写 `phase=budget_stop` 的可恢复 `latest.pt`。epoch train groups 完成后，在启动 dev 前还会单独检查 `estimated_dev + final_reserve`；若预算不足，停在 `(epoch, groups, phase=dev_pending)`，不会先进入不可中断 dev 再超预算。若首轮 profile 本身 OOM，明确失败并要求所有 rank 使用 `--force-checkpointing on` 重跑，不把单 rank OOM 当成可自动继续的状态。
 
 ## DDP、EMA 与恢复合同
 
 每卡 1 scene、4 micro-step 累积，nominal global scene batch=8。DDP 会平均 rank 梯度，因此每个 rank 使用 `world_size * local_numerator / global_denominator`，不再额外除 accumulation steps。空 source scene 仍走 parameter-connected zero，保持 collective 节奏。
+
+`accept_motion_transport_v1_ddp.py` 是服务器级真两卡验收，不以代数推导代替实际 optimizer step。它从真实 train windows 中寻找 empty-source window 和 source 数不同的 motion-valid nonempty windows；分别跑 full accumulation、empty-source rank、tail accumulation、activation checkpointing（若扫描到 nonempty zero-motion-pair window 还会额外运行）场景。每个场景先用各 rank local gradient 手工 SUM 得到全局 reference AdamW step，再从同一初始权重运行正式 DDP `world_size * numerator / global denominator` 路径，逐项比较未裁剪梯度、step 后模型参数和 AdamW optimizer tensor state，并把 source/motion-pair 分布与最大误差写入 JSON。任何 required scenario 不 allclose 都直接失败。
 
 前 20% progress 使用 all sources；之后每 scene 50% all / 50% fixed-seed uniform Q16。随机 budget 不依赖 MSP/GT。镜像只改变 F 局部表示，raw source/MSP/ego/GT 不变。
 
@@ -94,7 +128,6 @@ PYTHONPATH="$PWD:$PWD/upstream_occfm" pytest -q tests/real_motion/test_motion_tr
 PyTorch 2.6 CUDA 正式验收必须在真实 CUDA runner 上显式开启 fail-fast，不能把 CPU skip 当作通过：
 
 ```bash
-# 环境必须实际安装 PyTorch 2.6.x CUDA build，例如官方 cu124 wheel。
 export MT_V1_REQUIRE_CUDA=1
 PYTHONPATH="$PWD:$PWD/upstream_occfm" \
 pytest -q tests/real_motion/test_motion_transport_v1_cuda_acceptance.py::test_pytorch26_cuda_complete_acceptance
@@ -102,7 +135,7 @@ pytest -q tests/real_motion/test_motion_transport_v1_cuda_acceptance.py::test_py
 
 该 CUDA gate 会先要求 `torch.cuda.is_available()==True`，正式模式还要求 `torch.__version__` 以 `2.6.0` 开头；随后在 CUDA 上执行 soft probability 范围/归一化、zero-point CE autograd vs central finite difference、query-chunk probability/gradient 等价、hard zero-selected-delta KTA exact identity，以及完整 8-direction + ±pure-yaw + actual-λ-schedule hard reachability。没有 CUDA 时普通 CI 显式 `skip`；设置 `MT_V1_REQUIRE_CUDA=1` 时则直接失败。
 
-preflight 不再用自报 source 数作为稀疏执行证据：它对 STPN 注册真实 forward hook，要求 Q0 不调用 heavy network，Q16 的实际 source forward 数与 selected sources 一致。CE 与 motion 分别报告 output/head 梯度；联合梯度还必须保持 motion-directed recovery。
+真实数据 preflight 的正式命令必须同时使用 `--require-cuda --identity-scan all`。`--require-cuda` 禁止 CUDA 不可用时静默落到 CPU；`--identity-scan all` 会对 manifest 的 train + dev 全窗口比较新 source decomposition 的 zero-delta hard transport 与冻结 `strong_w2det_sequence` reference，并在 JSON 记录扫描窗口数、失败窗口数、总 diff voxels 和前 20 个失败样本。Q0/Q16 heavy-network 稀疏执行、zero-init routed identity 和 gradient probe 仍在指定 `--samples` 子集上执行。
 
 回归覆盖包括：
 
@@ -118,16 +151,16 @@ preflight 不再用自报 source 数作为稀疏执行证据：它对 STPN 注�
 - mid-epoch budget-stop 的 `latest.pt` / `last.pt` 必须保留同一真实 cursor，分别恢复后剩余样本顺序/global_step/最终参数一致。
 - `10→12→11` best-selection 的 dev 前/后 resume 回归。
 - bootstrap `+10 pp` 单位与 Q16 empty-source soft sample-set 一致性。
+- strict server gate 必须对错误 WORLD_SIZE / CPU fail closed，不能生成 formal training lock。
 
 ## 仍需目标服务器完成的训练准入
 
-依赖轻 CI 不能代替真实 nuScenes/Occ3D、冻结 MSP checkpoint、NCCL/BF16 和 2×L40S。正式长训练前仍必须在目标服务器完成：
+PyTorch 2.6 CUDA F1 strict gate 已有单 GPU CUDA 证据后，下一轮不再重复修改 F1；正式长训练前剩余的是：
 
-1. PyTorch 2.6 CUDA F1 strict gate（上面的 `MT_V1_REQUIRE_CUDA=1` 命令）；
-2. real-data preflight 与 Strong-W2Det identity/provenance scan；
-3. true 2-GPU one-step 等价检查，覆盖不同 source 数、不同 motion-valid 数、empty-source rank 与 tail accumulation；
-4. 2×L40S 50+200 formal profile、显存/checkpointing 和完整 dev timing；
-5. profile 生成 locked `lambda_reference`、`epochs_locked` 与 wall-clock reserve 后，才允许启动 formal training。
+1. **Gate A**：真实 nuScenes/Occ3D + frozen MSP 的 `--require-cuda --identity-scan all` preflight，要求 provenance 无泄漏、train/dev identity scan 0 diff、Q0/Q16 稀疏执行正确、gradient probe 通过；
+2. **Gate B**：2×L40S NCCL/BF16 `accept_motion_transport_v1_ddp.py`，required scenarios 全部 `gradient/model/optimizer_state_allclose=true`；
+3. **Gate C**：2×L40S `--formal-server-gate` 50+200 profile + 完整 dev timing，显存/checkpointing 决策完成，`epochs_locked > 0` 且 4h reserve 合法；
+4. 三个证据文件复核通过后，才允许启动 formal training。
 
 在这些服务器检查完成之前，代码回归通过只代表 **实现准入条件已修复**，不代表模型已经证明超过 KTA，也不声称真实 Moving-mIoU 改善。
 
