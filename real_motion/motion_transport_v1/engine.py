@@ -10,7 +10,7 @@ from .routing import training_budget_selection,scene_mirror_flag,sha256_file
 from .targets import build_training_targets
 from .crop_history import build_history_crops
 from .compositor import render_soft_ordered,compose_hard
-from .losses import occupancy_ce_full,motion_loss_sum,motion_pair_count,lambda_at,calibration_probe_like,calibrated_gradient_ratio,output_gradient_lambda_floor,gradient_summary
+from .losses import occupancy_ce_full,motion_loss_sum,motion_pair_count,lambda_at,calibration_probe_family_like,calibrated_gradient_ratio,output_gradient_lambda_floor,gradient_summary
 from .ema import WarmupEMA
 
 @dataclass
@@ -89,18 +89,19 @@ def _cosine(a,b):return float(torch.dot(a,b)/(torch.linalg.vector_norm(a)*torch.
 def calibrate_lambda(pipe,source,dataset,cfg,ctx,*,batches=8,seed=3407):
     raw=pipe.source_network;params=list(raw.head2.parameters());head_refs=[];floors=[];rows=[];raw.train();idxs,_=rank_epoch_indices(len(dataset),ctx,0,seed);eps=float(get(cfg,'loss.gradient_calibration.probe_epsilon',1e-3));frac=float(get(cfg,'loss.gradient_calibration.max_ce_antagonistic_fraction_of_motion',.5));active_rel=float(get(cfg,'loss.gradient_calibration.active_motion_grad_rel',1e-4))
     for bi in range(int(batches)):
-        w,c=dataset[idxs[bi%len(idxs)]];rec=prepare_scene(pipe,source,w,c,cfg,progress=0.,epoch=0,seed=seed);_,_,_,zero,delta,_,_,_=forward_losses(pipe,rec,cfg,use_amp=False);probe=calibration_probe_like(delta,eps);occ,mnum,mcount,_,_= _losses_for_delta(pipe,rec,cfg,probe);scenes=all_sum(torch.tensor(1.,device=ctx.device),ctx);pairs=all_sum(torch.tensor(float(mcount),device=ctx.device),ctx);os=occ*ctx.world_size/scenes;ms=mnum*ctx.world_size/pairs.clamp_min(1) if float(pairs)>0 else mnum*0;go=_global_grad(os+zero,params,ctx);gm=_global_grad(ms+zero,params,ctx);Go=float(torch.linalg.vector_norm(go));Gm=float(torch.linalg.vector_norm(gm));cos=_cosine(go,gm);head=calibrated_gradient_ratio(Go,Gm,cos,max_ce_antagonistic_fraction_of_motion=frac)
-        floor_local=0.;go_out=gm_out=None
-        if delta.numel() and delta.requires_grad and float(pairs)>0:
-            go_out=torch.autograd.grad(os+zero,delta,retain_graph=True,allow_unused=True)[0];gm_out=torch.autograd.grad(ms+zero,delta,retain_graph=True,allow_unused=True)[0]
-            if go_out is not None and gm_out is not None:floor_local=output_gradient_lambda_floor(go_out,gm_out,max_ce_antagonistic_fraction_of_motion=frac,active_motion_grad_rel=active_rel)
-        floor=all_max_float(floor_local,ctx);ratio=max(head if np.isfinite(head) else 0.,floor)
-        row={'batch':bi,'probe_epsilon':eps,'G_occ_head':Go,'G_mot_head':Gm,'head_grad_cosine':cos,'head_ratio':head,'output_conflict_floor':floor,'ratio':ratio,'motion_pairs_global':float(pairs),'head_occ_abs':gradient_summary(go),'head_motion_abs':gradient_summary(gm)}
-        if go_out is not None:row['output_occ_abs']=gradient_summary(go_out)
-        if gm_out is not None:row['output_motion_abs']=gradient_summary(gm_out)
-        rows.append(row)
-        if np.isfinite(head):head_refs.append(float(head))
-        floors.append(float(floor))
+        w,c=dataset[idxs[bi%len(idxs)]];rec=prepare_scene(pipe,source,w,c,cfg,progress=0.,epoch=0,seed=seed);_,_,_,zero,delta,_,_,_=forward_losses(pipe,rec,cfg,use_amp=False);scenes=all_sum(torch.tensor(1.,device=ctx.device),ctx);candidate_rows=[]
+        for pi,probe in enumerate(calibration_probe_family_like(delta,eps)):
+            occ,mnum,mcount,_,_=_losses_for_delta(pipe,rec,cfg,probe);pairs=all_sum(torch.tensor(float(mcount),device=ctx.device),ctx);os=occ*ctx.world_size/scenes;ms=mnum*ctx.world_size/pairs.clamp_min(1) if float(pairs)>0 else mnum*0;go=_global_grad(os+zero,params,ctx);gm=_global_grad(ms+zero,params,ctx);Go=float(torch.linalg.vector_norm(go));Gm=float(torch.linalg.vector_norm(gm));cos=_cosine(go,gm);head=calibrated_gradient_ratio(Go,Gm,cos,max_ce_antagonistic_fraction_of_motion=frac);floor_local=0.;go_out=gm_out=None
+            if delta.numel() and delta.requires_grad and float(pairs)>0:
+                go_out=torch.autograd.grad(os+zero,delta,retain_graph=True,allow_unused=True)[0];gm_out=torch.autograd.grad(ms+zero,delta,retain_graph=True,allow_unused=True)[0]
+                if go_out is not None and gm_out is not None:floor_local=output_gradient_lambda_floor(go_out,gm_out,max_ce_antagonistic_fraction_of_motion=frac,active_motion_grad_rel=active_rel)
+            floor=all_max_float(floor_local,ctx);ratio=max(head if np.isfinite(head) else 0.,floor);cand={'probe_index':pi,'G_occ_head':Go,'G_mot_head':Gm,'head_grad_cosine':cos,'head_ratio':head,'output_conflict_floor':floor,'ratio':ratio,'motion_pairs_global':float(pairs),'head_occ_abs':gradient_summary(go),'head_motion_abs':gradient_summary(gm)}
+            if go_out is not None:cand['output_occ_abs']=gradient_summary(go_out)
+            if gm_out is not None:cand['output_motion_abs']=gradient_summary(gm_out)
+            candidate_rows.append(cand)
+        finite=[x for x in candidate_rows if np.isfinite(x['ratio'])];best=max(finite,key=lambda x:x['ratio']) if finite else None
+        if best is None:rows.append({'batch':bi,'probe_epsilon':eps,'probe_family_size':len(candidate_rows),'probe_candidates':candidate_rows,'ratio':float('nan')});continue
+        row={'batch':bi,'probe_epsilon':eps,'probe_family_size':len(candidate_rows),'selected_probe_index':best['probe_index'],**best,'probe_candidates':candidate_rows};rows.append(row);head_refs.append(float(max((x['head_ratio'] for x in finite if np.isfinite(x['head_ratio'])),default=0.)));floors.append(float(max((x['output_conflict_floor'] for x in finite),default=0.)))
     if not head_refs and not any(x>0 for x in floors):raise RuntimeError('lambda calibration has no batch with usable motion gradient')
     ref=max(float(np.median(head_refs)) if head_refs else 0.,max(floors) if floors else 0.)
     if not np.isfinite(ref) or ref<=0:raise RuntimeError('lambda calibration produced invalid reference')
