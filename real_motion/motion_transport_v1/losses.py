@@ -1,4 +1,5 @@
 from __future__ import annotations
+import itertools
 import numpy as np,torch,torch.nn.functional as F
 from .geometry import f_to_world_matrix
 
@@ -26,11 +27,24 @@ def motion_loss_sum(deltas,selected_source_ids,decomp,targets,t0_pose):
     return num,count,{'motion_pairs':count,'motion_mean_local':float(np.mean(rows)) if rows else 0.}
 def motion_pair_count(selected_source_ids,targets):return int(sum(int(np.asarray(targets.motion_targets[int(s)].valid,bool).sum()) for s in selected_source_ids if int(s) in targets.motion_targets))
 def calibration_probe_like(delta,epsilon=1e-3):
-    """Deterministic GT-independent sub-voxel probe used only for lambda calibration."""
+    """Legacy deterministic probe retained for diagnostics/backward compatibility."""
     eps=float(epsilon)
-    if eps<=0:return delta
-    if delta.numel()==0:return delta
+    if eps<=0 or delta.numel()==0:return delta
     m,h,_=delta.shape;mi=torch.arange(m,device=delta.device)[:,None];hi=torch.arange(h,device=delta.device)[None,:];sgn=torch.where(((mi+hi)&1)==0,torch.ones((m,h),device=delta.device),-torch.ones((m,h),device=delta.device));p=torch.zeros_like(delta);p[:,:,0]=sgn*eps;p[:,:,1]=-sgn*eps;p[:,:,2]=sgn*eps;return delta+p
+def calibration_probe_family_like(delta,epsilon=1e-3):
+    """GT-independent, direction-neutral probe envelope for formal calibration.
+
+    A single checkerboard perturbation can accidentally sample a benign octant of
+    the piecewise-trilinear renderer.  We therefore probe all 8 signed (x,y,yaw)
+    octants with the same sub-voxel magnitude and take the safe envelope.  The
+    probes are deterministic and do not inspect future GT direction.
+    """
+    eps=float(epsilon)
+    if eps<=0 or delta.numel()==0:return (delta,)
+    out=[]
+    for sx,sy,sw in itertools.product((-1.,1.),repeat=3):
+        p=torch.zeros_like(delta);p[:,:,0]=sx*eps;p[:,:,1]=sy*eps;p[:,:,2]=sw*eps;out.append(delta+p)
+    return tuple(out)
 def calibrated_gradient_ratio(g_occ_norm,g_motion_norm,cosine,*,max_ce_antagonistic_fraction_of_motion=.5):
     """Global recovery calibration.
 
