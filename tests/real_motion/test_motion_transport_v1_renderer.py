@@ -15,6 +15,13 @@ def _optimize(g,c,d,targets,lam,steps=100):
     for _ in range(steps):
         opt.zero_grad();scene=render_soft_ordered(c,d,delta,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(delta,[0],d,targets,c.history_ego_to_world[-1]);(occ+lam*mn/n).backward();opt.step()
     after=np.count_nonzero(compose_hard(c,d,delta,[0],grid=g)!=gt);return before,after,delta.detach(),scene
+def _loss_grads(g,c,d,targets,v):
+    x=v.detach().clone().requires_grad_(True);scene=render_soft_ordered(c,d,x,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(x,[0],d,targets,c.history_ego_to_world[-1]);mot=mn/n;go=torch.autograd.grad(occ,x,retain_graph=True)[0];gm=torch.autograd.grad(mot,x)[0]
+    return {'occ':float(occ.detach()),'motion':float(mot.detach()),'g_occ':go.detach(),'g_motion':gm.detach()}
+def _grad_row(g,c,d,targets,v):
+    x=_loss_grads(g,c,d,targets,v);go=x['g_occ'];gm=x['g_motion'];return {'occ':x['occ'],'motion':x['motion'],'go_norm':float(go.norm()),'gm_norm':float(gm.norm()),'go_h0':go[0,0].tolist(),'gm_h0':gm[0,0].tolist(),'dot':float((go*gm).sum())}
+def _one_sided_ce(g,c,d,targets,axis,eps=1e-4):
+    z=torch.zeros((1,6,3));f0=_loss_grads(g,c,d,targets,z)['occ'];zp=z.clone();zm=z.clone();zp[0,0,axis]+=eps;zm[0,0,axis]-=eps;fp=_loss_grads(g,c,d,targets,zp)['occ'];fm=_loss_grads(g,c,d,targets,zm)['occ'];return {'backward':(f0-fm)/eps,'forward':(fp-f0)/eps}
 def test_soft_probability_gradient_and_chunk_equivalence():
     g,c,d=fixture();a=torch.zeros((1,6,3),requires_grad=True);b=a.detach().clone().requires_grad_(True);a.data[:,:,0]=.11;a.data[:,:,2]=.07;b.data.copy_(a.data);sa=render_soft_ordered(c,d,a,[0],grid=g,query_chunk=7);sb=render_soft_ordered(c,d,b,[0],grid=g,query_chunk=99999)
     for x,y in zip(sa.horizons,sb.horizons):assert torch.equal(x.flat_indices,y.flat_indices) and torch.allclose(x.probabilities.sum(1),torch.ones(len(x.probabilities)),atol=1e-5) and torch.allclose(x.probabilities,y.probabilities,atol=1e-7,rtol=1e-6)
@@ -38,6 +45,12 @@ def test_renderer_finite_difference_dx_and_yaw():
 def test_joint_calibrated_reachability_improves_hard_original_acceptance_case():
     g,c,d=fixture();td=torch.zeros((1,6,3));td[:,:,0]=.35;td[:,:,2]=.08;gt,targets=_targets_for_delta(g,c,d,td);lam,go,gm=_calibrated_lambda(g,c,d,targets);assert np.isfinite(lam) and lam>0;assert float(((go+lam*gm)*gm).sum())>0;before,after,delta,scene=_optimize(g,c,d,targets,lam,100);assert before==48;assert after<before,(before,after,delta[0,0].tolist(),lam);assert float(delta[:,:,0].mean())>0;assert soft_argmax_scene(scene).shape==gt.shape
 def test_eight_direction_reachability_matrix_hard_trend():
-    g,c,d=fixture();cases=[(.35,0,.08),(-.35,0,-.08),(0,.35,.08),(0,-.35,-.08),(.35,.35,0),(-.35,.35,0),(.35,-.35,0),(-.35,-.35,0)];rows=[]
+    g,c,d=fixture();cases=[(.35,0,.08),(-.35,0,-.08),(0,.35,.08),(0,-.35,-.08),(.35,.35,0),(-.35,.35,0),(.35,-.35,0),(-.35,-.35,0)];rows=[];failed=[]
     for dx,dy,yaw in cases:
-        td=torch.zeros((1,6,3));td[:,:,0]=dx;td[:,:,1]=dy;td[:,:,2]=yaw;_,targets=_targets_for_delta(g,c,d,td);lam,_,_=_calibrated_lambda(g,c,d,targets);before,after,delta,_=_optimize(g,c,d,targets,lam,100);rows.append((dx,dy,yaw,before,after,delta[0,0].tolist(),lam));assert before>0 and after<before,rows[-1]
+        td=torch.zeros((1,6,3));td[:,:,0]=dx;td[:,:,1]=dy;td[:,:,2]=yaw;_,targets=_targets_for_delta(g,c,d,td);lam,_,_=_calibrated_lambda(g,c,d,targets);zero=torch.zeros((1,6,3));probe=calibration_probe_like(zero,1e-3);zero_diag=_grad_row(g,c,d,targets,zero);probe_diag=_grad_row(g,c,d,targets,probe);delta=torch.zeros((1,6,3),requires_grad=True);opt=torch.optim.Adam([delta],lr=.01);gt=targets.future_semantics;before=int(np.count_nonzero(compose_hard(c,d,delta,[0],grid=g)!=gt));snap={}
+        for step in range(100):
+            opt.zero_grad();scene=render_soft_ordered(c,d,delta,[0],grid=g);occ,_=occupancy_ce_full(scene,targets);mn,n,_=motion_loss_sum(delta,[0],d,targets,c.history_ego_to_world[-1]);(occ+lam*mn/n).backward();opt.step()
+            if step in (0,9,24,49,99):snap[str(step+1)]={'delta_h0':delta.detach()[0,0].tolist(),'grad':_grad_row(g,c,d,targets,delta.detach())}
+        after=int(np.count_nonzero(compose_hard(c,d,delta,[0],grid=g)!=gt));state=opt.state[delta];row={'target':[dx,dy,yaw],'before':before,'after':after,'lambda':lam,'zero':zero_diag,'probe':probe_diag,'one_sided_dx':_one_sided_ce(g,c,d,targets,0),'one_sided_dy':_one_sided_ce(g,c,d,targets,1),'snapshots':snap,'adam_exp_avg_h0':state['exp_avg'][0,0].tolist(),'adam_exp_avg_sq_h0':state['exp_avg_sq'][0,0].tolist()};rows.append(row)
+        if not (before>0 and after<before):failed.append(row)
+    assert not failed,{'failed':failed,'all':rows}
