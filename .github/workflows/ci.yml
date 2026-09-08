@@ -48,4 +48,12 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/upstream_occfm
           OMP_NUM_THREADS: '1'
           MKL_NUM_THREADS: '1'
+          MT_V1_DIAG_PATH: ${{ runner.temp }}/mt_v1_torch26_diag.json
         run: pytest -q tests/real_motion/test_motion_transport_v1_*.py
+      - name: Upload MT-V1 torch 2.6 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt-v1-torch26-diagnostics
+          path: ${{ runner.temp }}/mt_v1_torch26_diag.json
+          if-no-files-found: warn
