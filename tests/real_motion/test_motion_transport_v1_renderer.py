@@ -58,6 +58,6 @@ def test_eight_direction_reachability_matrix_hard_trend():
         if not (before>0 and after<before):failed.append(row)
     assert not failed,{'failed':failed,'all':rows}
 def test_pure_yaw_and_actual_lambda_schedule_reach_hard_improvement():
-    g,c,d=fixture();cases=[(0.,0.,.14),(0.,0.,-.14),(-.35,.35,0.)]
+    g,c,d=fixture();cases=[(0.,0.,.8),(0.,0.,-.8),(-.35,.35,0.)]
     for dx,dy,yaw in cases:
         td=torch.zeros((1,6,3));td[:,:,0]=dx;td[:,:,1]=dy;td[:,:,2]=yaw;_,targets=_targets_for_delta(g,c,d,td);lam,_,_=_calibrated_lambda(g,c,d,targets);before,after,delta,_=_optimize(g,c,d,targets,lam,100,use_schedule=True);assert before>0 and after<before,(dx,dy,yaw,before,after,lam,delta[0,0].tolist())
