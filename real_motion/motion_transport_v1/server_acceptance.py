@@ -12,16 +12,26 @@ def expected_gpu_token(cfg):
     return raw.split('_',1)[0]
 
 
-def formal_server_environment(ctx,cfg,*,require_world_size=True,require_bf16=True,require_gpu_type=True):
-    expected_world=int(get(cfg,'training.gpus',2))
-    if require_world_size and int(ctx.world_size)!=expected_world:
-        raise RuntimeError(f'formal server gate requires WORLD_SIZE={expected_world}, got {ctx.world_size}')
+def formal_server_environment(ctx,cfg,*,require_world_size=False,require_bf16=True,require_gpu_type=False):
+    """Validate the hardware actually used for a formal profile/train launch.
+
+    MT-V1 supports either one or two GPUs. By default we require CUDA/BF16 but do
+    not require the config's advisory `training.gpus` or `training.gpu_type` to
+    match. A caller may opt into those checks for a deliberately fixed launch.
+    """
+    expected_world=get(cfg,'training.gpus')
+    if require_world_size:
+        if expected_world is None:raise RuntimeError('training.gpus is null but an exact WORLD_SIZE check was requested')
+        if int(ctx.world_size)!=int(expected_world):
+            raise RuntimeError(f'formal server gate requires WORLD_SIZE={int(expected_world)}, got {ctx.world_size}')
+    if int(ctx.world_size) not in (1,2):
+        raise RuntimeError(f'MT-V1 supports WORLD_SIZE 1 or 2, got {ctx.world_size}')
     if ctx.device.type!='cuda' or not torch.cuda.is_available():
         raise RuntimeError('formal server gate requires CUDA on every rank')
     if require_bf16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError('formal server gate requires CUDA BF16 support')
     if ctx.world_size>1 and dist.is_initialized() and dist.get_backend()!='nccl':
-        raise RuntimeError(f'formal server gate requires NCCL, got {dist.get_backend()}')
+        raise RuntimeError(f'multi-GPU formal server gate requires NCCL, got {dist.get_backend()}')
     local_name=torch.cuda.get_device_name(ctx.device)
     names=[local_name]
     if ctx.world_size>1:
@@ -39,5 +49,6 @@ def formal_server_environment(ctx,cfg,*,require_world_size=True,require_bf16=Tru
         'backend':dist.get_backend() if ctx.world_size>1 and dist.is_initialized() else None,
         'bf16_supported':bool(torch.cuda.is_bf16_supported()),
         'gpu_names':list(map(str,names)),
-        'expected_gpu_token':token,
+        'configured_gpu_count':None if expected_world is None else int(expected_world),
+        'configured_gpu_token':token,
     }
