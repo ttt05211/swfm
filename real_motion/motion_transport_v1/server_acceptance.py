@@ -41,14 +41,17 @@ def formal_server_environment(ctx,cfg,*,require_world_size=False,require_bf16=Tr
     if require_gpu_type and token:
         bad=[n for n in names if token.lower() not in str(n).lower()]
         if bad:raise RuntimeError(f'formal server gate expected GPU containing {token!r}, got {names}')
+    # torch.__version__ may be torch.torch_version.TorchVersion rather than a
+    # builtin str (for example under PyTorch 2.7).  Keep all runtime metadata
+    # YAML/JSON-safe because profile_environment is embedded in the locked config.
     return {
-        'torch':torch.__version__,
-        'cuda_build':torch.version.cuda,
+        'torch':str(torch.__version__),
+        'cuda_build':None if torch.version.cuda is None else str(torch.version.cuda),
         'cudnn':torch.backends.cudnn.version(),
         'world_size':int(ctx.world_size),
-        'backend':dist.get_backend() if ctx.world_size>1 and dist.is_initialized() else None,
+        'backend':str(dist.get_backend()) if ctx.world_size>1 and dist.is_initialized() else None,
         'bf16_supported':bool(torch.cuda.is_bf16_supported()),
         'gpu_names':list(map(str,names)),
         'configured_gpu_count':None if expected_world is None else int(expected_world),
-        'configured_gpu_token':token,
+        'configured_gpu_token':str(token),
     }
