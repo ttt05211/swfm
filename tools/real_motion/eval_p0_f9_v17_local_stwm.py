@@ -32,16 +32,21 @@ from real_motion.motion_transport_v2 import (
 )
 from real_motion.msp_wm_cache import MSPWorldModelCacheDataset
 from real_motion.nuscenes_adapter import NuScenesWindowSource, WindowTokens
-from real_motion.rigid_transport import compose_component_replacements, rasterize_rigid_component
+from real_motion.rigid_transport import (
+    compose_component_replacements,
+    compose_component_replacements_in_input_order,
+    rasterize_rigid_component,
+)
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig, extract_instances, match_instances
 from tools.real_motion import eval_p0_f9_frozen_sparse_occfm as safe
 
-PROTOCOL = "p0_f9_v17_local_stwm_rigid_transport_eval_v2"
+PROTOCOL = "p0_f9_v17_local_stwm_rigid_transport_eval_v3"
 OCCUPANCY_IOU_CONTRACT = "binary_occupied_vs_free_dataset_accumulated_per_horizon_then_mean_v1"
 VARIANTS = (
     "strong_anchor",
     "local_stwm_center_always",
+    "local_stwm_center_always_source_order",
     "local_stwm_center_rigid",
     "gt_center_rigid",
 )
@@ -55,7 +60,7 @@ def load_cache(path):
     if meta.get("target_contract") != TARGET_CONTRACT:
         raise RuntimeError("target contract mismatch")
     if meta.get("representation_contract") != REPRESENTATION_CONTRACT:
-        raise RuntimeError("representation contract mismatch")
+        raise RuntimeError("V17 representation contract mismatch")
     records = obj.get("records") or []
     if not records:
         raise RuntimeError("V17 cache has no records")
@@ -275,6 +280,17 @@ def main():
                 free_label=int(pcfg.free_label),
                 grid=pcfg.grid,
             )
+            # A1: same anchor, CLEAR masks, source set, predictions and rasterized
+            # components as legacy; only WRITE order changes to original Strong
+            # source order (the order of ``current`` / ``learned_all``).
+            pred_always_source_order = compose_component_replacements_in_input_order(
+                anchor,
+                baseline_all,
+                learned_all,
+                dynamic_class_ids=DYNAMIC_CLASS_IDS,
+                free_label=int(pcfg.free_label),
+                grid=pcfg.grid,
+            )
             pred_exist = compose_component_replacements(
                 anchor,
                 baseline_all,
@@ -293,6 +309,15 @@ def main():
             )
             _update_variant(
                 states, occupancy_states, "local_stwm_center_always", horizon, pred_always, gt, moving
+            )
+            _update_variant(
+                states,
+                occupancy_states,
+                "local_stwm_center_always_source_order",
+                horizon,
+                pred_always_source_order,
+                gt,
+                moving,
             )
             _update_variant(
                 states, occupancy_states, "local_stwm_center_rigid", horizon, pred_exist, gt, moving
@@ -333,11 +358,11 @@ def main():
         f"variant={ck.get('variant')} checkpoint_epoch={ck.get('epoch')} "
         f"use_representation={use_rep} overlap_weight={ck.get('overlap_weight')}"
     )
-    print(f"{'variant':28s} {'IoU':>9s} {'mIoU':>9s} {'Moving':>9s} {'dmIoU':>9s} {'dMoving':>9s}")
+    print(f"{'variant':40s} {'IoU':>9s} {'mIoU':>9s} {'Moving':>9s} {'dmIoU':>9s} {'dMoving':>9s}")
     for name in VARIANTS:
         o, m = metric_pair(reports[name])
         giou = float(reports[name]["occupancy"]["IoU"])
-        print(f"{name:28s} {giou:9.4f} {o:9.4f} {m:9.4f} {o-so:+9.4f} {m-sm:+9.4f}")
+        print(f"{name:40s} {giou:9.4f} {o:9.4f} {m:9.4f} {o-so:+9.4f} {m-sm:+9.4f}")
 
     print("\n=== OCCUPANCY IoU / MOVING-mIoU BY HORIZON ===")
     for name in VARIANTS:
@@ -351,7 +376,7 @@ def main():
             oi.append(float(orow["IoU"]))
             mi.append(float(mrow["mIoU"]))
         print(
-            f"{name:28s} IoU=[{oi[0]:.4f},{oi[1]:.4f},{oi[2]:.4f}] "
+            f"{name:40s} IoU=[{oi[0]:.4f},{oi[1]:.4f},{oi[2]:.4f}] "
             f"Moving=[{mi[0]:.4f},{mi[1]:.4f},{mi[2]:.4f}]"
         )
 
@@ -375,6 +400,7 @@ def main():
         "target_contract": TARGET_CONTRACT,
         "representation_contract": REPRESENTATION_CONTRACT,
         "occupancy_iou_contract": OCCUPANCY_IOU_CONTRACT,
+        "a1_write_order_contract": "legacy_clear_plus_original_strong_source_write_order_v1",
         "free_label": int(pcfg.free_label),
         "cache_metadata": cache_meta,
     }
