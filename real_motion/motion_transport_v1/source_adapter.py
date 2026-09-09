@@ -17,8 +17,8 @@ def _validate_times(causal,expected_dt_s,tolerance_s=.05):
     if len(ft) and np.max(np.abs(ft-expected))>tolerance_s:raise ValueError('future cadence mismatch')
 
 def decompose_strong_sources(causal,*,grid:OccupancyGrid,cfg:StrongW2DetConfig,frame_dt_s=.5,crop_radius_limit_m=11.2):
-    _validate_times(causal,float(frame_dt_s));hist=np.asarray(causal.history_semantics);sem0,prev=hist[-1],hist[-2];T0=np.asarray(causal.history_ego_to_world[-1],float);Tp=np.asarray(causal.history_ego_to_world[-2],float)
-    dyn=np.isin(sem0,np.asarray(DYNAMIC_CLASS_IDS,dtype=sem0.dtype));cur=extract_instances(sem0,T0,grid=grid,cfg=cfg);old=extract_instances(prev,Tp,grid=grid,cfg=cfg);vel=match_instances(old,cur,float(frame_dt_s),max_speed_mps=cfg.max_match_speed_mps)
+    frame_dt_s=float(frame_dt_s);_validate_times(causal,frame_dt_s);hist=np.asarray(causal.history_semantics);sem0,prev=hist[-1],hist[-2];T0=np.asarray(causal.history_ego_to_world[-1],float);Tp=np.asarray(causal.history_ego_to_world[-2],float)
+    dyn=np.isin(sem0,np.asarray(DYNAMIC_CLASS_IDS,dtype=sem0.dtype));cur=extract_instances(sem0,T0,grid=grid,cfg=cfg);old=extract_instances(prev,Tp,grid=grid,cfg=cfg);vel=match_instances(old,cur,frame_dt_s,max_speed_mps=cfg.max_match_speed_mps)
     sources=[];covered=np.zeros_like(dyn,bool)
     for j,inst in enumerate(cur):
         idx=np.asarray(inst['voxel_indices'],np.int64);covered[tuple(idx.T)]=True;p0=index_to_metric_center(idx,grid);pw=transform_points(T0,p0);v=np.zeros(3,float);matched=j in vel
@@ -29,7 +29,14 @@ def decompose_strong_sources(causal,*,grid:OccupancyGrid,cfg:StrongW2DetConfig,f
     static=sem0.copy();static[dyn]=int(cfg.free_label);background=[]
     for Th in causal.future_ego_to_world:
         cur_to_future=relative_transform(T0,np.asarray(Th,float));dst,known=inverse_warp(static,cur_to_future,grid,cfg.free_label);background.append(majority_fill(dst,~known,kernel=cfg.fill_kernel,min_fraction=cfg.fill_min_fraction))
-    horizons=np.asarray(causal.future_timestamps_s,float)-float(causal.history_timestamps_s[-1]);return SourceDecomposition(sources,np.stack(background),rest_idx,np.asarray(rest_labels),rest_world,horizons)
+    # Strong-W2Det is defined on the frozen 2 Hz protocol: the velocity is a
+    # backward difference over frame_dt_s and future propagation uses exactly
+    # (i+1)*frame_dt_s.  Real nuScenes timestamps are only used above to validate
+    # that a window obeys the cadence tolerance; using their small acquisition
+    # jitter here can move boundary points into adjacent voxels and breaks the
+    # required bit-exact zero-delta identity with strong_w2det_sequence().
+    horizons=np.arange(1,len(causal.future_timestamps_s)+1,dtype=np.float64)*frame_dt_s
+    return SourceDecomposition(sources,np.stack(background),rest_idx,np.asarray(rest_labels),rest_world,horizons)
 
 def extract_original_msp_candidates(causal,*,grid,motion_cfg,kta_cfg:KTAConfig):
     aligned=ego_compensate_sequence(causal.history_semantics,causal.history_ego_to_world,-1,grid,17);obs=_align_observation_sequence(causal.history_valid,causal.history_ego_to_world,-1,grid);masks=decompose_masks(aligned,motion_cfg,history_observed=obs);rows=[];enum=0
