@@ -75,7 +75,7 @@ def _deduplicate_indices(indices_xyz: np.ndarray, grid: OccupancyGrid) -> np.nda
     idx = np.asarray(indices_xyz, dtype=np.int64)
     if len(idx) == 0:
         return idx.reshape(0, 3)
-    X, Y, Z = [int(x) for x in grid.shape_hwd]
+    _, Y, Z = [int(x) for x in grid.shape_hwd]
     flat = (idx[:, 0] * Y + idx[:, 1]) * Z + idx[:, 2]
     _, first = np.unique(flat, return_index=True)
     return idx[np.sort(first)]
@@ -134,6 +134,42 @@ def rasterize_rigid_component(
     return RasterizedRigidComponent(int(class_id), dst_idx, int(len(src_idx)))
 
 
+def _compose_component_replacements_impl(
+    anchor_occ: np.ndarray,
+    baseline_components: Iterable[RasterizedRigidComponent],
+    replacement_components: Iterable[RasterizedRigidComponent],
+    *,
+    dynamic_class_ids: Sequence[int],
+    free_label: int,
+    grid: OccupancyGrid,
+    preserve_replacement_order: bool,
+) -> np.ndarray:
+    anchor = np.asarray(anchor_occ)
+    if tuple(anchor.shape) != tuple(grid.shape_hwd):
+        raise ValueError("anchor_occ shape differs from occupancy grid")
+    out = anchor.copy()
+    dyn_ids = np.asarray(tuple(int(x) for x in dynamic_class_ids), dtype=np.int64)
+    if dyn_ids.size == 0:
+        raise ValueError("dynamic_class_ids cannot be empty")
+
+    # A0/A1 intentionally share the exact same CLEAR contract.  Only the WRITE
+    # ordering is allowed to differ in the A1 diagnostic.
+    clear = np.zeros(grid.shape_hwd, dtype=bool)
+    for comp in baseline_components:
+        clear |= comp.mask(grid)
+    out[clear & np.isin(out, dyn_ids)] = int(free_label)
+
+    replacements = list(replacement_components)
+    if not bool(preserve_replacement_order):
+        # Frozen legacy behavior used by all historical V13/V16/V17 scores.
+        replacements.sort(key=lambda c: (-int(c.source_voxel_count), int(c.class_id)))
+    for comp in replacements:
+        idx = np.asarray(comp.voxel_indices, dtype=np.int64)
+        if len(idx):
+            out[idx[:, 0], idx[:, 1], idx[:, 2]] = int(comp.class_id)
+    return out
+
+
 def compose_component_replacements(
     anchor_occ: np.ndarray,
     baseline_components: Iterable[RasterizedRigidComponent],
@@ -145,33 +181,45 @@ def compose_component_replacements(
 ) -> np.ndarray:
     """Coherently replace selected Strong/KTA object predictions.
 
-    ``anchor_occ`` is the frozen Strong-W2Det future occupancy.  For each selected
-    source object we first clear the voxels where the Strong/KTA copy of that
-    object would land, then write the replacement rigidly transported source
-    shape.  All clears are performed before any writes so one object's write is
-    never erased by a later object's baseline mask.
-
-    Dynamic occupancy outside the selected source-object masks remains exactly
-    the Strong anchor.  This makes the probe a controlled replacement rather
-    than a second independent predictor pasted on top of KTA.
+    This is the frozen legacy A0 compositor.  For each selected source object we
+    first clear the voxels where the Strong/KTA copy would land, then write the
+    replacement rigidly transported source shape.  All clears happen before any
+    writes.  Replacement writes are ordered by descending source voxel count and
+    then class id, exactly as in the historical implementation.
     """
-    anchor = np.asarray(anchor_occ)
-    if tuple(anchor.shape) != tuple(grid.shape_hwd):
-        raise ValueError("anchor_occ shape differs from occupancy grid")
-    out = anchor.copy()
-    dyn_ids = np.asarray(tuple(int(x) for x in dynamic_class_ids), dtype=np.int64)
-    if dyn_ids.size == 0:
-        raise ValueError("dynamic_class_ids cannot be empty")
+    return _compose_component_replacements_impl(
+        anchor_occ,
+        baseline_components,
+        replacement_components,
+        dynamic_class_ids=dynamic_class_ids,
+        free_label=int(free_label),
+        grid=grid,
+        preserve_replacement_order=False,
+    )
 
-    clear = np.zeros(grid.shape_hwd, dtype=bool)
-    for comp in baseline_components:
-        clear |= comp.mask(grid)
-    out[clear & np.isin(out, dyn_ids)] = int(free_label)
 
-    replacements = list(replacement_components)
-    replacements.sort(key=lambda c: (-int(c.source_voxel_count), int(c.class_id)))
-    for comp in replacements:
-        idx = np.asarray(comp.voxel_indices, dtype=np.int64)
-        if len(idx):
-            out[idx[:, 0], idx[:, 1], idx[:, 2]] = int(comp.class_id)
-    return out
+def compose_component_replacements_in_input_order(
+    anchor_occ: np.ndarray,
+    baseline_components: Iterable[RasterizedRigidComponent],
+    replacement_components: Iterable[RasterizedRigidComponent],
+    *,
+    dynamic_class_ids: Sequence[int],
+    free_label: int = 17,
+    grid: OccupancyGrid = OccupancyGrid(),
+) -> np.ndarray:
+    """A1 diagnostic: legacy CLEAR plus replacement WRITE in input/source order.
+
+    No source, baseline mask, prediction, or clear rule is changed.  Callers are
+    responsible for supplying ``replacement_components`` in the original Strong
+    source order.  This isolates WRITE ordering from the much larger STPN
+    background/rest/ordered-compositor migration.
+    """
+    return _compose_component_replacements_impl(
+        anchor_occ,
+        baseline_components,
+        replacement_components,
+        dynamic_class_ids=dynamic_class_ids,
+        free_label=int(free_label),
+        grid=grid,
+        preserve_replacement_order=True,
+    )
