@@ -18,11 +18,26 @@ def test_zero_delta_identity_uses_canonical_protocol_horizons_under_timestamp_ji
     hist[-2,5:8,5:7,2]=4;hist[-1,6:9,5:7,2]=4
     poses=[pose(tx=.01*i,yaw=.005*i) for i in range(6)];future=[pose(tx=.09+.025*i,ty=-.01*i,yaw=.04+.01*i) for i in range(6)]
     ht=np.array([0.000,0.503,1.001,1.500,2.004,2.501],dtype=float)
-    # All deviations are within the accepted 50 ms cadence tolerance, but are
-    # deliberately non-canonical so using raw timestamp differences would no
-    # longer reproduce Strong-W2Det's frozen (i+1)*0.5 s propagation contract.
+    # Every adjacent interval stays within the 50 ms cadence tolerance, while
+    # the timestamps are deliberately non-canonical. KTA propagation must still
+    # use Strong-W2Det's frozen (i+1)*0.5 s horizons.
     ft=np.array([3.008,3.497,4.012,4.496,5.011,5.498],dtype=float)
     c=CausalInputs('s:jitter','s',hist,np.ones_like(hist,dtype=bool),tuple(poses),tuple(future),ht,ft)
+    dec=decompose_strong_sources(c,grid=grid,cfg=cfg,frame_dt_s=.5,crop_radius_limit_m=11.2)
+    assert np.array_equal(dec.horizons_s,np.arange(1,7,dtype=float)*.5)
+    got=hard_kta_identity(c,dec,grid=grid);ref=strong_w2det_sequence(hist,poses,future,frame_dt_s=.5,grid=grid,cfg=cfg)
+    assert np.array_equal(got,ref),np.count_nonzero(got!=ref)
+def test_cadence_validation_is_per_step_not_cumulative_from_t0():
+    grid=OccupancyGrid(-4,-4,-1,(.4,.4,.4),(20,20,8));cfg=StrongW2DetConfig();hist=np.full((6,*grid.shape_hwd),17,dtype=np.uint8)
+    hist[-2,5:8,5:7,2]=4;hist[-1,6:9,5:7,2]=4
+    poses=[pose() for _ in range(6)];future=[pose() for _ in range(6)]
+    ht=np.arange(6,dtype=float)*.5
+    # Each future interval is 0.54 s, which the manifest accepts because every
+    # individual step is within 0.5 +/- 0.05 s. The cumulative drift reaches
+    # 0.24 s by horizon 6 and must not be rejected by source decomposition.
+    ft=ht[-1]+np.arange(1,7,dtype=float)*.54
+    assert np.max(np.abs((ft-(ht[-1]+np.arange(1,7)*.5))))>.05
+    c=CausalInputs('s:cumulative-drift','s',hist,np.ones_like(hist,dtype=bool),tuple(poses),tuple(future),ht,ft)
     dec=decompose_strong_sources(c,grid=grid,cfg=cfg,frame_dt_s=.5,crop_radius_limit_m=11.2)
     assert np.array_equal(dec.horizons_s,np.arange(1,7,dtype=float)*.5)
     got=hard_kta_identity(c,dec,grid=grid);ref=strong_w2det_sequence(hist,poses,future,frame_dt_s=.5,grid=grid,cfg=cfg)
