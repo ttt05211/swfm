@@ -360,6 +360,16 @@ class LocalSpatialTemporalWorldModel(nn.Module):
             raise ValueError("semantic tube contains labels outside [0,17]")
 
         B = features.shape[0]
+        # Validation can legitimately contain windows with no Strong dynamic
+        # source. PyTorch SDPA rejects the resulting zero-sized attention batch,
+        # so preserve the semantic contract explicitly: no sources means no
+        # residual/existence predictions and the caller keeps the KTA anchor.
+        if B == 0:
+            return {
+                "residual_xy_m": features.new_empty((0, FUTURE_FRAMES, 2)),
+                "existence_logits": features.new_empty((0, FUTURE_FRAMES)),
+            }
+
         emb = self.semantic_embedding(labels)  # [B,T,H,W,E]
         x = emb.permute(0, 1, 4, 2, 3).reshape(
             B * HISTORY_FRAMES, cfg.semantic_dim, cfg.tube_hw, cfg.tube_hw
