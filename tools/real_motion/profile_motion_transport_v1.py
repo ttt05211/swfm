@@ -63,7 +63,7 @@ def _pass(cfg,source,train_ds,ctx,lambda_ref,checkpointing,warmup,measure,seed):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--config',default=None);p.add_argument('--override',action='append',default=[]);p.add_argument('--output-dir',default=None);p.add_argument('--dev-max-windows',type=int,default=None);p.add_argument('--force-checkpointing',choices=('auto','on','off'),default='auto');p.add_argument('--formal-server-gate',action='store_true',help='lock a full-dev CUDA/BF16 profile for the GPU count used by this launch (1 or 2)');a=p.parse_args();cfg=load_config(a.config,a.override);ctx=init_distributed(require_cuda=a.formal_server_gate)
     if ctx.world_size not in (1,2):raise RuntimeError('MT-V1 supports 1 or 2 GPUs')
-    formal_env=formal_server_environment(ctx,cfg,require_world_size=False,require_gpu_type=False) if a.formal_server_gate else {'torch':torch.__version__,'cuda_build':torch.version.cuda,'world_size':ctx.world_size,'device':str(ctx.device)}
+    formal_env=formal_server_environment(ctx,cfg,require_world_size=False,require_gpu_type=False) if a.formal_server_gate else {'torch':str(torch.__version__),'cuda_build':None if torch.version.cuda is None else str(torch.version.cuda),'world_size':int(ctx.world_size),'device':str(ctx.device)}
     if a.formal_server_gate and a.dev_max_windows is not None:raise RuntimeError('formal profile requires full dev; remove --dev-max-windows')
     seed=int(get(cfg,'training.initial_seed',3407));seed_all(seed);dr,info,manifest,msp=[get(cfg,x) for x in ('paths.dataroot','paths.info_pkl','paths.manifest','paths.msp_checkpoint')]
     if not all((dr,info,manifest,msp)):raise RuntimeError('profile runtime paths incomplete')
