@@ -64,6 +64,19 @@ def test_fresh_local_stwm_is_exact_kta_residual_zero():
     assert torch.equal(out["existence_logits"], torch.zeros_like(out["existence_logits"]))
 
 
+def test_local_stwm_accepts_zero_source_window():
+    cfg = LocalSTWMConfig(d_model=32, semantic_dim=8, heads=4, blocks=1, decoder_blocks=1, tube_hw=20)
+    model = LocalSpatialTemporalWorldModel(cfg)
+    features = torch.empty((0, FEATURE_DIM), dtype=torch.float32)
+    tube = torch.empty((0, HISTORY_FRAMES, 20, 20), dtype=torch.uint8)
+    kta = torch.empty((0, FUTURE_FRAMES, 2), dtype=torch.float32)
+    out = model(features, tube, kta)
+    assert out["residual_xy_m"].shape == (0, FUTURE_FRAMES, 2)
+    assert out["existence_logits"].shape == (0, FUTURE_FRAMES)
+    assert out["residual_xy_m"].dtype == features.dtype
+    assert out["existence_logits"].dtype == features.dtype
+
+
 def test_local_stwm_backpropagates_after_zero_head():
     cfg = LocalSTWMConfig(d_model=32, semantic_dim=8, heads=4, blocks=1, decoder_blocks=1, tube_hw=20)
     model = LocalSpatialTemporalWorldModel(cfg)
