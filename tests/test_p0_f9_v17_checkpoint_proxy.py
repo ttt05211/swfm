@@ -1,8 +1,12 @@
 import math
 
+import torch
+
+from real_motion.local_st_world_model_v17 import soft_transport_overlap_loss
 from tools.real_motion.diagnose_p0_f9_v17_checkpoint_proxy import (
     _corr,
     _rankdata,
+    _transport_iou_per_label,
     aggregate_proxy_samples,
 )
 
@@ -31,3 +35,35 @@ def test_spearman_via_rank_correlation_detects_matching_order():
     a = _rankdata([0.2, 0.8, 0.5, 1.0])
     b = _rankdata([2.0, 8.0, 5.0, 10.0])
     assert math.isclose(_corr(a, b), 1.0, rel_tol=0.0, abs_tol=1e-12)
+
+
+def test_proxy_soft_iou_matches_training_overlap_contract():
+    pred = torch.zeros(2, 6, 2)
+    target = torch.zeros_like(pred)
+    pred[0, :, 0] = 0.8
+    pred[1, :, 1] = -0.4
+    mask = torch.zeros(2, 20, 20)
+    mask[0, 8:12, 8:12] = 1.0
+    mask[1, 9:12, 7:13] = 1.0
+    valid = torch.ones(2, 6, dtype=torch.bool)
+
+    _, stats = soft_transport_overlap_loss(
+        pred,
+        target,
+        mask,
+        valid,
+        patch_resolution_m=0.8,
+    )
+    soft, _, present = _transport_iou_per_label(
+        pred - target,
+        mask,
+        patch_resolution_m=0.8,
+    )
+    usable = valid & present[:, None]
+    assert int(usable.sum()) == int(stats["transport_overlap_labels"])
+    assert math.isclose(
+        float(soft[usable].mean()),
+        float(stats["transport_soft_iou"]),
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    )
