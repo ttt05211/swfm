@@ -12,7 +12,14 @@ def _stable_last_write(out,idx,labels):
     if len(idx)==0:return
     _,Y,Z=out.shape;flat=(idx[:,0]*Y+idx[:,1])*Z+idx[:,2];seq=np.arange(len(flat),dtype=np.int64);order=np.lexsort((seq,flat));sf=flat[order];last=np.ones(len(order),bool);last[:-1]=sf[:-1]!=sf[1:];q=idx[order[last]];out[q[:,0],q[:,1],q[:,2]]=labels[order[last]]
 def predicted_source_points_world(source,horizon_s,delta,t0_pose):
-    d=np.asarray(delta,dtype=np.float64);yaw=float(d[2]);c,s=math.cos(yaw),math.sin(yaw);R=np.asarray([[c,-s,0],[s,c,0],[0,0,1.]],dtype=np.float64);rel=source.points_world-source.centroid_world[None];dW=f_to_world_matrix(t0_pose)[:3,:3]@np.asarray([d[0],d[1],0.]);return source.centroid_world[None]+source.velocity_world[None]*float(horizon_s)+rel@R.T+dW[None]
+    d=np.asarray(delta,dtype=np.float64)
+    # The zero-correction path is a contract, not merely a mathematical limit:
+    # it must reproduce Strong-W2Det/KTA bit-for-bit.  Avoid subtracting and
+    # re-adding the centroid at delta==0, because that otherwise introduces tiny
+    # floating-point reconstruction error before the final voxel floor.
+    if bool(np.all(d==0)):
+        return np.asarray(source.points_world,dtype=np.float64)+np.asarray(source.velocity_world,dtype=np.float64)[None]*float(horizon_s)
+    yaw=float(d[2]);c,s=math.cos(yaw),math.sin(yaw);R=np.asarray([[c,-s,0],[s,c,0],[0,0,1.]],dtype=np.float64);rel=source.points_world-source.centroid_world[None];dW=f_to_world_matrix(t0_pose)[:3,:3]@np.asarray([d[0],d[1],0.]);return source.centroid_world[None]+source.velocity_world[None]*float(horizon_s)+rel@R.T+dW[None]
 def compose_hard(causal,decomp,deltas,selected_source_ids,*,grid):
     selected=list(map(int,selected_source_ids));dnp=deltas.detach().float().cpu().numpy() if torch.is_tensor(deltas) else np.asarray(deltas,float)
     if dnp.shape!=(len(selected),len(decomp.horizons_s),3):raise ValueError('delta shape mismatch')
