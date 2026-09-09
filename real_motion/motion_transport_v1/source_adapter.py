@@ -12,9 +12,15 @@ from .geometry import index_to_metric_center,transform_points,source_bbox_F,worl
 
 def _validate_times(causal,expected_dt_s,tolerance_s=.05):
     ht=np.asarray(causal.history_timestamps_s,float);ft=np.asarray(causal.future_timestamps_s,float)
+    # Match the manifest contract: validate every adjacent keyframe interval,
+    # not cumulative distance from t0.  Real nuScenes keyframes can each be a
+    # few milliseconds off the nominal 0.5 s cadence, so cumulative drift over
+    # six future frames can legitimately exceed the per-step 50 ms tolerance.
     if len(ht)>1 and np.max(np.abs(np.diff(ht)-expected_dt_s))>tolerance_s:raise ValueError('history cadence mismatch')
-    expected=ht[-1]+np.arange(1,len(ft)+1)*expected_dt_s
-    if len(ft) and np.max(np.abs(ft-expected))>tolerance_s:raise ValueError('future cadence mismatch')
+    if len(ft):
+        if len(ht)==0:raise ValueError('future timestamps require a history t0')
+        future_steps=np.diff(np.concatenate(([ht[-1]],ft)))
+        if np.max(np.abs(future_steps-expected_dt_s))>tolerance_s:raise ValueError('future cadence mismatch')
 
 def decompose_strong_sources(causal,*,grid:OccupancyGrid,cfg:StrongW2DetConfig,frame_dt_s=.5,crop_radius_limit_m=11.2):
     frame_dt_s=float(frame_dt_s);_validate_times(causal,frame_dt_s);hist=np.asarray(causal.history_semantics);sem0,prev=hist[-1],hist[-2];T0=np.asarray(causal.history_ego_to_world[-1],float);Tp=np.asarray(causal.history_ego_to_world[-2],float)
