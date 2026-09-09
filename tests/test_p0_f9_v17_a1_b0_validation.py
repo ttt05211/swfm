@@ -74,10 +74,11 @@ def test_a1_matches_legacy_when_replacements_do_not_collide():
 def test_exact_source_mask_aligns_to_common_pooled_coordinates():
     grid = _grid()
     # Center 0.2 m lies in native cell (5,5) for x_min=y_min=-2 at 0.4 m.
-    # Four exact XY cells form one 0.8 m pooled support cell.
+    # With the 4 m local patch starting at native cell (0,0), cells 4/5 form
+    # one 2x2 block and therefore one 0.8 m pooled support cell.
     voxels = np.asarray(
         [
-            [5, 5, 0], [5, 6, 0], [6, 5, 1], [6, 6, 1],
+            [4, 4, 0], [4, 5, 0], [5, 4, 1], [5, 5, 1],
         ],
         dtype=np.int64,
     )
