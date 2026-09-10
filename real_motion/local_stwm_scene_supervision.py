@@ -280,7 +280,10 @@ def sparse_full_scene_ce_ordered(
     device = pred.device
     dyn = np.asarray(tuple(int(x) for x in DYNAMIC_CLASS_IDS), dtype=np.int64)
     full_count = int(np.prod(grid.shape_hwd))
-    corr_ce = -math.log(max(1.0 - class_count * float(eps), float(eps)))
+    # q = (1 - C*eps) * p + eps is normalized when p sums to one.  A one-hot
+    # correct prediction therefore assigns the target class 1-(C-1)*eps.
+    # Use that same convention for the constant outside-query KTA term.
+    corr_ce = -math.log(max(1.0 - (class_count - 1) * float(eps), float(eps)))
     wrong_ce = -math.log(float(eps))
     losses: list[torch.Tensor] = []
     rows: list[dict] = []
@@ -337,7 +340,6 @@ def sparse_full_scene_ce_ordered(
             clear_dyn = np.isin(base_labels[pos], dyn)
             base_labels[pos[clear_dyn]] = int(free_label)
 
-        uf = torch.as_tensor(U, device=device, dtype=torch.long)
         P = F.one_hot(
             torch.as_tensor(base_labels, device=device, dtype=torch.long),
             num_classes=int(class_count),
