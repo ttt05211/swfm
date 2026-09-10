@@ -52,9 +52,10 @@ def test_sparse_scene_ce_matches_correct_full_scene_at_identity():
         eps=1e-4,
         jitter_voxels=0.0,
     )
-    # Every voxel is predicted with its GT class.  Epsilon-smoothed correct CE
-    # is therefore the full-scene value, independent of sparse query size.
-    expected = -math.log(1.0 - 18.0e-4)
+    # q = (1 - C*eps) * p + eps is a normalized C-way distribution when
+    # p sums to one.  For a one-hot correct prediction the target probability
+    # is therefore 1 - (C-1)*eps, both inside and outside the sparse query.
+    expected = -math.log(1.0 - 17.0e-4)
     assert math.isclose(float(result.loss.detach()), expected, rel_tol=2e-5, abs_tol=2e-6)
     assert 0 < result.query_voxels < result.full_voxels
 
