@@ -88,6 +88,8 @@ def main():
     p = argparse.ArgumentParser()
     add_config_args(p)
     p.add_argument("--v17-train-cache", required=True)
+    p.add_argument("--v17-val-cache", required=True,
+                   help="used only to assert train/val scene disjointness before materializing GT")
     p.add_argument("--dataroot", required=True)
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output-dir", required=True)
@@ -99,7 +101,14 @@ def main():
 
     cfg = load_runtime_config(a.config, a.override)
     pcfg = make_prepare_config(cfg)
-    meta, records = load_cache(a.v17_train_cache)
+    train_meta, records = load_cache(a.v17_train_cache)
+    _, val_records = load_cache(a.v17_val_cache)
+    train_scenes_all = {str(r["scene_name"]) for r in records}
+    val_scenes = {str(r["scene_name"]) for r in val_records}
+    overlap = sorted(train_scenes_all & val_scenes)
+    if overlap:
+        raise RuntimeError(f"V17 train/val scene overlap before C cache build: {overlap[:5]}")
+
     selected_idx = scene_balanced_indices(records, len(records) if a.max_windows < 0 else a.max_windows)
     selected = [records[i] for i in selected_idx]
     if not selected:
@@ -107,6 +116,9 @@ def main():
     sample_ids = [str(r["sample_id"]) for r in selected]
     if len(sample_ids) != len(set(sample_ids)):
         raise RuntimeError("selected V17 sample ids are not unique")
+    selection_scenes = sorted({str(r["scene_name"]) for r in selected})
+    if set(selection_scenes) & val_scenes:
+        raise RuntimeError("selected C scene cache intersects V17 validation scenes")
 
     source = NuScenesWindowSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
@@ -204,7 +216,6 @@ def main():
             )
     flush()
 
-    selection_scenes = sorted({str(r["scene_name"]) for r in selected})
     index = {
         "version": SCENE_CACHE_VERSION,
         "metadata": {
@@ -212,8 +223,10 @@ def main():
             "scene_query_contract": SCENE_QUERY_CONTRACT,
             "selection_contract": SELECTION_CONTRACT,
             "selection_sample_ids_sha256": _ids_digest(selected),
-            "v17_cache_version": meta.get("representation_contract"),
+            "v17_representation_contract": train_meta.get("representation_contract"),
             "source_v17_train_cache": str(Path(a.v17_train_cache).resolve()),
+            "source_v17_val_cache": str(Path(a.v17_val_cache).resolve()),
+            "train_val_scene_overlap_checked": True,
             "num_windows": len(selected),
             "num_scenes": len(selection_scenes),
             "num_sources": int(total_sources),
