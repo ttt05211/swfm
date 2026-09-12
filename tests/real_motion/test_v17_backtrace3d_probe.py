@@ -9,7 +9,7 @@ from real_motion.local_st_world_model_v17 import (
     LocalSpatialTemporalWorldModelV17,
     LocalSTWMV17Config,
 )
-from real_motion.motion_transport import FEATURE_DIM
+from real_motion.motion_transport import FEATURE_DIM, FEATURE_NAMES
 from real_motion.v17_backtrace3d_probe import (
     Backtrace3DProbeConfig,
     LocalSpatialTemporalWorldModelV17Backtrace3D,
@@ -48,6 +48,41 @@ def test_gamma_zero_is_exact_v17():
             x["frame_motion"], x["source_mask"],
             branch_gamma=0.0,
         )
+    assert torch.equal(a["residual_xy_m"], b["residual_xy_m"])
+    assert torch.equal(a["existence_logits"], b["existence_logits"])
+
+
+def test_gamma_one_zero_init_branch_is_exact_v17():
+    torch.manual_seed(11)
+    cfg = LocalSTWMV17Config()
+    base = LocalSpatialTemporalWorldModelV17(cfg).eval()
+    treatment = LocalSpatialTemporalWorldModelV17Backtrace3D(
+        cfg, Backtrace3DProbeConfig(source_microbatch=1)
+    ).eval()
+    missing, unexpected = treatment.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected
+    assert missing
+    x = _inputs(batch=1)
+    semantics = torch.randint(0, 19, (1, 6, 64, 64, 16), dtype=torch.uint8)
+    valid = torch.ones_like(semantics, dtype=torch.bool)
+    source_mask = torch.zeros((1, 64, 64), dtype=torch.bool)
+    source_mask[:, 31:34, 29:35] = True
+    relative_times = torch.tensor([[-2.5, -2.0, -1.5, -1.0, -0.5, 0.0]])
+    with torch.no_grad():
+        a = base(
+            x["features"], x["tube"], x["kta"],
+            x["frame_motion"], x["source_mask"],
+        )
+        b = treatment(
+            x["features"], x["tube"], x["kta"],
+            x["frame_motion"], x["source_mask"],
+            backtrace_semantics=semantics,
+            backtrace_valid=valid,
+            backtrace_source_mask=source_mask,
+            backtrace_relative_times=relative_times,
+            branch_gamma=1.0,
+        )
+    assert torch.count_nonzero(b["backtrace3d_query_residual"]) == 0
     assert torch.equal(a["residual_xy_m"], b["residual_xy_m"])
     assert torch.equal(a["existence_logits"], b["existence_logits"])
 
@@ -106,6 +141,77 @@ def test_backtrace_crop_cuda_matches_cpu_identity():
     rec["native_source_footprint_mask"][0, 20, 20] = 1
     src = _FakeSource(sem, valid)
     cpu = build_kta_backtrace_3d_crops(src, rec, [0], grid=grid, frame_dt_s=0.5)
+    gpu = build_kta_backtrace_3d_crops(
+        src, rec, [0], grid=grid, frame_dt_s=0.5, device="cuda"
+    )
+    assert torch.equal(cpu["semantics"], gpu["semantics"].cpu())
+    assert torch.equal(cpu["valid"], gpu["valid"].cpu())
+    assert torch.equal(cpu["source_mask"], gpu["source_mask"].cpu())
+    assert torch.equal(cpu["relative_times"], gpu["relative_times"].cpu())
+
+
+class _FakeSequenceSource:
+    def __init__(self, sem_by_token, valid_by_token, pose_by_token):
+        self.sem_by_token = sem_by_token
+        self.valid_by_token = valid_by_token
+        self.pose_by_token = pose_by_token
+
+    def load_occ3d(self, scene_name, token, require_lidar_mask=True):
+        return self.sem_by_token[token], self.valid_by_token[token]
+
+    def pose(self, token):
+        return self.pose_by_token[token]
+
+
+def _pose(yaw_rad, tx, ty):
+    c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+    T = np.eye(4, dtype=np.float64)
+    T[:2, :2] = np.asarray([[c, -s], [s, c]], dtype=np.float64)
+    T[0, 3] = float(tx)
+    T[1, 3] = float(ty)
+    return T
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_backtrace_crop_cuda_matches_cpu_asymmetric_motion_pose():
+    grid = OccupancyGrid()
+    ix = np.arange(grid.shape_hwd[0], dtype=np.int64)[:, None, None]
+    iy = np.arange(grid.shape_hwd[1], dtype=np.int64)[None, :, None]
+    iz = np.arange(grid.shape_hwd[2], dtype=np.int64)[None, None, :]
+    sem = ((3 * ix + 5 * iy + 7 * iz) % 17).astype(np.uint8)
+    # Make two strongly asymmetric landmarks explicit as well.
+    sem[121, 73, 6] = 4
+    sem[84, 137, 11] = 7
+    valid = np.ones(grid.shape_hwd, dtype=bool)
+
+    rec = _fake_record()
+    rec["source_centroid_xy_t0_m"][0] = torch.tensor([0.0, 0.0])
+    vx = FEATURE_NAMES.index("current_vx_norm")
+    vy = FEATURE_NAMES.index("current_vy_norm")
+    # v13 normalization is /20 m/s => +/-0.8 m/s. Every 0.5 s is one
+    # native 0.4 m cell, so the test exercises non-zero KTA backtracing.
+    rec["features"][0, vx] = 0.04
+    rec["features"][0, vy] = -0.04
+    rec["native_source_footprint_mask"][0, 17, 24] = 1
+
+    tokens = rec["history_tokens"]
+    t0 = _pose(np.pi / 2.0, 0.8, -0.4)
+    poses = {
+        tokens[0]: np.eye(4, dtype=np.float64),
+        tokens[1]: np.eye(4, dtype=np.float64),
+        tokens[2]: _pose(np.pi / 2.0, 0.4, -0.8),
+        tokens[3]: _pose(np.pi / 2.0, 0.4, -0.8),
+        tokens[4]: t0,
+        tokens[5]: t0,
+    }
+    src = _FakeSequenceSource(
+        {t: sem for t in tokens},
+        {t: valid for t in tokens},
+        poses,
+    )
+    cpu = build_kta_backtrace_3d_crops(
+        src, rec, [0], grid=grid, frame_dt_s=0.5
+    )
     gpu = build_kta_backtrace_3d_crops(
         src, rec, [0], grid=grid, frame_dt_s=0.5, device="cuda"
     )
