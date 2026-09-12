@@ -247,6 +247,12 @@ def main():
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--match-max-distance-m", type=float, default=4.0)
+    p.add_argument(
+        "--min-matched-support-recall",
+        type=float,
+        default=0.50,
+        help="Below this Moving-support recall, yaw is diagnostically inconclusive and cannot be rejected.",
+    )
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--device", default="cuda")
     a = p.parse_args()
@@ -479,18 +485,41 @@ def main():
     yaw = _row(reports["v17_xy_gt_yaw"])
     gxy = _row(reports["gt_xy_fit"])
     grid = _row(reports["gt_rigid_fit"])
-    decision_gain = yaw["Moving"] - base["Moving"]
-    yaw_gtxy_gain = grid["Moving"] - gxy["Moving"]
-    if decision_gain < 0.20:
+    full_yaw_gain = yaw["Moving"] - base["Moving"]
+    full_yaw_gtxy_gain = grid["Moving"] - gxy["Moving"]
+    matched_base = float(matched_reports["v17_xy"]["mIoU"])
+    matched_yaw = float(matched_reports["v17_xy_gt_yaw"]["mIoU"])
+    matched_gxy = float(matched_reports["gt_xy_fit"]["mIoU"])
+    matched_grid = float(matched_reports["gt_rigid_fit"]["mIoU"])
+    matched_yaw_gain = matched_yaw - matched_base
+    matched_yaw_gtxy_gain = matched_grid - matched_gxy
+    matched_support_recall = support_inter / max(support_full, 1)
+
+    full_ph = reports["v17_xy_gt_yaw"]["moving"]["per_horizon"]
+    full_pb = reports["v17_xy"]["moving"]["per_horizon"]
+    matched_ph = matched_reports["v17_xy_gt_yaw"]["per_horizon"]
+    matched_pb = matched_reports["v17_xy"]["per_horizon"]
+    full_d2 = float(full_ph[2.0]["mIoU"] - full_pb[2.0]["mIoU"])
+    full_d3 = float(full_ph[3.0]["mIoU"] - full_pb[3.0]["mIoU"])
+    matched_d2 = float(matched_ph[2.0]["mIoU"] - matched_pb[2.0]["mIoU"])
+    matched_d3 = float(matched_ph[3.0]["mIoU"] - matched_pb[3.0]["mIoU"])
+
+    coverage_ok = (
+        np.isfinite(matched_yaw_gain)
+        and matched_support_recall >= float(a.min_matched_support_recall)
+    )
+    if not coverage_ok:
+        decision = "INCONCLUSIVE_LOW_MATCH_COVERAGE"
+        recommendation = "YAW_OPTIONAL"
+    elif full_yaw_gain < 0.20 and matched_yaw_gain < 0.20:
         decision = "NO_YAW_HEAD"
-    elif decision_gain > 0.50:
-        ph = reports["v17_xy_gt_yaw"]["moving"]["per_horizon"]
-        pb = reports["v17_xy"]["moving"]["per_horizon"]
-        d2 = float(ph[2.0]["mIoU"] - pb[2.0]["mIoU"])
-        d3 = float(ph[3.0]["mIoU"] - pb[3.0]["mIoU"])
-        decision = "ADD_YAW_HEAD" if d2 > 0 and d3 > 0 else "YAW_OPTIONAL"
+        recommendation = decision
+    elif matched_yaw_gain > 0.50 and matched_d2 > 0.0 and matched_d3 > 0.0:
+        decision = "ADD_YAW_HEAD"
+        recommendation = decision
     else:
         decision = "YAW_OPTIONAL"
+        recommendation = decision
 
     result = {
         "protocol": PROTOCOL,
@@ -510,16 +539,25 @@ def main():
             "full_voxels": support_full,
             "matched_voxels": support_matched,
             "intersection_voxels": support_inter,
-            "full_recall": support_inter / max(support_full, 1),
+            "full_recall": matched_support_recall,
             "matched_precision": support_inter / max(support_matched, 1),
         },
-        "yaw_gain_given_v17_xy_pp": decision_gain,
-        "yaw_gain_given_gt_xy_pp": yaw_gtxy_gain,
+        "full_yaw_gain_pp": full_yaw_gain,
+        "matched_yaw_gain_pp": matched_yaw_gain,
+        "full_yaw_gain_given_gt_xy_pp": full_yaw_gtxy_gain,
+        "matched_yaw_gain_given_gt_xy_pp": matched_yaw_gtxy_gain,
+        "full_yaw_gain_2s_pp": full_d2,
+        "full_yaw_gain_3s_pp": full_d3,
+        "matched_yaw_gain_2s_pp": matched_d2,
+        "matched_yaw_gain_3s_pp": matched_d3,
         "decision": decision,
-        "thresholds_pp": {
-            "no_yaw": 0.20,
-            "optional_upper": 0.50,
-            "formal_add_requires_2s_3s_positive": True,
+        "recommendation": recommendation,
+        "coverage_sufficient_for_rejection": bool(coverage_ok),
+        "thresholds": {
+            "no_yaw_gain_pp": 0.20,
+            "add_yaw_gain_pp": 0.50,
+            "formal_add_requires_matched_2s_3s_positive": True,
+            "min_matched_support_recall": float(a.min_matched_support_recall),
         },
     }
 
@@ -548,8 +586,14 @@ def main():
             vals[NUSCENES_LABELS[cid]] = float(np.mean(good)) if good else float("nan")
         print(name, json.dumps(vals))
     print(
-        f"\nyaw|V17={decision_gain:+.4f} pp "
-        f"yaw|GTXY={yaw_gtxy_gain:+.4f} pp decision={decision}"
+        f"\nfull_yaw_gain={full_yaw_gain:+.4f} pp "
+        f"matched_yaw_gain={matched_yaw_gain:+.4f} pp "
+        f"matched_support_recall={100*matched_support_recall:.2f}%"
+    )
+    print(
+        f"full_yaw|GTXY={full_yaw_gtxy_gain:+.4f} pp "
+        f"matched_yaw|GTXY={matched_yaw_gtxy_gain:+.4f} pp "
+        f"decision={decision} recommendation={recommendation}"
     )
     print(
         "source_match_fraction="
