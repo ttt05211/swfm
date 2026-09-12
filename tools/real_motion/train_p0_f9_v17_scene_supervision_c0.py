@@ -258,9 +258,12 @@ def main():
     if a.calibrate_only or a.arm=="C0-S":
         cal_loader=make_train_loader(a.paired_shuffle_seed)
         print("C0 source/scene alpha calibration ...",flush=True)
-        calibration=calibrate_c0(model,cal_loader,scene_ds,v17_by_id,device,pcfg=pcfg,amp=amp,cuda_prefetch=cuda_prefetch,
-            scene_batch_size=a.scene_batch_size,scene_seed=a.scene_seed,batches=a.calibration_batches,overlap_resolution_m=overlap_resolution_m,
-            halo_voxels=a.halo_voxels,eps=a.scene_eps,jitter=a.scene_jitter_voxels,target_ratio=a.calibration_target_ratio,max_alpha=a.max_calibrated_alpha)
+        # Calibration is diagnostic only. Restore the exact post-checkpoint RNG
+        # state so C0-S starts its source path identically to C0-C/B-C.
+        with preserve_rng_state(device):
+            calibration=calibrate_c0(model,cal_loader,scene_ds,v17_by_id,device,pcfg=pcfg,amp=amp,cuda_prefetch=cuda_prefetch,
+                scene_batch_size=a.scene_batch_size,scene_seed=a.scene_seed,batches=a.calibration_batches,overlap_resolution_m=overlap_resolution_m,
+                halo_voxels=a.halo_voxels,eps=a.scene_eps,jitter=a.scene_jitter_voxels,target_ratio=a.calibration_target_ratio,max_alpha=a.max_calibrated_alpha)
         payload={"preflight":preflight,"calibration":calibration}; print("=== C0 SCENE-LOSS CALIBRATION ==="); print(json.dumps(payload,indent=2),flush=True)
         print(f"recommended_scene_alpha={calibration['alpha']:.12g}",flush=True)
         if a.calibration_output:
@@ -276,7 +279,9 @@ def main():
     target_steps=max_available_steps if int(a.max_steps)==0 else min(int(a.max_steps),max_available_steps)
     if target_steps<=0:raise RuntimeError("C0 target step count is empty")
     warmup_steps=max(1,int(round(float(a.scene_warmup_fraction)*target_steps)))
-    _reset_seeds(a.paired_shuffle_seed); train_loader=make_train_loader(a.paired_shuffle_seed)
+    # Do not reseed global model RNG here: historical B-C continues from the
+    # post-model-load RNG state. The DataLoader permutation has its own generator.
+    train_loader=make_train_loader(a.paired_shuffle_seed)
     scene_state=_scene_state(scene_ds,v17_by_id,scene_batch_size=a.scene_batch_size,scene_seed=a.scene_seed) if a.arm=="C0-S" else None
 
     local_step=0; global_step=start_step; last_completed_epoch=EXPECTED_START_EPOCH; history=[]; run_started=time.perf_counter(); stop=False
