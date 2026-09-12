@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 import pytest
 import torch
@@ -10,6 +11,9 @@ from real_motion.local_st_world_model_v17 import (
     LocalSTWMV17Config,
 )
 from real_motion.motion_transport import FEATURE_DIM, FEATURE_NAMES
+from tools.real_motion.diagnose_p0_f9_v17_yaw_oracle import _decide_yaw
+from tools.real_motion.summarize_p0_f9_v17_backtrace3d_probe import _load as _load_summary_row
+
 from real_motion.v17_backtrace3d_probe import (
     Backtrace3DProbeConfig,
     LocalSpatialTemporalWorldModelV17Backtrace3D,
@@ -219,3 +223,99 @@ def test_backtrace_crop_cuda_matches_cpu_asymmetric_motion_pose():
     assert torch.equal(cpu["valid"], gpu["valid"].cpu())
     assert torch.equal(cpu["source_mask"], gpu["source_mask"].cpu())
     assert torch.equal(cpu["relative_times"], gpu["relative_times"].cpu())
+
+
+def test_yaw_add_requires_full_deployment_gain():
+    decision, recommendation = _decide_yaw(
+        coverage_ok=True,
+        full_yaw_gain=-0.10,
+        matched_yaw_gain=0.80,
+        full_d2=0.20,
+        full_d3=0.20,
+        matched_d2=0.40,
+        matched_d3=0.40,
+    )
+    assert decision == "YAW_OPTIONAL"
+    assert recommendation == "YAW_OPTIONAL"
+
+    decision, recommendation = _decide_yaw(
+        coverage_ok=True,
+        full_yaw_gain=0.60,
+        matched_yaw_gain=0.10,
+        full_d2=0.05,
+        full_d3=0.07,
+        matched_d2=0.01,
+        matched_d3=0.02,
+    )
+    assert decision == "ADD_YAW_HEAD"
+    assert recommendation == "ADD_YAW_HEAD"
+
+
+def test_yaw_low_coverage_is_inconclusive():
+    decision, recommendation = _decide_yaw(
+        coverage_ok=False,
+        full_yaw_gain=1.0,
+        matched_yaw_gain=1.0,
+        full_d2=1.0,
+        full_d3=1.0,
+        matched_d2=1.0,
+        matched_d3=1.0,
+    )
+    assert decision == "INCONCLUSIVE_LOW_MATCH_COVERAGE"
+    assert recommendation == "YAW_OPTIONAL"
+
+
+def test_summary_identity_keeps_train_cache_and_branch_seed(tmp_path):
+    report = {
+        "protocol": "p0_f9_v17_local_stwm_rigid_transport_eval_v3",
+        "checkpoint_protocol": "p0_f9_v17_local_spatial_temporal_world_model_v1",
+        "backtrace3d_enabled": False,
+        "variant": "RL",
+        "use_representation": True,
+        "overlap_weight": 0.25,
+        "local_stwm_cache": "/val/nativefp.pt",
+        "p0f9_cache": "/val/p0f9",
+        "num_windows": 128,
+        "target_contract": "target",
+        "representation_contract": "representation",
+        "occupancy_iou_contract": "occ",
+        "a1_write_order_contract": "a1",
+        "free_label": 17,
+        "model_config": {"d_model": 128},
+        "fast_probe_continuation": {
+            "protocol": "p0_f9_v17_backtrace3d_paired_probe_train_v1",
+            "arm": "control",
+            "resume_checkpoint": "/start/epoch_0005.pt",
+            "train_cache": "/train/nativefp.pt",
+            "start_epoch": 5,
+            "local_step": 300,
+            "paired_shuffle_seed": 20260910,
+            "branch_seed": 20260912,
+            "source_batch_size": 256,
+            "source_batch_contract": "paired-v1",
+            "loss_contract": "L_pos+L_exist+0.25L_overlap",
+            "branch_gamma_warmup_steps": 20,
+            "scene_ce": False,
+            "msp_routing": False,
+        },
+        "reports": {
+            "local_stwm_center_always_source_order": {
+                "occupancy": {"IoU": 50.0},
+                "overall": {"mIoU": 40.0},
+                "moving": {
+                    "mIoU": 20.0,
+                    "per_horizon": {
+                        "1.0": {"mIoU": 30.0},
+                        "2.0": {"mIoU": 20.0},
+                        "3.0": {"mIoU": 10.0},
+                    },
+                },
+            }
+        },
+        "diagnostics": {"learned_ade_m": 0.5, "learned_fde_m": 1.0},
+    }
+    path = tmp_path / "control300.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    row = _load_summary_row(path, expected_arm="control", expected_step=300)
+    assert row["identity"]["train_cache"] == "/train/nativefp.pt"
+    assert row["identity"]["branch_seed"] == 20260912
