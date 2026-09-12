@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize the paired V17 control/backtrace3D fast probe."""
+"""Fail-closed summary for the paired V17 control/backtrace3D fast probe."""
 from __future__ import annotations
 
 import argparse
@@ -7,22 +7,85 @@ import json
 from pathlib import Path
 
 BRANCH = "local_stwm_center_always_source_order"
+EVAL_PROTOCOL = "p0_f9_v17_local_stwm_rigid_transport_eval_v3"
+TRAIN_PROTOCOL = "p0_f9_v17_backtrace3d_paired_probe_train_v1"
+CONTROL_CHECKPOINT_PROTOCOL = "p0_f9_v17_local_spatial_temporal_world_model_v1"
+TREATMENT_CHECKPOINT_PROTOCOL = "p0_f9_v17_backtrace3d_query_residual_probe_v1"
+LOSS_CONTRACT = "L_pos+L_exist+0.25L_overlap"
 
 
 def _hrow(mapping, h):
-    return mapping.get(float(h), mapping.get(str(float(h))))
+    row = mapping.get(float(h), mapping.get(str(float(h))))
+    if row is None:
+        raise RuntimeError(f"missing horizon {h}")
+    return row
 
 
-def _load(path):
-    x = json.loads(Path(path).read_text(encoding="utf-8"))
+def _require(cond, message):
+    if not cond:
+        raise RuntimeError("PAIRING VALIDATION FAILED: " + message)
+
+
+def _load(path, *, expected_arm: str, expected_step: int):
+    p = Path(path)
+    x = json.loads(p.read_text(encoding="utf-8"))
+    _require(x.get("protocol") == EVAL_PROTOCOL, f"{p}: evaluator protocol mismatch")
+    cont = x.get("fast_probe_continuation")
+    _require(isinstance(cont, dict), f"{p}: missing fast_probe_continuation")
+    _require(cont.get("protocol") == TRAIN_PROTOCOL, f"{p}: training protocol mismatch")
+    _require(cont.get("arm") == expected_arm, f"{p}: arm={cont.get('arm')} expected={expected_arm}")
+    _require(int(cont.get("start_epoch", -1)) == 5, f"{p}: start_epoch must be 5")
+    _require(int(cont.get("local_step", -1)) == int(expected_step),
+             f"{p}: local_step={cont.get('local_step')} expected={expected_step}")
+    _require(int(cont.get("source_batch_size", -1)) == 256, f"{p}: source batch must be 256")
+    _require(cont.get("loss_contract") == LOSS_CONTRACT, f"{p}: loss contract mismatch")
+    _require(cont.get("scene_ce") is False, f"{p}: scene_ce must be false")
+    _require(cont.get("msp_routing") is False, f"{p}: msp_routing must be false")
+    _require(bool(cont.get("source_batch_contract")), f"{p}: missing source_batch_contract")
+    _require(cont.get("paired_shuffle_seed") is not None, f"{p}: missing paired_shuffle_seed")
+    _require(bool(cont.get("resume_checkpoint")), f"{p}: missing resume_checkpoint")
+
+    ck_protocol = x.get("checkpoint_protocol")
+    expected_ck = (
+        CONTROL_CHECKPOINT_PROTOCOL if expected_arm == "control"
+        else TREATMENT_CHECKPOINT_PROTOCOL
+    )
+    _require(ck_protocol == expected_ck, f"{p}: checkpoint protocol {ck_protocol} != {expected_ck}")
+    _require(bool(x.get("backtrace3d_enabled")) == (expected_arm == "backtrace3d"),
+             f"{p}: backtrace3d_enabled inconsistent with arm")
+    _require(str(x.get("variant")) == "RL", f"{p}: variant must be RL")
+    _require(bool(x.get("use_representation")), f"{p}: representation must be enabled")
+    _require(abs(float(x.get("overlap_weight", -1.0)) - 0.25) <= 1e-12,
+             f"{p}: overlap weight must be 0.25")
+
     r = (x.get("reports") or {}).get(BRANCH)
-    if r is None:
-        raise RuntimeError(f"{path}: missing {BRANCH}")
+    _require(r is not None, f"{p}: missing report branch {BRANCH}")
     mov = r["moving"]
     occ = r["occupancy"]
     return {
-        "path": str(path),
-        "checkpoint_protocol": x.get("checkpoint_protocol"),
+        "path": str(p),
+        "identity": {
+            "evaluator_protocol": x.get("protocol"),
+            "checkpoint_protocol": ck_protocol,
+            "arm": cont.get("arm"),
+            "resume_checkpoint": cont.get("resume_checkpoint"),
+            "start_epoch": int(cont.get("start_epoch")),
+            "local_step": int(cont.get("local_step")),
+            "paired_shuffle_seed": int(cont.get("paired_shuffle_seed")),
+            "source_batch_size": int(cont.get("source_batch_size")),
+            "source_batch_contract": cont.get("source_batch_contract"),
+            "loss_contract": cont.get("loss_contract"),
+            "branch_gamma_warmup_steps": int(cont.get("branch_gamma_warmup_steps", -1)),
+            "local_stwm_cache": x.get("local_stwm_cache"),
+            "p0f9_cache": x.get("p0f9_cache"),
+            "num_windows": int(x.get("num_windows", -1)),
+            "target_contract": x.get("target_contract"),
+            "representation_contract": x.get("representation_contract"),
+            "occupancy_iou_contract": x.get("occupancy_iou_contract"),
+            "a1_write_order_contract": x.get("a1_write_order_contract"),
+            "free_label": int(x.get("free_label", -1)),
+            "model_config": x.get("model_config"),
+        },
         "IoU": float(occ["IoU"]),
         "mIoU": float(r["overall"]["mIoU"]),
         "Moving": float(mov["mIoU"]),
@@ -34,10 +97,73 @@ def _load(path):
     }
 
 
+def _validate_all(rows):
+    keys_same_across_all = (
+        "evaluator_protocol",
+        "resume_checkpoint",
+        "start_epoch",
+        "paired_shuffle_seed",
+        "source_batch_size",
+        "source_batch_contract",
+        "loss_contract",
+        "branch_gamma_warmup_steps",
+        "local_stwm_cache",
+        "p0f9_cache",
+        "num_windows",
+        "target_contract",
+        "representation_contract",
+        "occupancy_iou_contract",
+        "a1_write_order_contract",
+        "free_label",
+        "model_config",
+    )
+    names = tuple(rows)
+    ref = rows[names[0]]["identity"]
+    for name in names[1:]:
+        cur = rows[name]["identity"]
+        for key in keys_same_across_all:
+            _require(cur.get(key) == ref.get(key),
+                     f"{name}: {key} differs from {names[0]}")
+
+    for step in (300, 600):
+        c = rows[f"control_step{step}"]["identity"]
+        t = rows[f"treatment_step{step}"]["identity"]
+        _require(c["local_step"] == t["local_step"] == step,
+                 f"step{step}: local_step mismatch")
+        _require(c["arm"] == "control" and t["arm"] == "backtrace3d",
+                 f"step{step}: control/treatment arm mismatch")
+
+    _require(
+        rows["control_step300"]["identity"]["resume_checkpoint"]
+        == rows["control_step600"]["identity"]["resume_checkpoint"],
+        "control 300/600 start checkpoint differs",
+    )
+    _require(
+        rows["treatment_step300"]["identity"]["resume_checkpoint"]
+        == rows["treatment_step600"]["identity"]["resume_checkpoint"],
+        "treatment 300/600 start checkpoint differs",
+    )
+    return {
+        "status": "PASS",
+        "common_resume_checkpoint": ref["resume_checkpoint"],
+        "paired_shuffle_seed": ref["paired_shuffle_seed"],
+        "source_batch_size": ref["source_batch_size"],
+        "source_batch_contract": ref["source_batch_contract"],
+        "loss_contract": ref["loss_contract"],
+        "validation_cache": ref["local_stwm_cache"],
+        "p0f9_cache": ref["p0f9_cache"],
+        "num_windows": ref["num_windows"],
+        "evaluator_protocol": ref["evaluator_protocol"],
+    }
+
+
 def _delta(t, c):
     return {
         k: float(t[k] - c[k])
-        for k in ("IoU", "mIoU", "Moving", "Moving_1s", "Moving_2s", "Moving_3s", "ADE", "FDE")
+        for k in (
+            "IoU", "mIoU", "Moving", "Moving_1s", "Moving_2s", "Moving_3s",
+            "ADE", "FDE",
+        )
     }
 
 
@@ -62,15 +188,17 @@ def main():
     a = p.parse_args()
 
     rows = {
-        "control_step300": _load(a.control_300),
-        "treatment_step300": _load(a.treatment_300),
-        "control_step600": _load(a.control_600),
-        "treatment_step600": _load(a.treatment_600),
+        "control_step300": _load(a.control_300, expected_arm="control", expected_step=300),
+        "treatment_step300": _load(a.treatment_300, expected_arm="backtrace3d", expected_step=300),
+        "control_step600": _load(a.control_600, expected_arm="control", expected_step=600),
+        "treatment_step600": _load(a.treatment_600, expected_arm="backtrace3d", expected_step=600),
     }
+    pairing = _validate_all(rows)
     d300 = _delta(rows["treatment_step300"], rows["control_step300"])
     d600 = _delta(rows["treatment_step600"], rows["control_step600"])
     out = {
         "report_branch": BRANCH,
+        "pairing_validation": pairing,
         "rows": rows,
         "treatment_minus_control": {"step300": d300, "step600": d600},
         "decision": {
@@ -87,7 +215,9 @@ def main():
         },
     }
 
-    print("=== V17 BACKTRACE3D FAST PROBE ===")
+    print("=== PAIRING VALIDATION ===")
+    print(json.dumps(pairing, indent=2))
+    print("\n=== V17 BACKTRACE3D FAST PROBE ===")
     print(
         f"{'checkpoint':20s} {'IoU':>8s} {'mIoU':>8s} {'Moving':>8s} "
         f"{'M@1s':>8s} {'M@2s':>8s} {'M@3s':>8s} {'ADE':>8s} {'FDE':>8s}"
