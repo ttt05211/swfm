@@ -94,6 +94,7 @@ def build_kta_backtrace_3d_crops(
     *,
     grid: OccupancyGrid = OccupancyGrid(),
     frame_dt_s: float = 0.5,
+    device: torch.device | str | None = None,
 ):
     """Build causal full-height crops for selected V17 sources in one window.
 
@@ -139,6 +140,78 @@ def build_kta_backtrace_3d_crops(
 
     m = len(ids)
     cx, cy, cz = BACKTRACE3D_SHAPE
+
+    target_device = torch.device(device) if device is not None else torch.device("cpu")
+    if target_device.type != "cpu":
+        # Fast path: for each history frame, sample all sources from the same
+        # Occ3D volume in one 5D nearest-neighbour grid_sample call.  Input
+        # layout is [N,C,Z,Y,X]; output is converted back to [N,X,Y,Z].
+        src_t = torch.as_tensor(src_xy, device=target_device, dtype=torch.float32)
+        vel_t = torch.as_tensor(vel, device=target_device, dtype=torch.float32)
+        rel_t_t = torch.as_tensor(rel_t, device=target_device, dtype=torch.float32)
+        gx = (torch.arange(cx, device=target_device, dtype=torch.float32) - (cx - 1) / 2.0) * float(BACKTRACE3D_XY_RESOLUTION_M)
+        gy = (torch.arange(cy, device=target_device, dtype=torch.float32) - (cy - 1) / 2.0) * float(BACKTRACE3D_XY_RESOLUTION_M)
+        gz = float(grid.z_min) + (torch.arange(cz, device=target_device, dtype=torch.float32) + 0.5) * float(grid.voxel_size[2])
+        # grid_sample 5D output order is [D,H,W].  Use [Z,X,Y] so the sampled
+        # tensor can be permuted directly to the repository's [X,Y,Z].
+        zz, xx, yy = torch.meshgrid(gz, gx, gy, indexing="ij")
+        base = torch.stack((xx, yy, zz), dim=-1)[None]  # [1,Z,X,Y,3]
+        origin = torch.tensor(
+            [grid.x_min, grid.y_min, grid.z_min],
+            device=target_device, dtype=torch.float32,
+        )
+        extent = torch.tensor(
+            [
+                grid.voxel_size[0] * grid.shape_hwd[0],
+                grid.voxel_size[1] * grid.shape_hwd[1],
+                grid.voxel_size[2] * grid.shape_hwd[2],
+            ],
+            device=target_device, dtype=torch.float32,
+        )
+        sem_frames = []
+        valid_frames = []
+        t0_pose_t = torch.as_tensor(t0_pose, device=target_device, dtype=torch.float32)
+        for ti in range(HISTORY_FRAMES):
+            center = src_t + vel_t * rel_t_t[ti]
+            p0 = base.expand(m, -1, -1, -1, -1).clone()
+            p0[..., 0] += center[:, None, None, None, 0]
+            p0[..., 1] += center[:, None, None, None, 1]
+
+            hist_pose_t = torch.as_tensor(poses[ti], device=target_device, dtype=torch.float32)
+            hist_from_t0 = torch.linalg.inv(hist_pose_t) @ t0_pose_t
+            ph = torch.einsum("...j,ij->...i", p0, hist_from_t0[:3, :3]) + hist_from_t0[:3, 3]
+            norm = 2.0 * (ph - origin) / extent - 1.0
+            in_bounds = ((norm >= -1.0) & (norm <= 1.0)).all(dim=-1)
+
+            sem_vol = torch.as_tensor(
+                occ[ti], device=target_device, dtype=torch.float32
+            ).permute(2, 1, 0)[None, None].expand(m, -1, -1, -1, -1)
+            obs_vol = torch.as_tensor(
+                obs[ti], device=target_device, dtype=torch.float32
+            ).permute(2, 1, 0)[None, None].expand(m, -1, -1, -1, -1)
+            sampled_sem = F.grid_sample(
+                sem_vol, norm, mode="nearest", padding_mode="zeros", align_corners=False
+            )[:, 0]
+            sampled_obs = F.grid_sample(
+                obs_vol, norm, mode="nearest", padding_mode="zeros", align_corners=False
+            )[:, 0] > 0.5
+            sampled_sem = sampled_sem.to(torch.uint8)
+            sampled_sem = torch.where(
+                in_bounds,
+                sampled_sem,
+                torch.full_like(sampled_sem, BACKTRACE3D_OOB_LABEL),
+            )
+            sampled_obs = sampled_obs & in_bounds
+            sem_frames.append(sampled_sem.permute(0, 2, 3, 1).contiguous())
+            valid_frames.append(sampled_obs.permute(0, 2, 3, 1).contiguous())
+
+        return {
+            "semantics": torch.stack(sem_frames, dim=1),
+            "valid": torch.stack(valid_frames, dim=1),
+            "source_mask": torch.as_tensor(native_mask, device=target_device, dtype=torch.bool),
+            "relative_times": rel_t_t[None].expand(m, -1).contiguous(),
+        }
+
     sem_out = np.full(
         (m, HISTORY_FRAMES, cx, cy, cz), BACKTRACE3D_OOB_LABEL, dtype=np.uint8
     )
