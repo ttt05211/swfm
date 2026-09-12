@@ -214,6 +214,7 @@ def main():
                 list(range(len(current))),
                 grid=pcfg.grid,
                 frame_dt_s=float(pcfg.frame_dt_s),
+                device=device,
             )
         with torch.no_grad(), torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
