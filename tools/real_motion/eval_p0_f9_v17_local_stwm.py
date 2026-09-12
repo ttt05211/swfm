@@ -459,6 +459,7 @@ def main():
         "diagnostics": diagnostics,
         "model_config": ck.get("model_config"),
         "checkpoint_protocol": ck.get("protocol"),
+        "fast_probe_continuation": ck.get("fast_probe_continuation"),
         "backtrace3d_enabled": bool(is_backtrace3d),
         "branch_config": ck.get("branch_config"),
         "eval_branch_gamma": float(ck.get("eval_branch_gamma", 0.0)) if is_backtrace3d else 0.0,
