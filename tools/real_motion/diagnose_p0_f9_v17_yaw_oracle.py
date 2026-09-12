@@ -514,7 +514,17 @@ def main():
     elif full_yaw_gain < 0.20 and matched_yaw_gain < 0.20:
         decision = "NO_YAW_HEAD"
         recommendation = decision
-    elif matched_yaw_gain > 0.50 and matched_d2 > 0.0 and matched_d3 > 0.0:
+    elif (
+        full_yaw_gain > 0.50
+        and full_d2 > 0.0
+        and full_d3 > 0.0
+        and matched_yaw_gain > 0.0
+        and matched_d2 > 0.0
+        and matched_d3 > 0.0
+    ):
+        # Full Moving is the deployment metric and therefore gates ADD.
+        # Matched-source metrics are explanatory/coverage diagnostics and must
+        # agree in sign, but can never override a degraded full-scene result.
         decision = "ADD_YAW_HEAD"
         recommendation = decision
     else:
@@ -555,7 +565,9 @@ def main():
         "coverage_sufficient_for_rejection": bool(coverage_ok),
         "thresholds": {
             "no_yaw_gain_pp": 0.20,
-            "add_yaw_gain_pp": 0.50,
+            "add_yaw_full_gain_pp": 0.50,
+            "formal_add_requires_full_2s_3s_positive": True,
+            "formal_add_requires_matched_gain_positive": True,
             "formal_add_requires_matched_2s_3s_positive": True,
             "min_matched_support_recall": float(a.min_matched_support_recall),
         },
