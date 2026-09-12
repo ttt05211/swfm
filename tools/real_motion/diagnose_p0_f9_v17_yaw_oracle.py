@@ -56,6 +56,32 @@ VARIANTS = ("v17_xy", "v17_xy_gt_yaw", "gt_xy_fit", "gt_rigid_fit")
 DISPLAY_CLASSES = (3, 4, 5, 7, 9, 10)
 
 
+def _decide_yaw(
+    *,
+    coverage_ok,
+    full_yaw_gain,
+    matched_yaw_gain,
+    full_d2,
+    full_d3,
+    matched_d2,
+    matched_d3,
+):
+    if not coverage_ok:
+        return "INCONCLUSIVE_LOW_MATCH_COVERAGE", "YAW_OPTIONAL"
+    if full_yaw_gain < 0.20 and matched_yaw_gain < 0.20:
+        return "NO_YAW_HEAD", "NO_YAW_HEAD"
+    if (
+        full_yaw_gain > 0.50
+        and full_d2 > 0.0
+        and full_d3 > 0.0
+        and matched_yaw_gain > 0.0
+        and matched_d2 > 0.0
+        and matched_d3 > 0.0
+    ):
+        return "ADD_YAW_HEAD", "ADD_YAW_HEAD"
+    return "YAW_OPTIONAL", "YAW_OPTIONAL"
+
+
 def _dynamic_annotations(nusc, sample_token):
     sample = nusc.get("sample", str(sample_token))
     out = []
@@ -508,28 +534,15 @@ def main():
         np.isfinite(matched_yaw_gain)
         and matched_support_recall >= float(a.min_matched_support_recall)
     )
-    if not coverage_ok:
-        decision = "INCONCLUSIVE_LOW_MATCH_COVERAGE"
-        recommendation = "YAW_OPTIONAL"
-    elif full_yaw_gain < 0.20 and matched_yaw_gain < 0.20:
-        decision = "NO_YAW_HEAD"
-        recommendation = decision
-    elif (
-        full_yaw_gain > 0.50
-        and full_d2 > 0.0
-        and full_d3 > 0.0
-        and matched_yaw_gain > 0.0
-        and matched_d2 > 0.0
-        and matched_d3 > 0.0
-    ):
-        # Full Moving is the deployment metric and therefore gates ADD.
-        # Matched-source metrics are explanatory/coverage diagnostics and must
-        # agree in sign, but can never override a degraded full-scene result.
-        decision = "ADD_YAW_HEAD"
-        recommendation = decision
-    else:
-        decision = "YAW_OPTIONAL"
-        recommendation = decision
+    decision, recommendation = _decide_yaw(
+        coverage_ok=coverage_ok,
+        full_yaw_gain=full_yaw_gain,
+        matched_yaw_gain=matched_yaw_gain,
+        full_d2=full_d2,
+        full_d3=full_d3,
+        matched_d2=matched_d2,
+        matched_d3=matched_d3,
+    )
 
     result = {
         "protocol": PROTOCOL,
