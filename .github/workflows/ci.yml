@@ -26,3 +26,34 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/upstream_occfm
         run: pytest -q tests -m 'not integration'
+
+  motion-transport-torch26:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install MT-V1 compatibility dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest 'numpy<2.3' scipy pyyaml easydict einops einops-exts
+          python -m pip install 'torch==2.6.0' --index-url https://download.pytorch.org/whl/cpu
+      - name: Report compatibility versions
+        run: python -c "import torch,numpy,sys; print(sys.version); print('torch',torch.__version__); print('numpy',numpy.__version__)"
+      - name: Run MT-V1 acceptance tests on PyTorch 2.6
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/upstream_occfm
+          OMP_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+          MT_V1_DIAG_PATH: ${{ runner.temp }}/mt_v1_torch26_diag.json
+        run: pytest -q tests/real_motion/test_motion_transport_v1_*.py
+      - name: Upload MT-V1 torch 2.6 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt-v1-torch26-diagnostics
+          path: ${{ runner.temp }}/mt_v1_torch26_diag.json
+          if-no-files-found: warn
