@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import json
 from pathlib import Path
 import sys
@@ -39,6 +40,12 @@ from real_motion.rigid_transport import (
 )
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig, extract_instances, match_instances
+from real_motion.v17_backtrace3d_probe import (
+    BACKTRACE3D_PROTOCOL,
+    Backtrace3DProbeConfig,
+    LocalSpatialTemporalWorldModelV17Backtrace3D,
+    build_kta_backtrace_3d_crops,
+)
 from tools.real_motion import eval_p0_f9_frozen_sparse_occfm as safe
 
 PROTOCOL = "p0_f9_v17_local_stwm_rigid_transport_eval_v3"
@@ -69,13 +76,34 @@ def load_cache(path):
 
 def load_model(path, device):
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    if ck.get("protocol") != MODEL_PROTOCOL_V17:
-        raise RuntimeError(f"checkpoint protocol mismatch: {ck.get('protocol')}")
+    protocol = ck.get("protocol")
     cfg = config_from_mapping_v17(ck.get("model_config"))
-    model = LocalSpatialTemporalWorldModelV17(cfg).to(device)
-    model.load_state_dict(ck["state_dict"], strict=True)
+    if protocol == MODEL_PROTOCOL_V17:
+        model = LocalSpatialTemporalWorldModelV17(cfg).to(device)
+        model.load_state_dict(ck["state_dict"], strict=True)
+        is_backtrace3d = False
+    elif protocol == BACKTRACE3D_PROTOCOL:
+        model = LocalSpatialTemporalWorldModelV17Backtrace3D(
+            cfg, Backtrace3DProbeConfig(**(ck.get("branch_config") or {}))
+        ).to(device)
+        model.load_state_dict(ck["state_dict"], strict=True)
+        is_backtrace3d = True
+    else:
+        raise RuntimeError(f"checkpoint protocol mismatch: {protocol}")
     model.eval()
-    return ck, model
+    return ck, model, is_backtrace3d
+
+
+class CachedEvalSource(NuScenesWindowSource):
+    @lru_cache(maxsize=256)
+    def load_occ3d(self, scene_name, token, require_lidar_mask=True):
+        return super().load_occ3d(
+            scene_name, token, require_lidar_mask=require_lidar_mask
+        )
+
+    @lru_cache(maxsize=2048)
+    def pose(self, token):
+        return super().pose(token)
 
 
 def window_from_record(r):
@@ -129,9 +157,9 @@ def main():
         records = records[: min(len(records), a.max_windows)]
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
-    ck, model = load_model(a.checkpoint, device)
+    ck, model, is_backtrace3d = load_model(a.checkpoint, device)
     use_rep = bool(ck.get("use_representation", False))
-    source = NuScenesWindowSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
+    source = CachedEvalSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     states = {name: safe._new_metrics() for name in VARIANTS}
     occupancy_states = {
@@ -150,7 +178,14 @@ def main():
         sample = ds[sid_to_idx[sid]]
         payload = safe._sample_payload(sample, torch.device("cpu"))
         w = window_from_record(rec)
-        history_occ = [source.load_semantics(w.scene_name, tok) for tok in w.history_tokens]
+        if is_backtrace3d:
+            history_pairs = [
+                source.load_occ3d(w.scene_name, tok, require_lidar_mask=True)
+                for tok in w.history_tokens
+            ]
+            history_occ = [np.asarray(x[0]) for x in history_pairs]
+        else:
+            history_occ = [source.load_semantics(w.scene_name, tok) for tok in w.history_tokens]
         history_poses = [np.asarray(source.pose(tok), dtype=np.float64) for tok in w.history_tokens]
         future_poses = [np.asarray(source.pose(tok), dtype=np.float64) for tok in w.future_tokens]
         current = extract_instances(history_occ[-1], history_poses[-1], grid=pcfg.grid, cfg=strong_cfg)
@@ -171,10 +206,33 @@ def main():
         kta_disp = rec["kta_displacement_xy_m"].float().to(device)
         frame_motion = rec["frame_motion_features"].float().to(device) if use_rep else None
         source_mask = rec["target_source_mask_tube"].to(device) if use_rep else None
+        backtrace_crop = None
+        if is_backtrace3d:
+            backtrace_crop = build_kta_backtrace_3d_crops(
+                source,
+                rec,
+                list(range(len(current))),
+                grid=pcfg.grid,
+                frame_dt_s=float(pcfg.frame_dt_s),
+            )
         with torch.no_grad(), torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
         ):
-            out = model(features, tube, kta_disp, frame_motion, source_mask)
+            if is_backtrace3d:
+                out = model(
+                    features,
+                    tube,
+                    kta_disp,
+                    frame_motion,
+                    source_mask,
+                    backtrace_semantics=backtrace_crop["semantics"],
+                    backtrace_valid=backtrace_crop["valid"],
+                    backtrace_source_mask=backtrace_crop["source_mask"],
+                    backtrace_relative_times=backtrace_crop["relative_times"],
+                    branch_gamma=float(ck.get("eval_branch_gamma", 1.0)),
+                )
+            else:
+                out = model(features, tube, kta_disp, frame_motion, source_mask)
         pred_residual = out["residual_xy_m"].float().cpu().numpy()
         exist_prob = torch.sigmoid(out["existence_logits"].float()).cpu().numpy()
         valid = rec["target_valid"].bool().numpy()
@@ -397,6 +455,10 @@ def main():
         "reports": reports,
         "diagnostics": diagnostics,
         "model_config": ck.get("model_config"),
+        "checkpoint_protocol": ck.get("protocol"),
+        "backtrace3d_enabled": bool(is_backtrace3d),
+        "branch_config": ck.get("branch_config"),
+        "eval_branch_gamma": float(ck.get("eval_branch_gamma", 0.0)) if is_backtrace3d else 0.0,
         "target_contract": TARGET_CONTRACT,
         "representation_contract": REPRESENTATION_CONTRACT,
         "occupancy_iou_contract": OCCUPANCY_IOU_CONTRACT,
