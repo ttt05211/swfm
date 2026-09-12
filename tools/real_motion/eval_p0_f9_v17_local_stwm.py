@@ -74,7 +74,7 @@ def load_cache(path):
     return meta, records
 
 
-def load_model(path, device):
+def load_model(path, device, *, return_mode: bool = False):
     ck = torch.load(path, map_location="cpu", weights_only=False)
     protocol = ck.get("protocol")
     cfg = config_from_mapping_v17(ck.get("model_config"))
@@ -91,7 +91,9 @@ def load_model(path, device):
     else:
         raise RuntimeError(f"checkpoint protocol mismatch: {protocol}")
     model.eval()
-    return ck, model, is_backtrace3d
+    if return_mode:
+        return ck, model, is_backtrace3d
+    return ck, model
 
 
 class CachedEvalSource(NuScenesWindowSource):
@@ -157,7 +159,7 @@ def main():
         records = records[: min(len(records), a.max_windows)]
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
-    ck, model, is_backtrace3d = load_model(a.checkpoint, device)
+    ck, model, is_backtrace3d = load_model(a.checkpoint, device, return_mode=True)
     use_rep = bool(ck.get("use_representation", False))
     source = CachedEvalSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
