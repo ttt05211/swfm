@@ -582,19 +582,57 @@ def validate_v17_scene_cache(
             f"scene-cache source count mismatch: metadata={num_sources}, entries={entry_sources}"
         )
 
-    def _assert_same_cache(meta_key: str, expected: str | Path | None):
+    def _assert_same_or_augmented_cache(meta_key: str, expected: str | Path | None) -> dict:
         if expected is None:
-            return
+            return {"mode": "unchecked"}
         recorded = metadata.get(meta_key)
         if not recorded:
             raise RuntimeError(f"scene cache metadata is missing {meta_key}")
         got = Path(str(recorded)).expanduser().resolve()
         want = Path(expected).expanduser().resolve()
-        if got != want:
-            raise RuntimeError(f"scene cache {meta_key} mismatch: recorded={got}, expected={want}")
+        if got == want:
+            return {"mode": "direct", "recorded": str(got), "expected": str(want)}
 
-    _assert_same_cache("source_v17_train_cache", expected_train_cache)
-    _assert_same_cache("source_v17_val_cache", expected_val_cache)
+        # Native-footprint caches are a provenance-preserving augmentation of
+        # the original V17 cache: all existing tensors/records are copied
+        # verbatim and only native_source_footprint_mask is added.  Accept that
+        # one-hop derived cache only when its sidecar explicitly points back to
+        # the exact cache used to build this scene cache.
+        summary = want.with_suffix(".summary.json")
+        if not summary.is_file():
+            raise RuntimeError(
+                f"scene cache {meta_key} mismatch: recorded={got}, expected={want}; "
+                f"no augmentation sidecar at {summary}"
+            )
+        aug = json.loads(summary.read_text(encoding="utf-8"))
+        parent = aug.get("native_source_footprint_augmented_from")
+        protocol = aug.get("native_source_footprint_augment_protocol")
+        if not parent:
+            raise RuntimeError(
+                f"scene cache {meta_key} mismatch and {summary} has no "
+                "native_source_footprint_augmented_from"
+            )
+        parent_path = Path(str(parent)).expanduser().resolve()
+        if parent_path != got:
+            raise RuntimeError(
+                f"scene cache {meta_key} provenance mismatch: recorded={got}, "
+                f"expected={want}, augmented_from={parent_path}"
+            )
+        if protocol != "p0_f9_v17_native_source_footprint_cache_augment_v1":
+            raise RuntimeError(
+                f"unexpected native-footprint augmentation protocol in {summary}: {protocol}"
+            )
+        return {
+            "mode": "native_source_footprint_augmented",
+            "recorded": str(got),
+            "expected": str(want),
+            "summary": str(summary),
+            "native_source_footprint_augmented_from": str(parent_path),
+            "native_source_footprint_augment_protocol": str(protocol),
+        }
+
+    train_provenance = _assert_same_or_augmented_cache("source_v17_train_cache", expected_train_cache)
+    val_provenance = _assert_same_or_augmented_cache("source_v17_val_cache", expected_val_cache)
 
     shard_names = sorted({str(e.get("shard", "")) for e in entries})
     if not shard_names or "" in shard_names:
@@ -619,6 +657,8 @@ def validate_v17_scene_cache(
         "gt_moving_filter_used": False,
         "source_v17_train_cache": str(metadata.get("source_v17_train_cache")),
         "source_v17_val_cache": str(metadata.get("source_v17_val_cache")),
+        "train_cache_provenance": train_provenance,
+        "val_cache_provenance": val_provenance,
         "selection_contract": metadata.get("selection_contract"),
         "scene_loss_contract": metadata.get("scene_loss_contract"),
         "scene_query_contract": metadata.get("scene_query_contract"),
