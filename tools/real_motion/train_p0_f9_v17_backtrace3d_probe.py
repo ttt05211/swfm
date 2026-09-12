@@ -240,6 +240,36 @@ def _forward_treatment(model, batch, crops, gamma, amp, device):
         )
 
 
+def _tensor_rms(x):
+    if x is None or not torch.is_tensor(x) or x.numel() == 0:
+        return float("nan")
+    return float(torch.sqrt(torch.mean(x.detach().float() ** 2)).cpu())
+
+
+def _grad_l2(named_params):
+    total = None
+    for _, p in named_params:
+        if p.grad is None:
+            continue
+        term = (p.grad.detach().float() ** 2).sum()
+        total = term if total is None else total + term
+    return float(torch.sqrt(total).cpu()) if total is not None else 0.0
+
+
+@torch.no_grad()
+def _parameter_delta_rms(named_params, initial):
+    total = None
+    count = 0
+    for name, p in named_params:
+        ref = initial[name]
+        term = ((p.detach().float() - ref.float()) ** 2).sum()
+        total = term if total is None else total + term
+        count += int(p.numel())
+    if total is None or count == 0:
+        return 0.0
+    return float(torch.sqrt(total / float(count)).cpu())
+
+
 def _load_base_optimizer(model, ck, base_lr, weight_decay, arm):
     if arm == "control":
         params = list(model.parameters())
@@ -421,6 +451,10 @@ def main():
     if branch_optimizer is not None:
         for g in branch_optimizer.param_groups:
             g["lr"] = actual_lr
+    branch_initial = (
+        {name: p.detach().clone() for name, p in model.branch_named_parameters()}
+        if a.arm == "backtrace3d" else {}
+    )
 
     raw_source = (
         CachedRawSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
@@ -460,6 +494,7 @@ def main():
     first_batch = _pack_v17_batch(records, first_refs, device)
 
     step0_identity = None
+    zero_init_gamma1_identity = None
     if a.arm == "backtrace3d":
         model.eval()
         with torch.no_grad():
@@ -477,8 +512,38 @@ def main():
             "bit_exact": bool(dxy == 0.0 and de == 0.0),
         }
         if not step0_identity["bit_exact"]:
-            raise RuntimeError(f"treatment step0 is not exact V17: {step0_identity}")
+            raise RuntimeError(f"treatment gamma=0 is not exact V17: {step0_identity}")
+
+        first_crops = _pack_backtrace_crops(
+            raw_source,
+            records,
+            first_refs,
+            grid=pcfg.grid,
+            frame_dt_s=float(pcfg.frame_dt_s),
+            device=device,
+        )
+        with torch.no_grad():
+            opened = _forward_treatment(model, first_batch, first_crops, 1.0, amp, device)
+        dxy1 = float(
+            (ref["residual_xy_m"].float() - opened["residual_xy_m"].float()).abs().max().cpu()
+        )
+        de1 = float(
+            (ref["existence_logits"].float() - opened["existence_logits"].float()).abs().max().cpu()
+        )
+        branch_rms0 = _tensor_rms(opened.get("backtrace3d_query_residual"))
+        zero_init_gamma1_identity = {
+            "max_abs_residual_xy": dxy1,
+            "max_abs_existence_logit": de1,
+            "branch_output_rms": branch_rms0,
+            "bit_exact": bool(dxy1 == 0.0 and de1 == 0.0 and branch_rms0 == 0.0),
+        }
+        if not zero_init_gamma1_identity["bit_exact"]:
+            raise RuntimeError(
+                "zero-init branch with gamma=1 is not exact V17: "
+                f"{zero_init_gamma1_identity}"
+            )
     preflight["step0_identity"] = step0_identity
+    preflight["zero_init_gamma1_identity"] = zero_init_gamma1_identity
     (out / "preflight.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")
     print("=== V17 BACKTRACE3D PAIRED PREFLIGHT ===")
     print(json.dumps(preflight, indent=2), flush=True)
@@ -535,8 +600,20 @@ def main():
         )
         if not bool(torch.isfinite(loss).detach().cpu()):
             raise FloatingPointError(f"non-finite loss at step {local_step}")
+        branch_output_rms = (
+            _tensor_rms(pred.get("backtrace3d_query_residual"))
+            if a.arm == "backtrace3d" else float("nan")
+        )
+        gamma_scaled_residual_rms = (
+            _tensor_rms(pred.get("backtrace3d_scaled_query_residual"))
+            if a.arm == "backtrace3d" else float("nan")
+        )
         loss.backward()
 
+        branch_grad_norm = (
+            _grad_l2(model.branch_named_parameters())
+            if a.arm == "backtrace3d" else float("nan")
+        )
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         if not bool(torch.isfinite(torch.as_tensor(grad_norm)).detach().cpu()):
             raise FloatingPointError(f"non-finite gradient at step {local_step}")
@@ -544,6 +621,10 @@ def main():
         base_optimizer.step()
         if branch_optimizer is not None and gamma != 0.0:
             branch_optimizer.step()
+        branch_parameter_delta_rms = (
+            _parameter_delta_rms(model.branch_named_parameters(), branch_initial)
+            if a.arm == "backtrace3d" else float("nan")
+        )
         global_step += 1
 
         next_lr = base_lr * _lr_scale(global_step, total_original_steps)
@@ -570,6 +651,10 @@ def main():
                 "trajectory_smooth_l1": float(parts["trajectory_smooth_l1"]),
                 "existence_bce": float(parts["existence_bce"]),
                 "transport_overlap_loss": float(parts["transport_overlap_loss"]),
+                "branch_output_rms": branch_output_rms,
+                "gamma_scaled_residual_rms": gamma_scaled_residual_rms,
+                "branch_grad_norm": branch_grad_norm,
+                "branch_parameter_delta_rms": branch_parameter_delta_rms,
                 "crop_seconds": crop_seconds,
                 "elapsed_s": time.perf_counter() - started,
             }
