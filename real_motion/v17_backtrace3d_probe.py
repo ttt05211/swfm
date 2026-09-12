@@ -323,6 +323,10 @@ class Backtrace3DFutureQueryBranch(nn.Module):
             nn.LayerNorm(int(cfg.branch_dim)),
             nn.Linear(int(cfg.branch_dim), int(cfg.branch_dim)),
         )
+        # Residual-branch contract: before learning, opening gamma must still
+        # inject exactly zero into the pretrained V17 future queries.
+        nn.init.zeros_(self.out[1].weight)
+        nn.init.zeros_(self.out[1].bias)
 
     def _one(self, sem, valid, source_mask, relative_times):
         device = self.embedding.weight.device
