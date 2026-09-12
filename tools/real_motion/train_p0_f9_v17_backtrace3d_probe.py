@@ -173,15 +173,15 @@ def _pack_v17_batch(records, refs, device):
     return batch
 
 
-def _pack_backtrace_crops(source, records, refs, *, grid, frame_dt_s):
+def _pack_backtrace_crops(source, records, refs, *, grid, frame_dt_s, device):
     groups = {}
     for pos, (ridx, sid) in enumerate(refs):
         groups.setdefault(int(ridx), []).append((int(pos), int(sid)))
     n = len(refs)
-    sem = torch.empty((n, 6, 64, 64, 16), dtype=torch.uint8)
-    valid = torch.empty((n, 6, 64, 64, 16), dtype=torch.bool)
-    source_mask = torch.empty((n, 64, 64), dtype=torch.bool)
-    relative_times = torch.empty((n, 6), dtype=torch.float32)
+    sem = torch.empty((n, 6, 64, 64, 16), dtype=torch.uint8, device=device)
+    valid = torch.empty((n, 6, 64, 64, 16), dtype=torch.bool, device=device)
+    source_mask = torch.empty((n, 64, 64), dtype=torch.bool, device=device)
+    relative_times = torch.empty((n, 6), dtype=torch.float32, device=device)
     for ridx, items in groups.items():
         positions = [p for p, _ in items]
         source_ids = [s for _, s in items]
@@ -191,8 +191,9 @@ def _pack_backtrace_crops(source, records, refs, *, grid, frame_dt_s):
             source_ids,
             grid=grid,
             frame_dt_s=float(frame_dt_s),
+            device=device,
         )
-        pos = torch.as_tensor(positions, dtype=torch.long)
+        pos = torch.as_tensor(positions, dtype=torch.long, device=device)
         sem[pos] = crop["semantics"]
         valid[pos] = crop["valid"]
         source_mask[pos] = crop["source_mask"]
@@ -514,6 +515,7 @@ def main():
                 refs,
                 grid=pcfg.grid,
                 frame_dt_s=float(pcfg.frame_dt_s),
+                device=device,
             )
             crop_seconds = time.perf_counter() - t_crop
 
