@@ -190,6 +190,7 @@ def main():
     p.add_argument("--halo-voxels",type=int,default=2); p.add_argument("--scene-eps",type=float,default=1e-4); p.add_argument("--scene-jitter-voxels",type=float,default=0.25)
     p.add_argument("--calibration-batches",type=int,default=8); p.add_argument("--calibration-target-ratio",type=float,default=0.25)
     p.add_argument("--max-calibrated-alpha",type=float,default=1e4); p.add_argument("--calibration-output",default="")
+    p.add_argument("--calibration-input",default="",help="required for C0-S training; JSON produced by --calibrate-only")
     p.add_argument("--calibrate-only",action="store_true"); p.add_argument("--device",default="cuda"); p.add_argument("--no-amp",action="store_true")
     p.add_argument("--no-cuda-prefetch",action="store_true")
     a=p.parse_args()
@@ -198,6 +199,16 @@ def main():
     if a.scene_batch_size<=0 or a.calibration_batches<=0:raise ValueError("invalid scene/calibration batch settings")
     if not 0<=a.scene_warmup_fraction<=1:raise ValueError("scene warmup fraction must be in [0,1]")
     if a.halo_voxels<0 or not 0<a.scene_eps<1/18 or a.scene_jitter_voxels<0:raise ValueError("invalid scene renderer settings")
+    if a.arm=="C0-S" and not a.calibrate_only and not a.calibration_input:
+        raise ValueError("C0-S training requires --calibration-input from the prior --calibrate-only run")
+    out_dir=Path(a.output_dir)
+    if not a.calibrate_only and out_dir.exists():
+        old_ckpts=sorted(out_dir.glob("*.pt"))
+        if old_ckpts:
+            raise FileExistsError(
+                "C0 training output already contains checkpoints; refusing to mix runs: "
+                + ", ".join(str(x) for x in old_ckpts[:8])
+            )
     save_steps=_parse_save_steps(a.save_steps)
     _reset_seeds(a.paired_shuffle_seed)
     device=torch.device(a.device if a.device!="cuda" or torch.cuda.is_available() else "cpu")
@@ -262,32 +273,41 @@ def main():
     print("=== C0 SOURCE-FIDELITY PREFLIGHT ==="); print(json.dumps(preflight,indent=2),flush=True)
 
     calibration=None
-    if a.calibrate_only or a.arm=="C0-S":
+    if a.calibrate_only:
         cal_loader=make_train_loader(a.paired_shuffle_seed)
         print("C0 source/scene alpha calibration ...",flush=True)
         # Calibration is diagnostic only. Restore the exact post-checkpoint RNG
-        # state so C0-S starts its source path identically to C0-C/B-C.
+        # state so a later C0-S run starts its source path identically to C0-C.
         with preserve_rng_state(device):
             calibration=calibrate_c0(model,cal_loader,scene_ds,v17_by_id,device,pcfg=pcfg,amp=amp,cuda_prefetch=cuda_prefetch,
                 scene_batch_size=a.scene_batch_size,scene_seed=a.scene_seed,batches=a.calibration_batches,overlap_resolution_m=overlap_resolution_m,
                 halo_voxels=a.halo_voxels,eps=a.scene_eps,jitter=a.scene_jitter_voxels,target_ratio=a.calibration_target_ratio,max_alpha=a.max_calibrated_alpha)
         payload={"preflight":preflight,"calibration":calibration}; print("=== C0 SCENE-LOSS CALIBRATION ==="); print(json.dumps(payload,indent=2),flush=True)
         print(f"recommended_scene_alpha={calibration['alpha']:.12g}",flush=True)
-        if a.calibration_output:
-            cp=Path(a.calibration_output); cp.parent.mkdir(parents=True,exist_ok=True); cp.write_text(json.dumps(payload,indent=2),encoding="utf-8"); print(f"saved {cp}",flush=True)
-        if a.calibrate_only:return
-        if a.scene_alpha<=0:raise ValueError("C0-S training requires positive --scene-alpha from calibrate-only")
-        if not math.isclose(float(a.scene_alpha),float(calibration["alpha"]),rel_tol=5e-3,abs_tol=1e-12):
-            raise RuntimeError(f"--scene-alpha {a.scene_alpha} differs from C0 calibration {calibration['alpha']}")
+        if not a.calibration_output:
+            raise ValueError("--calibrate-only requires --calibration-output so C0-S can reuse the exact result")
+        cp=Path(a.calibration_output); cp.parent.mkdir(parents=True,exist_ok=True); cp.write_text(json.dumps(payload,indent=2),encoding="utf-8"); print(f"saved {cp}",flush=True)
+        return
+    if a.arm=="C0-S":
+        cp=Path(a.calibration_input)
+        if not cp.is_file():raise FileNotFoundError(f"calibration input not found: {cp}")
+        payload=json.loads(cp.read_text(encoding="utf-8"))
+        calibration=payload.get("calibration")
+        if not isinstance(calibration,dict) or "alpha" not in calibration:
+            raise RuntimeError(f"invalid C0 calibration JSON: {cp}")
+        cal_preflight=payload.get("preflight") or {}
+        if str(cal_preflight.get("resume_checkpoint"))!=str(Path(a.resume_checkpoint).resolve()):
+            raise RuntimeError("calibration checkpoint provenance does not match C0-S resume checkpoint")
+        cal_scene=(cal_preflight.get("scene_cache") or {}).get("root")
+        if cal_scene and Path(cal_scene).resolve()!=Path(a.scene_cache).resolve():
+            raise RuntimeError("calibration scene-cache provenance does not match C0-S scene cache")
+        if int(cal_preflight.get("paired_shuffle_seed",-1))!=int(a.paired_shuffle_seed):
+            raise RuntimeError("calibration paired-shuffle seed does not match C0-S")
+        if a.scene_alpha<=0:raise ValueError("C0-S training requires positive --scene-alpha from calibration JSON")
+        if not math.isclose(float(a.scene_alpha),float(calibration["alpha"]),rel_tol=0.0,abs_tol=1e-12):
+            raise RuntimeError(f"--scene-alpha {a.scene_alpha} is not exactly the calibrated alpha {calibration['alpha']}")
+        print(f"C0 using frozen calibration from {cp}: scene_alpha={a.scene_alpha:.12g}",flush=True)
 
-    out_dir=Path(a.output_dir)
-    if not a.calibrate_only and out_dir.exists():
-        old_ckpts=sorted(out_dir.glob("*.pt"))
-        if old_ckpts:
-            raise FileExistsError(
-                "C0 training output already contains checkpoints; refusing to mix runs: "
-                + ", ".join(str(x) for x in old_ckpts[:8])
-            )
     out_dir.mkdir(parents=True,exist_ok=True)
     (out_dir/"preflight.json").write_text(json.dumps({**preflight,"calibration":calibration},indent=2),encoding="utf-8")
     max_available_steps=int(a.continuation_epochs)*batches_per_epoch
@@ -360,7 +380,9 @@ def main():
     report={"protocol":PROTOCOL,"arm":a.arm,"resume_checkpoint":str(Path(a.resume_checkpoint).resolve()),"start_epoch":EXPECTED_START_EPOCH,
         "last_completed_epoch":int(last_completed_epoch),"local_steps":int(local_step),"global_optimizer_step":int(global_step),"target_steps":int(target_steps),
         "source_batch_size":int(batch_size),"batches_per_epoch":int(batches_per_epoch),"all_parameters_trainable":True,
-        "scene_alpha":max(float(a.scene_alpha),0.0),"calibration":calibration,"scene_cache":scene_cache_report,
+        "scene_alpha":max(float(a.scene_alpha),0.0),"calibration":calibration,
+        "calibration_input":str(Path(a.calibration_input).resolve()) if a.calibration_input else "",
+        "scene_cache":scene_cache_report,
         "nonfinite_detected":False,"history":history,"elapsed_s":time.perf_counter()-run_started,
         "fidelity_reference":"Compare C0-C epoch_0008 to historical V17 B-C epoch_0008 under the same A1 evaluator."}
     (out_dir/"training_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
