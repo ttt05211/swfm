@@ -525,6 +525,146 @@ def calibrate_scene_alpha_from_gradients(
     }
 
 
+def validate_v17_scene_cache(
+    root: str | Path,
+    *,
+    expected_train_cache: str | Path | None = None,
+    expected_val_cache: str | Path | None = None,
+    verify_shards: bool = True,
+) -> dict:
+    """Validate the immutable C/C0 scene-cache contract and provenance.
+
+    This is intentionally strict.  C0-S must not silently consume a scene cache
+    generated from another V17 train/val cache or a cache that used a GT-moving
+    filter.  The returned dictionary is JSON-serializable and can be embedded in
+    preflight/training reports.
+    """
+    root = Path(root).expanduser().resolve()
+    index_path = root / "index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"scene cache is missing index.json: {index_path}")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    if index.get("version") != SCENE_CACHE_VERSION:
+        raise RuntimeError(
+            f"V17 scene cache version mismatch: {index.get('version')} != {SCENE_CACHE_VERSION}"
+        )
+
+    metadata = index.get("metadata") or {}
+    entries = index.get("entries") or []
+    if not entries:
+        raise RuntimeError(f"empty V17 scene cache: {root}")
+    if metadata.get("train_val_scene_overlap_checked") is not True:
+        raise RuntimeError("scene cache did not record train/val scene-overlap validation")
+    if metadata.get("gt_moving_filter_used") is not False:
+        raise RuntimeError("scene cache must have gt_moving_filter_used=false")
+
+    num_windows = int(metadata.get("num_windows", -1))
+    num_scenes = int(metadata.get("num_scenes", -1))
+    num_sources = int(metadata.get("num_sources", -1))
+    if min(num_windows, num_scenes, num_sources) <= 0:
+        raise RuntimeError(
+            f"invalid scene-cache counts: windows={num_windows}, scenes={num_scenes}, sources={num_sources}"
+        )
+    if int(index.get("num_samples", -1)) != len(entries) or num_windows != len(entries):
+        raise RuntimeError(
+            f"scene-cache window count mismatch: metadata={num_windows}, "
+            f"index={index.get('num_samples')}, entries={len(entries)}"
+        )
+
+    entry_scenes = {str(e.get("scene_name", "")) for e in entries}
+    if "" in entry_scenes or len(entry_scenes) != num_scenes:
+        raise RuntimeError(
+            f"scene-cache scene count mismatch: metadata={num_scenes}, entries={len(entry_scenes)}"
+        )
+    entry_sources = sum(int(e.get("source_count", -1)) for e in entries)
+    if any(int(e.get("source_count", -1)) < 0 for e in entries) or entry_sources != num_sources:
+        raise RuntimeError(
+            f"scene-cache source count mismatch: metadata={num_sources}, entries={entry_sources}"
+        )
+
+    def _assert_same_or_augmented_cache(meta_key: str, expected: str | Path | None) -> dict:
+        if expected is None:
+            return {"mode": "unchecked"}
+        recorded = metadata.get(meta_key)
+        if not recorded:
+            raise RuntimeError(f"scene cache metadata is missing {meta_key}")
+        got = Path(str(recorded)).expanduser().resolve()
+        want = Path(expected).expanduser().resolve()
+        if got == want:
+            return {"mode": "direct", "recorded": str(got), "expected": str(want)}
+
+        # Native-footprint caches are a provenance-preserving augmentation of
+        # the original V17 cache: all existing tensors/records are copied
+        # verbatim and only native_source_footprint_mask is added.  Accept that
+        # one-hop derived cache only when its sidecar explicitly points back to
+        # the exact cache used to build this scene cache.
+        summary = want.with_suffix(".summary.json")
+        if not summary.is_file():
+            raise RuntimeError(
+                f"scene cache {meta_key} mismatch: recorded={got}, expected={want}; "
+                f"no augmentation sidecar at {summary}"
+            )
+        aug = json.loads(summary.read_text(encoding="utf-8"))
+        parent = aug.get("native_source_footprint_augmented_from")
+        protocol = aug.get("native_source_footprint_augment_protocol")
+        if not parent:
+            raise RuntimeError(
+                f"scene cache {meta_key} mismatch and {summary} has no "
+                "native_source_footprint_augmented_from"
+            )
+        parent_path = Path(str(parent)).expanduser().resolve()
+        if parent_path != got:
+            raise RuntimeError(
+                f"scene cache {meta_key} provenance mismatch: recorded={got}, "
+                f"expected={want}, augmented_from={parent_path}"
+            )
+        if protocol != "p0_f9_v17_native_source_footprint_cache_augment_v1":
+            raise RuntimeError(
+                f"unexpected native-footprint augmentation protocol in {summary}: {protocol}"
+            )
+        return {
+            "mode": "native_source_footprint_augmented",
+            "recorded": str(got),
+            "expected": str(want),
+            "summary": str(summary),
+            "native_source_footprint_augmented_from": str(parent_path),
+            "native_source_footprint_augment_protocol": str(protocol),
+        }
+
+    train_provenance = _assert_same_or_augmented_cache("source_v17_train_cache", expected_train_cache)
+    val_provenance = _assert_same_or_augmented_cache("source_v17_val_cache", expected_val_cache)
+
+    shard_names = sorted({str(e.get("shard", "")) for e in entries})
+    if not shard_names or "" in shard_names:
+        raise RuntimeError("scene cache index contains an empty shard name")
+    if verify_shards:
+        missing = [name for name in shard_names if not (root / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"scene cache is missing shard files: {missing[:8]}")
+        bad_names = [name for name in shard_names if not (name.startswith("shard_") and name.endswith(".pt"))]
+        if bad_names:
+            raise RuntimeError(f"unexpected scene-cache shard names: {bad_names[:8]}")
+
+    return {
+        "root": str(root),
+        "index": str(index_path),
+        "version": str(index.get("version")),
+        "num_windows": num_windows,
+        "num_scenes": num_scenes,
+        "num_sources": num_sources,
+        "num_shards": len(shard_names),
+        "train_val_scene_overlap_checked": True,
+        "gt_moving_filter_used": False,
+        "source_v17_train_cache": str(metadata.get("source_v17_train_cache")),
+        "source_v17_val_cache": str(metadata.get("source_v17_val_cache")),
+        "train_cache_provenance": train_provenance,
+        "val_cache_provenance": val_provenance,
+        "selection_contract": metadata.get("selection_contract"),
+        "scene_loss_contract": metadata.get("scene_loss_contract"),
+        "scene_query_contract": metadata.get("scene_query_contract"),
+    }
+
+
 class V17SceneCacheDataset(Dataset):
     """Small sharded cache used only by the C scene-supervision experiment."""
     def __init__(self, root: str | Path):

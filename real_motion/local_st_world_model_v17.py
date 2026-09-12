@@ -170,8 +170,11 @@ class LocalSpatialTemporalWorldModelV17(LocalSpatialTemporalWorldModel):
         kta_displacement_xy_m: torch.Tensor,
         frame_motion_features: torch.Tensor | None = None,
         target_source_mask_tube: torch.Tensor | None = None,
+        future_query_residual: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if not bool(self.v17_config.use_representation):
+            if future_query_residual is not None:
+                raise ValueError("future_query_residual requires the V17 representation path")
             return super().forward(features, local_semantic_tube, kta_displacement_xy_m)
 
         cfg = self.config
@@ -219,6 +222,13 @@ class LocalSpatialTemporalWorldModelV17(LocalSpatialTemporalWorldModel):
         q = self.future_query.expand(B, -1, -1) + self.future_time_embedding
         q = q + self.kinematic_proj(features).unsqueeze(1)
         q = q + self.kta_future_proj(kta_displacement_xy_m.to(q.dtype) / 20.0)
+        if future_query_residual is not None:
+            if future_query_residual.shape != q.shape:
+                raise ValueError(
+                    f"future_query_residual must be {tuple(q.shape)}, got "
+                    f"{tuple(future_query_residual.shape)}"
+                )
+            q = q + future_query_residual.to(q.dtype)
         for block in self.decoder:
             q = block(q, context)
         return {
