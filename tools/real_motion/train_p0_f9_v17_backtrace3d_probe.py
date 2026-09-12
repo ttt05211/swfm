@@ -299,11 +299,13 @@ def _save_checkpoint(
             "protocol": PROTOCOL,
             "arm": arm,
             "resume_checkpoint": str(Path(args.resume_checkpoint).resolve()),
+            "train_cache": str(Path(args.train_cache).resolve()),
             "start_epoch": START_EPOCH,
             "local_step": int(local_step),
             "global_optimizer_step": int(global_step),
             "source_batch_contract": batch_contract,
             "paired_shuffle_seed": int(args.paired_shuffle_seed),
+            "branch_seed": int(args.branch_seed),
             "source_batch_size": int(args.batch_size),
             "branch_gamma": float(gamma),
             "branch_gamma_warmup_steps": int(args.branch_gamma_warmup_steps),
@@ -542,6 +544,8 @@ def main():
                 "zero-init branch with gamma=1 is not exact V17: "
                 f"{zero_init_gamma1_identity}"
             )
+        del first_crops, opened, ref, got
+    del first_batch
     preflight["step0_identity"] = step0_identity
     preflight["zero_init_gamma1_identity"] = zero_init_gamma1_identity
     (out / "preflight.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")
