@@ -44,6 +44,8 @@ def _load(path, *, expected_arm: str, expected_step: int):
     _require(bool(cont.get("source_batch_contract")), f"{p}: missing source_batch_contract")
     _require(cont.get("paired_shuffle_seed") is not None, f"{p}: missing paired_shuffle_seed")
     _require(bool(cont.get("resume_checkpoint")), f"{p}: missing resume_checkpoint")
+    _require(bool(cont.get("train_cache")), f"{p}: missing train_cache")
+    _require(cont.get("branch_seed") is not None, f"{p}: missing branch_seed")
 
     ck_protocol = x.get("checkpoint_protocol")
     expected_ck = (
@@ -101,8 +103,10 @@ def _validate_all(rows):
     keys_same_across_all = (
         "evaluator_protocol",
         "resume_checkpoint",
+        "train_cache",
         "start_epoch",
         "paired_shuffle_seed",
+        "branch_seed",
         "source_batch_size",
         "source_batch_contract",
         "loss_contract",
@@ -146,7 +150,9 @@ def _validate_all(rows):
     return {
         "status": "PASS",
         "common_resume_checkpoint": ref["resume_checkpoint"],
+        "train_cache": ref["train_cache"],
         "paired_shuffle_seed": ref["paired_shuffle_seed"],
+        "branch_seed": ref["branch_seed"],
         "source_batch_size": ref["source_batch_size"],
         "source_batch_contract": ref["source_batch_contract"],
         "loss_contract": ref["loss_contract"],
