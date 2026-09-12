@@ -137,6 +137,9 @@ def build_kta_backtrace_3d_crops(
     vel = velocity_xy_t0_from_features(record["features"])[ids]
     rel_t = (np.arange(HISTORY_FRAMES, dtype=np.float64) - (HISTORY_FRAMES - 1)) * float(frame_dt_s)
     native_mask = _native_source_mask_64(record, ids)
+    # Shared by both CPU and CUDA paths. Keep this assignment before the
+    # device-specific branch so the CUDA fast path never reads an unbound pose.
+    t0_pose = poses[-1]
 
     m = len(ids)
     cx, cy, cz = BACKTRACE3D_SHAPE
@@ -226,7 +229,6 @@ def build_kta_backtrace_3d_crops(
         float(grid.z_min),
         float(grid.voxel_size[2]),
     )
-    t0_pose = poses[-1]
     for ti in range(HISTORY_FRAMES):
         hist_from_t0 = np.linalg.inv(poses[ti]) @ t0_pose
         R = hist_from_t0[:3, :3]
@@ -448,11 +450,16 @@ class LocalSpatialTemporalWorldModelV17Backtrace3D(LocalSpatialTemporalWorldMode
             backtrace_source_mask,
             backtrace_relative_times,
         )
-        return super().forward(
+        scaled = gamma * residual
+        out = super().forward(
             features,
             local_semantic_tube,
             kta_displacement_xy_m,
             frame_motion_features,
             target_source_mask_tube,
-            future_query_residual=gamma * residual,
+            future_query_residual=scaled,
         )
+        # Training-only observability. Historical consumers ignore unknown keys.
+        out["backtrace3d_query_residual"] = residual
+        out["backtrace3d_scaled_query_residual"] = scaled
+        return out
