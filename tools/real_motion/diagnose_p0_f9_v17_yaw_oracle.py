@@ -224,7 +224,7 @@ def main():
         raise RuntimeError(f"P0-F9 cache misses V17 samples: {missing[:5]}")
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
-    ck, model, is_backtrace3d = load_model(a.checkpoint, device)
+    ck, model, is_backtrace3d = load_model(a.checkpoint, device, return_mode=True)
     if ck.get("protocol") != MODEL_PROTOCOL_V17 or is_backtrace3d:
         raise RuntimeError("yaw oracle must use a standard V17 checkpoint")
     if not bool(ck.get("use_representation", False)):
