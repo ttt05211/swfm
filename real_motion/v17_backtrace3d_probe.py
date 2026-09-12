@@ -181,7 +181,10 @@ def build_kta_backtrace_3d_crops(
             hist_from_t0 = torch.linalg.inv(hist_pose_t) @ t0_pose_t
             ph = torch.einsum("...j,ij->...i", p0, hist_from_t0[:3, :3]) + hist_from_t0[:3, 3]
             norm = 2.0 * (ph - origin) / extent - 1.0
-            in_bounds = ((norm >= -1.0) & (norm <= 1.0)).all(dim=-1)
+            # Use the repository's metric half-open grid contract rather than
+            # normalized [-1,1], because align_corners=False places x=1 at the
+            # outer half-voxel boundary.
+            in_bounds = ((ph >= origin) & (ph < (origin + extent))).all(dim=-1)
 
             sem_vol = torch.as_tensor(
                 occ[ti], device=target_device, dtype=torch.float32
