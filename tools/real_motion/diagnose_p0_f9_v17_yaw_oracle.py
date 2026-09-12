@@ -53,7 +53,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import (
 
 PROTOCOL = "p0_f9_v17_yaw_renderer_consistent_oracle_v1"
 VARIANTS = ("v17_xy", "v17_xy_gt_yaw", "gt_xy_fit", "gt_rigid_fit")
-VEHICLE_CLASSES = (3, 4, 5, 9, 10)
+DISPLAY_CLASSES = (3, 4, 5, 7, 9, 10)
 
 
 def _dynamic_annotations(nusc, sample_token):
@@ -80,24 +80,64 @@ def _ann_map(nusc, token):
     return {x["instance_token"]: x for x in _dynamic_annotations(nusc, token)}
 
 
-def _match_components(components, anns, max_distance_m):
-    pairs = []
+def _points_inside_annotation(points_world, ann):
+    p = np.asarray(points_world, dtype=np.float64)
+    center = np.asarray(ann["center_world"], dtype=np.float64)
+    yaw = float(ann["yaw_world"])
+    l, w, h = [float(x) for x in ann["size_lwh"]]
+    d = p - center[None]
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    lx = cy * d[:, 0] + sy * d[:, 1]
+    ly = -sy * d[:, 0] + cy * d[:, 1]
+    return (
+        (np.abs(lx) <= l / 2.0)
+        & (np.abs(ly) <= w / 2.0)
+        & (np.abs(d[:, 2]) <= h / 2.0)
+    )
+
+
+def _match_components(
+    components,
+    source_points,
+    anns,
+    max_distance_m,
+    *,
+    best_coverage_min=0.8,
+    second_coverage_max=0.2,
+):
+    """Deterministic one-to-one source/GT matching by point-in-box coverage."""
+    candidates = []
     for ci, comp in enumerate(components):
         c = np.asarray(comp["centroid_world"], dtype=np.float64)
+        rows = []
         for ai, ann in enumerate(anns):
             if int(comp["class_id"]) != int(ann["class_id"]):
                 continue
             d = float(np.linalg.norm(c[:2] - ann["center_world"][:2]))
-            if d <= float(max_distance_m):
-                pairs.append((d, ci, ai, ann["instance_token"]))
-    pairs.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+            if d > float(max_distance_m):
+                continue
+            pts = source_points[int(ci)]
+            cov = float(_points_inside_annotation(pts, ann).mean()) if len(pts) else 0.0
+            rows.append((cov, d, ai))
+        rows.sort(key=lambda x: (-x[0], x[1], x[2]))
+        best = rows[0][0] if rows else 0.0
+        second = rows[1][0] if len(rows) > 1 else 0.0
+        if rows and best >= float(best_coverage_min) and second <= float(second_coverage_max):
+            cov, dist, ai = rows[0]
+            candidates.append((-cov, dist, ci, ai, second))
+
+    candidates.sort()
     used_c, used_a = set(), set()
     out = {}
-    for _, ci, ai, _ in pairs:
+    for neg_cov, dist, ci, ai, second in candidates:
         if ci in used_c or ai in used_a:
             continue
         used_c.add(ci); used_a.add(ai)
-        out[int(ci)] = anns[int(ai)]
+        ann = dict(anns[int(ai)])
+        ann["_match_coverage"] = float(-neg_cov)
+        ann["_second_coverage"] = float(second)
+        ann["_match_centroid_distance_m"] = float(dist)
+        out[int(ci)] = ann
     return out
 
 
@@ -281,18 +321,22 @@ def main():
         residual = pred["residual_xy_m"].float().cpu().numpy()
 
         ann0_list = _dynamic_annotations(source.nusc, w.t0_token)
-        matches = _match_components(current, ann0_list, a.match_max_distance_m)
-        fmap = [_ann_map(source.nusc, t) for t in w.future_tokens]
         t0_pose = history_poses[-1]
-
-        totals["windows"] += 1
-        totals["sources"] += len(current)
-        totals["gt_matches"] += len(matches)
-
         source_points = {
             i: _voxel_centers_world(c["voxel_indices"], t0_pose, pcfg.grid)
             for i, c in enumerate(current)
         }
+        matches = _match_components(
+            current, source_points, ann0_list, a.match_max_distance_m
+        )
+        fmap = [_ann_map(source.nusc, t) for t in w.future_tokens]
+
+        totals["windows"] += 1
+        totals["sources"] += len(current)
+        totals["gt_matches"] += len(matches)
+        totals["match_best_coverage_sum"] = totals.get("match_best_coverage_sum", 0.0) + sum(
+            float(x.get("_match_coverage", 0.0)) for x in matches.values()
+        )
 
         for horizon, hi in safe.REPORT.items():
             gt = payload["gt"][hi]
@@ -454,6 +498,14 @@ def main():
         "variants": reports,
         "matched_source_moving": matched_reports,
         "totals": totals,
+        "source_match": {
+            "matched_sources": int(totals["gt_matches"]),
+            "all_sources": int(totals["sources"]),
+            "fraction": totals["gt_matches"] / max(totals["sources"], 1),
+            "mean_best_point_coverage": totals.get("match_best_coverage_sum", 0.0) / max(totals["gt_matches"], 1),
+            "best_coverage_min": 0.8,
+            "second_coverage_max": 0.2,
+        },
         "matched_support": {
             "full_voxels": support_full,
             "matched_voxels": support_matched,
@@ -490,7 +542,7 @@ def main():
     for name in VARIANTS:
         ph = reports[name]["moving"]["per_horizon"]
         vals = {}
-        for cid in VEHICLE_CLASSES:
+        for cid in DISPLAY_CLASSES:
             hs = [float(ph[h]["per_class"].get(cid, float("nan"))) for h in (1.0, 2.0, 3.0)]
             good = [x for x in hs if np.isfinite(x)]
             vals[NUSCENES_LABELS[cid]] = float(np.mean(good)) if good else float("nan")
@@ -498,6 +550,12 @@ def main():
     print(
         f"\nyaw|V17={decision_gain:+.4f} pp "
         f"yaw|GTXY={yaw_gtxy_gain:+.4f} pp decision={decision}"
+    )
+    print(
+        "source_match_fraction="
+        f"{100*result['source_match']['fraction']:.2f}% "
+        "mean_best_point_coverage="
+        f"{100*result['source_match']['mean_best_point_coverage']:.2f}%"
     )
     print(
         "matched_support_recall="
