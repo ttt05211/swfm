@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Build causal KTA/V17 selector labels and optional GT-assisted budget curves.
 
-This is a feasibility experiment, not the final method.  For each Strong source
+This is a feasibility experiment, not the final method. For each Strong source
 we compare two frozen experts under the final A1 source-order compositor:
   * KTA rigid transport;
   * V17-RL epoch5 rigid transport.
 
-Future GT is used only to assign an *offline* source utility label: the change
-in correctly classified semantic voxels on GT Moving support when exactly this
-source is switched from KTA to V17 while all other sources remain KTA.  The
-selector inputs stored in the output are causal and do not contain V17 output or
-future GT.
+Future GT is used only to assign an offline source utility label: the change in
+correctly classified semantic voxels on GT Moving support when exactly this
+source is switched from KTA to V17 while all other sources remain KTA. Selector
+inputs stored in the output are causal and contain neither V17 output nor future
+GT.
 
 When --evaluate-curves is set, the script also composes exact final occupancy
 predictions for per-window Q budgets using GT utility ranking, current-speed
-ranking, and deterministic random ranking.  This answers whether correction
+ranking and deterministic random ranking. This answers whether correction
 benefit is sparse before any selector is trained.
 """
 from __future__ import annotations
@@ -62,7 +62,6 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import (
 )
 
 PROTOCOL = "p0_f9_kta_v17_selector_utility_builder_v1"
-REPORT_HORIZONS = tuple(float(h) for h in safe.REPORT)
 
 
 def _parse_budgets(raw: str):
@@ -80,13 +79,44 @@ def _parse_budgets(raw: str):
     return tuple(sorted(set(vals)))
 
 
+def _scene_balanced_cap(records, cap: int, seed: int):
+    """Round-robin a deterministic per-scene shuffle instead of taking first N."""
+    if cap <= 0 or len(records) <= cap:
+        return list(records)
+    groups = {}
+    for r in records:
+        groups.setdefault(str(r["scene_name"]), []).append(r)
+    rng = np.random.default_rng(int(seed))
+    scenes = sorted(groups)
+    scenes = [scenes[i] for i in rng.permutation(len(scenes))]
+    queues = {}
+    for scene in scenes:
+        rows = groups[scene]
+        order = rng.permutation(len(rows)).tolist()
+        queues[scene] = [rows[i] for i in order]
+    out = []
+    depth = 0
+    while len(out) < cap:
+        added = False
+        for scene in scenes:
+            q = queues[scene]
+            if depth < len(q):
+                out.append(q[depth])
+                added = True
+                if len(out) >= cap:
+                    return out
+        if not added:
+            break
+        depth += 1
+    return out
+
+
 def _new_state(free_label: int):
     return {
         "safe": safe._new_metrics(),
         "occ": OccupancyIoUMultiHorizon(free_label=int(free_label)),
         "selected": 0,
         "sources": 0,
-        "windows": 0,
     }
 
 
@@ -140,6 +170,7 @@ def main():
     p.add_argument("--budgets", default="0,10,20,40,100")
     p.add_argument("--random-repeats", type=int, default=5)
     p.add_argument("--random-seed", type=int, default=20260913)
+    p.add_argument("--selection-seed", type=int, default=20260913)
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--evaluate-curves", action="store_true")
     p.add_argument("--device", default="cuda")
@@ -155,13 +186,13 @@ def main():
     sid_to_idx = {str(e["sample_id"]): i for i, e in enumerate(ds.entries)}
     records = [r for r in records if str(r["sample_id"]) in sid_to_idx]
     if a.max_windows > 0:
-        records = records[: min(len(records), int(a.max_windows))]
+        records = _scene_balanced_cap(records, int(a.max_windows), int(a.selection_seed))
     if not records:
         raise RuntimeError("no V17/P0F9 sample intersection")
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
     ck, model = load_model(a.checkpoint, device)
-    if bool(ck.get("protocol") != "p0_f9_v17_local_spatial_temporal_world_model_v1"):
+    if ck.get("protocol") != "p0_f9_v17_local_spatial_temporal_world_model_v1":
         raise RuntimeError("selector feasibility requires the standard frozen V17 checkpoint")
     if not bool(ck.get("use_representation", False)):
         raise RuntimeError("selector feasibility requires V17 representation checkpoint")
@@ -209,7 +240,6 @@ def main():
             pred = model(features, tube, kta_disp, frame_motion, source_mask)
         residual = pred["residual_xy_m"].float().cpu().numpy()
 
-        # Build both frozen experts once per report horizon.
         baseline_by_hi = {}
         learned_by_hi = {}
         base_pred_by_hi = {}
@@ -249,7 +279,6 @@ def main():
                 free_label=pcfg.free_label, grid=pcfg.grid,
             )
 
-        # Offline GT utility: exact one-source counterfactual under final A1.
         utility_raw = np.zeros(n, dtype=np.float64)
         utility_h = np.zeros((n, len(safe.REPORT)), dtype=np.float64)
         moving_voxels = 0
@@ -348,6 +377,10 @@ def main():
         "num_windows": len(out_records),
         "num_sources": total_sources,
         "scene_names": sorted({str(r["scene_name"]) for r in out_records}),
+        "selection_protocol": (
+            "all_common_records" if a.max_windows <= 0
+            else f"scene_balanced_round_robin_cap_{int(a.max_windows)}_seed_{int(a.selection_seed)}"
+        ),
         "utility_summary": utility_summary,
         "budgets": list(budgets),
         "gt_usage": "labels_and_oracle_ranking_only_never_selector_inputs",
