@@ -166,8 +166,13 @@ def main():
             "total_ms": 1000.0 * (t2 - t0),
         }
 
-    # Warm all kernels/memory paths at dense budget.
+    # Warm both routed and dense paths so the first timing sample does not
+    # absorb selector or V17 kernel initialization.
+    routed_warm_q = 20.0 if 20.0 in budgets else next(
+        (q for q in budgets if q < 100.0), 100.0
+    )
     for rec in chosen[: int(a.warmup_windows)]:
+        one(rec, routed_warm_q, timed=False)
         one(rec, 100.0, timed=False)
 
     timed_records = chosen[
