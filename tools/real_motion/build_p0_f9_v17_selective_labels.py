@@ -29,7 +29,10 @@ import torch
 
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS, REPORT_HORIZONS_S
 from real_motion.msp_wm_cache import MSPWorldModelCacheDataset
-from real_motion.nuscenes_adapter import NuScenesWindowSource
+from real_motion.nuscenes_adapter import (
+    NuScenesWindowSource,
+    gt_moving_support_for_horizon,
+)
 from real_motion.rigid_transport import rasterize_rigid_component
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.selective_forecast import (
@@ -42,7 +45,12 @@ from real_motion.selective_forecast import (
     moving_miou_from_counts,
     single_source_moving_delta_counts,
 )
-from real_motion.strong_w2det import StrongW2DetConfig, extract_instances, match_instances
+from real_motion.strong_w2det import (
+    StrongW2DetConfig,
+    extract_instances,
+    match_instances,
+    strong_w2det_sequence,
+)
 from tools.real_motion import eval_p0_f9_frozen_sparse_occfm as safe
 from tools.real_motion.eval_p0_f9_v17_local_stwm import (
     load_cache,
@@ -69,6 +77,78 @@ def _select_records(records, p0f9_ids, *, max_windows: int, seed: int, allow_mis
         selected = selected[: int(max_windows)]
         selected.sort(key=lambda r: str(r["sample_id"]))
     return selected, missing
+
+
+def _raw_eval_payload(source, w, pcfg, strong_cfg):
+    history_occ = np.stack(
+        [source.load_semantics(w.scene_name, tok) for tok in w.history_tokens],
+        axis=0,
+    ).astype(np.uint8, copy=False)
+    history_poses = [
+        np.asarray(source.pose(tok), dtype=np.float64) for tok in w.history_tokens
+    ]
+    future_poses = [
+        np.asarray(source.pose(tok), dtype=np.float64) for tok in w.future_tokens
+    ]
+    gt = np.stack(
+        [source.load_semantics(w.scene_name, tok) for tok in w.future_tokens],
+        axis=0,
+    ).astype(np.uint8, copy=False)
+    anchor = strong_w2det_sequence(
+        history_occ,
+        history_poses,
+        future_poses,
+        frame_dt_s=float(pcfg.frame_dt_s),
+        grid=pcfg.grid,
+        cfg=strong_cfg,
+    ).astype(np.uint8, copy=False)
+    moving = np.zeros_like(gt, dtype=bool)
+    for horizon, hi in safe.REPORT.items():
+        sup, _, _ = gt_moving_support_for_horizon(
+            source.nusc,
+            w.t0_token,
+            w.future_tokens[hi],
+            float(horizon),
+            grid=pcfg.grid,
+        )
+        moving[hi] = sup
+    return {
+        "gt": gt,
+        "anchor": anchor,
+        "moving": moving,
+        "history_occ": history_occ,
+        "history_poses": history_poses,
+        "future_poses": future_poses,
+        "source": "raw_occ3d_reconstructed",
+    }
+
+
+def _cached_eval_payload(sample):
+    needed = (
+        "eval_future_gt_occ",
+        "eval_strong_anchor_occ",
+        "eval_gt_moving_support",
+    )
+    if not all(k in sample for k in needed):
+        return None
+    return {
+        "gt": sample["eval_future_gt_occ"].cpu().numpy(),
+        "anchor": sample["eval_strong_anchor_occ"].cpu().numpy(),
+        "moving": sample["eval_gt_moving_support"].cpu().numpy().astype(bool),
+        "source": "p0f9_cached_eval_payload",
+    }
+
+
+def _assert_payload_equal(raw, cached, sid):
+    for key in ("gt", "anchor", "moving"):
+        if not np.array_equal(np.asarray(raw[key]), np.asarray(cached[key])):
+            a = np.asarray(raw[key])
+            b = np.asarray(cached[key])
+            diff = int(np.count_nonzero(a != b))
+            raise RuntimeError(
+                f"{sid}: raw-reconstructed {key} differs from cached eval payload "
+                f"at {diff} voxels"
+            )
 
 
 def _label_stats(values):
@@ -102,6 +182,12 @@ def main():
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--selection-seed", type=int, default=20260913)
     p.add_argument("--allow-missing", action="store_true")
+    p.add_argument(
+        "--audit-raw-payload-windows",
+        type=int,
+        default=2,
+        help="When cached eval payload exists, compare this many windows against exact raw reconstruction.",
+    )
     p.add_argument("--device", default="cuda")
     a = p.parse_args()
 
@@ -143,15 +229,39 @@ def main():
 
     for wi, rec in enumerate(records):
         sid = str(rec["sample_id"])
-        payload = safe._sample_payload(ds[sid_to_idx[sid]], torch.device("cpu"))
         w = window_from_record(rec)
-        history_occ = [source.load_semantics(w.scene_name, tok) for tok in w.history_tokens]
-        history_poses = [
-            np.asarray(source.pose(tok), dtype=np.float64) for tok in w.history_tokens
-        ]
-        future_poses = [
-            np.asarray(source.pose(tok), dtype=np.float64) for tok in w.future_tokens
-        ]
+        cached = None
+        # Validation P0-F9 caches carry the compact eval payload; training
+        # caches commonly do not. Raw reconstruction is therefore the canonical
+        # path, with cached validation payload used only as an audited fast path.
+        if bool(ds.metadata.get("include_eval_payload", False)):
+            cached = _cached_eval_payload(ds[sid_to_idx[sid]])
+        need_raw = cached is None or wi < int(a.audit_raw_payload_windows)
+        raw = (
+            _raw_eval_payload(source, w, pcfg, strong_cfg)
+            if need_raw else None
+        )
+        if cached is not None and raw is not None:
+            _assert_payload_equal(raw, cached, sid)
+        payload = cached if cached is not None else raw
+        if payload is None:
+            raise RuntimeError(f"{sid}: no evaluation payload available")
+        if raw is not None:
+            history_occ = [np.asarray(x) for x in raw["history_occ"]]
+            history_poses = raw["history_poses"]
+            future_poses = raw["future_poses"]
+        else:
+            history_occ = [
+                source.load_semantics(w.scene_name, tok) for tok in w.history_tokens
+            ]
+            history_poses = [
+                np.asarray(source.pose(tok), dtype=np.float64)
+                for tok in w.history_tokens
+            ]
+            future_poses = [
+                np.asarray(source.pose(tok), dtype=np.float64)
+                for tok in w.future_tokens
+            ]
         current = extract_instances(
             history_occ[-1], history_poses[-1], grid=pcfg.grid, cfg=strong_cfg
         )
@@ -301,6 +411,14 @@ def main():
         "future_gt_used_for_labels_only": True,
         "selector_inputs_are_causal_only": True,
         "uses_gt_instance_matching": False,
+        "eval_payload_source": (
+            "cached_p0f9_when_available_else_raw_occ3d_reconstruction"
+        ),
+        "raw_payload_reconstruction_contract": (
+            "raw_future_occ3d+strong_w2det_sequence+gt_moving_support_for_horizon_v1"
+        ),
+        "audit_raw_payload_windows": int(a.audit_raw_payload_windows),
+        "p0f9_include_eval_payload": bool(ds.metadata.get("include_eval_payload", False)),
         "a1_single_source_clear_write": True,
         "cache_metadata": cache_meta,
     }
