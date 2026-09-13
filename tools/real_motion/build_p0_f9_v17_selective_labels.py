@@ -49,7 +49,7 @@ from real_motion.strong_w2det import (
     StrongW2DetConfig,
     extract_instances,
     match_instances,
-    strong_w2det_sequence,
+    w2det_predict,
 )
 from tools.real_motion import eval_p0_f9_frozen_sparse_occfm as safe
 from tools.real_motion.eval_p0_f9_v17_local_stwm import (
@@ -80,30 +80,35 @@ def _select_records(records, p0f9_ids, *, max_windows: int, seed: int, allow_mis
 
 
 def _raw_eval_payload(source, w, pcfg, strong_cfg):
-    history_occ = np.stack(
-        [source.load_semantics(w.scene_name, tok) for tok in w.history_tokens],
-        axis=0,
-    ).astype(np.uint8, copy=False)
-    history_poses = [
-        np.asarray(source.pose(tok), dtype=np.float64) for tok in w.history_tokens
-    ]
+    # Only t-1/t0 are needed by frozen Strong-W2Det; V17's full six-frame
+    # causal representation is already frozen in the V17 cache.
+    previous = source.load_semantics(w.scene_name, w.history_tokens[-2])
+    current = source.load_semantics(w.scene_name, w.history_tokens[-1])
+    previous_pose = np.asarray(source.pose(w.history_tokens[-2]), dtype=np.float64)
+    current_pose = np.asarray(source.pose(w.history_tokens[-1]), dtype=np.float64)
     future_poses = [
         np.asarray(source.pose(tok), dtype=np.float64) for tok in w.future_tokens
     ]
-    gt = np.stack(
-        [source.load_semantics(w.scene_name, tok) for tok in w.future_tokens],
-        axis=0,
-    ).astype(np.uint8, copy=False)
-    anchor = strong_w2det_sequence(
-        history_occ,
-        history_poses,
-        future_poses,
-        frame_dt_s=float(pcfg.frame_dt_s),
-        grid=pcfg.grid,
-        cfg=strong_cfg,
-    ).astype(np.uint8, copy=False)
+
+    shape = tuple(int(x) for x in pcfg.grid.shape_hwd)
+    gt = np.full((6, *shape), int(pcfg.free_label), dtype=np.uint8)
+    anchor = np.full_like(gt, int(pcfg.free_label))
     moving = np.zeros_like(gt, dtype=bool)
     for horizon, hi in safe.REPORT.items():
+        gt[hi] = source.load_semantics(
+            w.scene_name, w.future_tokens[hi]
+        ).astype(np.uint8, copy=False)
+        anchor[hi] = w2det_predict(
+            current,
+            previous,
+            current_pose,
+            previous_pose,
+            future_poses[hi],
+            dt_future_s=(hi + 1) * float(pcfg.frame_dt_s),
+            dt_previous_s=float(pcfg.frame_dt_s),
+            grid=pcfg.grid,
+            cfg=strong_cfg,
+        ).astype(np.uint8, copy=False)
         sup, _, _ = gt_moving_support_for_horizon(
             source.nusc,
             w.t0_token,
@@ -116,10 +121,10 @@ def _raw_eval_payload(source, w, pcfg, strong_cfg):
         "gt": gt,
         "anchor": anchor,
         "moving": moving,
-        "history_occ": history_occ,
-        "history_poses": history_poses,
+        "history_occ": [previous, current],
+        "history_poses": [previous_pose, current_pose],
         "future_poses": future_poses,
-        "source": "raw_occ3d_reconstructed",
+        "source": "raw_occ3d_reconstructed_report_horizons",
     }
 
 
@@ -140,14 +145,15 @@ def _cached_eval_payload(sample):
 
 
 def _assert_payload_equal(raw, cached, sid):
+    report_indices = [int(x) for x in safe.REPORT.values()]
     for key in ("gt", "anchor", "moving"):
-        if not np.array_equal(np.asarray(raw[key]), np.asarray(cached[key])):
-            a = np.asarray(raw[key])
-            b = np.asarray(cached[key])
+        a = np.asarray(raw[key])[report_indices]
+        b = np.asarray(cached[key])[report_indices]
+        if not np.array_equal(a, b):
             diff = int(np.count_nonzero(a != b))
             raise RuntimeError(
                 f"{sid}: raw-reconstructed {key} differs from cached eval payload "
-                f"at {diff} voxels"
+                f"at report horizons by {diff} voxels"
             )
 
 
@@ -415,7 +421,7 @@ def main():
             "cached_p0f9_when_available_else_raw_occ3d_reconstruction"
         ),
         "raw_payload_reconstruction_contract": (
-            "raw_future_occ3d+strong_w2det_sequence+gt_moving_support_for_horizon_v1"
+            "raw_report_future_occ3d+w2det_predict_tminus1_t0+gt_moving_support_for_horizon_v1"
         ),
         "audit_raw_payload_windows": int(a.audit_raw_payload_windows),
         "p0f9_include_eval_payload": bool(ds.metadata.get("include_eval_payload", False)),
