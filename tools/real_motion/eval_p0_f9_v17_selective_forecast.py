@@ -211,6 +211,25 @@ def main():
     selector_ck, selector, fmean, fstd, tmean, tstd = load_selector(
         a.selector_checkpoint, device
     )
+    selector_label_meta = selector_ck.get("label_cache_metadata") or {}
+    if selector_label_meta.get("checkpoint") != label_meta.get("checkpoint"):
+        raise RuntimeError(
+            "selector was trained against a different frozen V17 expert checkpoint"
+        )
+    eval_scenes = {str(label_by_id[sid]["scene_name"]) for sid in sample_ids}
+    selector_fit_scenes = set(selector_ck.get("train_scenes") or []) | set(
+        selector_ck.get("val_scenes") or []
+    )
+    overlap = sorted(eval_scenes & selector_fit_scenes)
+    if overlap:
+        raise RuntimeError(
+            "selector train/internal-val scenes overlap evaluation scenes: "
+            f"{overlap[:10]}"
+        )
+    if not bool(ds.metadata.get("include_eval_payload", False)):
+        raise RuntimeError(
+            "selective evaluation requires P0-F9 validation cache with eval payload"
+        )
     source = NuScenesWindowSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
 
@@ -479,20 +498,39 @@ def main():
         )
         if branch is None:
             raise RuntimeError("reference V17 JSON misses A1 report branch")
+        strong = (ref.get("reports") or {}).get("strong_anchor")
+        if strong is None:
+            raise RuntimeError("reference V17 JSON misses Strong/KTA report branch")
         reference_check = {
             "reference_path": str(Path(a.reference_v17_json).resolve()),
-            "reference_IoU": float(branch["occupancy"]["IoU"]),
-            "reference_mIoU": float(branch["overall"]["mIoU"]),
-            "reference_Moving": float(branch["moving"]["mIoU"]),
+            "reference_KTA_IoU": float(strong["occupancy"]["IoU"]),
+            "reference_KTA_mIoU": float(strong["overall"]["mIoU"]),
+            "reference_KTA_Moving": float(strong["moving"]["mIoU"]),
+            "reference_V17_IoU": float(branch["occupancy"]["IoU"]),
+            "reference_V17_mIoU": float(branch["overall"]["mIoU"]),
+            "reference_V17_Moving": float(branch["moving"]["mIoU"]),
+            "q0_IoU": curve["oracle"][_qname(0.0)]["IoU"],
+            "q0_mIoU": curve["oracle"][_qname(0.0)]["mIoU"],
+            "q0_Moving": curve["oracle"][_qname(0.0)]["Moving"],
             "q100_IoU": curve["oracle"][_qname(100.0)]["IoU"],
             "q100_mIoU": curve["oracle"][_qname(100.0)]["mIoU"],
             "q100_Moving": curve["oracle"][_qname(100.0)]["Moving"],
         }
-        reference_check["max_abs_metric_diff"] = max(
-            abs(reference_check["reference_IoU"] - reference_check["q100_IoU"]),
-            abs(reference_check["reference_mIoU"] - reference_check["q100_mIoU"]),
-            abs(reference_check["reference_Moving"] - reference_check["q100_Moving"]),
-        )
+        diffs = [
+            abs(reference_check["reference_KTA_IoU"] - reference_check["q0_IoU"]),
+            abs(reference_check["reference_KTA_mIoU"] - reference_check["q0_mIoU"]),
+            abs(reference_check["reference_KTA_Moving"] - reference_check["q0_Moving"]),
+            abs(reference_check["reference_V17_IoU"] - reference_check["q100_IoU"]),
+            abs(reference_check["reference_V17_mIoU"] - reference_check["q100_mIoU"]),
+            abs(reference_check["reference_V17_Moving"] - reference_check["q100_Moving"]),
+        ]
+        reference_check["max_abs_metric_diff"] = max(diffs)
+        reference_check["pass_1e-6"] = bool(reference_check["max_abs_metric_diff"] <= 1e-6)
+        if not reference_check["pass_1e-6"]:
+            raise RuntimeError(
+                "Q=0/100 do not reproduce frozen KTA/V17 reference metrics: "
+                f"max diff={reference_check['max_abs_metric_diff']}"
+            )
 
     result = {
         "protocol": PROTOCOL,
@@ -504,6 +542,11 @@ def main():
         "p0f9_cache": str(Path(a.p0f9_cache).resolve()),
         "selector_checkpoint": str(Path(a.selector_checkpoint).resolve()),
         "selector_train_label_cache": selector_ck.get("label_cache"),
+        "selector_frozen_v17_checkpoint": selector_label_meta.get("checkpoint"),
+        "eval_frozen_v17_checkpoint": label_meta.get("checkpoint"),
+        "selector_fit_scenes": sorted(selector_fit_scenes),
+        "evaluation_scenes": sorted(eval_scenes),
+        "scene_overlap_checked_zero": True,
         "num_windows": len(sample_ids),
         "num_sources": int(source_total),
         "budgets_percent": budgets,
