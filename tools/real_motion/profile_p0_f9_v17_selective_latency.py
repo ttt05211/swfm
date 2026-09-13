@@ -117,13 +117,20 @@ def main():
         f_cpu = rec["features"].float()
         n = int(f_cpu.shape[0])
         t0 = time.perf_counter()
-        f = f_cpu.to(device, non_blocking=False)
-        score = selector((f - fmean) / fstd.clamp_min(1e-6))
-        score_cpu = score.float().cpu().numpy()
-        _sync(device)
-        t1 = time.perf_counter()
-
-        mask = top_budget_mask(score_cpu, q)
+        if float(q) >= 100.0:
+            # Dense V17 is the no-router reference; do not charge it selector
+            # overhead just to manufacture an all-true mask.
+            score_cpu = np.zeros((n,), dtype=np.float64)
+            _sync(device)
+            t1 = time.perf_counter()
+            mask = np.ones((n,), dtype=bool)
+        else:
+            f = f_cpu.to(device, non_blocking=False)
+            score = selector((f - fmean) / fstd.clamp_min(1e-6))
+            score_cpu = score.float().cpu().numpy()
+            _sync(device)
+            t1 = time.perf_counter()
+            mask = top_budget_mask(score_cpu, q)
         ids_np = np.flatnonzero(mask)
         if len(ids_np) == 0:
             _sync(device)
