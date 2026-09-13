@@ -146,7 +146,7 @@ def test_scene_split_is_disjoint_and_deterministic():
 
 
 def test_spearman_and_selector_shapes():
-    assert spearman_corr(np.arange(10), np.arange(10)) == 1.0
+    assert spearman_corr(np.arange(10), np.arange(10)) == pytest.approx(1.0)
     model = CorrectionSelector()
-    y = model(torch.zeros((4, 46)))
+    y = model(torch.zeros((4, model.net[0].in_features)))
     assert y.shape == (4,)
