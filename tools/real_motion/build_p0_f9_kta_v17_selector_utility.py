@@ -187,11 +187,10 @@ def _selector_eval_payload(
         "eval_gt_moving_support",
     )
     if all(k in sample for k in required):
-        cached = safe._sample_payload(sample, torch.device("cpu"))
         return {
-            "gt": cached["gt"],
-            "anchor": cached["anchor"],
-            "moving": cached["moving"],
+            "gt": sample["eval_future_gt_occ"].cpu().numpy(),
+            "anchor": sample["eval_strong_anchor_occ"].cpu().numpy(),
+            "moving": sample["eval_gt_moving_support"].cpu().numpy().astype(bool),
         }, "cached_eval"
 
     gt = np.stack(
