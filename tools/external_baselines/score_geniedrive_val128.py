@@ -77,6 +77,32 @@ def compose_kta(sample, frame_index):
     return output
 
 
+def evaluation_arrays(sample):
+    """Normalize full-prepared and compact P0-F9 evaluation payloads."""
+    if "future_gt_occ" in sample and "gt_moving_support" in sample:
+        return {
+            "target": np.asarray(sample["future_gt_occ"]),
+            "moving_support": np.asarray(sample["gt_moving_support"]).astype(bool),
+            "baseline_name": "KTA_composed_baseline",
+            "baseline": np.stack(
+                [compose_kta(sample, frame_index) for frame_index in range(6)], axis=0
+            ),
+        }
+    if "eval_future_gt_occ" in sample and "eval_gt_moving_support" in sample:
+        baseline = sample.get("eval_strong_anchor_occ")
+        return {
+            "target": np.asarray(sample["eval_future_gt_occ"]),
+            "moving_support": np.asarray(sample["eval_gt_moving_support"]).astype(bool),
+            "baseline_name": (
+                "Strong-W2Det_baseline" if baseline is not None else None
+            ),
+            "baseline": np.asarray(baseline) if baseline is not None else None,
+        }
+    raise KeyError(
+        "reference cache sample lacks full prepared targets and compact P0-F9 eval payload"
+    )
+
+
 def summarized(accumulators):
     per_horizon = {
         str(horizon): accumulators[horizon].compute() for horizon, _ in REPORT
@@ -87,21 +113,23 @@ def summarized(accumulators):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prepared", required=True)
+    parser.add_argument(
+        "--reference-cache", "--prepared", dest="reference_cache", required=True
+    )
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--pred-dir", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
-    prepared_root = Path(args.prepared)
-    prepared_index = json.loads(
-        (prepared_root / "index.json").read_text(encoding="utf-8")
+    reference_root = Path(args.reference_cache)
+    reference_index = json.loads(
+        (reference_root / "index.json").read_text(encoding="utf-8")
     )
     manifest = load_manifest(args.manifest)
     manifest_ids = [row["sample_id"] for row in manifest["entries"]]
-    prepared_ids = [str(row["sample_id"]) for row in prepared_index["entries"]]
-    if prepared_ids != manifest_ids:
-        raise RuntimeError("prepared index no longer matches the frozen val128 manifest")
+    reference_ids = [str(row["sample_id"]) for row in reference_index["entries"]]
+    if reference_ids != manifest_ids:
+        raise RuntimeError("reference cache index no longer matches the frozen val128 manifest")
 
     prediction_root = Path(args.pred_dir)
     prediction_index = json.loads(
@@ -118,15 +146,17 @@ def main():
     overall = {horizon: IoUAccumulator(range(17)) for horizon, _ in REPORT}
     dynamic = {horizon: IoUAccumulator(DYNAMIC_CLASSES) for horizon, _ in REPORT}
     moving = {horizon: IoUAccumulator(DYNAMIC_CLASSES) for horizon, _ in REPORT}
-    kta_overall = {horizon: IoUAccumulator(range(17)) for horizon, _ in REPORT}
-    kta_moving = {horizon: IoUAccumulator(DYNAMIC_CLASSES) for horizon, _ in REPORT}
+    baseline_overall = {horizon: IoUAccumulator(range(17)) for horizon, _ in REPORT}
+    baseline_dynamic = {horizon: IoUAccumulator(DYNAMIC_CLASSES) for horizon, _ in REPORT}
+    baseline_moving = {horizon: IoUAccumulator(DYNAMIC_CLASSES) for horizon, _ in REPORT}
+    baseline_name = None
 
     cached_shard_name = None
     cached_shard = None
-    for entry in prepared_index["entries"]:
+    for entry in reference_index["entries"]:
         if entry["shard"] != cached_shard_name:
             cached_shard = torch.load(
-                str(prepared_root / entry["shard"]), map_location="cpu"
+                str(reference_root / entry["shard"]), map_location="cpu"
             )
             cached_shard_name = entry["shard"]
         sample = cached_shard[entry["index"]]
@@ -135,15 +165,23 @@ def main():
             str(prediction_files[sample_id]), map_location="cpu"
         )
         prediction = validate_prediction(prediction_payload["pred_occ"])
+        arrays = evaluation_arrays(sample)
+        if arrays["baseline_name"] is not None:
+            if baseline_name is None:
+                baseline_name = arrays["baseline_name"]
+            elif baseline_name != arrays["baseline_name"]:
+                raise RuntimeError("reference cache mixes baseline payload contracts")
         for horizon, frame_index in REPORT:
-            target = np.asarray(sample["future_gt_occ"])[frame_index]
-            support = np.asarray(sample["gt_moving_support"])[frame_index].astype(bool)
-            kta = compose_kta(sample, frame_index)
+            target = arrays["target"][frame_index]
+            support = arrays["moving_support"][frame_index]
             overall[horizon].update(prediction[frame_index], target)
             dynamic[horizon].update(prediction[frame_index], target)
             moving[horizon].update(prediction[frame_index], target, support)
-            kta_overall[horizon].update(kta, target)
-            kta_moving[horizon].update(kta, target, support)
+            if arrays["baseline"] is not None:
+                baseline = arrays["baseline"][frame_index]
+                baseline_overall[horizon].update(baseline, target)
+                baseline_dynamic[horizon].update(baseline, target)
+                baseline_moving[horizon].update(baseline, target, support)
 
     report = {
         "version": "swfm_geniedrive_val128_score_v1",
@@ -154,9 +192,9 @@ def main():
             "dynamic": summarized(dynamic),
             "Moving-mIoU_v2": summarized(moving),
         },
-        "KTA_composed_baseline": {
-            "overall": summarized(kta_overall),
-            "Moving-mIoU_v2": summarized(kta_moving),
+        "reference_cache": {
+            "root": str(reference_root.resolve()),
+            "version": reference_index.get("version"),
         },
         "prediction_provenance": {
             key: value
@@ -164,6 +202,12 @@ def main():
             if key != "entries"
         },
     }
+    if baseline_name is not None:
+        report[baseline_name] = {
+            "overall": summarized(baseline_overall),
+            "dynamic": summarized(baseline_dynamic),
+            "Moving-mIoU_v2": summarized(baseline_moving),
+        }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2), encoding="utf-8")

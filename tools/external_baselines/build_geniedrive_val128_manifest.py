@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze the current SWFM prepared val128 sample IDs for external baselines."""
+"""Freeze sample IDs from an SWFM val128 reference cache."""
 import argparse
 import json
 import sys
@@ -13,18 +13,25 @@ from tools.external_baselines.geniedrive_contract import build_manifest
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prepared", required=True, help="SWFM prepared val128 directory")
+    parser.add_argument(
+        "--reference-cache", "--prepared", dest="reference_cache", required=True,
+        help=(
+            "SWFM val128 cache directory. Accepts either the full prepared cache "
+            "or a compact P0-F9 validation cache with eval payload."
+        ),
+    )
     parser.add_argument("--output", required=True, help="manifest JSON path")
     parser.add_argument("--expected-count", type=int, default=128)
     args = parser.parse_args()
 
-    prepared = Path(args.prepared).resolve()
-    index_path = prepared / "index.json"
+    reference = Path(args.reference_cache).resolve()
+    index_path = reference / "index.json"
     if not index_path.is_file():
-        raise FileNotFoundError(f"prepared index does not exist: {index_path}")
+        raise FileNotFoundError(f"reference cache index does not exist: {index_path}")
     index = json.loads(index_path.read_text(encoding="utf-8"))
     manifest = build_manifest(index, expected_count=args.expected_count)
-    manifest["prepared_root"] = str(prepared)
+    manifest["reference_cache_root"] = str(reference)
+    manifest["reference_cache_version"] = index.get("version")
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

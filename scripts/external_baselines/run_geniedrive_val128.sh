@@ -8,7 +8,7 @@ source "${SWFM_ROOT}/scripts/external_baselines/sanitize_geniedrive_environment.
 EXTERNAL_ROOT="${EXTERNAL_ROOT:-/root/nas/occ/external_baselines/geniedrive_val128}"
 GENIEDRIVE_ROOT="${GENIEDRIVE_ROOT:-${EXTERNAL_ROOT}/GenieDrive}"
 DOWNLOAD_ROOT="${DOWNLOAD_ROOT:-${EXTERNAL_ROOT}/downloads}"
-PREPARED_VAL="${PREPARED_VAL:-${SWFM_ROOT}/data/prepared_val}"
+REFERENCE_CACHE="${REFERENCE_CACHE:-${PREPARED_VAL:-${SWFM_ROOT}/data/p0_f9_v2_wm_val_top2_128}}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${EXTERNAL_ROOT}/results}"
 GENIEDRIVE_ENV="${GENIEDRIVE_ENV:-geniedrive-occ}"
 GPU_ID="${GPU_ID:-0}"
@@ -26,7 +26,7 @@ fi
 LD_LIBRARY_PATH="${GENIEDRIVE_TORCH_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
 conda run --no-capture-output -n "${GENIEDRIVE_ENV}" \
   python "${SWFM_ROOT}/tools/external_baselines/build_geniedrive_val128_manifest.py" \
-  --prepared "${PREPARED_VAL}" \
+  --reference-cache "${REFERENCE_CACHE}" \
   --output "${OUTPUT_ROOT}/val128_manifest.json" \
   --expected-count 128
 
@@ -43,7 +43,7 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" conda run --no-capture-output -n "${GENIEDRIVE_
 LD_LIBRARY_PATH="${GENIEDRIVE_TORCH_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
 conda run --no-capture-output -n "${GENIEDRIVE_ENV}" \
   python "${SWFM_ROOT}/tools/external_baselines/score_geniedrive_val128.py" \
-  --prepared "${PREPARED_VAL}" \
+  --reference-cache "${REFERENCE_CACHE}" \
   --manifest "${OUTPUT_ROOT}/val128_manifest.json" \
   --pred-dir "${OUTPUT_ROOT}/predictions" \
   --output "${OUTPUT_ROOT}/geniedrive_val128_moving_miou_v2.json"

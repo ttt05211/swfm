@@ -21,6 +21,7 @@ from tools.external_baselines.export_geniedrive_val128 import (
 from tools.external_baselines.score_geniedrive_val128 import (
     IoUAccumulator,
     compose_kta,
+    evaluation_arrays,
 )
 
 
@@ -119,3 +120,18 @@ def test_python38_scorer_kta_composition_and_masked_iou():
     target[0, 0, 0] = 4
     metric.update(composed, target, np.ones_like(target, dtype=bool))
     assert metric.compute()["mIoU"] == pytest.approx(100.0)
+
+
+def test_python38_scorer_accepts_compact_p0_f9_eval_payload():
+    target = np.full((6, 2, 2, 1), 17, dtype=np.uint8)
+    anchor = target.copy()
+    support = np.zeros_like(target, dtype=bool)
+    sample = {
+        "eval_future_gt_occ": torch.from_numpy(target),
+        "eval_strong_anchor_occ": torch.from_numpy(anchor),
+        "eval_gt_moving_support": torch.from_numpy(support),
+    }
+    arrays = evaluation_arrays(sample)
+    assert arrays["baseline_name"] == "Strong-W2Det_baseline"
+    assert arrays["target"].shape == target.shape
+    assert arrays["baseline"].shape == anchor.shape

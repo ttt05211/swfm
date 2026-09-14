@@ -25,11 +25,26 @@ prepared data, checkpoints, or existing outputs.
 export SWFM_ROOT=/root/nas/occ/swfm
 export EXTERNAL_ROOT=/root/nas/occ/external_baselines/geniedrive_val128
 export NUSCENES_ROOT=/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes
-export PREPARED_VAL=/root/nas/occ/swfm/data/prepared_val
+export REFERENCE_CACHE=/root/nas/occ/swfm_v16_main/data/p0_f9_v2_wm_val_top2_128
 ```
 
 `NUSCENES_ROOT` must directly contain `gts/` and `v1.0-trainval/`. Point it at
 the already installed Occ3D-nuScenes tree; no new raw dataset is required.
+
+The external scorer accepts either the old full `prepared_val` directory or the
+compact P0-F9 validation cache. The latter is preferred because it already
+contains the exact frozen 128 sample IDs, semantic GT, Moving-v2 support and
+Strong-W2Det reference predictions. Locate it without scanning checkpoint
+contents:
+
+```bash
+find /root/nas/occ -type f \
+  -path '*/p0_f9_v2_wm_val_top2_128/index.json' -print
+```
+
+Set `REFERENCE_CACHE` to the parent directory of the returned `index.json`.
+Do not run the generic README `prepare_nuscenes.py --max-windows 16` example:
+it is a smoke subset and is not the frozen scene-disjoint val128 protocol.
 
 ## 2. Download from China mirrors
 
@@ -130,7 +145,9 @@ r=json.load(open(p))
 print('GenieDrive Overall:', r['GenieDrive']['overall'])
 print('GenieDrive Dynamic:', r['GenieDrive']['dynamic'])
 print('GenieDrive Moving-mIoU v2:', r['GenieDrive']['Moving-mIoU_v2'])
-print('Same-val128 KTA:', r['KTA_composed_baseline']['Moving-mIoU_v2'])
+for name in ('Strong-W2Det_baseline', 'KTA_composed_baseline'):
+    if name in r:
+        print('Same-val128 '+name+':', r[name]['Moving-mIoU_v2'])
 PY
 ```
 
