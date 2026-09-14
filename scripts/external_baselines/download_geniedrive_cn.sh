@@ -13,8 +13,8 @@ mkdir -p "${EXTERNAL_ROOT}" "${DOWNLOAD_ROOT}"
 fresh_clone=0
 if [[ ! -d "${GENIEDRIVE_ROOT}/.git" ]]; then
   mirrors=(
-    "${GITHUB_MIRROR_URL:-https://ghproxy.1888866.xyz/https://github.com/Huster-YZY/GenieDrive.git}"
-    "https://gh-proxy.com/https://github.com/Huster-YZY/GenieDrive.git"
+    "${GITHUB_MIRROR_URL:-https://gh-proxy.com/https://github.com/Huster-YZY/GenieDrive.git}"
+    "https://ghproxy.1888866.xyz/https://github.com/Huster-YZY/GenieDrive.git"
     "https://ghproxy.net/https://github.com/Huster-YZY/GenieDrive.git"
     "https://ghfast.top/https://github.com/Huster-YZY/GenieDrive.git"
   )

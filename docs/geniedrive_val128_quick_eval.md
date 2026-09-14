@@ -46,7 +46,7 @@ The GitHub script tries four China proxy endpoints. To select a local working
 proxy explicitly:
 
 ```bash
-export GITHUB_MIRROR_URL=https://ghproxy.1888866.xyz/https://github.com/Huster-YZY/GenieDrive.git
+export GITHUB_MIRROR_URL=https://gh-proxy.com/https://github.com/Huster-YZY/GenieDrive.git
 ```
 
 Only `genie_occ.pth` and `world-nuscenes_infos_val.pkl` are downloaded from
