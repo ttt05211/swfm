@@ -33,6 +33,13 @@ def test_selector_features_are_fixed_shape_and_causal_record_only():
     assert torch.equal(x, y)
 
 
+def test_selector_features_support_zero_source_windows():
+    r = _record(0)
+    x = selector_features(r)
+    assert x.shape == (0, SELECTOR_FEATURE_DIM)
+    assert x.dtype == torch.float32
+
+
 def test_top_fraction_mask_is_deterministic_and_source_order_tie_broken():
     s = np.asarray([1.0, 3.0, 3.0, 2.0])
     assert top_fraction_mask(s, 0.0).tolist() == [False, False, False, False]
