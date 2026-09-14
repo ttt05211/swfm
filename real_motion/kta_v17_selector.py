@@ -55,8 +55,17 @@ def selector_features(record: Mapping) -> torch.Tensor:
     # Keep every channel on roughly O(1) scale.  V17 base features are already
     # normalized.  Frame-motion offsets/velocities and KTA displacements are in
     # metres, so use the same conservative 20 m scale as the V17 feature code.
+    # Use explicit flattened dimensions rather than -1.  Windows with
+    # zero Strong sources are valid evaluation cases; torch.reshape(0, -1) is
+    # ambiguous, while [0, fixed_dim] is well-defined and should propagate
+    # through selector/ranking code as an empty source set.
+    n = int(base.shape[0])
     out = torch.cat(
-        [base, frame.reshape(base.shape[0], -1) / 20.0, kta.reshape(base.shape[0], -1) / 20.0],
+        [
+            base,
+            frame.reshape(n, HISTORY_FRAMES * 5) / 20.0,
+            kta.reshape(n, FUTURE_FRAMES * 2) / 20.0,
+        ],
         dim=1,
     )
     if out.shape[1] != SELECTOR_FEATURE_DIM:
