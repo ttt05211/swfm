@@ -9,6 +9,7 @@ from real_motion.kta_v17_selector import (
     random_fraction_mask,
     selector_features,
     top_fraction_mask,
+    utility_pairwise_ranking_loss,
 )
 from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRAMES
 
@@ -63,3 +64,37 @@ def test_selector_forward_shape():
     model = KtaV17Selector(SELECTOR_FEATURE_DIM, hidden_dim=32)
     out = model(torch.zeros(5, SELECTOR_FEATURE_DIM))
     assert out.shape == (5,)
+
+
+def test_utility_pairwise_ranking_prefers_positive_over_zero_over_negative():
+    utility = torch.tensor([2.0, 0.5, 0.0, -0.25, -2.0])
+
+    good = torch.tensor([3.0, 2.0, 0.0, -1.0, -3.0], requires_grad=True)
+    bad = torch.tensor([-3.0, -2.0, 0.0, 1.0, 3.0], requires_grad=True)
+
+    good_loss, good_stats = utility_pairwise_ranking_loss(good, utility)
+    bad_loss, _ = utility_pairwise_ranking_loss(bad, utility)
+
+    assert good_loss.item() < bad_loss.item()
+    assert good_stats["positive_negative_pairs"] == 4
+    assert good_stats["positive_zero_pairs"] == 2
+    assert good_stats["zero_negative_pairs"] == 2
+
+    good_loss.backward()
+    assert good.grad is not None
+    assert torch.isfinite(good.grad).all()
+
+
+def test_utility_pairwise_ranking_handles_all_zero_window():
+    scores = torch.randn(6, requires_grad=True)
+    utility = torch.zeros(6)
+    loss, stats = utility_pairwise_ranking_loss(scores, utility)
+
+    assert loss.item() == 0.0
+    assert stats["positive_negative_pairs"] == 0
+    assert stats["positive_zero_pairs"] == 0
+    assert stats["zero_negative_pairs"] == 0
+
+    loss.backward()
+    assert scores.grad is not None
+    assert torch.equal(scores.grad, torch.zeros_like(scores))
