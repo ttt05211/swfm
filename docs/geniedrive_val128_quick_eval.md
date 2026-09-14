@@ -116,6 +116,23 @@ bash $SWFM_ROOT/scripts/external_baselines/run_geniedrive_val128.sh \
   2>&1 | tee $EXTERNAL_ROOT/results/run.log
 ```
 
+For a quiet terminal, capture the full log and print only the final gate/metric
+table:
+
+```bash
+bash $SWFM_ROOT/scripts/external_baselines/run_geniedrive_val128_quiet.sh
+```
+
+If evaluation has already completed, summarize the existing files without
+rerunning inference:
+
+```bash
+bash $SWFM_ROOT/scripts/external_baselines/show_geniedrive_val128_result.sh
+```
+
+The summary is also saved as `results/final_summary.json` and
+`results/final_summary.md`.
+
 The command fails unless all 128 selected nuScenes tokens are found. Main files:
 
 ```text
