@@ -16,6 +16,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .motion_transport import FEATURE_DIM, FEATURE_NAMES, FUTURE_FRAMES, HISTORY_FRAMES
 
@@ -131,6 +132,86 @@ class KtaV17Selector(nn.Module):
         if x.ndim != 2 or x.shape[1] != self.net[0].in_features:
             raise ValueError(f"selector input shape mismatch: {tuple(x.shape)}")
         return self.net(x).squeeze(-1)
+
+
+def utility_pairwise_ranking_loss(
+    scores: torch.Tensor,
+    utility: torch.Tensor,
+    *,
+    zero_pair_weight: float = 0.25,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Utility-weighted within-window ranking objective.
+
+    The final selector is consumed through a per-window Top-Q operator, so
+    ranking is the quantity that matters.  The strongest constraint orders
+    beneficial V17 replacements above harmful replacements.  Zero-utility
+    sources are used only as weaker intermediate constraints:
+
+        positive > zero > negative.
+
+    Future GT utility is a training label only; it never enters selector input.
+    """
+    s = torch.as_tensor(scores)
+    u = torch.as_tensor(utility, dtype=s.dtype, device=s.device)
+    if s.ndim != 1 or u.shape != s.shape:
+        raise ValueError(f"scores/utility must be matching [N], got {s.shape} and {u.shape}")
+    if zero_pair_weight < 0:
+        raise ValueError("zero_pair_weight must be non-negative")
+
+    pos = torch.nonzero(u > 0, as_tuple=False).flatten()
+    neg = torch.nonzero(u < 0, as_tuple=False).flatten()
+    zero = torch.nonzero(u == 0, as_tuple=False).flatten()
+
+    zero_loss = s.sum() * 0.0
+
+    def ordered_loss(left: torch.Tensor, right: torch.Tensor, weight: torch.Tensor):
+        if left.numel() == 0 or right.numel() == 0:
+            return zero_loss, 0
+        margin = s[left][:, None] - s[right][None, :]
+        w = weight.to(dtype=s.dtype, device=s.device)
+        if w.shape != margin.shape:
+            w = torch.broadcast_to(w, margin.shape)
+        denom = w.sum().clamp_min(torch.finfo(s.dtype).eps)
+        return (F.softplus(-margin) * w).sum() / denom, int(margin.numel())
+
+    # Strongest relation: high positive utility should outrank severe harm.
+    ph_weight = (
+        u[pos].clamp_min(0)[:, None] + (-u[neg]).clamp_min(0)[None, :]
+        if pos.numel() and neg.numel()
+        else torch.empty((int(pos.numel()), int(neg.numel())), device=s.device, dtype=s.dtype)
+    )
+    ph, n_ph = ordered_loss(pos, neg, ph_weight)
+
+    # Weak relations keep exact-zero sources between clearly useful/harmful
+    # edits without allowing the dominant zero class to control the objective.
+    pz_weight = (
+        u[pos].clamp_min(0)[:, None]
+        if pos.numel() and zero.numel()
+        else torch.empty((int(pos.numel()), int(zero.numel())), device=s.device, dtype=s.dtype)
+    )
+    pz, n_pz = ordered_loss(pos, zero, pz_weight)
+
+    zh_weight = (
+        (-u[neg]).clamp_min(0)[None, :]
+        if zero.numel() and neg.numel()
+        else torch.empty((int(zero.numel()), int(neg.numel())), device=s.device, dtype=s.dtype)
+    )
+    zh, n_zh = ordered_loss(zero, neg, zh_weight)
+
+    total = ph + float(zero_pair_weight) * (pz + zh)
+    stats = {
+        "loss": float(total.detach().cpu()),
+        "positive_negative_loss": float(ph.detach().cpu()),
+        "positive_zero_loss": float(pz.detach().cpu()),
+        "zero_negative_loss": float(zh.detach().cpu()),
+        "positive_negative_pairs": n_ph,
+        "positive_zero_pairs": n_pz,
+        "zero_negative_pairs": n_zh,
+        "positive_sources": int(pos.numel()),
+        "negative_sources": int(neg.numel()),
+        "zero_sources": int(zero.numel()),
+    }
+    return total, stats
 
 
 @dataclass(frozen=True)
