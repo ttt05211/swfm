@@ -2,6 +2,9 @@
 set -euo pipefail
 
 SWFM_ROOT="${SWFM_ROOT:-/root/nas/occ/swfm}"
+# Prevent a managed host's system Python 3.12 torch from leaking into the
+# separate Python 3.8 GenieDrive environment.
+source "${SWFM_ROOT}/scripts/external_baselines/sanitize_geniedrive_environment.sh"
 EXTERNAL_ROOT="${EXTERNAL_ROOT:-/root/nas/occ/external_baselines/geniedrive_val128}"
 GENIEDRIVE_ROOT="${GENIEDRIVE_ROOT:-${EXTERNAL_ROOT}/GenieDrive}"
 DOWNLOAD_ROOT="${DOWNLOAD_ROOT:-${EXTERNAL_ROOT}/downloads}"
