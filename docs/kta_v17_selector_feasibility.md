@@ -114,3 +114,39 @@ learned routing as a main paper contribution.
 `val-128` is only a rapid feasibility screen. Any accepted paper claim must be
 rerun on a frozen independent/full validation protocol with the same selector
 checkpoint and no retuning.
+
+## D. Final loss-alignment probe: utility-weighted ranking
+
+The regression selector passed the basic causal-predictability gate but showed a
+specific failure mode on val-128: it captured most positive utility mass while
+also routing a large fraction of harmful sources. A historical KTA-error probe
+did not separate positive from negative utility, so no new feature family is
+introduced.
+
+The one allowed follow-up changes **only the selector objective**, not its
+architecture or causal inputs.
+
+For each window, define:
+
+- positive sources: one-source counterfactual utility u_i > 0;
+- zero sources: u_i = 0;
+- harmful sources: u_i < 0.
+
+The ranking objective enforces positive > zero > harmful, with the strongest
+utility-weighted pairwise term on positive-vs-harmful pairs. Positive-vs-zero
+and zero-vs-harmful pairs receive a fixed weight of 0.25. The tiny 96-dim MLP,
+optimizer scale, causal feature contract and 2000-step budget remain unchanged.
+
+Checkpoint selection is also aligned to deployment: maximize **internal-dev Q20
+net selected utility**, not regression loss. Val-128 remains diagnostic only
+during training, and final acceptance is still decided by exact A1-composed
+Moving-mIoU at the frozen Q=0/10/20/40/100% budgets.
+
+Ranking logits are intentionally *not* calibrated utility values. Therefore
+the earlier predicted-utility-positive abstention rule is invalid for this
+model and is disabled by the evaluator.
+
+This is the final selector-training variant. If it does not materially reduce
+harmful-source capture and improve exact Moving-mIoU over the regression
+selector, stop selector optimization rather than adding a larger router,
+additional feature families or reinforcement learning.
