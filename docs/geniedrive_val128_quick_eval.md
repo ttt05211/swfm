@@ -61,6 +61,7 @@ conda activate geniedrive-occ
 
 # Required on managed images that globally expose a Python 3.12 torch build.
 source $SWFM_ROOT/scripts/external_baselines/sanitize_geniedrive_environment.sh
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.8/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 pip install mmcv-full==1.7.0 \
   -f https://download.openmmlab.com/mmcv/dist/cu117/torch1.13/index.html

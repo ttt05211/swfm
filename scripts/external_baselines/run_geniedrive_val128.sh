@@ -16,12 +16,21 @@ GPU_ID="${GPU_ID:-0}"
 
 mkdir -p "${OUTPUT_ROOT}"
 
+GENIEDRIVE_PREFIX="$(conda run -n "${GENIEDRIVE_ENV}" python -c 'import sys; print(sys.prefix)')"
+GENIEDRIVE_PYTHON="$(conda run -n "${GENIEDRIVE_ENV}" python -c 'import sys; print("python%d.%d" % sys.version_info[:2])')"
+GENIEDRIVE_TORCH_LIB="${GENIEDRIVE_PREFIX}/lib/${GENIEDRIVE_PYTHON}/site-packages/torch/lib"
+if [[ ! -d "${GENIEDRIVE_TORCH_LIB}" ]]; then
+  echo "Missing GenieDrive torch library directory: ${GENIEDRIVE_TORCH_LIB}" >&2
+  exit 5
+fi
+
 conda run --no-capture-output -n "${SWFM_ENV}" \
   python "${SWFM_ROOT}/tools/external_baselines/build_geniedrive_val128_manifest.py" \
   --prepared "${PREPARED_VAL}" \
   --output "${OUTPUT_ROOT}/val128_manifest.json" \
   --expected-count 128
 
+LD_LIBRARY_PATH="${GENIEDRIVE_TORCH_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
 CUDA_VISIBLE_DEVICES="${GPU_ID}" conda run --no-capture-output -n "${GENIEDRIVE_ENV}" \
   python "${SWFM_ROOT}/tools/external_baselines/export_geniedrive_val128.py" \
   --geniedrive-root "${GENIEDRIVE_ROOT}" \
