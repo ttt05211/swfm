@@ -141,6 +141,7 @@ def main():
         raise RuntimeError("utility cache/evaluation scene set mismatch")
     device=torch.device(a.device if a.device!="cuda" or torch.cuda.is_available() else "cpu")
     vck,v17=load_model(a.v17_checkpoint,device); sck,selector=_load_selector(a.selector_checkpoint,device)
+    positive_cap_valid = sck.get("score_semantics") != "pairwise_ranking_logit_not_calibrated_utility"
     if str(Path(sck["val_cache"]).resolve()) != str(Path(a.utility_cache).resolve()):
         raise RuntimeError("selector checkpoint was not diagnosed against this utility cache")
     source=NuScenesWindowSource(a.dataroot,info_pkl=a.info_pkl,verbose=False); strong=StrongW2DetConfig(free_label=int(pcfg.free_label))
@@ -173,10 +174,11 @@ def main():
         oracle_score=torch.as_tensor(urec["gt_utility_pct"]).numpy(); speed_score_arr=speed_score(rec).numpy()
         masks={
             "learned":{q:top_fraction_mask(learned_score,q) for q in budgets},
-            "learned_positive":{q:_positive_capped_mask(learned_score,q) for q in budgets},
             "oracle":{q:top_fraction_mask(oracle_score,q) for q in budgets},
             "speed":{q:top_fraction_mask(speed_score_arr,q) for q in budgets},
         }
+        if positive_cap_valid:
+            masks["learned_positive"]={q:_positive_capped_mask(learned_score,q) for q in budgets}
         rm={r:{q:random_fraction_mask(n,q,a.random_seed+r*100003,sample_id=sid) for q in budgets} for r in range(a.random_repeats)}
         if a.measure_latency and wi >= int(a.latency_warmup_windows):
             reps=max(1,int(a.latency_repeats))
@@ -186,10 +188,11 @@ def main():
                 latency_topq[q]["selector_ms"].append(selector_ms)
                 latency_topq[q]["selected"].append(len(ids))
                 latency_topq[q]["v17_selected_ms"].append(_timed_forward(v17,rec,ids,device,reps))
-                ids2=np.flatnonzero(masks["learned_positive"][q]).tolist()
-                latency_positive[q]["selector_ms"].append(selector_ms)
-                latency_positive[q]["selected"].append(len(ids2))
-                latency_positive[q]["v17_selected_ms"].append(_timed_forward(v17,rec,ids2,device,reps))
+                if positive_cap_valid:
+                    ids2=np.flatnonzero(masks["learned_positive"][q]).tolist()
+                    latency_positive[q]["selector_ms"].append(selector_ms)
+                    latency_positive[q]["selected"].append(len(ids2))
+                    latency_positive[q]["v17_selected_ms"].append(_timed_forward(v17,rec,ids2,device,reps))
         payload=safe._sample_payload(ds[sid2[sid]],torch.device("cpu")); t0=hp[-1]
         for horizon,hi in safe.REPORT.items():
             base=[]; lv=[]; dt=(hi+1)*float(pcfg.frame_dt_s)
@@ -200,14 +203,17 @@ def main():
                 lv.append(rasterize_rigid_component(c["voxel_indices"],int(c["class_id"]),t0,fp[hi],source_center_world=sc,target_center_world=dst,yaw_delta_rad=0.0,grid=pcfg.grid))
             gt=payload["gt"][hi]; moving=payload["moving"][hi]; anchor=payload["anchor"][hi]
             for q in budgets:
-                for name,table in (("learned",learned),("learned_positive",learned_positive),("oracle",oracle),("speed",speed)):
+                routed=(("learned",learned),("oracle",oracle),("speed",speed))
+                if positive_cap_valid:
+                    routed=(("learned",learned),("learned_positive",learned_positive),("oracle",oracle),("speed",speed))
+                for name,table in routed:
                     m=masks[name][q]; pred=_mix(anchor,base,lv,m,pcfg.free_label,pcfg.grid); _update(table[q],horizon,pred,gt,moving,m.sum(),n)
                 for r in range(a.random_repeats):
                     m=rm[r][q]; pred=_mix(anchor,base,lv,m,pcfg.free_label,pcfg.grid); _update(random[r][q],horizon,pred,gt,moving,m.sum(),n)
         if wi==0 or (wi+1)%16==0 or wi+1==len(records): print(f"selector eval {wi+1}/{len(records)} {sid}",flush=True)
 
     lr={str(q):_report(learned[q]) for q in budgets}
-    lpr={str(q):_report(learned_positive[q]) for q in budgets}
+    lpr={str(q):_report(learned_positive[q]) for q in budgets} if positive_cap_valid else {}
     orr={str(q):_report(oracle[q]) for q in budgets}; sr={str(q):_report(speed[q]) for q in budgets}
     rr={}
     for q in budgets:
@@ -225,13 +231,16 @@ def main():
             }
         return out
     lat_topq=_lat_report(latency_topq) if a.measure_latency else {}
-    lat_positive=_lat_report(latency_positive) if a.measure_latency else {}
+    lat_positive=_lat_report(latency_positive) if a.measure_latency and positive_cap_valid else {}
     report={
         "protocol":PROTOCOL,"num_windows":len(records),"budgets":list(budgets),
         "v17_checkpoint":str(Path(a.v17_checkpoint).resolve()),
         "selector_checkpoint":str(Path(a.selector_checkpoint).resolve()),
         "utility_cache":str(Path(a.utility_cache).resolve()),
-        "learned":lr,"learned_positive_cap":lpr,
+        "learned":lr,
+        "learned_positive_cap":lpr,
+        "positive_cap_valid":bool(positive_cap_valid),
+        "selector_score_semantics":sck.get("score_semantics","calibrated_utility_regression"),
         "oracle_gt_utility_rank":orr,"speed_rule":sr,"random":rr,
         "latency":{
             "measured":bool(a.measure_latency),
@@ -245,9 +254,15 @@ def main():
     }
     op=Path(a.output); op.parent.mkdir(parents=True,exist_ok=True); op.write_text(json.dumps(report,indent=2),encoding="utf-8")
     print("=== KTA/V17 SELECTOR EVAL ===")
-    print(f"{'Q':>7} {'learned':>10} {'learned+':>10} {'oracle':>10} {'speed':>10} {'random':>10}")
-    for q in budgets:
-        print(f"{100*q:6.1f}% {lr[str(q)]['moving']['mIoU']:10.4f} {lpr[str(q)]['moving']['mIoU']:10.4f} {orr[str(q)]['moving']['mIoU']:10.4f} {sr[str(q)]['moving']['mIoU']:10.4f} {rr[str(q)]['Moving_mean']:10.4f}")
+    if positive_cap_valid:
+        print(f"{'Q':>7} {'learned':>10} {'learned+':>10} {'oracle':>10} {'speed':>10} {'random':>10}")
+        for q in budgets:
+            print(f"{100*q:6.1f}% {lr[str(q)]['moving']['mIoU']:10.4f} {lpr[str(q)]['moving']['mIoU']:10.4f} {orr[str(q)]['moving']['mIoU']:10.4f} {sr[str(q)]['moving']['mIoU']:10.4f} {rr[str(q)]['Moving_mean']:10.4f}")
+    else:
+        print("ranking selector score is not calibrated utility; learned+ abstention is disabled")
+        print(f"{'Q':>7} {'learned':>10} {'oracle':>10} {'speed':>10} {'random':>10}")
+        for q in budgets:
+            print(f"{100*q:6.1f}% {lr[str(q)]['moving']['mIoU']:10.4f} {orr[str(q)]['moving']['mIoU']:10.4f} {sr[str(q)]['moving']['mIoU']:10.4f} {rr[str(q)]['Moving_mean']:10.4f}")
     if a.measure_latency: print("latency=",json.dumps(report["latency"],indent=2))
     print(f"saved {op}")
 
