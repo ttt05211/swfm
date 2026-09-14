@@ -18,6 +18,10 @@ from tools.external_baselines.export_geniedrive_val128 import (
     official_binary_iou,
     official_semantic_miou,
 )
+from tools.external_baselines.score_geniedrive_val128 import (
+    IoUAccumulator,
+    compose_kta,
+)
 
 
 def fake_index(count=3):
@@ -88,3 +92,30 @@ def test_native_metric_sanity_matches_official_class_conventions():
     assert official_semantic_miou(semantic) == pytest.approx(50.0)
     binary = confusion_matrix(pred != 17, gt != 17, 2)
     assert official_binary_iou(binary) == pytest.approx(80.0)
+
+
+def test_python38_scorer_kta_composition_and_masked_iou():
+    shape = (1, 2, 2, 1)
+    static = np.full(shape, 17, dtype=np.uint8)
+    kta = np.full(shape, 17, dtype=np.uint8)
+    kta[0, 0, 0, 0] = 4
+    kta[0, 0, 1, 0] = 4
+    sample = {
+        "static_future_occ": static,
+        "kta_future_occ": kta,
+        "confident_static_future_mask": np.array(
+            [[[[False], [True]], [[False], [False]]]], dtype=bool
+        ),
+        "generation_support_occ": np.array(
+            [[[True, True], [False, False]]], dtype=bool
+        ),
+    }
+    composed = compose_kta(sample, 0)
+    assert composed[0, 0, 0] == 4
+    assert composed[0, 1, 0] == 17
+
+    metric = IoUAccumulator((4,))
+    target = np.full((2, 2, 1), 17, dtype=np.uint8)
+    target[0, 0, 0] = 4
+    metric.update(composed, target, np.ones_like(target, dtype=bool))
+    assert metric.compute()["mIoU"] == pytest.approx(100.0)

@@ -25,7 +25,7 @@ prepared data, checkpoints, or existing outputs.
 export SWFM_ROOT=/root/nas/occ/swfm
 export EXTERNAL_ROOT=/root/nas/occ/external_baselines/geniedrive_val128
 export NUSCENES_ROOT=/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes
-export PREPARED_VAL=$SWFM_ROOT/data/prepared_val
+export PREPARED_VAL=/root/nas/occ/swfm/data/prepared_val
 ```
 
 `NUSCENES_ROOT` must directly contain `gts/` and `v1.0-trainval/`. Point it at
@@ -94,9 +94,9 @@ MMDetection inside the main SWFM environment.
 ## 4. Run and score
 
 ```bash
-export SWFM_ENV=base
 export GENIEDRIVE_ENV=geniedrive-occ
 export GPU_ID=0
+mkdir -p $EXTERNAL_ROOT/results
 bash $SWFM_ROOT/scripts/external_baselines/run_geniedrive_val128.sh \
   2>&1 | tee $EXTERNAL_ROOT/results/run.log
 ```
@@ -127,13 +127,13 @@ python - <<'PY'
 import json, os
 p=os.path.join(os.environ['EXTERNAL_ROOT'],'results','geniedrive_val128_moving_miou_v2.json')
 r=json.load(open(p))
-print('GenieDrive Overall:', r['SWFM']['overall'])
-print('GenieDrive Dynamic:', r['SWFM']['dynamic'])
-print('GenieDrive Moving-mIoU v2:', r['SWFM']['Moving-mIoU_v2'])
+print('GenieDrive Overall:', r['GenieDrive']['overall'])
+print('GenieDrive Dynamic:', r['GenieDrive']['dynamic'])
+print('GenieDrive Moving-mIoU v2:', r['GenieDrive']['Moving-mIoU_v2'])
 print('Same-val128 KTA:', r['KTA_composed_baseline']['Moving-mIoU_v2'])
 PY
 ```
 
-`SWFM` in the JSON is the evaluator's historical prediction-slot name; for
-this run it contains GenieDrive results, as confirmed by
-`predictions/index.json` (`source: GenieDrive`).
+The scorer is self-contained and compatible with GenieDrive's Python 3.8 and
+PyTorch 1.13 environment. The prediction source and checkpoint hash remain in
+`predictions/index.json`.
