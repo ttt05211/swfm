@@ -52,7 +52,13 @@ from real_motion.rigid_transport import (
     rasterize_rigid_component,
 )
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
-from real_motion.strong_w2det import StrongW2DetConfig, extract_instances, match_instances
+from real_motion.strong_w2det import (
+    StrongW2DetConfig,
+    extract_instances,
+    match_instances,
+    strong_w2det_sequence,
+)
+from tools.real_motion import build_p0_f5_cache_direct as wm_base
 from tools.real_motion import eval_p0_f9_frozen_sparse_occfm as safe
 from tools.real_motion.eval_p0_f9_v17_local_stwm import (
     load_cache,
@@ -157,6 +163,61 @@ def _moving_correct(pred, gt, moving):
     return int((np.asarray(pred)[m] == np.asarray(gt)[m]).sum())
 
 
+def _selector_eval_payload(
+    sample,
+    *,
+    source,
+    window,
+    pcfg,
+    strong_cfg,
+    history_occ,
+    history_poses,
+    future_poses,
+):
+    """Return GT/Strong-anchor/Moving payload for utility labels.
+
+    Validation P0-F9 caches carry an evaluation-only payload and we reuse it
+    exactly.  Train P0-F9 caches intentionally omit that payload to save space;
+    in that case reconstruct the same quantities from the exact nuScenes window.
+    Future GT remains label-only and never enters selector inputs.
+    """
+    required = (
+        "eval_future_gt_occ",
+        "eval_strong_anchor_occ",
+        "eval_gt_moving_support",
+    )
+    if all(k in sample for k in required):
+        cached = safe._sample_payload(sample, torch.device("cpu"))
+        return {
+            "gt": cached["gt"],
+            "anchor": cached["anchor"],
+            "moving": cached["moving"],
+        }, "cached_eval"
+
+    gt = np.stack(
+        [
+            np.asarray(source.load_semantics(window.scene_name, tok), dtype=np.uint8)
+            for tok in window.future_tokens
+        ],
+        axis=0,
+    )
+    anchor = strong_w2det_sequence(
+        history_occ,
+        history_poses,
+        future_poses,
+        frame_dt_s=float(pcfg.frame_dt_s),
+        grid=pcfg.grid,
+        cfg=strong_cfg,
+    ).astype(np.uint8, copy=False)
+    moving = wm_base._gt_moving_support(source, window, pcfg).astype(bool, copy=False)
+    if gt.shape != anchor.shape or gt.shape != moving.shape:
+        raise RuntimeError(
+            f"{sample['sample_id']}: reconstructed payload shape mismatch "
+            f"gt={gt.shape} anchor={anchor.shape} moving={moving.shape}"
+        )
+    return {"gt": gt, "anchor": anchor, "moving": moving}, "raw_reconstructed"
+
+
 def main():
     p = argparse.ArgumentParser()
     add_config_args(p)
@@ -209,14 +270,26 @@ def main():
     out_records = []
     all_utility = []
     total_sources = 0
+    payload_source_counts = {"cached_eval": 0, "raw_reconstructed": 0}
 
     for wi, rec in enumerate(records):
         sid = str(rec["sample_id"])
-        payload = safe._sample_payload(ds[sid_to_idx[sid]], torch.device("cpu"))
+        sample = ds[sid_to_idx[sid]]
         w = window_from_record(rec)
         history_occ = [source.load_semantics(w.scene_name, tok) for tok in w.history_tokens]
         history_poses = [np.asarray(source.pose(tok), dtype=np.float64) for tok in w.history_tokens]
         future_poses = [np.asarray(source.pose(tok), dtype=np.float64) for tok in w.future_tokens]
+        payload, payload_source = _selector_eval_payload(
+            sample,
+            source=source,
+            window=w,
+            pcfg=pcfg,
+            strong_cfg=strong_cfg,
+            history_occ=history_occ,
+            history_poses=history_poses,
+            future_poses=future_poses,
+        )
+        payload_source_counts[payload_source] += 1
         current = extract_instances(history_occ[-1], history_poses[-1], grid=pcfg.grid, cfg=strong_cfg)
         previous = extract_instances(history_occ[-2], history_poses[-2], grid=pcfg.grid, cfg=strong_cfg)
         velocities = match_instances(
@@ -384,6 +457,10 @@ def main():
         "utility_summary": utility_summary,
         "budgets": list(budgets),
         "gt_usage": "labels_and_oracle_ranking_only_never_selector_inputs",
+        "eval_payload_source_counts": payload_source_counts,
+        "eval_payload_contract": (
+            "reuse_cached_validation_payload_else_reconstruct_exact_raw_nuscenes_v1"
+        ),
         "expert_contract": "KTA_vs_V17_RL_epoch5_A1_source_order",
     }
     op = Path(a.output_cache)
