@@ -474,7 +474,7 @@ def main():
         if a.arm != "Y":
             raise ValueError("--calibrate-only is defined only for Y")
         _calibrate(
-            model, val_loader, device, amp=amp,
+            model, train_loader, device, amp=amp,
             patch_resolution_m=patch_resolution,
             batches=int(a.calibration_batches),
             target_fraction=float(a.calibration_target_fraction),
