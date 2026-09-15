@@ -38,6 +38,7 @@ from real_motion.local_st_world_model_v18_se2 import (
     SE2_SHAPE_CONTRACT,
     SE2_TARGET_CONTRACT,
     LocalSpatialTemporalWorldModelV18SE2,
+    kta_relative_safe_transport_loss,
     periodic_yaw_loss,
     soft_se2_transport_overlap_loss,
 )
@@ -45,7 +46,7 @@ from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES
 from tools.real_motion.train_p0_f9_v17_local_stwm import objective_loss as v17_objective_loss
 
 PROTOCOL = "p0_f9_v18_se2_paired_continuation_v1"
-ARMS = ("C", "Y")
+ARMS = ("C", "Y", "S")
 EXPECTED_START_EPOCH = 5
 EXPECTED_VARIANT = "RL"
 EXPECTED_OVERLAP = 0.25
@@ -186,7 +187,16 @@ def _existence_loss(outputs, batch):
     return logits.sum() * 0.0
 
 
-def se2_objective_loss(outputs, batch, *, yaw_weight, shape_weight, patch_resolution_m):
+def se2_objective_loss(
+    outputs,
+    batch,
+    *,
+    yaw_weight,
+    shape_weight,
+    patch_resolution_m,
+    safe_weight=0.0,
+    safe_margin=0.0,
+):
     pred_xy = outputs["residual_xy_m"]
     target_xy = batch["target_source_residual_xy_m"].to(pred_xy.dtype)
     valid = batch["se2_target_valid"].bool()
@@ -220,15 +230,42 @@ def se2_objective_loss(outputs, batch, *, yaw_weight, shape_weight, patch_resolu
         batch["yaw_label_valid"],
         patch_resolution_m=float(patch_resolution_m),
     )
-    total = trans + exist + float(yaw_weight) * yaw + float(shape_weight) * shape
+    safe_stats = {}
+    if float(safe_weight) > 0.0:
+        safe_loss, safe_stats = kta_relative_safe_transport_loss(
+            pred_disp,
+            batch["kta_displacement_xy_m"].float(),
+            batch["target_source_displacement_xy_m"].float(),
+            outputs["yaw_delta_rad"].float(),
+            batch["target_yaw_rad"].float(),
+            batch["target_source_mask_tube"][:, -1].float(),
+            valid,
+            batch["yaw_enabled"],
+            batch["yaw_label_valid"],
+            margin=float(safe_margin),
+            patch_resolution_m=float(patch_resolution_m),
+        )
+    else:
+        safe_loss = pred_disp.sum() * 0.0 + outputs["yaw_delta_rad"].sum() * 0.0
+
+    total = (
+        trans
+        + exist
+        + float(yaw_weight) * yaw
+        + float(shape_weight) * shape
+        + float(safe_weight) * safe_loss
+    )
     stats = {
         "objective_loss": float(total.detach().cpu()),
         "translation_smooth_l1": float(trans.detach().cpu()),
         "existence_bce": float(exist.detach().cpu()),
         "yaw_periodic_loss": float(yaw.detach().cpu()),
         "se2_shape_loss": float(shape.detach().cpu()),
+        "safe_weight": float(safe_weight),
+        "safe_weighted_loss": float(safe_weight) * float(safe_loss.detach().cpu()),
         **yaw_stats,
         **shape_stats,
+        **safe_stats,
     }
     return total, stats
 
@@ -317,11 +354,17 @@ def _save(path, *, arm, model, optimizer, ck, args, global_step, val_meta):
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "model_config": ck.get("model_config"),
-        "variant": "RL" if arm == "C" else "RL-SE2",
+        "variant": (
+            "RL" if arm == "C" else ("RL-SE2" if arm == "Y" else "RL-SE2-SAFE")
+        ),
         "use_representation": True,
         "overlap_weight": EXPECTED_OVERLAP,
         "yaw_weight": None if arm == "C" else float(args.yaw_weight),
         "shape_weight": EXPECTED_OVERLAP,
+        "safe_weight": (
+            float(args.safe_weight) if arm == "S" and args.safe_weight is not None else None
+        ),
+        "safe_margin": float(args.safe_margin) if arm == "S" else None,
         "se2_target_contract": SE2_TARGET_CONTRACT,
         "se2_shape_contract": SE2_SHAPE_CONTRACT,
         "paired_seed": int(args.seed),
@@ -365,6 +408,125 @@ def _calibrate(model, loader, device, *, amp, patch_resolution_m, batches, targe
     return report
 
 
+
+def _grad_l2_norm(grads):
+    total = None
+    for g in grads:
+        if g is None:
+            continue
+        v = g.detach().float().pow(2).sum()
+        total = v if total is None else total + v
+    return float(torch.sqrt(total).cpu()) if total is not None else 0.0
+
+
+def _calibrate_safe_weight(
+    model,
+    loader,
+    device,
+    *,
+    amp,
+    patch_resolution_m,
+    batches,
+    target_fraction,
+    yaw_weight,
+    safe_margin,
+):
+    """One-time gradient-scale calibration for the safe objective.
+
+    The coefficient is chosen so the safe-loss gradient L2 norm is a fixed
+    fraction of the existing SE(2) base-objective gradient norm at the frozen
+    epoch-5 initialization.  This avoids a hyperparameter sweep and directly
+    limits the anti-harm term's optimization strength.
+    """
+    if float(target_fraction) <= 0.0:
+        raise ValueError("safe calibration target fraction must be positive")
+    params = [p for p in model.parameters() if p.requires_grad]
+    vals = []
+    model.eval()
+    for bi, raw in enumerate(loader):
+        if bi >= int(batches):
+            break
+        b = unpack(raw, device)
+        out = forward_model(model, b, amp=amp, device=device)
+        base_loss, base_stats = se2_objective_loss(
+            out,
+            b,
+            yaw_weight=float(yaw_weight),
+            shape_weight=EXPECTED_OVERLAP,
+            patch_resolution_m=patch_resolution_m,
+            safe_weight=0.0,
+        )
+        pred_disp = (
+            b["kta_displacement_xy_m"].float()
+            + out["residual_xy_m"].float()
+        )
+        safe_loss, safe_stats = kta_relative_safe_transport_loss(
+            pred_disp,
+            b["kta_displacement_xy_m"].float(),
+            b["target_source_displacement_xy_m"].float(),
+            out["yaw_delta_rad"].float(),
+            b["target_yaw_rad"].float(),
+            b["target_source_mask_tube"][:, -1].float(),
+            b["se2_target_valid"].bool(),
+            b["yaw_enabled"],
+            b["yaw_label_valid"],
+            margin=float(safe_margin),
+            patch_resolution_m=float(patch_resolution_m),
+        )
+        base_grads = torch.autograd.grad(
+            base_loss, params, retain_graph=True, allow_unused=True
+        )
+        safe_grads = torch.autograd.grad(
+            safe_loss, params, retain_graph=False, allow_unused=True
+        )
+        vals.append({
+            "base_grad_norm": _grad_l2_norm(base_grads),
+            "safe_grad_norm": _grad_l2_norm(safe_grads),
+            "base_objective_loss": float(base_loss.detach().cpu()),
+            "safe_loss": float(safe_loss.detach().cpu()),
+            "safe_active_fraction": float(safe_stats["safe_active_fraction"]),
+            "safe_pred_soft_iou": float(safe_stats["safe_pred_soft_iou"]),
+            "safe_kta_soft_iou": float(safe_stats["safe_kta_soft_iou"]),
+        })
+
+    if not vals:
+        raise RuntimeError("safe calibration loader yielded no batches")
+    base_grad = float(np.median([x["base_grad_norm"] for x in vals]))
+    safe_grad = float(np.median([x["safe_grad_norm"] for x in vals]))
+    if not math.isfinite(safe_grad) or safe_grad <= 1e-12:
+        raise RuntimeError(f"safe calibration gradient is degenerate: {safe_grad}")
+    recommended = float(target_fraction) * base_grad / safe_grad
+    report = {
+        "calibration_batches": len(vals),
+        "yaw_weight": float(yaw_weight),
+        "safe_margin": float(safe_margin),
+        "target_safe_to_base_gradient_fraction": float(target_fraction),
+        "median_base_grad_norm": base_grad,
+        "median_safe_grad_norm": safe_grad,
+        "median_base_objective_loss": float(
+            np.median([x["base_objective_loss"] for x in vals])
+        ),
+        "median_safe_loss": float(np.median([x["safe_loss"] for x in vals])),
+        "median_safe_active_fraction": float(
+            np.median([x["safe_active_fraction"] for x in vals])
+        ),
+        "median_safe_pred_soft_iou": float(
+            np.median([x["safe_pred_soft_iou"] for x in vals])
+        ),
+        "median_safe_kta_soft_iou": float(
+            np.median([x["safe_kta_soft_iou"] for x in vals])
+        ),
+        "recommended_safe_weight": recommended,
+        "note": (
+            "one-time gradient calibration from frozen epoch-5; "
+            "not a hyperparameter sweep"
+        ),
+    }
+    print("=== KTA-RELATIVE SAFE-WEIGHT CALIBRATION ===")
+    print(json.dumps(report, indent=2))
+    return report
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--train-cache", required=True)
@@ -375,6 +537,8 @@ def main():
     p.add_argument("--steps", type=int, default=600)
     p.add_argument("--save-steps", default="300,600")
     p.add_argument("--yaw-weight", type=float, default=None)
+    p.add_argument("--safe-weight", type=float, default=None)
+    p.add_argument("--safe-margin", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=20260915)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", default="cuda")
@@ -382,14 +546,25 @@ def main():
     p.add_argument("--calibrate-only", action="store_true")
     p.add_argument("--calibration-batches", type=int, default=8)
     p.add_argument("--calibration-target-fraction", type=float, default=0.25)
+    p.add_argument("--safe-calibrate-only", action="store_true")
+    p.add_argument("--safe-calibration-batches", type=int, default=4)
+    p.add_argument("--safe-calibration-target-fraction", type=float, default=0.25)
     a = p.parse_args()
 
     if a.steps <= 0:
         raise ValueError("--steps must be positive")
-    if a.arm == "Y" and not a.calibrate_only and a.yaw_weight is None:
-        raise ValueError("Y training requires explicit --yaw-weight from calibration")
+    if a.calibrate_only and a.safe_calibrate_only:
+        raise ValueError("choose only one calibration mode")
+    if a.arm in {"Y", "S"} and not a.calibrate_only and a.yaw_weight is None:
+        raise ValueError("SE2 training requires explicit --yaw-weight from calibration")
+    if a.arm == "S" and not a.safe_calibrate_only and a.safe_weight is None:
+        raise ValueError("S training requires explicit --safe-weight from calibration")
     if a.yaw_weight is not None and float(a.yaw_weight) < 0:
         raise ValueError("--yaw-weight must be non-negative")
+    if a.safe_weight is not None and float(a.safe_weight) < 0:
+        raise ValueError("--safe-weight must be non-negative")
+    if float(a.safe_margin) < 0:
+        raise ValueError("--safe-margin must be non-negative")
     save_steps = _parse_save_steps(a.save_steps)
     if max(save_steps) > int(a.steps):
         raise ValueError("save step exceeds --steps")
@@ -446,7 +621,7 @@ def main():
         raise RuntimeError(
             f"resume LR mismatch: checkpoint={got_lr} expected={expected_lr}"
         )
-    if a.arm == "Y":
+    if a.arm in {"Y", "S"}:
         # Step-0 contract: inherited XY/existence are exactly the frozen V17
         # predictions and the new yaw output is exactly zero by construction.
         if not torch.equal(model.yaw_head.weight.detach(), torch.zeros_like(model.yaw_head.weight)):
@@ -486,6 +661,29 @@ def main():
         )
         return
 
+    if a.safe_calibrate_only:
+        if a.arm != "S":
+            raise ValueError("--safe-calibrate-only is defined only for S")
+        if a.yaw_weight is None:
+            raise ValueError("safe calibration requires fixed --yaw-weight")
+        report = _calibrate_safe_weight(
+            model,
+            train_loader,
+            device,
+            amp=amp,
+            patch_resolution_m=patch_resolution,
+            batches=int(a.safe_calibration_batches),
+            target_fraction=float(a.safe_calibration_target_fraction),
+            yaw_weight=float(a.yaw_weight),
+            safe_margin=float(a.safe_margin),
+        )
+        out_dir = Path(a.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "safe_weight_calibration.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
+        return
+
     out_dir = Path(a.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.train()
@@ -512,6 +710,12 @@ def main():
                     yaw_weight=float(a.yaw_weight),
                     shape_weight=EXPECTED_OVERLAP,
                     patch_resolution_m=patch_resolution,
+                    safe_weight=(
+                        float(a.safe_weight)
+                        if a.arm == "S"
+                        else 0.0
+                    ),
+                    safe_margin=float(a.safe_margin),
                 )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -550,6 +754,10 @@ def main():
         "history": history,
         "yaw_weight": None if a.arm == "C" else float(a.yaw_weight),
         "shape_weight": EXPECTED_OVERLAP,
+        "safe_weight": (
+            float(a.safe_weight) if a.arm == "S" and a.safe_weight is not None else None
+        ),
+        "safe_margin": float(a.safe_margin) if a.arm == "S" else None,
         "se2_target_contract": SE2_TARGET_CONTRACT,
         "se2_shape_contract": SE2_SHAPE_CONTRACT,
     }
