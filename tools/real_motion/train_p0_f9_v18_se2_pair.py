@@ -473,11 +473,16 @@ def main():
     if a.calibrate_only:
         if a.arm != "Y":
             raise ValueError("--calibrate-only is defined only for Y")
-        _calibrate(
+        report = _calibrate(
             model, train_loader, device, amp=amp,
             patch_resolution_m=patch_resolution,
             batches=int(a.calibration_batches),
             target_fraction=float(a.calibration_target_fraction),
+        )
+        out_dir = Path(a.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "yaw_weight_calibration.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
         )
         return
 
