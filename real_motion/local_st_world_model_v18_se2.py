@@ -323,7 +323,7 @@ def _warp_footprint_se2(
     ).reshape(B, Fh, Hc, Wc)
 
 
-def soft_se2_transport_overlap_loss(
+def _soft_se2_transport_iou_per_label(
     pred_source_displacement_xy_m: torch.Tensor,
     target_source_displacement_xy_m: torch.Tensor,
     pred_yaw_rad: torch.Tensor,
@@ -335,12 +335,12 @@ def soft_se2_transport_overlap_loss(
     *,
     patch_resolution_m: float = 0.8,
     eps: float = 1e-6,
-) -> tuple[torch.Tensor, dict[str, float | int]]:
-    """Soft-IoU between predicted and GT SE(2)-transported source footprints.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return per-label soft IoU plus the frozen usable/yaw masks.
 
-    For classes with yaw disabled, and for future labels without valid yaw, both
-    predicted and GT effective yaw are forced to zero.  Translation supervision
-    remains active.  Thus future GT validity never becomes a deployment gate.
+    All geometry is evaluated in the GT source frame.  This helper is shared by
+    the ordinary SE(2) shape loss and the KTA-relative safe loss so the two
+    objectives cannot silently drift to different rasterization contracts.
     """
     pred_d = pred_source_displacement_xy_m
     tgt_d = target_source_displacement_xy_m.to(pred_d.dtype)
@@ -363,13 +363,10 @@ def soft_se2_transport_overlap_loss(
         yaw_use, target_yaw_rad.to(pred_yaw_rad.dtype), torch.zeros_like(pred_yaw_rad)
     )
 
-    # Compare in the GT source frame rather than rasterizing both absolute
-    # transforms.  For T_p(q)=R_p q+d_p and T_g(q)=R_g q+d_g:
+    # Compare in the GT source frame. For T_p(q)=R_p q+d_p and
+    # T_g(q)=R_g q+d_g:
     #
     #   T_g^{-1} T_p(q) = R_g^T R_p q + R_g^T(d_p-d_g).
-    #
-    # This keeps the GT footprint canonical/binary and makes the exact target
-    # yield identity warp and SoftIoU==1 even for non-grid-aligned GT motion.
     rel_yaw = wrap_angle_tensor(pred_yaw_eff - tgt_yaw_eff)
     delta = pred_d - tgt_d
     cg = torch.cos(tgt_yaw_eff)
@@ -397,18 +394,147 @@ def soft_se2_transport_overlap_loss(
 
     footprint_present = source_footprint_mask.flatten(1).sum(dim=1) > 0
     usable = target_valid.bool() & footprint_present[:, None]
+    return iou, usable, yaw_use
+
+
+def soft_se2_transport_overlap_loss(
+    pred_source_displacement_xy_m: torch.Tensor,
+    target_source_displacement_xy_m: torch.Tensor,
+    pred_yaw_rad: torch.Tensor,
+    target_yaw_rad: torch.Tensor,
+    source_footprint_mask: torch.Tensor,
+    target_valid: torch.Tensor,
+    yaw_enabled: torch.Tensor,
+    yaw_label_valid: torch.Tensor,
+    *,
+    patch_resolution_m: float = 0.8,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Soft-IoU loss for predicted vs GT source-centred SE(2) transport."""
+    iou, usable, yaw_use = _soft_se2_transport_iou_per_label(
+        pred_source_displacement_xy_m,
+        target_source_displacement_xy_m,
+        pred_yaw_rad,
+        target_yaw_rad,
+        source_footprint_mask,
+        target_valid,
+        yaw_enabled,
+        yaw_label_valid,
+        patch_resolution_m=float(patch_resolution_m),
+        eps=float(eps),
+    )
     if bool(usable.any()):
         loss = (1.0 - iou[usable]).mean()
         mean_iou = float(iou[usable].detach().mean().cpu())
         count = int(usable.sum().item())
     else:
-        loss = pred_d.sum() * 0.0 + pred_yaw_rad.sum() * 0.0
+        loss = (
+            pred_source_displacement_xy_m.sum() * 0.0
+            + pred_yaw_rad.sum() * 0.0
+        )
         mean_iou = float("nan")
         count = 0
     return loss, {
         "se2_transport_soft_iou": mean_iou,
         "se2_transport_overlap_labels": count,
         "se2_yaw_active_labels": int((usable & yaw_use).sum().item()),
+    }
+
+
+def kta_relative_safe_transport_loss(
+    pred_source_displacement_xy_m: torch.Tensor,
+    kta_displacement_xy_m: torch.Tensor,
+    target_source_displacement_xy_m: torch.Tensor,
+    pred_yaw_rad: torch.Tensor,
+    target_yaw_rad: torch.Tensor,
+    source_footprint_mask: torch.Tensor,
+    target_valid: torch.Tensor,
+    yaw_enabled: torch.Tensor,
+    yaw_label_valid: torch.Tensor,
+    *,
+    margin: float = 0.0,
+    patch_resolution_m: float = 0.8,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """One-sided KTA-relative anti-harm loss.
+
+    For every valid source/horizon label, compare the same differentiable
+    footprint loss under the learned SE(2) transform and under the physical KTA
+    baseline (KTA translation, zero yaw):
+
+        regret = relu(L_pred - L_KTA - margin).
+
+    KTA is a reference only; it receives no gradient.  The ordinary GT
+    translation/yaw/shape losses remain active, so this term does not reward
+    collapsing to KTA when the learned correction is already better.
+    """
+    if float(margin) < 0.0:
+        raise ValueError("safe margin must be non-negative")
+    pred_iou, usable, _ = _soft_se2_transport_iou_per_label(
+        pred_source_displacement_xy_m,
+        target_source_displacement_xy_m,
+        pred_yaw_rad,
+        target_yaw_rad,
+        source_footprint_mask,
+        target_valid,
+        yaw_enabled,
+        yaw_label_valid,
+        patch_resolution_m=float(patch_resolution_m),
+        eps=float(eps),
+    )
+    zero_yaw = torch.zeros_like(pred_yaw_rad)
+    kta_iou, kta_usable, _ = _soft_se2_transport_iou_per_label(
+        kta_displacement_xy_m.to(pred_source_displacement_xy_m.dtype),
+        target_source_displacement_xy_m,
+        zero_yaw,
+        target_yaw_rad,
+        source_footprint_mask,
+        target_valid,
+        yaw_enabled,
+        yaw_label_valid,
+        patch_resolution_m=float(patch_resolution_m),
+        eps=float(eps),
+    )
+    if not torch.equal(usable, kta_usable):
+        raise RuntimeError("safe-loss pred/KTA usable masks diverged")
+
+    pred_loss = 1.0 - pred_iou
+    kta_loss = (1.0 - kta_iou).detach()
+    regret = F.relu(pred_loss - kta_loss - float(margin))
+
+    if bool(usable.any()):
+        r = regret[usable]
+        active = r > 0
+        loss = r.mean()
+        count = int(usable.sum().item())
+        active_count = int(active.sum().item())
+        pred_mean = float(pred_iou[usable].detach().mean().cpu())
+        kta_mean = float(kta_iou[usable].detach().mean().cpu())
+        positive_mean = (
+            float(r[active].detach().mean().cpu()) if active_count else 0.0
+        )
+    else:
+        loss = (
+            pred_source_displacement_xy_m.sum() * 0.0
+            + pred_yaw_rad.sum() * 0.0
+        )
+        count = 0
+        active_count = 0
+        pred_mean = float("nan")
+        kta_mean = float("nan")
+        positive_mean = 0.0
+
+    return loss, {
+        "safe_loss": float(loss.detach().cpu()),
+        "safe_labels": count,
+        "safe_active_labels": active_count,
+        "safe_active_fraction": (
+            float(active_count) / float(count) if count else float("nan")
+        ),
+        "safe_pred_soft_iou": pred_mean,
+        "safe_kta_soft_iou": kta_mean,
+        "safe_positive_regret_mean": positive_mean,
+        "safe_margin": float(margin),
     }
 
 
