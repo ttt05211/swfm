@@ -363,16 +363,34 @@ def soft_se2_transport_overlap_loss(
         yaw_use, target_yaw_rad.to(pred_yaw_rad.dtype), torch.zeros_like(pred_yaw_rad)
     )
 
-    pred_mask = _warp_footprint_se2(
-        source_footprint_mask, pred_d, pred_yaw_eff,
+    # Compare in the GT source frame rather than rasterizing both absolute
+    # transforms.  For T_p(q)=R_p q+d_p and T_g(q)=R_g q+d_g:
+    #
+    #   T_g^{-1} T_p(q) = R_g^T R_p q + R_g^T(d_p-d_g).
+    #
+    # This keeps the GT footprint canonical/binary and makes the exact target
+    # yield identity warp and SoftIoU==1 even for non-grid-aligned GT motion.
+    rel_yaw = wrap_angle_tensor(pred_yaw_eff - tgt_yaw_eff)
+    delta = pred_d - tgt_d
+    cg = torch.cos(tgt_yaw_eff)
+    sg = torch.sin(tgt_yaw_eff)
+    rel_dx = cg * delta[..., 0] + sg * delta[..., 1]
+    rel_dy = -sg * delta[..., 0] + cg * delta[..., 1]
+    rel_d = torch.stack((rel_dx, rel_dy), dim=-1)
+
+    pred_rel = _warp_footprint_se2(
+        source_footprint_mask,
+        rel_d,
+        rel_yaw,
         patch_resolution_m=float(patch_resolution_m),
     )
-    tgt_mask = _warp_footprint_se2(
-        source_footprint_mask, tgt_d, tgt_yaw_eff,
-        patch_resolution_m=float(patch_resolution_m),
+    H, W = int(source_footprint_mask.shape[-2]), int(source_footprint_mask.shape[-1])
+    canonical = F.pad(
+        source_footprint_mask[:, None].to(pred_rel.dtype), (W, W, H, H)
     )
-    inter = (pred_mask * tgt_mask).sum(dim=(-2, -1))
-    union = (pred_mask + tgt_mask - pred_mask * tgt_mask).sum(dim=(-2, -1))
+    canonical = canonical.expand(B, Fh, 1, *canonical.shape[-2:])[:, :, 0]
+    inter = (pred_rel * canonical).sum(dim=(-2, -1))
+    union = (pred_rel + canonical - pred_rel * canonical).sum(dim=(-2, -1))
     iou = (inter + float(eps)) / (union + float(eps))
 
     footprint_present = source_footprint_mask.flatten(1).sum(dim=1) > 0
