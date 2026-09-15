@@ -16,6 +16,7 @@ from real_motion.local_st_world_model_v18_se2 import (
     LocalSpatialTemporalWorldModelV18SE2,
     apply_box_centered_rigid_xy,
     apply_source_centered_rigid_xy,
+    kta_relative_safe_transport_loss,
     relative_yaw_in_t0,
     soft_se2_transport_overlap_loss,
     source_center_se2_target,
@@ -180,6 +181,106 @@ def test_yaw_disabled_class_receives_no_shape_yaw_gradient():
     assert torch.equal(pred_yaw.grad, torch.zeros_like(pred_yaw.grad))
 
 
+
+def test_safe_loss_is_zero_when_prediction_matches_or_beats_kta():
+    B = 1
+    footprint = torch.zeros(B, 20, 20)
+    footprint[:, 8:12, 5:15] = 1.0
+    valid = torch.ones(B, FUTURE_FRAMES, dtype=torch.bool)
+    enabled = torch.ones(B, dtype=torch.bool)
+    yaw_valid = torch.ones(B, FUTURE_FRAMES, dtype=torch.bool)
+
+    # GT is a nonzero translation. Prediction exactly matches GT; KTA is worse.
+    target_d = torch.zeros(B, FUTURE_FRAMES, 2)
+    target_d[..., 0] = 1.6
+    target_d[..., 1] = -0.8
+    pred_d = target_d.clone().requires_grad_(True)
+    kta_d = torch.zeros_like(target_d)
+    target_yaw = torch.full((B, FUTURE_FRAMES), 0.2)
+    pred_yaw = target_yaw.clone().requires_grad_(True)
+
+    loss, stats = kta_relative_safe_transport_loss(
+        pred_d,
+        kta_d,
+        target_d,
+        pred_yaw,
+        target_yaw,
+        footprint,
+        valid,
+        enabled,
+        yaw_valid,
+    )
+    assert float(loss.detach()) < 1e-7
+    assert stats["safe_active_labels"] == 0
+    loss.backward()
+    assert pred_d.grad is not None
+    assert pred_yaw.grad is not None
+
+
+def test_safe_loss_is_positive_when_prediction_is_worse_than_kta():
+    B = 1
+    footprint = torch.zeros(B, 20, 20)
+    footprint[:, 8:12, 5:15] = 1.0
+    valid = torch.ones(B, FUTURE_FRAMES, dtype=torch.bool)
+    enabled = torch.ones(B, dtype=torch.bool)
+    yaw_valid = torch.ones(B, FUTURE_FRAMES, dtype=torch.bool)
+
+    # GT == KTA, while the learned transform introduces a harmful shift/yaw.
+    target_d = torch.zeros(B, FUTURE_FRAMES, 2)
+    kta_d = torch.zeros_like(target_d)
+    pred_d = torch.zeros_like(target_d, requires_grad=True)
+    pred_d.data[..., 0] = 2.4
+    target_yaw = torch.zeros(B, FUTURE_FRAMES)
+    pred_yaw = torch.full(
+        (B, FUTURE_FRAMES), 0.35, requires_grad=True
+    )
+
+    loss, stats = kta_relative_safe_transport_loss(
+        pred_d,
+        kta_d,
+        target_d,
+        pred_yaw,
+        target_yaw,
+        footprint,
+        valid,
+        enabled,
+        yaw_valid,
+    )
+    assert float(loss.detach()) > 0.05
+    assert stats["safe_active_labels"] == B * FUTURE_FRAMES
+    assert stats["safe_active_fraction"] == 1.0
+    assert stats["safe_pred_soft_iou"] < stats["safe_kta_soft_iou"]
+    loss.backward()
+    assert torch.isfinite(pred_d.grad).all()
+    assert torch.isfinite(pred_yaw.grad).all()
+
+
+def test_safe_loss_margin_is_one_sided_tolerance():
+    B = 1
+    footprint = torch.zeros(B, 20, 20)
+    footprint[:, 8:12, 5:15] = 1.0
+    valid = torch.ones(B, FUTURE_FRAMES, dtype=torch.bool)
+    enabled = torch.ones(B, dtype=torch.bool)
+    yaw_valid = torch.ones(B, FUTURE_FRAMES, dtype=torch.bool)
+    target_d = torch.zeros(B, FUTURE_FRAMES, 2)
+    kta_d = torch.zeros_like(target_d)
+    pred_d = torch.zeros_like(target_d)
+    pred_d[..., 0] = 0.05
+    target_yaw = torch.zeros(B, FUTURE_FRAMES)
+    pred_yaw = torch.zeros_like(target_yaw)
+
+    no_margin, _ = kta_relative_safe_transport_loss(
+        pred_d, kta_d, target_d, pred_yaw, target_yaw,
+        footprint, valid, enabled, yaw_valid, margin=0.0,
+    )
+    with_margin, _ = kta_relative_safe_transport_loss(
+        pred_d, kta_d, target_d, pred_yaw, target_yaw,
+        footprint, valid, enabled, yaw_valid, margin=1.0,
+    )
+    assert float(no_margin) >= 0.0
+    assert float(with_margin) == 0.0
+
+
 def test_v18_optimizer_resume_preserves_old_state_and_appends_yaw_group():
     cfg = LocalSTWMV17Config(
         d_model=32,
@@ -218,3 +319,8 @@ def test_v18_optimizer_resume_preserves_old_state_and_appends_yaw_group():
     yaw_ids = {id(p) for p in new.yaw_head.parameters()}
     assert all(id(p) in yaw_ids for p in resumed.param_groups[1]["params"])
     assert all(p not in resumed.state for p in resumed.param_groups[1]["params"])
+
+    safe_model, safe_opt = _build_model_optimizer("S", ck, torch.device("cpu"))
+    assert isinstance(safe_model, LocalSpatialTemporalWorldModelV18SE2)
+    assert len(safe_opt.param_groups) == 2
+    assert len(safe_opt.param_groups[1]["params"]) == 2
