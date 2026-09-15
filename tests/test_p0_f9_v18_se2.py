@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+from dataclasses import asdict
 
 import numpy as np
 import torch
 
 from real_motion.local_st_world_model_v17 import (
+    MODEL_PROTOCOL_V17,
     LocalSTWMV17Config,
     LocalSpatialTemporalWorldModelV17,
     frame_motion_features_from_flat,
@@ -19,6 +21,7 @@ from real_motion.local_st_world_model_v18_se2 import (
     source_center_se2_target,
 )
 from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRAMES
+from tools.real_motion.train_p0_f9_v18_se2_pair import _build_model_optimizer
 
 
 def _yaw_pose(yaw):
@@ -175,3 +178,43 @@ def test_yaw_disabled_class_receives_no_shape_yaw_gradient():
     loss.backward()
     assert pred_yaw.grad is not None
     assert torch.equal(pred_yaw.grad, torch.zeros_like(pred_yaw.grad))
+
+
+def test_v18_optimizer_resume_preserves_old_state_and_appends_yaw_group():
+    cfg = LocalSTWMV17Config(
+        d_model=32,
+        semantic_dim=8,
+        heads=4,
+        blocks=1,
+        decoder_blocks=1,
+        tube_hw=20,
+        use_representation=True,
+    )
+    old = LocalSpatialTemporalWorldModelV17(cfg)
+    opt = torch.optim.AdamW(old.parameters(), lr=5e-4, weight_decay=1e-4)
+    # Populate Adam moments without depending on a particular forward graph.
+    for p in old.parameters():
+        if p.requires_grad:
+            p.grad = torch.full_like(p, 1e-3)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+    ck = {
+        "protocol": MODEL_PROTOCOL_V17,
+        "epoch": 5,
+        "variant": "RL",
+        "use_representation": True,
+        "overlap_weight": 0.25,
+        "state_dict": old.state_dict(),
+        "optimizer": opt.state_dict(),
+        "model_config": asdict(cfg),
+        "args": {"lr": 5e-4, "weight_decay": 1e-4},
+    }
+    new, resumed = _build_model_optimizer("Y", ck, torch.device("cpu"))
+    assert isinstance(new, LocalSpatialTemporalWorldModelV18SE2)
+    assert len(resumed.param_groups) == 2
+    assert len(resumed.param_groups[1]["params"]) == 2
+    # Historical Adam state exists only for inherited parameters at step 0.
+    yaw_ids = {id(p) for p in new.yaw_head.parameters()}
+    assert all(id(p) in yaw_ids for p in resumed.param_groups[1]["params"])
+    assert all(p not in resumed.state for p in resumed.param_groups[1]["params"])
