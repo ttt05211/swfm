@@ -388,7 +388,9 @@ def soft_se2_transport_overlap_loss(
     canonical = F.pad(
         source_footprint_mask[:, None].to(pred_rel.dtype), (W, W, H, H)
     )
-    canonical = canonical.expand(B, Fh, 1, *canonical.shape[-2:])[:, :, 0]
+    canonical = canonical[:, None].expand(
+        B, Fh, 1, canonical.shape[-2], canonical.shape[-1]
+    )[:, :, 0]
     inter = (pred_rel * canonical).sum(dim=(-2, -1))
     union = (pred_rel + canonical - pred_rel * canonical).sum(dim=(-2, -1))
     iou = (inter + float(eps)) / (union + float(eps))
