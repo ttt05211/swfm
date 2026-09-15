@@ -116,15 +116,23 @@ def _upgrade_record(rec, source, *, strict=True):
                         f"source={i} horizon={h}"
                     )
                 continue
+
             ah = _center_t0(annh, t0_pose)
             yawh_world = float(quaternion_yaw(annh["rotation"]))
-            dyaw = relative_yaw_in_t0(yaw0_world, yawh_world, t0_pose)
-            tgt = source_center_se2_target(source_xy[i], a0, ah, dyaw)
+            raw_dyaw = relative_yaw_in_t0(yaw0_world, yawh_world, t0_pose)
+
+            # Classes disabled for yaw must remain the historical translation-only
+            # contract in BOTH training and deployment.  Therefore their XY target
+            # also uses an effective zero rotation rather than absorbing an
+            # unmodelled pivot-rotation term into translation.
+            effective_dyaw = raw_dyaw if bool(yaw_enabled[i]) else 0.0
+            tgt = source_center_se2_target(source_xy[i], a0, ah, effective_dyaw)
+
             target_disp[i, h] = tgt.source_displacement_xy_m
             target_res[i, h] = (
                 tgt.source_displacement_xy_m.astype(np.float64) - kta[i, h]
             ).astype(np.float32)
-            target_yaw[i, h] = np.float32(tgt.yaw_rad)
+            target_yaw[i, h] = np.float32(raw_dyaw)
             yaw_valid[i, h] = True
             se2_valid[i, h] = True
 
@@ -209,6 +217,7 @@ def main():
             "se2_gt_motion_source": "matched_nuscenes_annotation_relative_rigid_transform",
             "yaw_encoding": "scalar_relative_yaw_rad",
             "yaw_enabled_class_ids": list(YAW_ENABLED_CLASS_IDS),
+            "yaw_disabled_xy_contract": "legacy_translation_only_box_center_displacement",
             "yaw_deployment_rule": "semantic_class_only_no_future_validity_gate",
             "num_windows": len(out_records),
             "num_sources": nsrc,
