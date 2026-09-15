@@ -53,8 +53,9 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import (
 )
 from tools.real_motion.train_p0_f9_v18_se2_pair import PROTOCOL
 
-EVAL_PROTOCOL = "p0_f9_v18_se2_hard_a1_eval_v1"
+EVAL_PROTOCOL = "p0_f9_v18_se2_hard_a1_eval_v2_yaw_mode"
 TURN_BINS = ("straight", "mild", "strong")
+YAW_MODES = ("zero", "pred", "gt")
 
 
 def load_cache(path):
@@ -172,6 +173,32 @@ def _latest(values, valid):
     return out
 
 
+def _eval_yaw_delta(
+    *,
+    mode,
+    arm,
+    class_id,
+    pred_yaw_rad,
+    gt_yaw_rad,
+    gt_yaw_valid,
+):
+    """Return hard-renderer yaw for the inference-only ablation.
+
+    The semantic yaw-enable rule is frozen for every mode. GT is an offline
+    oracle diagnostic only; unavailable future yaw falls back to zero instead
+    of changing the source set.
+    """
+    if int(class_id) not in YAW_ENABLED_CLASS_IDS:
+        return 0.0
+    if mode == "zero":
+        return 0.0
+    if mode == "pred":
+        return float(pred_yaw_rad) if arm == "Y" else 0.0
+    if mode == "gt":
+        return float(gt_yaw_rad) if bool(gt_yaw_valid) else 0.0
+    raise ValueError(f"unknown yaw mode {mode}")
+
+
 def main():
     p = argparse.ArgumentParser()
     add_config_args(p)
@@ -183,6 +210,15 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--turn-mild-deg", type=float, default=5.0)
     p.add_argument("--turn-strong-deg", type=float, default=15.0)
+    p.add_argument(
+        "--yaw-mode",
+        choices=YAW_MODES,
+        default="pred",
+        help=(
+            "hard-renderer yaw ablation: zero=no rotation, pred=model yaw, "
+            "gt=GT relative-yaw oracle. XY predictions are identical across modes."
+        ),
+    )
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--device", default="cuda")
     a = p.parse_args()
@@ -329,11 +365,17 @@ def main():
                 pred_center = t0_xy_to_world_preserve_source_z(
                     xy_pred, src_center, t0_pose
                 )
-                use_yaw = (
-                    arm == "Y"
-                    and int(comp["class_id"]) in set(YAW_ENABLED_CLASS_IDS)
+                yaw = _eval_yaw_delta(
+                    mode=str(a.yaw_mode),
+                    arm=arm,
+                    class_id=int(comp["class_id"]),
+                    pred_yaw_rad=pred_yaw[i, hi],
+                    gt_yaw_rad=yaw_target[i, hi],
+                    gt_yaw_valid=bool(
+                        yaw_valid[i, hi]
+                        and rec["se2_target_valid"][i, hi].item()
+                    ),
                 )
-                yaw = float(pred_yaw[i, hi]) if use_yaw else 0.0
                 candidate_all.append(
                     rasterize_rigid_component(
                         comp["voxel_indices"],
@@ -381,6 +423,10 @@ def main():
 
     diag = {
         "arm": arm,
+        "yaw_mode": str(a.yaw_mode),
+        "yaw_mode_contract": (
+            "same_checkpoint_same_xy_only_hard_renderer_yaw_changes_v1"
+        ),
         "source_count": sources,
         "yaw_enabled_source_count": yaw_enabled_sources,
         "trajectory_error_definition": (
@@ -419,7 +465,10 @@ def main():
     }
 
     print("\n=== V17/V18 HARD A1 EVAL ===")
-    print(f"arm={arm} step={ck.get('continuation_step')}")
+    print(
+        f"arm={arm} step={ck.get('continuation_step')} "
+        f"yaw_mode={a.yaw_mode}"
+    )
     print(f"{'variant':20s} {'IoU':>9s} {'mIoU':>9s} {'Moving':>9s}")
     for n in names:
         rr = reports[n]
@@ -436,6 +485,9 @@ def main():
         "checkpoint": str(Path(a.checkpoint).resolve()),
         "checkpoint_protocol": ck.get("protocol"),
         "arm": arm,
+        "yaw_mode": str(a.yaw_mode),
+        "yaw_mode_contract": "same_checkpoint_same_xy_only_hard_renderer_yaw_changes_v1",
+        "gt_yaw_is_offline_oracle": bool(a.yaw_mode == "gt"),
         "continuation_step": int(ck.get("continuation_step", -1)),
         "num_windows": len(records),
         "reports": reports,
