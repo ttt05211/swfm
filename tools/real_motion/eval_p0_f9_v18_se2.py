@@ -79,7 +79,7 @@ def load_model(path, device):
     cfg = config_from_mapping_v17(ck.get("model_config"))
     if arm == "C":
         model = LocalSpatialTemporalWorldModelV17(cfg).to(device)
-    elif arm == "Y":
+    elif arm in {"Y", "S"}:
         model = LocalSpatialTemporalWorldModelV18SE2(cfg).to(device)
     else:
         raise RuntimeError(f"unknown paired arm {arm}")
@@ -193,7 +193,7 @@ def _eval_yaw_delta(
     if mode == "zero":
         return 0.0
     if mode == "pred":
-        return float(pred_yaw_rad) if arm == "Y" else 0.0
+        return float(pred_yaw_rad) if arm in {"Y", "S"} else 0.0
     if mode == "gt":
         return float(gt_yaw_rad) if bool(gt_yaw_valid) else 0.0
     raise ValueError(f"unknown yaw mode {mode}")
@@ -298,18 +298,18 @@ def main():
         residual = out["residual_xy_m"].float().cpu().numpy()
         pred_yaw = (
             out["yaw_delta_rad"].float().cpu().numpy()
-            if arm == "Y"
+            if arm in {"Y", "S"}
             else np.zeros((len(current), FUTURE_FRAMES), dtype=np.float32)
         )
 
         valid = (
             rec["se2_target_valid"].bool().numpy()
-            if arm == "Y"
+            if arm in {"Y", "S"}
             else rec["target_valid"].bool().numpy()
         )
         target_res = (
             rec["target_source_residual_xy_m"].float().numpy()
-            if arm == "Y"
+            if arm in {"Y", "S"}
             else rec["target_residual_xy_m"].float().numpy()
         )
         err = np.linalg.norm(residual - target_res, axis=-1)
@@ -322,7 +322,7 @@ def main():
         sources += len(current)
         yaw_enabled_sources += int(yaw_enabled.sum())
         ym = yaw_enabled[:, None] & yaw_valid & rec["se2_target_valid"].bool().numpy()
-        if arm == "Y" and bool(ym.any()):
+        if arm in {"Y", "S"} and bool(ym.any()):
             de = np.arctan2(
                 np.sin(pred_yaw - yaw_target),
                 np.cos(pred_yaw - yaw_target),
@@ -431,7 +431,7 @@ def main():
         "yaw_enabled_source_count": yaw_enabled_sources,
         "trajectory_error_definition": (
             "source_center_ADE_FDE"
-            if arm == "Y"
+            if arm in {"Y", "S"}
             else "legacy_box_displacement_equivalent_ADE_FDE"
         ),
         "learned_ade_m": float(np.mean(xy_err)) if xy_err else float("nan"),
