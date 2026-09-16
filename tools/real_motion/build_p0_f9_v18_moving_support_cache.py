@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from real_motion.geometry import quaternion_yaw
-from real_motion.local_stwm_moving_safe import (
+from real_motion.local_stwm_scene_moving_safe import (
     MOVING_SAFE_LOSS_CONTRACT,
     MOVING_SUPPORT_CACHE_VERSION,
     REPORT_FRAME_INDICES,
