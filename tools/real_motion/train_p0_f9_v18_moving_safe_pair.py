@@ -32,7 +32,7 @@ import torch
 from real_motion.local_st_world_model_v18_se2 import (
     LocalSpatialTemporalWorldModelV18SE2,
 )
-from real_motion.local_stwm_moving_safe import (
+from real_motion.local_stwm_scene_moving_safe import (
     MOVING_SAFE_LOSS_CONTRACT,
     load_moving_support_cache,
     scene_moving_safe_loss,
