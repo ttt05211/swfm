@@ -516,6 +516,20 @@ def main():
     # The scene cache was already audited against the canonical runtime grid.
     from real_motion.geometry import OccupancyGrid
     grid = OccupancyGrid()
+    scene_shape = tuple(int(x) for x in scene_ds.metadata.get("grid_shape_hwd", []))
+    scene_voxel = tuple(float(x) for x in scene_ds.metadata.get("grid_voxel_size", []))
+    support_shape = tuple(int(x) for x in support_meta.get("grid_shape_hwd", []))
+    support_voxel = tuple(float(x) for x in support_meta.get("grid_voxel_size", []))
+    if scene_shape != tuple(grid.shape_hwd) or support_shape != tuple(grid.shape_hwd):
+        raise RuntimeError(
+            f"scene/support grid shape mismatch: scene={scene_shape} "
+            f"support={support_shape} runtime={grid.shape_hwd}"
+        )
+    if scene_voxel != tuple(grid.voxel_size) or support_voxel != tuple(grid.voxel_size):
+        raise RuntimeError(
+            f"scene/support voxel size mismatch: scene={scene_voxel} "
+            f"support={support_voxel} runtime={grid.voxel_size}"
+        )
     free_label = int(scene_ds.metadata.get("free_label", 17))
 
     calibration = _calibrate(
