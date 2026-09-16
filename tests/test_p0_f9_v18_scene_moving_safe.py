@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from real_motion.geometry import OccupancyGrid
-from real_motion.local_stwm_moving_safe import (
+from real_motion.local_stwm_scene_moving_safe import (
     REPORT_FRAME_INDICES,
     _sample_source_alpha_se2,
     scene_moving_safe_loss,
