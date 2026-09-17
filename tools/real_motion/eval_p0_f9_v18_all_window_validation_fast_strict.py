@@ -8,6 +8,10 @@ change from concatenating sources across neighboring windows.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import sys
+
 import numpy as np
 import torch
 
@@ -45,7 +49,23 @@ def _predict_scene_strict(records, y_model, c_model, device, *, source_batch_siz
     return out
 
 
+def _output_path_from_argv() -> Path | None:
+    for i, arg in enumerate(sys.argv[1:], start=1):
+        if arg == "--output" and i + 1 < len(sys.argv):
+            return Path(sys.argv[i + 1])
+        if arg.startswith("--output="):
+            return Path(arg.split("=", 1)[1])
+    return None
+
+
 fast._predict_scene = _predict_scene_strict
 
 if __name__ == "__main__":
+    output = _output_path_from_argv()
     fast.main()
+    if output is not None and output.exists():
+        report = json.loads(output.read_text(encoding="utf-8"))
+        opt = report.setdefault("optimization", {})
+        opt["scene_batched_model_inference"] = False
+        opt["model_inference_mode"] = "strict_per_window_historical_bf16"
+        output.write_text(json.dumps(report, indent=2), encoding="utf-8")
