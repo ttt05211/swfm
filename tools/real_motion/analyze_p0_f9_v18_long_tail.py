@@ -20,6 +20,11 @@ from real_motion.long_tail_sampling import build_balanced_source_weights
 from tools.real_motion.train_p0_f9_v18_se2_pair import flatten_supervised, load_se2_cache
 
 
+def _fmt_q(q, key):
+    v = q.get(key)
+    return f"{float(v):8.3f}" if v is not None else f"{'nan':>8s}"
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--train-cache", required=True)
@@ -43,23 +48,27 @@ def main():
     op.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("=== V18 LONG-TAIL TRAIN DISTRIBUTION ===")
-    print(f"sources={report['sources']}")
+    print(
+        f"sources={report['sources']} "
+        f"motion_labeled={report['motion_labeled_sources']} "
+        f"motion_unlabeled={report['motion_unlabeled_sources']}"
+    )
     print(f"effective_sample_fraction={report['effective_sample_fraction']:.4f}")
     print(
         f"global top10 motion threshold="
         f"{report['global_top10_motion_threshold_m']:.4f} m"
     )
     print(
-        f"{'class':>5s} {'N':>8s} {'raw%':>8s} {'sample%':>9s} "
+        f"{'class':>5s} {'N':>8s} {'Nmot':>8s} {'raw%':>8s} {'sample%':>9s} "
         f"{'q50':>8s} {'q90':>8s} {'q95':>8s} {'mean_w':>8s}"
     )
     for cid, row in report["classes"].items():
         q = row["motion_difficulty_m"]
         print(
-            f"{cid:>5s} {row['sources']:8d} "
+            f"{cid:>5s} {row['sources']:8d} {row['motion_labeled_sources']:8d} "
             f"{100*row['source_fraction']:8.3f} "
             f"{100*row['expected_sample_fraction']:9.3f} "
-            f"{q['median']:8.3f} {q['p90']:8.3f} {q['p95']:8.3f} "
+            f"{_fmt_q(q, 'median')} {_fmt_q(q, 'p90')} {_fmt_q(q, 'p95')} "
             f"{row['mean_final_weight']:8.3f}"
         )
     print(f"saved {op}")
