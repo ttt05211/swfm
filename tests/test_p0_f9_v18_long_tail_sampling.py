@@ -24,10 +24,22 @@ def test_source_motion_difficulty_is_mean_valid_kta_relative_magnitude():
     assert torch.allclose(got, torch.tensor([7.5, 1.5]))
 
 
+def test_source_without_valid_motion_target_is_retained_as_nan_difficulty():
+    residual = torch.zeros(3, 2, 2)
+    residual[0, :, 0] = 0.5
+    residual[1, :, 0] = 1.0
+    valid = torch.tensor([
+        [True, True],
+        [False, False],
+        [True, False],
+    ])
+    got = source_motion_difficulty(residual, valid)
+    assert torch.isfinite(got[0])
+    assert torch.isnan(got[1])
+    assert torch.isfinite(got[2])
+
+
 def test_balanced_weights_raise_tail_class_and_motion_tail_without_special_cases():
-    # Class 4 is frequent; class 6 is rare. Within each class, the final sample
-    # has a larger KTA-relative correction target. No class ID is hard-coded in
-    # the implementation, so swapping IDs would preserve the same behavior.
     ids = torch.tensor([4] * 12 + [6] * 3, dtype=torch.long)
     residual = torch.zeros(15, 3, 2)
     valid = torch.ones(15, 3, dtype=torch.bool)
@@ -36,14 +48,32 @@ def test_balanced_weights_raise_tail_class_and_motion_tail_without_special_cases
 
     out = build_balanced_source_weights(ids, residual, valid)
     w = out.weights.numpy()
-
-    # Rare class receives more expected mass per source than the head class.
     assert w[12:].mean() > w[:12].mean()
-    # The rare hard-motion source is sampled more often than the rare easy one.
     assert w[14] > w[12]
     assert np.isfinite(w).all()
     assert (w > 0).all()
     assert float(w.max()) <= MAX_NORMALIZED_WEIGHT + 1e-12
+
+
+def test_motion_unlabeled_source_gets_neutral_motion_factor_but_class_factor_remains():
+    ids = torch.tensor([4, 4, 4, 6], dtype=torch.long)
+    residual = torch.zeros(4, 2, 2)
+    residual[0, :, 0] = 0.1
+    residual[1, :, 0] = 0.2
+    residual[2, :, 0] = 0.3
+    residual[3, :, 0] = 0.8
+    valid = torch.tensor([
+        [True, True],
+        [False, False],
+        [True, True],
+        [True, True],
+    ])
+    out = build_balanced_source_weights(ids, residual, valid)
+    assert torch.isnan(out.motion_difficulty_m[1])
+    assert abs(float(out.motion_weights[1]) - 1.0) < 1e-7
+    assert np.isfinite(out.weights.numpy()).all()
+    assert out.report["motion_unlabeled_sources"] == 1
+    assert out.report["classes"]["4"]["motion_unlabeled_sources"] == 1
 
 
 def test_balanced_sampler_keeps_exactly_n_draws_per_epoch_and_is_reproducible():
@@ -68,6 +98,8 @@ def test_report_exposes_raw_and_expected_class_fractions():
     report = out.report
 
     assert report["sources"] == 6
+    assert report["motion_labeled_sources"] == 6
+    assert report["motion_unlabeled_sources"] == 0
     assert report["class_counts"] == {"2": 1, "4": 3, "6": 2}
     assert abs(sum(v["expected_sample_fraction"] for v in report["classes"].values()) - 1.0) < 1e-8
     assert "global_top10_motion_threshold_m" in report
