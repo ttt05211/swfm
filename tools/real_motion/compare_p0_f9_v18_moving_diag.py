@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two V18 macro/micro moving diagnostic JSON reports.
 
-Primary use: Y600-pred versus Clean-E14.  Prints overall metrics, macro/micro
+Primary use: Y600-pred versus Clean-E14. Prints overall metrics, macro/micro
 Moving-IoU by horizon, and the full dynamic-class x horizon Moving-IoU table.
 """
 from __future__ import annotations
@@ -10,6 +10,10 @@ import argparse
 import json
 import math
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 import numpy as np
 
@@ -63,10 +67,6 @@ def _horizon_report(x, h):
 def _class_value(report, class_id):
     pc = report["per_class"]
     return float(pc[_key(pc, class_id)])
-
-
-def _fmt(v, width=9, digits=4):
-    return f"{v:{width}.{digits}f}" if math.isfinite(v) else f"{'nan':>{width}s}"
 
 
 def main():
@@ -139,7 +139,11 @@ def main():
 
     for c in DYNAMIC_CLASS_IDS:
         rv, cv = [], []
-        row = {"class_id": int(c), "class_name": NUSCENES_LABELS[int(c)], "horizons": {}}
+        row = {
+            "class_id": int(c),
+            "class_name": NUSCENES_LABELS[int(c)],
+            "horizons": {},
+        }
         line = f"{c}:{NUSCENES_LABELS[int(c)]:<20}"
         for h in REPORT_HORIZONS_S:
             rm, _ = _horizon_report(ref, h)
