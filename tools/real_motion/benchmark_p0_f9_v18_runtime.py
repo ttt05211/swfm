@@ -398,8 +398,14 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
     future_poses = [
         np.asarray(source.pose(str(tok)), dtype=np.float64) for tok in w.future_tokens
     ]
-    current = extract_instances(current_sem, current_pose, grid=pcfg.grid, cfg=strong_cfg)
-    previous = extract_instances(previous_sem, previous_pose, grid=pcfg.grid, cfg=strong_cfg)
+    # Deployment/runtime path uses the cropped implementation.  Formal
+    # exactness checks recompute the frozen full-grid reference extraction.
+    current = extract_instances_cropped_exact(
+        current_sem, current_pose, grid=pcfg.grid, cfg=strong_cfg
+    )
+    previous = extract_instances_cropped_exact(
+        previous_sem, previous_pose, grid=pcfg.grid, cfg=strong_cfg
+    )
     velocities = match_instances(
         previous, current, float(pcfg.frame_dt_s),
         max_speed_mps=strong_cfg.max_match_speed_mps,
@@ -590,16 +596,16 @@ def _time_prior_rebuild(state, pcfg, strong_cfg, device):
 
 
 def _exactness_check(model, state, pcfg, strong_cfg, device):
-    fast_cur = extract_instances_cropped_exact(
+    ref_cur = extract_instances(
         state["current_sem"], state["current_pose"], grid=pcfg.grid, cfg=strong_cfg
     )
-    fast_prev = extract_instances_cropped_exact(
+    ref_prev = extract_instances(
         state["previous_sem"], state["previous_pose"], grid=pcfg.grid, cfg=strong_cfg
     )
-    if not component_lists_equal(fast_cur, state["current"]):
-        raise RuntimeError("runtime fast current-component extraction mismatch")
-    if not component_lists_equal(fast_prev, state["previous"]):
-        raise RuntimeError("runtime fast previous-component extraction mismatch")
+    if not component_lists_equal(ref_cur, state["current"]):
+        raise RuntimeError("runtime cropped current-component extraction mismatch")
+    if not component_lists_equal(ref_prev, state["previous"]):
+        raise RuntimeError("runtime cropped previous-component extraction mismatch")
 
     history2 = np.stack([state["previous_sem"], state["current_sem"]], axis=0)
     ref_anchor = strong_w2det_sequence(
@@ -1123,6 +1129,7 @@ def main():
             "footprints/CLEAR + cached target centers + vectorized SE2 raster + A1"
         ),
         "gpu_input_staging": "one_window_at_a_time_outside_timed_regions",
+        "component_extraction_runtime": "cropped_connected_components_bit_exact_gated",
         "selection_seed": int(a.seed),
         "source_count": {
             "mean": float(np.mean(source_counts)) if source_counts else float("nan"),
