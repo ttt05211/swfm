@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -60,24 +61,33 @@ def _seed_all(seed: int) -> None:
 
 
 def _load_occfm_model(occfm_root: Path, cfg_path: Path, ckpt_path: Path, device):
-    root = str(occfm_root.resolve())
+    root_path = occfm_root.resolve()
+    root = str(root_path)
     if root not in sys.path:
         sys.path.insert(0, root)
     from easydict import EasyDict
     from forecast.config import cfg_from_yaml_file
     from forecast.models import build_network
 
-    cfg = EasyDict()
-    cfg.ROOT_DIR = occfm_root.resolve()
-    cfg.LOCAL_RANK = 0
-    cfg_from_yaml_file(str(cfg_path), cfg)
-    model = build_network(
-        model_cfg=cfg.MODEL,
-        loss_cfg=cfg.LOSS,
-        cache_mode=cfg.CACHE_MODE,
-    ).to(device)
-    model.eval()
-    status = model.recover_training(str(ckpt_path))
+    # OccFM's cfg loader resolves _BASE_CONFIG_ paths relative to cwd rather
+    # than relative to cfg_path.  Build/recover under the OccFM repository root
+    # so absolute top-level cfg paths still resolve their released base configs.
+    old_cwd = Path.cwd()
+    try:
+        os.chdir(root_path)
+        cfg = EasyDict()
+        cfg.ROOT_DIR = root_path
+        cfg.LOCAL_RANK = 0
+        cfg_from_yaml_file(str(cfg_path), cfg)
+        model = build_network(
+            model_cfg=cfg.MODEL,
+            loss_cfg=cfg.LOSS,
+            cache_mode=cfg.CACHE_MODE,
+        ).to(device)
+        model.eval()
+        status = model.recover_training(str(ckpt_path))
+    finally:
+        os.chdir(old_cwd)
     return model, cfg, status
 
 
