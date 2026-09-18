@@ -366,6 +366,16 @@ def _gpu_inputs(rec, device):
     }
 
 
+def _stage_gpu_inputs(state, device):
+    if state.get("gpu") is not None:
+        raise RuntimeError("GPU inputs already staged for this state")
+    state["gpu"] = _gpu_inputs(state["rec"], device)
+
+
+def _release_gpu_inputs(state):
+    state["gpu"] = None
+
+
 def _model_forward(model, gi, device):
     with torch.inference_mode(), torch.autocast(
         device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
@@ -450,7 +460,10 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         "baseline_by_hi": baseline_by_hi,
         "baseline_clear_by_hi": baseline_clear_by_hi,
         "world_to_future": world_to_future,
-        "gpu": _gpu_inputs(rec, device),
+        # Staged one window at a time immediately before exactness/timing.
+        # This keeps the reported peak CUDA memory representative of one
+        # forecasting window instead of all selected benchmark windows.
+        "gpu": None,
     }
 
 
@@ -605,6 +618,47 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
         if not np.array_equal(ref_anchor[hi], fast_anchor[hi]):
             n = int(np.count_nonzero(ref_anchor[hi] != fast_anchor[hi]))
             raise RuntimeError(f"runtime fast Strong mismatch hi={hi} voxels={n}")
+
+        # The dense Strong anchor can be identical even if a per-source
+        # baseline footprint differs. A1 CLEAR depends on those footprints, so
+        # verify every source against the frozen rigid renderer as well.
+        ref_baseline = []
+        dt = (hi + 1) * float(pcfg.frame_dt_s)
+        for i, comp in enumerate(state["current"]):
+            cid = int(comp["class_id"])
+            src_center = np.asarray(comp["centroid_world"], dtype=np.float64)
+            v = np.asarray(state["velocities"].get(i, np.zeros(3)), dtype=np.float64)
+            rb = rasterize_rigid_component(
+                comp["voxel_indices"],
+                cid,
+                state["current_pose"],
+                state["future_poses"][hi],
+                source_center_world=src_center,
+                target_center_world=src_center + v * dt,
+                yaw_delta_rad=0.0,
+                grid=pcfg.grid,
+            )
+            ref_baseline.append(rb)
+            if i >= len(fast_base[hi]):
+                raise RuntimeError(
+                    f"runtime Strong baseline source-count mismatch hi={hi}"
+                )
+            fast_idx = _deduplicate_indices(
+                np.asarray(fast_base[hi][i].voxel_indices, dtype=np.int64),
+                pcfg.grid,
+            )
+            if not np.array_equal(rb.voxel_indices, fast_idx):
+                raise RuntimeError(
+                    f"runtime Strong baseline footprint mismatch hi={hi} source={i}"
+                )
+        if len(ref_baseline) != len(fast_base[hi]):
+            raise RuntimeError(
+                f"runtime Strong baseline source-count mismatch hi={hi}: "
+                f"ref={len(ref_baseline)} fast={len(fast_base[hi])}"
+            )
+        ref_clear = baseline_clear_mask(ref_baseline, grid=pcfg.grid)
+        if not np.array_equal(ref_clear, state["baseline_clear_by_hi"][hi]):
+            raise RuntimeError(f"runtime Strong baseline CLEAR mismatch hi={hi}")
 
     out = _model_forward(model, state["gpu"], device)
     pred_res = out["residual_xy_m"].float().cpu().numpy()
@@ -831,8 +885,15 @@ def main():
     _, records = mid.base.load_cache(a.val_cache)
     if not records:
         raise RuntimeError("validation cache is empty")
-    if int(a.measure_windows) <= 0 or int(a.warmup_windows) < 0 or int(a.exactness_windows) < 0:
-        raise ValueError("invalid warmup/measure/exactness counts")
+    if int(a.warmup_windows) < 0 or int(a.exactness_windows) < 0:
+        raise ValueError("warmup/exactness counts must be non-negative")
+    if bool(a.preflight_only):
+        if int(a.exactness_windows) <= 0:
+            raise ValueError("--preflight-only requires --exactness-windows > 0")
+        if int(a.measure_windows) < 0:
+            raise ValueError("measure count must be non-negative")
+    elif int(a.measure_windows) <= 0:
+        raise ValueError("normal benchmark requires --measure-windows > 0")
 
     device = torch.device(
         a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu"
@@ -904,7 +965,11 @@ def main():
                 f"{prep_ms:.1f} ms",
                 flush=True,
             )
-            _exactness_check(model, state, pcfg, strong_cfg, device)
+            _stage_gpu_inputs(state, device)
+            try:
+                _exactness_check(model, state, pcfg, strong_cfg, device)
+            finally:
+                _release_gpu_inputs(state)
             print(f"RUNTIME EXACTNESS WINDOW {pi}/{exact_n}: PASS", flush=True)
         elif pi == exact_n + 1 or pi % 10 == 0 or pi == len(selected):
             elapsed = time.perf_counter() - prep_started
@@ -927,31 +992,63 @@ def main():
 
     nw = min(int(a.warmup_windows), len(prepared))
     for state in prepared[:nw]:
-        _model_forward(model, state["gpu"], device)
-        _forecast_once(model, state, pcfg, strong_cfg, device)
+        _stage_gpu_inputs(state, device)
+        try:
+            _model_forward(model, state["gpu"], device)
+            _forecast_once(model, state, pcfg, strong_cfg, device)
+        finally:
+            _release_gpu_inputs(state)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
-    measured = prepared[nw:]
+    # Never let extra exactness-only records silently increase the requested
+    # measurement population.
+    measured = prepared[nw : nw + int(a.measure_windows)]
     neural_ms, core_ms, prior_ms, full_ms, source_ms = [], [], [], [], []
     prior_breakdown_rows = []
     core_breakdown_rows = []
     source_counts = []
     for j, state in enumerate(measured, start=1):
         source_counts.append(len(state["current"]))
-        neural_ms.append(_time_neural(model, state, device))
-        core_total, core_parts = _time_forecast(
-            model, state, pcfg, strong_cfg, device
-        )
-        core_ms.append(core_total)
+        _stage_gpu_inputs(state, device)
+        try:
+            neural_value = _time_neural(model, state, device)
+            core_result = _time_forecast(model, state, pcfg, strong_cfg, device)
+            if (
+                not isinstance(core_result, tuple)
+                or len(core_result) != 2
+                or not isinstance(core_result[1], dict)
+            ):
+                raise TypeError(
+                    "_time_forecast must return (total_ms: float, profile: dict)"
+                )
+            core_total, core_parts = core_result
+            prior_result = _time_prior_rebuild(
+                state, pcfg, strong_cfg, device
+            )
+            if (
+                not isinstance(prior_result, tuple)
+                or len(prior_result) != 2
+                or not isinstance(prior_result[1], dict)
+            ):
+                raise TypeError(
+                    "_time_prior_rebuild must return (total_ms: float, profile: dict)"
+                )
+            prior_total, prior_parts = prior_result
+            full_value = _time_full_in_memory(
+                model, state, pcfg, strong_cfg, device
+            )
+        finally:
+            _release_gpu_inputs(state)
+
+        neural_ms.append(float(neural_value))
+        core_ms.append(float(core_total))
         core_breakdown_rows.append(core_parts)
-        prior_total, prior_parts = _time_prior_rebuild(
-            state, pcfg, strong_cfg, device
-        )
-        prior_ms.append(prior_total)
+        prior_ms.append(float(prior_total))
         prior_breakdown_rows.append(prior_parts)
-        full_ms.append(_time_full_in_memory(model, state, pcfg, strong_cfg, device))
-        source_ms.append(_time_source_extract(state, pcfg, strong_cfg))
+        full_ms.append(float(full_value))
+        source_ms.append(float(_time_source_extract(state, pcfg, strong_cfg)))
+
         if j == 1 or j % 25 == 0 or j == len(measured):
             print(
                 f"runtime {j}/{len(measured)} "
@@ -969,8 +1066,15 @@ def main():
     )
     flops = None
     if bool(a.profile_flops) and measured:
-        median_idx = int(np.argsort(np.asarray(source_counts))[len(source_counts) // 2])
-        flops = _measure_model_flops(model, measured[median_idx], device)
+        median_idx = int(
+            np.argsort(np.asarray(source_counts))[len(source_counts) // 2]
+        )
+        flop_state = measured[median_idx]
+        _stage_gpu_inputs(flop_state, device)
+        try:
+            flops = _measure_model_flops(model, flop_state, device)
+        finally:
+            _release_gpu_inputs(flop_state)
 
     prior_breakdown_mean = {}
     if prior_breakdown_rows:
@@ -1014,6 +1118,11 @@ def main():
         "warmup_windows": nw,
         "measured_windows": len(measured),
         "exactness_windows": exact_n,
+        "exactness_gate": (
+            "reference components + six Strong anchors + per-source KTA baseline "
+            "footprints/CLEAR + cached target centers + vectorized SE2 raster + A1"
+        ),
+        "gpu_input_staging": "one_window_at_a_time_outside_timed_regions",
         "selection_seed": int(a.seed),
         "source_count": {
             "mean": float(np.mean(source_counts)) if source_counts else float("nan"),
