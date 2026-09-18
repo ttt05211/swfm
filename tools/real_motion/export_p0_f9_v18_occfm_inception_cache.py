@@ -94,8 +94,28 @@ def main():
         a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu"
     )
     ck, model, _ = mid._load_model(a.checkpoint, CLEAN_PROTOCOL, device)
-    if str(ck.get("training_mode")) != "clean_one_stage_from_scratch_v1":
-        raise RuntimeError("export requires frozen clean one-stage checkpoint")
+    training_mode = str(ck.get("training_mode") or "")
+    variant = str(ck.get("variant") or "")
+    if "balanced" in training_mode.lower() or "balanced" in variant.lower():
+        raise RuntimeError(
+            f"export refuses balanced checkpoint: "
+            f"training_mode={training_mode!r} variant={variant!r}"
+        )
+    if training_mode and training_mode != "clean_one_stage_from_scratch_v1":
+        raise RuntimeError(
+            f"unexpected Clean checkpoint training_mode={training_mode!r}"
+        )
+    print(
+        "EXPORT CHECKPOINT "
+        + json.dumps({
+            "protocol": ck.get("protocol"),
+            "training_mode": ck.get("training_mode"),
+            "variant": ck.get("variant"),
+            "epoch": ck.get("epoch"),
+            "global_step": ck.get("global_step"),
+        }),
+        flush=True,
+    )
 
     out_dir = Path(a.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
