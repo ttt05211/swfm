@@ -84,7 +84,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import (
 )
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 
-PROTOCOL = "p0_f9_v18_clean_runtime_benchmark_v2"
+PROTOCOL = "p0_f9_v18_clean_runtime_benchmark_v3"
 FUTURE_FRAMES = 6
 
 
@@ -117,6 +117,67 @@ def _summary_ms(values):
         "max_ms": float(x.max()),
         "windows_per_s_from_mean": float(1000.0 / x.mean()),
         "future_frames_per_s_from_mean": float(6000.0 / x.mean()),
+    }
+
+
+def _occworld_style_summary(
+    encode_ms,
+    autoreg_ms,
+    *,
+    future_frames: int = FUTURE_FRAMES,
+):
+    """Paired OccWorld-style FPS summary.
+
+    OccWorld defines per-frame time as:
+        encode_time + autoregressive_time / N_future
+    and reports FPS = 1 / per_frame_time.
+
+    For V18 we intentionally use the most conservative currently measured
+    online boundary available in this benchmark:
+      encode_ms  := source extraction + causal matching from in-memory t-1/t0
+      autoreg_ms := full causal six-frame forecast from the prepared source
+                    representation, including Strong/KTA, Clean inference,
+                    SE(2) rendering and final dense A1 composition.
+
+    Important limitation: V18's learned source features/local semantic tube are
+    loaded from the frozen causal cache, so this is an OccWorld-formula
+    compatibility metric, not raw-occupancy end-to-end latency.  The JSON scope
+    string records this explicitly.
+    """
+    enc = np.asarray(encode_ms, dtype=np.float64)
+    aut = np.asarray(autoreg_ms, dtype=np.float64)
+    if enc.shape != aut.shape:
+        raise ValueError("OccWorld-style encode/autoreg timing arrays must align")
+    if enc.size == 0:
+        return {}
+    nf = int(future_frames)
+    if nf <= 0:
+        raise ValueError("future_frames must be positive")
+    per_frame = enc + aut / float(nf)
+    return {
+        "n": int(per_frame.size),
+        "future_frames": nf,
+        "formula": "encode_ms + autoreg_6frames_ms / future_frames",
+        "encode_mean_ms": float(enc.mean()),
+        "autoreg_6frames_mean_ms": float(aut.mean()),
+        "per_frame_mean_ms": float(per_frame.mean()),
+        "per_frame_median_ms": float(np.median(per_frame)),
+        "per_frame_p90_ms": float(np.quantile(per_frame, 0.90)),
+        "per_frame_p95_ms": float(np.quantile(per_frame, 0.95)),
+        "fps_from_mean": float(1000.0 / per_frame.mean()),
+        "scope": (
+            "OccWorld-formula compatibility metric: encode=runtime source "
+            "extraction+matching from in-memory t-1/t0 occupancy; "
+            "autoreg=full causal six-frame Strong/KTA+Clean+SE2+A1 dense "
+            "forecast. Frozen causal learned representation tensors "
+            "(features/local tube/frame-motion/source-mask) remain cached."
+        ),
+        "comparison_note": (
+            "Use only when explicitly stating the boundary. It is more "
+            "conservative than cached-representation FPS because deterministic "
+            "prior/render/compose are included, but it is not raw-occupancy "
+            "end-to-end because learned representation construction is cached."
+        ),
     }
 
 
@@ -1134,6 +1195,12 @@ def main():
             vals = [float(row.get(key, 0.0)) for row in core_breakdown_rows]
             core_breakdown_mean[key] = float(np.mean(vals))
 
+    occworld_style = _occworld_style_summary(
+        source_ms,
+        full_ms,
+        future_frames=FUTURE_FRAMES,
+    )
+
     result = {
         "protocol": PROTOCOL,
         "checkpoint": str(Path(a.checkpoint).resolve()),
@@ -1174,6 +1241,10 @@ def main():
             "full_causal_forecast_in_memory_6frames": _summary_ms(full_ms),
             "source_extract_match": _summary_ms(source_ms),
         },
+        "occworld_style_fps": (
+            float(occworld_style["fps_from_mean"]) if occworld_style else None
+        ),
+        "occworld_style": occworld_style,
         "strong_kta_prior_breakdown_mean_ms": prior_breakdown_mean,
         "cached_forecast_breakdown_mean_ms": core_breakdown_mean,
         "timing_boundaries": {
@@ -1198,6 +1269,12 @@ def main():
             "source_extract_match": (
                 "in-memory t-1/t0 occupancy and poses -> Strong components + matching; "
                 "reported separately as causal representation preparation"
+            ),
+            "occworld_style_fps": (
+                "OccWorld formula: per-frame time = encode + autoreg/N_future. "
+                "Here encode is source extraction+matching and autoreg is the full "
+                "causal six-frame dense forecast; cached learned representation "
+                "construction is explicitly excluded."
             ),
             "occfm_comparison_note": (
                 "OccFM released cfm_eval uses CUDA events after cached latent preparation "
