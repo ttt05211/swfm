@@ -34,10 +34,11 @@ def test_sparse_majority_fill_matches_reference_random():
 
 def test_cropped_component_extraction_matches_reference():
     grid = OccupancyGrid(
-        x_min=-4.0, x_max=4.0,
-        y_min=-4.0, y_max=4.0,
-        z_min=-1.0, z_max=1.0,
+        x_min=-4.0,
+        y_min=-4.0,
+        z_min=-1.0,
         voxel_size=(0.4, 0.4, 0.4),
+        shape_hwd=(20, 20, 5),
     )
     sem = np.full(grid.shape_hwd, 17, dtype=np.uint8)
     # Two same-class components and one different dynamic class.
@@ -54,10 +55,11 @@ def test_cropped_component_extraction_matches_reference():
 
 def test_fast_a1_compositor_matches_reference():
     grid = OccupancyGrid(
-        x_min=-2.0, x_max=2.0,
-        y_min=-2.0, y_max=2.0,
-        z_min=-0.8, z_max=0.8,
+        x_min=-2.0,
+        y_min=-2.0,
+        z_min=-0.8,
         voxel_size=(0.4, 0.4, 0.4),
+        shape_hwd=(10, 10, 4),
     )
     anchor = np.full(grid.shape_hwd, 17, dtype=np.uint8)
     anchor[2:5, 2:5, 1] = 4
@@ -73,5 +75,20 @@ def test_fast_a1_compositor_matches_reference():
     fast = compose_component_replacements_fast_exact(
         anchor, [b1,b2], [r1,r2],
         dynamic_class_ids=(4,7), free_label=17, grid=grid,
+    )
+    assert np.array_equal(ref, fast)
+
+
+def test_sparse_majority_fill_matches_reference_boundary_and_ties():
+    sem = np.full((17, 19, 3), 17, dtype=np.uint8)
+    # Equal-support classes around unknown cells exercise the frozen strict-'>' tie rule.
+    sem[0:5, 0:5, 1] = 4
+    sem[0:5:2, 0:5, 1] = 7
+    unknown = np.zeros_like(sem, dtype=bool)
+    unknown[0:3, 0:4, 1] = True
+    unknown[8:11, 8:11, 1] = True
+    ref = majority_fill(sem, unknown, kernel=(5, 5, 1), min_fraction=0.3)
+    fast = majority_fill_sparse_5x5x1(
+        sem, unknown, kernel=(5, 5, 1), min_fraction=0.3
     )
     assert np.array_equal(ref, fast)
