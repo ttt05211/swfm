@@ -216,6 +216,7 @@ def _strong_all_horizons(
     frame_dt_s,
     grid,
     cfg,
+    profile=None,
 ):
     """Bit-exact-gated Strong/KTA runtime path for all six horizons.
 
@@ -223,6 +224,7 @@ def _strong_all_horizons(
     dynamic point clouds, labels and per-point velocities are concatenated once
     and only the horizon-dependent affine transport is repeated.
     """
+    _t_pre = time.perf_counter() if profile is not None else None
     sem0 = np.asarray(current_semantics)
     dyn = np.isin(sem0, np.asarray(DYNAMIC_CLASS_IDS, dtype=sem0.dtype))
     static_src = sem0.copy()
@@ -272,20 +274,35 @@ def _strong_all_horizons(
         point_velocity = np.zeros((0, 3), dtype=np.float64)
         labels = np.zeros((0,), dtype=sem0.dtype)
 
+    if profile is not None:
+        profile["precompute_ms"] = profile.get("precompute_ms", 0.0) + (
+            time.perf_counter() - _t_pre
+        ) * 1000.0
     outputs, baselines = [], []
     for hi, future_pose in enumerate(future_poses):
         future_pose = np.asarray(future_pose, dtype=np.float64)
         t_future_from_current = relative_transform(current_pose, future_pose)
+        _t = time.perf_counter() if profile is not None else None
         static_dst, known = inverse_warp(
             static_src, t_future_from_current, grid, int(cfg.free_label)
         )
+        if profile is not None:
+            profile["inverse_warp_ms"] = profile.get("inverse_warp_ms", 0.0) + (
+                time.perf_counter() - _t
+            ) * 1000.0
+        _t = time.perf_counter() if profile is not None else None
         out = majority_fill_sparse_5x5x1(
             static_dst,
             ~known,
             kernel=cfg.fill_kernel,
             min_fraction=cfg.fill_min_fraction,
         )
+        if profile is not None:
+            profile["majority_fill_ms"] = profile.get("majority_fill_ms", 0.0) + (
+                time.perf_counter() - _t
+            ) * 1000.0
 
+        _t = time.perf_counter() if profile is not None else None
         baseline_components = []
         if len(base_world):
             dt = (hi + 1) * float(frame_dt_s)
@@ -305,6 +322,10 @@ def _strong_all_horizons(
                     )
                 )
 
+        if profile is not None:
+            profile["dynamic_transport_scatter_ms"] = profile.get(
+                "dynamic_transport_scatter_ms", 0.0
+            ) + (time.perf_counter() - _t) * 1000.0
         outputs.append(out.astype(np.uint8, copy=False))
         baselines.append(baseline_components)
     return outputs, baselines
@@ -467,13 +488,17 @@ def _forecast_once_with_prior_rebuild(model, state, pcfg, strong_cfg, device):
 
 
 def _time_prior_rebuild(state, pcfg, strong_cfg):
+    profile = {}
     t0 = time.perf_counter()
     _strong_all_horizons(
         state["current_sem"], state["current_pose"], state["future_poses"],
         state["current"], state["velocities"], state["source_world_points"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
+        profile=profile,
     )
-    return (time.perf_counter() - t0) * 1000.0
+    total = (time.perf_counter() - t0) * 1000.0
+    profile["total_ms"] = total
+    return total, profile
 
 
 def _exactness_check(model, state, pcfg, strong_cfg, device):
@@ -791,12 +816,15 @@ def main():
 
     measured = prepared[nw:]
     neural_ms, core_ms, prior_ms, full_ms, source_ms = [], [], [], [], []
+    prior_breakdown_rows = []
     source_counts = []
     for j, state in enumerate(measured, start=1):
         source_counts.append(len(state["current"]))
         neural_ms.append(_time_neural(model, state, device))
         core_ms.append(_time_forecast(model, state, pcfg, strong_cfg, device))
-        prior_ms.append(_time_prior_rebuild(state, pcfg, strong_cfg))
+        prior_total, prior_parts = _time_prior_rebuild(state, pcfg, strong_cfg)
+        prior_ms.append(prior_total)
+        prior_breakdown_rows.append(prior_parts)
         full_ms.append(_time_full_in_memory(model, state, pcfg, strong_cfg, device))
         source_ms.append(_time_source_extract(state, pcfg, strong_cfg))
         if j == 1 or j % 25 == 0 or j == len(measured):
@@ -818,6 +846,18 @@ def main():
     if bool(a.profile_flops) and measured:
         median_idx = int(np.argsort(np.asarray(source_counts))[len(source_counts) // 2])
         flops = _measure_model_flops(model, measured[median_idx], device)
+
+    prior_breakdown_mean = {}
+    if prior_breakdown_rows:
+        for key in (
+            "precompute_ms",
+            "inverse_warp_ms",
+            "majority_fill_ms",
+            "dynamic_transport_scatter_ms",
+            "total_ms",
+        ):
+            vals = [float(row.get(key, 0.0)) for row in prior_breakdown_rows]
+            prior_breakdown_mean[key] = float(np.mean(vals))
 
     result = {
         "protocol": PROTOCOL,
@@ -851,6 +891,7 @@ def main():
             "full_causal_forecast_in_memory_6frames": _summary_ms(full_ms),
             "source_extract_match": _summary_ms(source_ms),
         },
+        "strong_kta_prior_breakdown_mean_ms": prior_breakdown_mean,
         "timing_boundaries": {
             "neural_model": (
                 "cached causal source tensors resident on GPU -> all six motion outputs"
