@@ -1,4 +1,6 @@
 import numpy as np
+import pytest
+import torch
 
 from real_motion.geometry import OccupancyGrid
 from real_motion.rigid_transport import (
@@ -9,11 +11,13 @@ from real_motion.runtime_fastpath import (
     component_lists_equal,
     compose_component_replacements_fast_exact,
     extract_instances_cropped_exact,
+    inverse_warp_sequence_cuda_exact,
     majority_fill_sparse_5x5x1,
 )
 from real_motion.strong_w2det import (
     StrongW2DetConfig,
     extract_instances,
+    inverse_warp,
     majority_fill,
 )
 
@@ -92,3 +96,43 @@ def test_sparse_majority_fill_matches_reference_boundary_and_ties():
         sem, unknown, kernel=(5, 5, 1), min_fraction=0.3
     )
     assert np.array_equal(ref, fast)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime fast path")
+def test_cuda_inverse_warp_matches_reference_small_grid():
+    grid = OccupancyGrid(
+        x_min=-4.0,
+        y_min=-4.0,
+        z_min=-1.0,
+        voxel_size=(0.4, 0.4, 0.4),
+        shape_hwd=(20, 20, 5),
+    )
+    rng = np.random.default_rng(20260918)
+    sem = rng.integers(0, 18, size=grid.shape_hwd, dtype=np.uint8)
+
+    transforms = []
+    for yaw, tx, ty, tz in [
+        (0.013, 0.17, -0.09, 0.01),
+        (-0.027, 0.41, 0.18, -0.02),
+        (0.061, -0.36, 0.22, 0.03),
+    ]:
+        c0, s0 = np.cos(yaw), np.sin(yaw)
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = np.asarray(
+            [[c0, -s0, 0.0], [s0, c0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        T[:3, 3] = np.asarray([tx, ty, tz], dtype=np.float64)
+        transforms.append(T)
+
+    fast = inverse_warp_sequence_cuda_exact(
+        sem,
+        transforms,
+        grid=grid,
+        free_label=17,
+        device=torch.device("cuda"),
+    )
+    for T, (fast_sem, fast_known) in zip(transforms, fast):
+        ref_sem, ref_known = inverse_warp(sem, T, grid, 17)
+        assert np.array_equal(ref_sem, fast_sem)
+        assert np.array_equal(ref_known, fast_known)
