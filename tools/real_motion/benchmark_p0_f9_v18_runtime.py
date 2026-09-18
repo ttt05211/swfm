@@ -59,6 +59,7 @@ from real_motion.runtime_fastpath import (
     component_lists_equal,
     compose_component_replacements_fast_exact,
     extract_instances_cropped_exact,
+    inverse_warp_sequence_cuda_exact,
     majority_fill_sparse_5x5x1,
 )
 from real_motion.strong_w2det import (
@@ -217,6 +218,7 @@ def _strong_all_horizons(
     grid,
     cfg,
     profile=None,
+    runtime_device=None,
 ):
     """Bit-exact-gated Strong/KTA runtime path for all six horizons.
 
@@ -278,18 +280,41 @@ def _strong_all_horizons(
         profile["precompute_ms"] = profile.get("precompute_ms", 0.0) + (
             time.perf_counter() - _t_pre
         ) * 1000.0
-    outputs, baselines = [], []
-    for hi, future_pose in enumerate(future_poses):
-        future_pose = np.asarray(future_pose, dtype=np.float64)
-        t_future_from_current = relative_transform(current_pose, future_pose)
-        _t = time.perf_counter() if profile is not None else None
-        static_dst, known = inverse_warp(
-            static_src, t_future_from_current, grid, int(cfg.free_label)
+
+    future_pose_arr = [np.asarray(p, dtype=np.float64) for p in future_poses]
+    src_to_dst_seq = [
+        relative_transform(current_pose, p) for p in future_pose_arr
+    ]
+    accelerated_inverse = None
+    if runtime_device is not None and torch.device(runtime_device).type == "cuda":
+        _t_inv_all = time.perf_counter() if profile is not None else None
+        accelerated_inverse = inverse_warp_sequence_cuda_exact(
+            static_src,
+            src_to_dst_seq,
+            grid=grid,
+            free_label=int(cfg.free_label),
+            device=runtime_device,
         )
         if profile is not None:
-            profile["inverse_warp_ms"] = profile.get("inverse_warp_ms", 0.0) + (
-                time.perf_counter() - _t
-            ) * 1000.0
+            profile["inverse_warp_ms"] = (
+                profile.get("inverse_warp_ms", 0.0)
+                + (time.perf_counter() - _t_inv_all) * 1000.0
+            )
+
+    outputs, baselines = [], []
+    for hi, future_pose in enumerate(future_pose_arr):
+        t_future_from_current = src_to_dst_seq[hi]
+        if accelerated_inverse is None:
+            _t = time.perf_counter() if profile is not None else None
+            static_dst, known = inverse_warp(
+                static_src, t_future_from_current, grid, int(cfg.free_label)
+            )
+            if profile is not None:
+                profile["inverse_warp_ms"] = profile.get(
+                    "inverse_warp_ms", 0.0
+                ) + (time.perf_counter() - _t) * 1000.0
+        else:
+            static_dst, known = accelerated_inverse[hi]
         _t = time.perf_counter() if profile is not None else None
         out = majority_fill_sparse_5x5x1(
             static_dst,
@@ -386,6 +411,7 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         current_sem, current_pose, future_poses, current, velocities,
         source_world_points,
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
+        runtime_device=device,
     )
     baseline_clear_by_hi = [
         baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi
@@ -471,6 +497,7 @@ def _forecast_once_with_prior_rebuild(model, state, pcfg, strong_cfg, device):
         state["current_sem"], state["current_pose"], state["future_poses"],
         state["current"], state["velocities"], state["source_world_points"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
+        runtime_device=device,
     )
     clear_by_hi = [baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi]
     old_a, old_b, old_c = (
@@ -487,7 +514,7 @@ def _forecast_once_with_prior_rebuild(model, state, pcfg, strong_cfg, device):
         )
 
 
-def _time_prior_rebuild(state, pcfg, strong_cfg):
+def _time_prior_rebuild(state, pcfg, strong_cfg, device):
     profile = {}
     t0 = time.perf_counter()
     _strong_all_horizons(
@@ -495,6 +522,7 @@ def _time_prior_rebuild(state, pcfg, strong_cfg):
         state["current"], state["velocities"], state["source_world_points"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
         profile=profile,
+        runtime_device=device,
     )
     total = (time.perf_counter() - t0) * 1000.0
     profile["total_ms"] = total
@@ -519,11 +547,13 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
         [state["previous_pose"], state["current_pose"]],
         state["future_poses"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
+        runtime_device=device,
     )
     fast_anchor, fast_base = _strong_all_horizons(
         state["current_sem"], state["current_pose"], state["future_poses"],
         state["current"], state["velocities"], state["source_world_points"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
+        runtime_device=device,
     )
     for hi in range(FUTURE_FRAMES):
         if not np.array_equal(ref_anchor[hi], fast_anchor[hi]):
@@ -822,7 +852,9 @@ def main():
         source_counts.append(len(state["current"]))
         neural_ms.append(_time_neural(model, state, device))
         core_ms.append(_time_forecast(model, state, pcfg, strong_cfg, device))
-        prior_total, prior_parts = _time_prior_rebuild(state, pcfg, strong_cfg)
+        prior_total, prior_parts = _time_prior_rebuild(
+            state, pcfg, strong_cfg, device
+        )
         prior_ms.append(prior_total)
         prior_breakdown_rows.append(prior_parts)
         full_ms.append(_time_full_in_memory(model, state, pcfg, strong_cfg, device))
