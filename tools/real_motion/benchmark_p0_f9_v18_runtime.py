@@ -816,6 +816,11 @@ def main():
         "--exactness-windows", type=int, default=8,
         help="number of selected windows checked against frozen slow reference before timing",
     )
+    p.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="prepare/check only exactness windows, then exit before timing benchmark",
+    )
     p.add_argument("--seed", type=int, default=20260918)
     p.add_argument("--device", default="cuda")
     p.add_argument("--profile-flops", action="store_true")
@@ -873,25 +878,52 @@ def main():
     )
 
     rng = np.random.default_rng(int(a.seed))
-    total_need = min(
-        len(records), int(a.warmup_windows) + int(a.measure_windows)
+    requested_total = (
+        int(a.exactness_windows)
+        if bool(a.preflight_only)
+        else int(a.warmup_windows) + int(a.measure_windows)
     )
+    total_need = min(len(records), max(requested_total, int(a.exactness_windows)))
     ids = np.sort(rng.choice(len(records), size=total_need, replace=False))
     selected = [records[int(i)] for i in ids]
 
     source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
-    prepared = [
-        _prepare_record(r, source, pcfg, strong_cfg, device) for r in selected
-    ]
+    exact_n = min(int(a.exactness_windows), len(selected))
+    prepared = []
+    prep_started = time.perf_counter()
+    for pi, rec in enumerate(selected, start=1):
+        tprep = time.perf_counter()
+        state = _prepare_record(rec, source, pcfg, strong_cfg, device)
+        prep_ms = (time.perf_counter() - tprep) * 1000.0
+        prepared.append(state)
+
+        if pi <= exact_n:
+            print(
+                f"RUNTIME PREPARE exactness {pi}/{exact_n}: "
+                f"{prep_ms:.1f} ms",
+                flush=True,
+            )
+            _exactness_check(model, state, pcfg, strong_cfg, device)
+            print(f"RUNTIME EXACTNESS WINDOW {pi}/{exact_n}: PASS", flush=True)
+        elif pi == exact_n + 1 or pi % 10 == 0 or pi == len(selected):
+            elapsed = time.perf_counter() - prep_started
+            print(
+                f"RUNTIME PREPARE {pi}/{len(selected)} "
+                f"last={prep_ms:.1f} ms elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+
+        if bool(a.preflight_only) and pi >= exact_n:
+            print(
+                "RUNTIME PREFLIGHT: exactness gate passed; exiting before timing.",
+                flush=True,
+            )
+            return
+
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
-
-    exact_n = min(int(a.exactness_windows), len(prepared))
-    for ei, state in enumerate(prepared[:exact_n], start=1):
-        _exactness_check(model, state, pcfg, strong_cfg, device)
-        print(f"RUNTIME EXACTNESS WINDOW {ei}/{exact_n}: PASS", flush=True)
 
     nw = min(int(a.warmup_windows), len(prepared))
     for state in prepared[:nw]:
