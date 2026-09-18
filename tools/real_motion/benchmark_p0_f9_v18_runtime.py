@@ -550,9 +550,19 @@ def main():
             f"runtime benchmark refuses balanced checkpoint: "
             f"training_mode={training_mode!r} variant={variant!r}"
         )
-    if training_mode and training_mode != "clean_one_stage_from_scratch_v1":
+    allowed_main_modes = {
+        "",
+        "clean_one_stage_from_scratch_v1",
+        "clean_one_stage_from_scratch_v1_tail_continuation",
+    }
+    if training_mode not in allowed_main_modes:
         raise RuntimeError(
-            f"unexpected Clean checkpoint training_mode={training_mode!r}"
+            f"unexpected frozen-main checkpoint training_mode={training_mode!r}"
+        )
+    if training_mode.endswith("_tail_continuation") and int(ck.get("epoch", -1)) != 14:
+        raise RuntimeError(
+            "formal runtime benchmark expects the frozen Clean-E14 tail checkpoint; "
+            f"got epoch={ck.get('epoch')!r}"
         )
     print(
         "RUNTIME CHECKPOINT "
