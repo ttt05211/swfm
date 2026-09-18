@@ -24,23 +24,28 @@ Report these boundaries:
 - `strong_kta_prior_rebuild_6frames`: deterministic prior reconstruction.
 - `full_causal_forecast_in_memory_6frames`: prior rebuild + Clean + render + composition.
 - `source_extract_match`: t-1/t0 connected components and matching.
-- `occworld_style_fps`: compatibility metric following OccWorld's public algebra
-  `per_frame = encode + autoreg / N_future`. For V18, `encode` is the measured
-  in-memory source extraction + causal matching stage, and `autoreg` is the
-  measured full causal six-frame forecast. The benchmark computes this per
-  window first and only then averages the per-frame latency, avoiding
-  mean-of-ratios ambiguity.
+- `occworld_style_fps`: repository-native diagnostic that mechanically follows
+  the historical OccWorld expression `per_frame = encode + autoreg / N_future`.
+  It is **not** the paper main-table FPS.
+- paper main-table FPS: six-frame-amortized generation throughput,
+  `FPS = N_future / T_generate_N_future`. For the frozen v3 result this is
+  `6 / 100.746246 ms = 59.5556 FPS`.
 
-The `occworld_style_fps` field is deliberately labeled as a compatibility
-metric rather than raw-occupancy end-to-end latency. The frozen learned
-representation tensors (source features, local semantic tube, frame-motion
-features and source mask) are still loaded from the causal cache, while
-Strong/KTA reconstruction, Clean inference, SE(2) rendering and final dense A1
-composition are included in the six-frame forecast term. This boundary is more
-conservative than cached-representation FPS but should not be described as full
-sensor/occupancy-to-output runtime.
+A direct public-code audit shows that I2-World and GenieDrive store test time as
+`(end_time - start_time) / test_future_frame / bs`, i.e. they amortize the
+timed multi-frame generation block over the generated future frames. OccFM's
+maintainer likewise clarified in issue #2 that the reported FPS is the
+six-frame generation speed amortized to a single future frame. Therefore
+`occworld_style_fps=20.6193` is retained only for diagnostic compatibility
+with the historical OccWorld repository formula and must not be placed in the
+paper main efficiency table.
 
-All timings exclude disk I/O, GT and metric computation. For a paper comparison with OccFM, use `cached_representation_forecast_6frames` only if OccFM is also timed on the same GPU with its released `cfm_eval` timer. For papers that explicitly state that FPS follows OccWorld, report `occworld_style_fps` together with the scope note above. Keep the full in-memory timing as a supplementary transparency row. Never compare an H100/A800 V18 FPS directly with an RTX-4090 published FPS as if hardware were matched.
+The main V18 generation timer includes Strong/KTA reconstruction, Clean
+inference, predicted SE(2) rendering and final dense A1 composition. A stricter
+transparency value may additionally charge the separately measured source
+extraction/matching stage; that value is not the primary generation FPS.
+
+All timings exclude disk I/O, GT and metric computation. The paper main efficiency row uses the full causal six-frame generation latency and reports both latency and `6 / latency` FPS. Keep source-extraction timing and cached-representation timing as transparency rows. Hardware must be stated, and published RTX-4090 FPS should not be treated as a hardware-matched speedup against an L40S result.
 
 FLOPs are optional. The script first tries PyTorch `FlopCounterMode` and falls back to profiler-supported FLOPs. This applies to the learned Clean forward only, not deterministic geometry.
 
