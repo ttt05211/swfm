@@ -154,6 +154,57 @@ def _fast_rasterize_from_world(
     return RasterizedRigidComponent(int(class_id), dst_idx, int(source_voxel_count))
 
 
+def _rasterize_all_sources_horizon(
+    current,
+    source_world_points,
+    source_rel_xy,
+    target_centers_world,
+    yaw_values,
+    world_to_future,
+    grid,
+):
+    """Rasterize every source with one world->future transform per horizon.
+
+    Object-centric rotation is still performed source-by-source in frozen input
+    order; only the expensive affine transform and metric->voxel conversion are
+    fused across sources.  Components are deduplicated independently exactly as
+    in the reference renderer.
+    """
+    if not current:
+        return []
+    lengths = [int(len(x)) for x in source_world_points]
+    slices = []
+    cursor = 0
+    for n in lengths:
+        slices.append(slice(cursor, cursor + n))
+        cursor += n
+    if cursor == 0:
+        return [
+            RasterizedRigidComponent(int(comp["class_id"]), np.zeros((0, 3), dtype=np.int64), 0)
+            for comp in current
+        ]
+    moved_world = np.concatenate(source_world_points, axis=0).copy()
+    for i, (comp, sl) in enumerate(zip(current, slices)):
+        theta = float(yaw_values[i])
+        cc, ss = math.cos(theta), math.sin(theta)
+        rel = source_rel_xy[i]
+        target = np.asarray(target_centers_world[i], dtype=np.float64)
+        moved_world[sl, 0] = target[0] + cc * rel[:, 0] - ss * rel[:, 1]
+        moved_world[sl, 1] = target[1] + ss * rel[:, 0] + cc * rel[:, 1]
+        # Planar contract: preserve each observed source point's world Z.
+    moved_future = rigid_transform_points(world_to_future, moved_world)
+    idx_all, valid_all = _metric_to_indices(moved_future, grid)
+    out = []
+    for comp, sl in zip(current, slices):
+        cidx = _deduplicate_indices(idx_all[sl][valid_all[sl]], grid)
+        out.append(
+            RasterizedRigidComponent(
+                int(comp["class_id"]), cidx, int(len(comp["voxel_indices"]))
+            )
+        )
+    return out
+
+
 def _strong_all_horizons(
     current_semantics,
     current_pose,
@@ -166,7 +217,12 @@ def _strong_all_horizons(
     grid,
     cfg,
 ):
-    """Exact Strong-W2Det for all six horizons while reusing source extraction."""
+    """Bit-exact-gated Strong/KTA runtime path for all six horizons.
+
+    Source extraction is reused across horizons; static hole filling is sparse;
+    dynamic point clouds, labels and per-point velocities are concatenated once
+    and only the horizon-dependent affine transport is repeated.
+    """
     sem0 = np.asarray(current_semantics)
     dyn = np.isin(sem0, np.asarray(DYNAMIC_CLASS_IDS, dtype=sem0.dtype))
     static_src = sem0.copy()
@@ -188,6 +244,34 @@ def _strong_all_horizons(
         rest_world = np.zeros((0, 3), dtype=np.float64)
         rest_labels = np.zeros((0,), dtype=sem0.dtype)
 
+    base_parts = []
+    vel_parts = []
+    label_parts = []
+    slices = []
+    cursor = 0
+    for j, comp in enumerate(current):
+        pts = np.asarray(source_world_points[j], dtype=np.float64)
+        n = int(len(pts))
+        v = np.asarray(velocities.get(j, np.zeros(3)), dtype=np.float64)
+        base_parts.append(pts)
+        vel_parts.append(np.broadcast_to(v[None], (n, 3)))
+        label_parts.append(np.full(n, int(comp["class_id"]), dtype=sem0.dtype))
+        slices.append(slice(cursor, cursor + n))
+        cursor += n
+    if len(rest_world):
+        base_parts.append(rest_world)
+        vel_parts.append(np.zeros_like(rest_world, dtype=np.float64))
+        label_parts.append(rest_labels)
+
+    if base_parts:
+        base_world = np.concatenate(base_parts, axis=0)
+        point_velocity = np.concatenate(vel_parts, axis=0)
+        labels = np.concatenate(label_parts, axis=0)
+    else:
+        base_world = np.zeros((0, 3), dtype=np.float64)
+        point_velocity = np.zeros((0, 3), dtype=np.float64)
+        labels = np.zeros((0,), dtype=sem0.dtype)
+
     outputs, baselines = [], []
     for hi, future_pose in enumerate(future_poses):
         future_pose = np.asarray(future_pose, dtype=np.float64)
@@ -202,27 +286,10 @@ def _strong_all_horizons(
             min_fraction=cfg.fill_min_fraction,
         )
 
-        dt = (hi + 1) * float(frame_dt_s)
-        world_parts, label_parts, slices = [], [], []
-        cursor = 0
-        for j, comp in enumerate(current):
-            pts = np.asarray(source_world_points[j], dtype=np.float64)
-            v = np.asarray(velocities.get(j, np.zeros(3)), dtype=np.float64)
-            moved = pts + v[None] * dt
-            world_parts.append(moved)
-            label_parts.append(
-                np.full(len(moved), int(comp["class_id"]), dtype=sem0.dtype)
-            )
-            slices.append(slice(cursor, cursor + len(moved)))
-            cursor += len(moved)
-        if len(rest_world):
-            world_parts.append(rest_world)
-            label_parts.append(rest_labels)
-
         baseline_components = []
-        if world_parts:
-            moved_world = np.concatenate(world_parts, axis=0)
-            labels = np.concatenate(label_parts, axis=0)
+        if len(base_world):
+            dt = (hi + 1) * float(frame_dt_s)
+            moved_world = base_world + point_velocity * dt
             world_to_future = np.linalg.inv(future_pose)
             moved_future = strong_transform_points(world_to_future, moved_world)
             idx_all = _metric_to_voxel(moved_future, grid)
@@ -241,7 +308,6 @@ def _strong_all_horizons(
         outputs.append(out.astype(np.uint8, copy=False))
         baselines.append(baseline_components)
     return outputs, baselines
-
 
 def _gpu_inputs(rec, device):
     return {
@@ -288,6 +354,11 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
     if got != exp:
         raise RuntimeError(f"{rec['sample_id']}: Strong/source order mismatch")
     source_world_points = _precompute_source_world(current, current_pose, pcfg.grid)
+    source_rel_xy = [
+        np.asarray(pts, dtype=np.float64)[:, :2]
+        - np.asarray(comp["centroid_world"], dtype=np.float64)[None, :2]
+        for pts, comp in zip(source_world_points, current)
+    ]
     # Frozen deterministic prior is prepared outside the OccFM-comparable timing
     # boundary, analogous to OccFM loading/preparing its cached latent input.
     anchors, baseline_by_hi = _strong_all_horizons(
@@ -314,6 +385,7 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         "previous": previous,
         "velocities": velocities,
         "source_world_points": source_world_points,
+        "source_rel_xy": source_rel_xy,
         "anchors": anchors,
         "baseline_by_hi": baseline_by_hi,
         "baseline_clear_by_hi": baseline_clear_by_hi,
@@ -339,20 +411,29 @@ def _forecast_once(model, state, pcfg, strong_cfg, device):
     preds = []
     for hi in range(FUTURE_FRAMES):
         world_to_future = state["world_to_future"][hi]
-        repl = []
+        target_centers = []
+        yaw_values = []
         for i, comp in enumerate(current):
             cid = int(comp["class_id"])
             src_center = np.asarray(comp["centroid_world"], dtype=np.float64)
             xy = rec["anchors_xy_t0_m"][i, hi].numpy() + pred_res[i, hi]
-            center = t0_xy_to_world_preserve_source_z(xy, src_center, current_pose)
-            repl.append(
-                _fast_rasterize_from_world(
-                    source_world_points[i], cid, len(comp["voxel_indices"]),
-                    src_center, center,
-                    renderer_yaw_delta(cid, pred_yaw[i, hi], zero_two_wheel_yaw=False),
-                    world_to_future, pcfg.grid,
+            target_centers.append(
+                t0_xy_to_world_preserve_source_z(xy, src_center, current_pose)
+            )
+            yaw_values.append(
+                renderer_yaw_delta(
+                    cid, pred_yaw[i, hi], zero_two_wheel_yaw=False
                 )
             )
+        repl = _rasterize_all_sources_horizon(
+            current,
+            source_world_points,
+            state["source_rel_xy"],
+            target_centers,
+            yaw_values,
+            world_to_future,
+            pcfg.grid,
+        )
         pred = compose_component_replacements_fast_exact(
             anchors[hi], baseline_by_hi[hi], repl,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
@@ -591,6 +672,10 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--warmup-windows", type=int, default=20)
     p.add_argument("--measure-windows", type=int, default=200)
+    p.add_argument(
+        "--exactness-windows", type=int, default=8,
+        help="number of selected windows checked against frozen slow reference before timing",
+    )
     p.add_argument("--seed", type=int, default=20260918)
     p.add_argument("--device", default="cuda")
     p.add_argument("--profile-flops", action="store_true")
@@ -601,8 +686,8 @@ def main():
     _, records = mid.base.load_cache(a.val_cache)
     if not records:
         raise RuntimeError("validation cache is empty")
-    if int(a.measure_windows) <= 0 or int(a.warmup_windows) < 0:
-        raise ValueError("invalid warmup/measure counts")
+    if int(a.measure_windows) <= 0 or int(a.warmup_windows) < 0 or int(a.exactness_windows) < 0:
+        raise ValueError("invalid warmup/measure/exactness counts")
 
     device = torch.device(
         a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu"
@@ -663,8 +748,10 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
 
-    if prepared:
-        _exactness_check(model, prepared[0], pcfg, strong_cfg, device)
+    exact_n = min(int(a.exactness_windows), len(prepared))
+    for ei, state in enumerate(prepared[:exact_n], start=1):
+        _exactness_check(model, state, pcfg, strong_cfg, device)
+        print(f"RUNTIME EXACTNESS WINDOW {ei}/{exact_n}: PASS", flush=True)
 
     nw = min(int(a.warmup_windows), len(prepared))
     for state in prepared[:nw]:
@@ -720,6 +807,7 @@ def main():
         "peak_cuda_memory_bytes": peak_mem,
         "warmup_windows": nw,
         "measured_windows": len(measured),
+        "exactness_windows": exact_n,
         "selection_seed": int(a.seed),
         "source_count": {
             "mean": float(np.mean(source_counts)) if source_counts else float("nan"),
