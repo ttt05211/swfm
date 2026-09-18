@@ -103,7 +103,14 @@ def majority_fill_sparse_5x5x1(
     fill = (lhs > rhs) & (tie_count == 1)
 
     # Only these cells can be affected by scipy float32 rounding/tie behavior.
-    ambiguous = (lhs == rhs) | ((lhs > rhs) & (tie_count > 1))
+    # denom_count==0 is never ambiguous in the frozen reference:
+    # denom is clamped to 1e-6, every class score is exactly zero, and the
+    # voxel is not filled.  Excluding those cells avoids expensive scipy replay
+    # over large fully-unknown boundary bands.
+    ambiguous = (
+        ((denom_count > 0) & (lhs == rhs))
+        | ((lhs > rhs) & (tie_count > 1))
+    )
     if bool(ambiguous.any()):
         ai = np.flatnonzero(ambiguous)
         # Each queried voxel already has its exact 5x5 neighborhood gathered.
