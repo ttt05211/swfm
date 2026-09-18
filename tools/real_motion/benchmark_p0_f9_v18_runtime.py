@@ -56,11 +56,13 @@ from real_motion.rigid_transport import (
 )
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.runtime_fastpath import (
+    baseline_clear_flat_indices,
     baseline_clear_mask,
     component_lists_equal,
     compose_component_replacements_fast_exact,
     extract_instances_cropped_exact,
     inverse_warp_sequence_cuda_exact,
+    majority_fill_cuda_exact,
     majority_fill_sparse_5x5x1,
 )
 from real_motion.strong_w2det import (
@@ -317,12 +319,21 @@ def _strong_all_horizons(
         else:
             static_dst, known = accelerated_inverse[hi]
         _t = time.perf_counter() if profile is not None else None
-        out = majority_fill_sparse_5x5x1(
-            static_dst,
-            ~known,
-            kernel=cfg.fill_kernel,
-            min_fraction=cfg.fill_min_fraction,
-        )
+        if runtime_device is not None and torch.device(runtime_device).type == "cuda":
+            out = majority_fill_cuda_exact(
+                static_dst,
+                ~known,
+                kernel=cfg.fill_kernel,
+                min_fraction=cfg.fill_min_fraction,
+                device=runtime_device,
+            )
+        else:
+            out = majority_fill_sparse_5x5x1(
+                static_dst,
+                ~known,
+                kernel=cfg.fill_kernel,
+                min_fraction=cfg.fill_min_fraction,
+            )
         if profile is not None:
             profile["majority_fill_ms"] = profile.get("majority_fill_ms", 0.0) + (
                 time.perf_counter() - _t
@@ -444,6 +455,9 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
     baseline_clear_by_hi = [
         baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi
     ]
+    baseline_clear_flat_by_hi = [
+        baseline_clear_flat_indices(rows, grid=pcfg.grid) for rows in baseline_by_hi
+    ]
     world_to_future = [
         np.linalg.inv(np.asarray(p, dtype=np.float64)) for p in future_poses
     ]
@@ -465,6 +479,7 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         "anchors": anchors,
         "baseline_by_hi": baseline_by_hi,
         "baseline_clear_by_hi": baseline_clear_by_hi,
+        "baseline_clear_flat_by_hi": baseline_clear_flat_by_hi,
         "world_to_future": world_to_future,
         # Staged one window at a time immediately before exactness/timing.
         # This keeps the reported peak CUDA memory representative of one
@@ -547,7 +562,7 @@ def _forecast_once(model, state, pcfg, strong_cfg, device, profile=None):
             anchors[hi], baseline_by_hi[hi], repl,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
             free_label=int(pcfg.free_label), grid=pcfg.grid,
-            precomputed_clear_mask=state["baseline_clear_by_hi"][hi],
+            precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][hi],
         )
         if profile is not None:
             profile["a1_compose_ms"] = profile.get(
@@ -565,19 +580,29 @@ def _forecast_once_with_prior_rebuild(model, state, pcfg, strong_cfg, device):
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
         runtime_device=device,
     )
-    clear_by_hi = [baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi]
-    old_a, old_b, old_c = (
-        state["anchors"], state["baseline_by_hi"], state["baseline_clear_by_hi"]
+    clear_by_hi = [
+        baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi
+    ]
+    clear_flat_by_hi = [
+        baseline_clear_flat_indices(rows, grid=pcfg.grid) for rows in baseline_by_hi
+    ]
+    old_a, old_b, old_c, old_d = (
+        state["anchors"],
+        state["baseline_by_hi"],
+        state["baseline_clear_by_hi"],
+        state["baseline_clear_flat_by_hi"],
     )
-    state["anchors"], state["baseline_by_hi"], state["baseline_clear_by_hi"] = (
-        anchors, baseline_by_hi, clear_by_hi
-    )
+    state["anchors"] = anchors
+    state["baseline_by_hi"] = baseline_by_hi
+    state["baseline_clear_by_hi"] = clear_by_hi
+    state["baseline_clear_flat_by_hi"] = clear_flat_by_hi
     try:
         return _forecast_once(model, state, pcfg, strong_cfg, device)
     finally:
-        state["anchors"], state["baseline_by_hi"], state["baseline_clear_by_hi"] = (
-            old_a, old_b, old_c
-        )
+        state["anchors"] = old_a
+        state["baseline_by_hi"] = old_b
+        state["baseline_clear_by_hi"] = old_c
+        state["baseline_clear_flat_by_hi"] = old_d
 
 
 def _time_prior_rebuild(state, pcfg, strong_cfg, device):
@@ -665,6 +690,15 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
         ref_clear = baseline_clear_mask(ref_baseline, grid=pcfg.grid)
         if not np.array_equal(ref_clear, state["baseline_clear_by_hi"][hi]):
             raise RuntimeError(f"runtime Strong baseline CLEAR mismatch hi={hi}")
+        ref_clear_flat = np.flatnonzero(ref_clear.reshape(-1)).astype(
+            np.int64, copy=False
+        )
+        if not np.array_equal(
+            ref_clear_flat, state["baseline_clear_flat_by_hi"][hi]
+        ):
+            raise RuntimeError(
+                f"runtime Strong sparse baseline CLEAR mismatch hi={hi}"
+            )
 
     out = _model_forward(model, state["gpu"], device)
     pred_res = out["residual_xy_m"].float().cpu().numpy()
@@ -755,7 +789,7 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
             state["anchors"][hi], state["baseline_by_hi"][hi], repl_fast,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
             free_label=int(pcfg.free_label), grid=pcfg.grid,
-            precomputed_clear_mask=state["baseline_clear_by_hi"][hi],
+            precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][hi],
         )
         if not np.array_equal(ref_pred, fast_pred):
             neq = int(np.count_nonzero(ref_pred != fast_pred))
@@ -1130,6 +1164,8 @@ def main():
         ),
         "gpu_input_staging": "one_window_at_a_time_outside_timed_regions",
         "component_extraction_runtime": "cropped_connected_components_bit_exact_gated",
+        "majority_fill_runtime": "cuda_integer_box_counts_with_exact_scipy_edge_replay",
+        "a1_clear_runtime": "precomputed_sparse_flat_clear_indices",
         "selection_seed": int(a.seed),
         "source_count": {
             "mean": float(np.mean(source_counts)) if source_counts else float("nan"),
