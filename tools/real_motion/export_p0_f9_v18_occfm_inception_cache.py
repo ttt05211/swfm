@@ -35,6 +35,8 @@ from tools.real_motion.benchmark_p0_f9_v18_runtime import (
     _exactness_check,
     _forecast_once,
     _prepare_record,
+    _release_gpu_inputs,
+    _stage_gpu_inputs,
 )
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
@@ -156,14 +158,18 @@ def main():
             continue
 
         state = _prepare_record(rec, source, pcfg, strong_cfg, device)
-        if not exactness_done:
-            _exactness_check(model, state, pcfg, strong_cfg, device)
-            exactness_done = True
+        _stage_gpu_inputs(state, device)
+        try:
+            if not exactness_done:
+                _exactness_check(model, state, pcfg, strong_cfg, device)
+                exactness_done = True
 
-        # Causal prediction first.
-        pred = np.stack(
-            _forecast_once(model, state, pcfg, strong_cfg, device), axis=0
-        ).astype(np.uint8, copy=False)
+            # Causal prediction first.
+            pred = np.stack(
+                _forecast_once(model, state, pcfg, strong_cfg, device), axis=0
+            ).astype(np.uint8, copy=False)
+        finally:
+            _release_gpu_inputs(state)
 
         # Evaluation target is loaded only after the prediction is complete.
         w = window_from_record(rec)
