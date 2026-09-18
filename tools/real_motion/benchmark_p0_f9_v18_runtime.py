@@ -44,6 +44,7 @@ import torch
 
 from real_motion.geometry import relative_transform
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
+from real_motion.motion_transport import world_points_to_t0
 from real_motion.rigid_transport import (
     RasterizedRigidComponent,
     _deduplicate_indices,
@@ -405,6 +406,17 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         - np.asarray(comp["centroid_world"], dtype=np.float64)[None, :2]
         for pts, comp in zip(source_world_points, current)
     ]
+    # Preserve the frozen conversion exactly, but only once per source.
+    source_z_t0 = np.asarray(
+        [
+            world_points_to_t0(
+                np.asarray(comp["centroid_world"], dtype=np.float64)[None],
+                current_pose,
+            )[0, 2]
+            for comp in current
+        ],
+        dtype=np.float64,
+    )
     # Frozen deterministic prior is prepared outside the OccFM-comparable timing
     # boundary, analogous to OccFM loading/preparing its cached latent input.
     anchors, baseline_by_hi = _strong_all_horizons(
@@ -433,6 +445,7 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         "velocities": velocities,
         "source_world_points": source_world_points,
         "source_rel_xy": source_rel_xy,
+        "source_z_t0": source_z_t0,
         "anchors": anchors,
         "baseline_by_hi": baseline_by_hi,
         "baseline_clear_by_hi": baseline_clear_by_hi,
@@ -441,7 +454,19 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
     }
 
 
-def _forecast_once(model, state, pcfg, strong_cfg, device):
+def _target_world_from_xy_cached(xy_t0, source_z_t0, t0_pose):
+    # Exact same final homogeneous matvec as
+    # t0_xy_to_world_preserve_source_z, but the source t0-Z has already been
+    # computed once during record preparation instead of recomputing inv(t0)
+    # for every source at every horizon.
+    p = np.asarray(
+        [float(xy_t0[0]), float(xy_t0[1]), float(source_z_t0), 1.0],
+        dtype=np.float64,
+    )
+    return (np.asarray(t0_pose, dtype=np.float64) @ p)[:3]
+
+
+def _forecast_once(model, state, pcfg, strong_cfg, device, profile=None):
     rec = state["rec"]
     current = state["current"]
     current_pose = state["current_pose"]
@@ -451,13 +476,19 @@ def _forecast_once(model, state, pcfg, strong_cfg, device):
     anchors = state["anchors"]
     baseline_by_hi = state["baseline_by_hi"]
 
+    _t_model = time.perf_counter() if profile is not None else None
     out = _model_forward(model, state["gpu"], device)
     pred_res = out["residual_xy_m"].float().cpu().numpy()
     pred_yaw = out["yaw_delta_rad"].float().cpu().numpy()
+    if profile is not None:
+        profile["model_and_output_transfer_ms"] = (
+            time.perf_counter() - _t_model
+        ) * 1000.0
 
     preds = []
     for hi in range(FUTURE_FRAMES):
         world_to_future = state["world_to_future"][hi]
+        _t_target = time.perf_counter() if profile is not None else None
         target_centers = []
         yaw_values = []
         for i, comp in enumerate(current):
@@ -465,13 +496,20 @@ def _forecast_once(model, state, pcfg, strong_cfg, device):
             src_center = np.asarray(comp["centroid_world"], dtype=np.float64)
             xy = rec["anchors_xy_t0_m"][i, hi].numpy() + pred_res[i, hi]
             target_centers.append(
-                t0_xy_to_world_preserve_source_z(xy, src_center, current_pose)
+                _target_world_from_xy_cached(
+                    xy, state["source_z_t0"][i], current_pose
+                )
             )
             yaw_values.append(
                 renderer_yaw_delta(
                     cid, pred_yaw[i, hi], zero_two_wheel_yaw=False
                 )
             )
+        if profile is not None:
+            profile["target_and_yaw_ms"] = profile.get(
+                "target_and_yaw_ms", 0.0
+            ) + (time.perf_counter() - _t_target) * 1000.0
+        _t_raster = time.perf_counter() if profile is not None else None
         repl = _rasterize_all_sources_horizon(
             current,
             source_world_points,
@@ -481,12 +519,21 @@ def _forecast_once(model, state, pcfg, strong_cfg, device):
             world_to_future,
             pcfg.grid,
         )
+        if profile is not None:
+            profile["rigid_raster_ms"] = profile.get(
+                "rigid_raster_ms", 0.0
+            ) + (time.perf_counter() - _t_raster) * 1000.0
+        _t_comp = time.perf_counter() if profile is not None else None
         pred = compose_component_replacements_fast_exact(
             anchors[hi], baseline_by_hi[hi], repl,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
             free_label=int(pcfg.free_label), grid=pcfg.grid,
             precomputed_clear_mask=state["baseline_clear_by_hi"][hi],
         )
+        if profile is not None:
+            profile["a1_compose_ms"] = profile.get(
+                "a1_compose_ms", 0.0
+            ) + (time.perf_counter() - _t_comp) * 1000.0
         preds.append(pred)
     return preds
 
@@ -601,6 +648,13 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
             center = t0_xy_to_world_preserve_source_z(
                 xy, src_center, state["current_pose"]
             )
+            cached_center = _target_world_from_xy_cached(
+                xy, state["source_z_t0"][i], state["current_pose"]
+            )
+            if not np.array_equal(center, cached_center):
+                raise RuntimeError(
+                    f"runtime cached target-center mismatch hi={hi} source={i}"
+                )
             yaw = renderer_yaw_delta(
                 cid, pred_yaw[i, hi], zero_two_wheel_yaw=False
             )
@@ -674,11 +728,14 @@ def _time_forecast(model, state, pcfg, strong_cfg, device):
     """OccFM-comparable core: prepared causal representation -> 6 dense grids."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    profile = {}
     t0 = time.perf_counter()
-    _forecast_once(model, state, pcfg, strong_cfg, device)
+    _forecast_once(model, state, pcfg, strong_cfg, device, profile=profile)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    return (time.perf_counter() - t0) * 1000.0
+    total = (time.perf_counter() - t0) * 1000.0
+    profile["total_ms"] = total
+    return total, profile
 
 
 def _time_full_in_memory(model, state, pcfg, strong_cfg, device):
@@ -846,6 +903,7 @@ def main():
     measured = prepared[nw:]
     neural_ms, core_ms, prior_ms, full_ms, source_ms = [], [], [], [], []
     prior_breakdown_rows = []
+    core_breakdown_rows = []
     source_counts = []
     for j, state in enumerate(measured, start=1):
         source_counts.append(len(state["current"]))
@@ -890,6 +948,18 @@ def main():
             vals = [float(row.get(key, 0.0)) for row in prior_breakdown_rows]
             prior_breakdown_mean[key] = float(np.mean(vals))
 
+    core_breakdown_mean = {}
+    if core_breakdown_rows:
+        for key in (
+            "model_and_output_transfer_ms",
+            "target_and_yaw_ms",
+            "rigid_raster_ms",
+            "a1_compose_ms",
+            "total_ms",
+        ):
+            vals = [float(row.get(key, 0.0)) for row in core_breakdown_rows]
+            core_breakdown_mean[key] = float(np.mean(vals))
+
     result = {
         "protocol": PROTOCOL,
         "checkpoint": str(Path(a.checkpoint).resolve()),
@@ -923,6 +993,7 @@ def main():
             "source_extract_match": _summary_ms(source_ms),
         },
         "strong_kta_prior_breakdown_mean_ms": prior_breakdown_mean,
+        "cached_forecast_breakdown_mean_ms": core_breakdown_mean,
         "timing_boundaries": {
             "neural_model": (
                 "cached causal source tensors resident on GPU -> all six motion outputs"
