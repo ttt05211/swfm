@@ -32,18 +32,19 @@ def majority_fill_sparse_5x5x1(
     kernel: tuple[int, int, int] = (5, 5, 1),
     min_fraction: float = 0.3,
 ) -> np.ndarray:
-    """Bit-exact batched equivalent of the frozen majority fill.
+    """Sparse bit-exact majority fill for the frozen 5x5x1 contract.
 
-    A first attempt used direct integer neighborhood counts only at unknown
-    voxels.  That is mathematically equivalent, but it is *not* bit-exact to
-    scipy.ndimage.uniform_filter(float32): separable float32 filtering can round
-    at slightly different points and flip threshold/tie decisions.
+    The fast path first computes *integer* 5x5 neighborhood histograms only at
+    unknown voxels.  For almost every queried voxel this is sufficient:
+      - a unique integer winner safely above 0.3 is filled;
+      - an integer winner safely below 0.3 is not filled.
 
-    This implementation therefore preserves scipy's exact filtering path while
-    reducing Python overhead: all present semantic classes are stacked as a
-    leading channel dimension and filtered in one 4-D call with filter size
-    (1, 5, 5, 1).  Because the class-axis kernel is one, each channel is
-    independent and numerically identical to the frozen per-class reference.
+    scipy.uniform_filter(float32) can differ from exact rational arithmetic only
+    at threshold/tie edge cases because of separable float32 rounding.  We
+    therefore replay scipy's exact filter path *only* for ambiguous queried
+    voxels (ratio exactly 0.3, or a max-count tie above threshold), using compact
+    5x5 patches.  This preserves the reference output bit-for-bit while avoiding
+    full-volume per-class filtering.
     """
     if tuple(int(x) for x in kernel) != (5, 5, 1):
         raise ValueError("runtime majority fill only supports frozen kernel=(5,5,1)")
@@ -56,42 +57,87 @@ def majority_fill_sparse_5x5x1(
         return sem.copy()
     if sem.ndim != 3:
         raise ValueError("semantic occupancy must be 3-D")
+    if abs(float(min_fraction) - 0.3) > 1e-12:
+        raise ValueError("runtime sparse exact path is frozen to min_fraction=0.3")
 
+    coords = np.argwhere(unknown)
+    m = int(coords.shape[0])
+    X, Y, Z = [int(x) for x in sem.shape]
+    offsets = np.asarray(
+        [(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)],
+        dtype=np.int64,
+    )
+    nx = coords[:, 0:1] + offsets[None, :, 0]
+    ny = coords[:, 1:2] + offsets[None, :, 1]
+    z = coords[:, 2:3]
+    inb = (nx >= 0) & (nx < X) & (ny >= 0) & (ny < Y)
+
+    gx = np.clip(nx, 0, X - 1)
+    gy = np.clip(ny, 0, Y - 1)
+    gz = np.broadcast_to(z, gx.shape)
     known = ~unknown
-    denom = uniform_filter(
-        known.astype(np.float32),
-        size=(5, 5, 1),
-        mode="constant",
-    )
-    denom = np.maximum(denom, np.float32(1e-6))
+    valid_known = inb & known[gx, gy, gz]
+    neigh_label = sem[gx, gy, gz].astype(np.int64, copy=False)
 
-    classes = np.unique(sem[known])
-    if len(classes) == 0:
-        return sem.copy()
+    if sem.size and int(sem.min()) < 0:
+        raise ValueError("negative semantic label unsupported")
+    nlabels = int(sem.max()) + 1 if sem.size else 1
+    rows = np.broadcast_to(np.arange(m, dtype=np.int64)[:, None], gx.shape)
+    rr = rows[valid_known]
+    ll = neigh_label[valid_known]
+    counts = np.bincount(
+        rr * nlabels + ll,
+        minlength=m * nlabels,
+    ).reshape(m, nlabels)
+    denom_count = valid_known.sum(axis=1).astype(np.int64, copy=False)
 
-    class_masks = (
-        (sem[None, ...] == classes[:, None, None, None])
-        & known[None, ...]
-    ).astype(np.float32)
-    scores = uniform_filter(
-        class_masks,
-        size=(1, 5, 5, 1),
-        mode="constant",
-    )
-    scores = scores / denom[None, ...]
+    max_count = counts.max(axis=1)
+    best_label = counts.argmax(axis=1).astype(sem.dtype, copy=False)
+    tie_count = (counts == max_count[:, None]).sum(axis=1)
 
-    # Reference loops np.unique(...) in ascending order and only updates on
-    # strict '>'.  np.argmax returns the first maximum, exactly matching that
-    # tie rule.
-    best_idx = np.argmax(scores, axis=0)
-    best_score = np.take_along_axis(
-        scores, best_idx[None, ...], axis=0
-    )[0]
-    best_label = classes[best_idx]
+    # Compare max_count / denom_count with 3/10 using exact integers.
+    lhs = 10 * max_count
+    rhs = 3 * denom_count
+    fill = (lhs > rhs) & (tie_count == 1)
 
-    fill = unknown & (best_score >= float(min_fraction))
+    # Only these cells can be affected by scipy float32 rounding/tie behavior.
+    ambiguous = (lhs == rhs) | ((lhs > rhs) & (tie_count > 1))
+    if bool(ambiguous.any()):
+        ai = np.flatnonzero(ambiguous)
+        # Each queried voxel already has its exact 5x5 neighborhood gathered.
+        # Keeping query and class axes at filter-size 1 makes every patch
+        # independent while reproducing the frozen 5x5 separable float path.
+        patch_known = valid_known[ai].reshape(len(ai), 5, 5)
+        patch_label = neigh_label[ai].reshape(len(ai), 5, 5)
+        denom = uniform_filter(
+            patch_known.astype(np.float32),
+            size=(1, 5, 5),
+            mode="constant",
+        )[:, 2, 2]
+        denom = np.maximum(denom, np.float32(1e-6))
+
+        classes = np.unique(sem[known]).astype(np.int64, copy=False)
+        masks = (
+            (patch_label[:, None, :, :] == classes[None, :, None, None])
+            & patch_known[:, None, :, :]
+        ).astype(np.float32)
+        scores = uniform_filter(
+            masks,
+            size=(1, 1, 5, 5),
+            mode="constant",
+        )[:, :, 2, 2]
+        scores = scores / denom[:, None]
+
+        # np.unique is ascending and the reference updates only on strict '>'.
+        # argmax's first-maximum rule therefore reproduces the exact tie order.
+        best_idx = np.argmax(scores, axis=1)
+        best_score = scores[np.arange(len(ai)), best_idx]
+        best_label[ai] = classes[best_idx].astype(sem.dtype, copy=False)
+        fill[ai] = best_score >= float(min_fraction)
+
     out = sem.copy()
-    out[fill] = best_label[fill]
+    fc = coords[fill]
+    out[fc[:, 0], fc[:, 1], fc[:, 2]] = best_label[fill]
     return out
 
 def extract_instances_cropped_exact(
