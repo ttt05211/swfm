@@ -16,13 +16,15 @@ The main optimizations are:
 from __future__ import annotations
 
 from typing import Iterable, Sequence
+from functools import lru_cache
 
 import numpy as np
 from scipy.ndimage import generate_binary_structure, label, uniform_filter
+import torch
 
 from .metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from .rigid_transport import RasterizedRigidComponent
-from .strong_w2det import StrongW2DetConfig, _transform_points
+from .strong_w2det import StrongW2DetConfig, _transform_points, _voxel_centers
 
 
 def majority_fill_sparse_5x5x1(
@@ -270,3 +272,117 @@ def baseline_clear_mask(
         if len(idx):
             clear[idx[:, 0], idx[:, 1], idx[:, 2]] = True
     return clear
+
+
+@lru_cache(maxsize=8)
+def _torch_voxel_centers_cached(
+    shape: tuple[int, int, int],
+    origin: tuple[float, float, float],
+    step: tuple[float, float, float],
+    device_key: str,
+) -> torch.Tensor:
+    # Construct through the frozen NumPy helper so coordinates originate from
+    # exactly the same voxel-center convention as the reference inverse_warp.
+    class _GridProxy:
+        shape_hwd = shape
+        x_min, y_min, z_min = origin
+        voxel_size = step
+    pts = _voxel_centers(_GridProxy())
+    return torch.from_numpy(pts.astype(np.float32, copy=False)).to(device_key)
+
+
+def inverse_warp_sequence_cuda_exact(
+    semantics: np.ndarray,
+    src_to_dst_seq: Sequence[np.ndarray],
+    *,
+    grid,
+    free_label: int,
+    device,
+    boundary_tol_vox: float = 5e-3,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Accelerated six-horizon inverse warp with exact boundary correction.
+
+    The dense affine transform is evaluated in float32 on CUDA.  A voxel index
+    can differ from the frozen float64 NumPy reference only when a transformed
+    coordinate lies close to an integer voxel boundary.  We conservatively
+    detect those points in normalized voxel coordinates and recompute *only*
+    them with the exact reference float64 expression before any gather.
+
+    Formal use is always guarded by whole-grid np.array_equal comparison against
+    the frozen CPU Strong/KTA implementation on multiple real validation
+    windows.  CPU devices intentionally fall back to the reference caller.
+    """
+    if torch.device(device).type != "cuda":
+        raise ValueError("CUDA exact-corrected inverse warp requires a CUDA device")
+
+    sem = np.asarray(semantics)
+    if tuple(sem.shape) != tuple(grid.shape_hwd):
+        raise ValueError("semantic grid shape mismatch")
+
+    shape = tuple(int(x) for x in grid.shape_hwd)
+    origin_np = np.asarray([grid.x_min, grid.y_min, grid.z_min], dtype=np.float64)
+    step_np = np.asarray(grid.voxel_size, dtype=np.float64)
+    device_key = str(torch.device(device))
+    dst_pts32 = _torch_voxel_centers_cached(
+        shape,
+        tuple(float(x) for x in origin_np),
+        tuple(float(x) for x in step_np),
+        device_key,
+    )
+    # Float64 NumPy centers are used only for the sparse correction set.
+    dst_pts64 = _voxel_centers(grid)
+    origin32 = torch.tensor(origin_np, dtype=torch.float32, device=device)
+    step32 = torch.tensor(step_np, dtype=torch.float32, device=device)
+    sem_t = torch.from_numpy(sem.reshape(-1)).to(device=device)
+    X, Y, Z = shape
+    tol = float(boundary_tol_vox)
+    outputs = []
+
+    for src_to_dst in src_to_dst_seq:
+        # Preserve the exact reference inverse before converting to the fast
+        # CUDA representation.
+        dst_to_src64 = np.linalg.inv(np.asarray(src_to_dst, dtype=np.float64))
+        mat32 = torch.from_numpy(dst_to_src64[:3, :3].astype(np.float32)).to(device)
+        trans32 = torch.from_numpy(dst_to_src64[:3, 3].astype(np.float32)).to(device)
+
+        src_pts32 = dst_pts32 @ mat32.T + trans32
+        q32 = (src_pts32 - origin32) / step32
+        idx = torch.floor(q32).to(torch.int64)
+
+        # Distance to the nearest integer boundary in voxel-coordinate space.
+        frac = torch.abs(q32 - torch.round(q32))
+        uncertain = torch.any(frac <= tol, dim=1)
+        if bool(torch.any(uncertain)):
+            pos_t = torch.nonzero(uncertain, as_tuple=False).flatten()
+            pos = pos_t.detach().cpu().numpy()
+            ref_src = (
+                dst_pts64[pos] @ dst_to_src64[:3, :3].T
+                + dst_to_src64[:3, 3]
+            )
+            ref_idx = np.floor(
+                (ref_src - origin_np[None]) / step_np[None]
+            ).astype(np.int64)
+            idx[pos_t] = torch.from_numpy(ref_idx).to(device=device)
+
+        known = (
+            (idx[:, 0] >= 0) & (idx[:, 0] < X)
+            & (idx[:, 1] >= 0) & (idx[:, 1] < Y)
+            & (idx[:, 2] >= 0) & (idx[:, 2] < Z)
+        )
+        out = torch.full(
+            (idx.shape[0],),
+            int(free_label),
+            dtype=sem_t.dtype,
+            device=device,
+        )
+        if bool(torch.any(known)):
+            q = idx[known]
+            flat_idx = (q[:, 0] * Y + q[:, 1]) * Z + q[:, 2]
+            out[known] = sem_t[flat_idx]
+        outputs.append(
+            (
+                out.reshape(shape).detach().cpu().numpy(),
+                known.reshape(shape).detach().cpu().numpy(),
+            )
+        )
+    return outputs
