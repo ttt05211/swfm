@@ -16,6 +16,8 @@ from real_motion.runtime_fastpath import (
     majority_fill_cuda_exact,
     majority_fill_sparse_5x5x1,
 )
+from tools.real_motion.benchmark_p0_f9_v18_runtime import _occworld_style_summary
+
 from real_motion.strong_w2det import (
     StrongW2DetConfig,
     extract_instances,
@@ -166,3 +168,14 @@ def test_cuda_majority_fill_matches_reference_random_and_dense_unknown():
                 device=torch.device("cuda"),
             )
             assert np.array_equal(ref, fast)
+
+
+def test_occworld_style_summary_uses_paired_encode_plus_autoreg_per_frame():
+    enc = np.asarray([30.0, 10.0], dtype=np.float64)
+    aut = np.asarray([120.0, 60.0], dtype=np.float64)
+    out = _occworld_style_summary(enc, aut, future_frames=6)
+    # Per-window times are [50, 20] ms, so the paired mean is 35 ms.
+    assert out["per_frame_mean_ms"] == pytest.approx(35.0)
+    assert out["fps_from_mean"] == pytest.approx(1000.0 / 35.0)
+    assert out["encode_mean_ms"] == pytest.approx(20.0)
+    assert out["autoreg_6frames_mean_ms"] == pytest.approx(90.0)
