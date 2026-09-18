@@ -12,6 +12,12 @@ OccFM's released implementation measures `cfm_eval` with CUDA events. That timer
 
 Script: `tools/real_motion/benchmark_p0_f9_v18_runtime.py`
 
+The formal checkpoint is the exact Clean-E14 path stored in the frozen
+provenance.  Its metadata mode is
+`clean_one_stage_from_scratch_v1_tail_continuation`: it is the same
+from-scratch clean V18 objective/model continued with restored optimizer state
+and fixed tail LR, not a Balanced or V17-warm-start checkpoint.
+
 Report these boundaries:
 - `neural_model`: cached source tensors on GPU -> six motion outputs.
 - `cached_representation_forecast_6frames`: main OccFM-comparable boundary. Frozen cached causal source representation and precomputed deterministic Strong/KTA prior -> six dense future occupancy grids. Includes Clean forward, predicted SE(2) rigid transport and hard-A1 composition.
