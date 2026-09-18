@@ -537,8 +537,34 @@ def main():
         a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu"
     )
     ck, model, _ = mid._load_model(a.checkpoint, CLEAN_PROTOCOL, device)
-    if str(ck.get("training_mode")) != "clean_one_stage_from_scratch_v1":
-        raise RuntimeError("runtime benchmark requires frozen clean one-stage checkpoint")
+    # CLEAN_PROTOCOL is the authoritative compatibility check performed by
+    # _load_model.  Historical Clean-E14 checkpoints may predate the
+    # training_mode metadata field, while Balanced checkpoints deliberately
+    # reuse the same model protocol.  Reject known non-main variants/modes, but
+    # do not reject a valid historical Clean checkpoint merely because that
+    # optional metadata key is absent.
+    training_mode = str(ck.get("training_mode") or "")
+    variant = str(ck.get("variant") or "")
+    if "balanced" in training_mode.lower() or "balanced" in variant.lower():
+        raise RuntimeError(
+            f"runtime benchmark refuses balanced checkpoint: "
+            f"training_mode={training_mode!r} variant={variant!r}"
+        )
+    if training_mode and training_mode != "clean_one_stage_from_scratch_v1":
+        raise RuntimeError(
+            f"unexpected Clean checkpoint training_mode={training_mode!r}"
+        )
+    print(
+        "RUNTIME CHECKPOINT "
+        + json.dumps({
+            "protocol": ck.get("protocol"),
+            "training_mode": ck.get("training_mode"),
+            "variant": ck.get("variant"),
+            "epoch": ck.get("epoch"),
+            "global_step": ck.get("global_step"),
+        }),
+        flush=True,
+    )
 
     rng = np.random.default_rng(int(a.seed))
     total_need = min(
