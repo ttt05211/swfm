@@ -547,7 +547,6 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
         [state["previous_pose"], state["current_pose"]],
         state["future_poses"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
-        runtime_device=device,
     )
     fast_anchor, fast_base = _strong_all_horizons(
         state["current_sem"], state["current_pose"], state["future_poses"],
