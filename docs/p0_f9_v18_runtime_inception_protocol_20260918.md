@@ -24,8 +24,23 @@ Report these boundaries:
 - `strong_kta_prior_rebuild_6frames`: deterministic prior reconstruction.
 - `full_causal_forecast_in_memory_6frames`: prior rebuild + Clean + render + composition.
 - `source_extract_match`: t-1/t0 connected components and matching.
+- `occworld_style_fps`: compatibility metric following OccWorld's public algebra
+  `per_frame = encode + autoreg / N_future`. For V18, `encode` is the measured
+  in-memory source extraction + causal matching stage, and `autoreg` is the
+  measured full causal six-frame forecast. The benchmark computes this per
+  window first and only then averages the per-frame latency, avoiding
+  mean-of-ratios ambiguity.
 
-All timings exclude disk I/O, GT and metric computation. For a paper comparison with OccFM, use `cached_representation_forecast_6frames` only if OccFM is also timed on the same GPU with its released `cfm_eval` timer. Keep the full in-memory timing as a supplementary transparency row. Never compare an H100/A800 V18 FPS directly with an RTX-4090 published FPS as if hardware were matched.
+The `occworld_style_fps` field is deliberately labeled as a compatibility
+metric rather than raw-occupancy end-to-end latency. The frozen learned
+representation tensors (source features, local semantic tube, frame-motion
+features and source mask) are still loaded from the causal cache, while
+Strong/KTA reconstruction, Clean inference, SE(2) rendering and final dense A1
+composition are included in the six-frame forecast term. This boundary is more
+conservative than cached-representation FPS but should not be described as full
+sensor/occupancy-to-output runtime.
+
+All timings exclude disk I/O, GT and metric computation. For a paper comparison with OccFM, use `cached_representation_forecast_6frames` only if OccFM is also timed on the same GPU with its released `cfm_eval` timer. For papers that explicitly state that FPS follows OccWorld, report `occworld_style_fps` together with the scope note above. Keep the full in-memory timing as a supplementary transparency row. Never compare an H100/A800 V18 FPS directly with an RTX-4090 published FPS as if hardware were matched.
 
 FLOPs are optional. The script first tries PyTorch `FlopCounterMode` and falls back to profiler-supported FLOPs. This applies to the learned Clean forward only, not deterministic geometry.
 
@@ -60,7 +75,7 @@ KID uses those single-frame features with a fixed standard unbiased degree-3 pol
 
 ## 6. Public OccFM script audit
 
-The current released `tools/test_fid.py` loads GT and prediction but then contains `pred = gt[:, indices, ...]` before feature extraction. That overwrites the model prediction and is consistent with a Reorder-GT diagnostic rather than ordinary model evaluation. With the documented `[6,200,200,16]` layout, axis 1 is also spatial rather than the six-frame time axis.
+The current released `tools/test_fid.py` loads GT and prediction but then contains `pred = gt[:, indices, ...]` before feature extraction. That overwrites the model prediction and is consistent with a Reorder-GT diagnostic rather than ordinary model evaluation. After DataLoader batching, the documented clip is `[1,6,200,200,16]`, so axis 1 is the six-frame time axis. The overwrite still makes the released line a Reorder-GT-style diagnostic rather than ordinary prediction FVD.
 
 Our evaluator follows the intended released feature-extractor contract but does not reproduce that overwrite. Optional `--reorder-gt-sanity` instead correctly shuffles the six-frame time axis.
 
