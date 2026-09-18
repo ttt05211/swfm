@@ -84,7 +84,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import (
 )
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 
-PROTOCOL = "p0_f9_v18_clean_runtime_benchmark_v1"
+PROTOCOL = "p0_f9_v18_clean_runtime_benchmark_v2"
 FUTURE_FRAMES = 6
 
 
@@ -580,28 +580,22 @@ def _forecast_once_with_prior_rebuild(model, state, pcfg, strong_cfg, device):
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
         runtime_device=device,
     )
-    clear_by_hi = [
-        baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi
-    ]
     clear_flat_by_hi = [
         baseline_clear_flat_indices(rows, grid=pcfg.grid) for rows in baseline_by_hi
     ]
-    old_a, old_b, old_c, old_d = (
+    old_a, old_b, old_d = (
         state["anchors"],
         state["baseline_by_hi"],
-        state["baseline_clear_by_hi"],
         state["baseline_clear_flat_by_hi"],
     )
     state["anchors"] = anchors
     state["baseline_by_hi"] = baseline_by_hi
-    state["baseline_clear_by_hi"] = clear_by_hi
     state["baseline_clear_flat_by_hi"] = clear_flat_by_hi
     try:
         return _forecast_once(model, state, pcfg, strong_cfg, device)
     finally:
         state["anchors"] = old_a
         state["baseline_by_hi"] = old_b
-        state["baseline_clear_by_hi"] = old_c
         state["baseline_clear_flat_by_hi"] = old_d
 
 
@@ -797,7 +791,7 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
                 f"runtime vectorized raster/A1 mismatch hi={hi} voxels={neq}"
             )
     print(
-        "RUNTIME EXACTNESS: components + Strong all-6 + vectorized rigid raster + A1 PASS",
+        "RUNTIME EXACTNESS: components + Strong all-6 + KTA footprints/CLEAR + vectorized rigid raster + sparse A1 PASS",
         flush=True,
     )
 
