@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Iterable, Sequence
 
 import numpy as np
-from scipy.ndimage import generate_binary_structure, label
+from scipy.ndimage import generate_binary_structure, label, uniform_filter
 
 from .metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from .rigid_transport import RasterizedRigidComponent
@@ -32,19 +32,21 @@ def majority_fill_sparse_5x5x1(
     kernel: tuple[int, int, int] = (5, 5, 1),
     min_fraction: float = 0.3,
 ) -> np.ndarray:
-    """Sparse equivalent of the frozen scipy-uniform-filter majority fill.
+    """Bit-exact batched equivalent of the frozen majority fill.
 
-    Only the values of the majority score at unknown voxels can affect output,
-    so the 5x5x1 neighborhood is gathered directly.  For each unknown voxel,
-    numerator and denominator share the same 1/25 uniform-filter normalization;
-    we explicitly round those two normalized counts to float32 before division
-    to mirror the reference dtype path.
+    A first attempt used direct integer neighborhood counts only at unknown
+    voxels.  That is mathematically equivalent, but it is *not* bit-exact to
+    scipy.ndimage.uniform_filter(float32): separable float32 filtering can round
+    at slightly different points and flip threshold/tie decisions.
 
-    The fast path is deliberately limited to the frozen 5x5x1 kernel.  Other
-    kernels should continue to use the reference implementation.
+    This implementation therefore preserves scipy's exact filtering path while
+    reducing Python overhead: all present semantic classes are stacked as a
+    leading channel dimension and filtered in one 4-D call with filter size
+    (1, 5, 5, 1).  Because the class-axis kernel is one, each channel is
+    independent and numerically identical to the frozen per-class reference.
     """
     if tuple(int(x) for x in kernel) != (5, 5, 1):
-        raise ValueError("runtime sparse majority fill only supports frozen kernel=(5,5,1)")
+        raise ValueError("runtime majority fill only supports frozen kernel=(5,5,1)")
 
     sem = np.asarray(semantics)
     unknown = np.asarray(unknown_mask, dtype=bool)
@@ -55,59 +57,42 @@ def majority_fill_sparse_5x5x1(
     if sem.ndim != 3:
         raise ValueError("semantic occupancy must be 3-D")
 
-    coords = np.argwhere(unknown)
-    m = int(coords.shape[0])
-    X, Y, Z = [int(x) for x in sem.shape]
-    offsets = np.asarray(
-        [(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)],
-        dtype=np.int64,
+    known = ~unknown
+    denom = uniform_filter(
+        known.astype(np.float32),
+        size=(5, 5, 1),
+        mode="constant",
     )
-    nx = coords[:, 0:1] + offsets[None, :, 0]
-    ny = coords[:, 1:2] + offsets[None, :, 1]
-    z = coords[:, 2:3]
-    inb = (nx >= 0) & (nx < X) & (ny >= 0) & (ny < Y)
+    denom = np.maximum(denom, np.float32(1e-6))
 
-    # Safe clipped gather; out-of-grid positions are subsequently masked out,
-    # matching scipy mode="constant", cval=0 for the known-mask numerator.
-    gx = np.clip(nx, 0, X - 1)
-    gy = np.clip(ny, 0, Y - 1)
-    gz = np.broadcast_to(z, gx.shape)
-    neigh_unknown = unknown[gx, gy, gz]
-    valid_known = inb & (~neigh_unknown)
-    neigh_label = sem[gx, gy, gz].astype(np.int64, copy=False)
+    classes = np.unique(sem[known])
+    if len(classes) == 0:
+        return sem.copy()
 
-    # The frozen occupancy label space is 0..17.  Keep this generic enough for
-    # any non-negative integer labels while preserving the reference tie rule:
-    # np.unique iterates labels ascending and updates only on strictly-greater
-    # score, which is exactly argmax's first-index behavior.
-    if sem.size and int(sem.min()) < 0:
-        raise ValueError("negative semantic label unsupported")
-    nlabels = int(sem.max()) + 1 if sem.size else 1
-    rows = np.broadcast_to(np.arange(m, dtype=np.int64)[:, None], gx.shape)
-    rr = rows[valid_known]
-    ll = neigh_label[valid_known]
-    counts = np.bincount(
-        rr * nlabels + ll,
-        minlength=m * nlabels,
-    ).reshape(m, nlabels)
-    denom_count = valid_known.sum(axis=1).astype(np.int64, copy=False)
-    best_label = counts.argmax(axis=1).astype(sem.dtype, copy=False)
-    best_count = counts[np.arange(m), best_label.astype(np.int64)]
+    class_masks = (
+        (sem[None, ...] == classes[:, None, None, None])
+        & known[None, ...]
+    ).astype(np.float32)
+    scores = uniform_filter(
+        class_masks,
+        size=(1, 5, 5, 1),
+        mode="constant",
+    )
+    scores = scores / denom[None, ...]
 
-    # Reference: uniform_filter(float32) returns normalized counts, then
-    # score = numerator / max(denominator, 1e-6).
-    kvol = np.float32(25.0)
-    num_f = (best_count.astype(np.float32) / kvol).astype(np.float32, copy=False)
-    den_f = (denom_count.astype(np.float32) / kvol).astype(np.float32, copy=False)
-    den_f = np.maximum(den_f, np.float32(1e-6))
-    score = (num_f / den_f).astype(np.float32, copy=False)
-    fill = score >= np.float32(min_fraction)
+    # Reference loops np.unique(...) in ascending order and only updates on
+    # strict '>'.  np.argmax returns the first maximum, exactly matching that
+    # tie rule.
+    best_idx = np.argmax(scores, axis=0)
+    best_score = np.take_along_axis(
+        scores, best_idx[None, ...], axis=0
+    )[0]
+    best_label = classes[best_idx]
 
+    fill = unknown & (best_score >= float(min_fraction))
     out = sem.copy()
-    fc = coords[fill]
-    out[fc[:, 0], fc[:, 1], fc[:, 2]] = best_label[fill]
+    out[fill] = best_label[fill]
     return out
-
 
 def extract_instances_cropped_exact(
     semantics: np.ndarray,
