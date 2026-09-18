@@ -54,6 +54,13 @@ from real_motion.rigid_transport import (
     rasterize_rigid_component,
 )
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
+from real_motion.runtime_fastpath import (
+    baseline_clear_mask,
+    component_lists_equal,
+    compose_component_replacements_fast_exact,
+    extract_instances_cropped_exact,
+    majority_fill_sparse_5x5x1,
+)
 from real_motion.strong_w2det import (
     StrongW2DetConfig,
     _in_grid,
@@ -188,7 +195,7 @@ def _strong_all_horizons(
         static_dst, known = inverse_warp(
             static_src, t_future_from_current, grid, int(cfg.free_label)
         )
-        out = majority_fill(
+        out = majority_fill_sparse_5x5x1(
             static_dst,
             ~known,
             kernel=cfg.fill_kernel,
@@ -288,6 +295,12 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         source_world_points,
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
     )
+    baseline_clear_by_hi = [
+        baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi
+    ]
+    world_to_future = [
+        np.linalg.inv(np.asarray(p, dtype=np.float64)) for p in future_poses
+    ]
     return {
         "rec": rec,
         "window": w,
@@ -303,6 +316,8 @@ def _prepare_record(rec, source, pcfg, strong_cfg, device):
         "source_world_points": source_world_points,
         "anchors": anchors,
         "baseline_by_hi": baseline_by_hi,
+        "baseline_clear_by_hi": baseline_clear_by_hi,
+        "world_to_future": world_to_future,
         "gpu": _gpu_inputs(rec, device),
     }
 
@@ -323,7 +338,7 @@ def _forecast_once(model, state, pcfg, strong_cfg, device):
 
     preds = []
     for hi in range(FUTURE_FRAMES):
-        world_to_future = np.linalg.inv(future_poses[hi])
+        world_to_future = state["world_to_future"][hi]
         repl = []
         for i, comp in enumerate(current):
             cid = int(comp["class_id"])
@@ -338,10 +353,11 @@ def _forecast_once(model, state, pcfg, strong_cfg, device):
                     world_to_future, pcfg.grid,
                 )
             )
-        pred = compose_component_replacements_in_input_order(
+        pred = compose_component_replacements_fast_exact(
             anchors[hi], baseline_by_hi[hi], repl,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
             free_label=int(pcfg.free_label), grid=pcfg.grid,
+            precomputed_clear_mask=state["baseline_clear_by_hi"][hi],
         )
         preds.append(pred)
     return preds
@@ -354,12 +370,19 @@ def _forecast_once_with_prior_rebuild(model, state, pcfg, strong_cfg, device):
         state["current"], state["velocities"], state["source_world_points"],
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
     )
-    old_a, old_b = state["anchors"], state["baseline_by_hi"]
-    state["anchors"], state["baseline_by_hi"] = anchors, baseline_by_hi
+    clear_by_hi = [baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi]
+    old_a, old_b, old_c = (
+        state["anchors"], state["baseline_by_hi"], state["baseline_clear_by_hi"]
+    )
+    state["anchors"], state["baseline_by_hi"], state["baseline_clear_by_hi"] = (
+        anchors, baseline_by_hi, clear_by_hi
+    )
     try:
         return _forecast_once(model, state, pcfg, strong_cfg, device)
     finally:
-        state["anchors"], state["baseline_by_hi"] = old_a, old_b
+        state["anchors"], state["baseline_by_hi"], state["baseline_clear_by_hi"] = (
+            old_a, old_b, old_c
+        )
 
 
 def _time_prior_rebuild(state, pcfg, strong_cfg):
@@ -373,6 +396,17 @@ def _time_prior_rebuild(state, pcfg, strong_cfg):
 
 
 def _exactness_check(model, state, pcfg, strong_cfg, device):
+    fast_cur = extract_instances_cropped_exact(
+        state["current_sem"], state["current_pose"], grid=pcfg.grid, cfg=strong_cfg
+    )
+    fast_prev = extract_instances_cropped_exact(
+        state["previous_sem"], state["previous_pose"], grid=pcfg.grid, cfg=strong_cfg
+    )
+    if not component_lists_equal(fast_cur, state["current"]):
+        raise RuntimeError("runtime fast current-component extraction mismatch")
+    if not component_lists_equal(fast_prev, state["previous"]):
+        raise RuntimeError("runtime fast previous-component extraction mismatch")
+
     history2 = np.stack([state["previous_sem"], state["current_sem"]], axis=0)
     ref_anchor = strong_w2det_sequence(
         history2,
@@ -416,7 +450,44 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
         )
         if not np.array_equal(fast_comp.voxel_indices, ref_comp.voxel_indices):
             raise RuntimeError("runtime fast rigid raster mismatch")
-    print("RUNTIME EXACTNESS: Strong all-6 + rigid raster PASS", flush=True)
+    # Full A1 output equivalence of the optimized compositor against the frozen
+    # reference compositor, using identical predicted replacement components.
+    out = _model_forward(model, state["gpu"], device)
+    pred_res = out["residual_xy_m"].float().cpu().numpy()
+    pred_yaw = out["yaw_delta_rad"].float().cpu().numpy()
+    for hi in range(FUTURE_FRAMES):
+        repl = []
+        for i, comp in enumerate(state["current"]):
+            cid = int(comp["class_id"])
+            src_center = np.asarray(comp["centroid_world"], dtype=np.float64)
+            xy = state["rec"]["anchors_xy_t0_m"][i, hi].numpy() + pred_res[i, hi]
+            center = t0_xy_to_world_preserve_source_z(
+                xy, src_center, state["current_pose"]
+            )
+            repl.append(_fast_rasterize_from_world(
+                state["source_world_points"][i], cid, len(comp["voxel_indices"]),
+                src_center, center,
+                renderer_yaw_delta(cid, pred_yaw[i, hi], zero_two_wheel_yaw=False),
+                state["world_to_future"][hi], pcfg.grid,
+            ))
+        ref_pred = compose_component_replacements_in_input_order(
+            state["anchors"][hi], state["baseline_by_hi"][hi], repl,
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
+            free_label=int(pcfg.free_label), grid=pcfg.grid,
+        )
+        fast_pred = compose_component_replacements_fast_exact(
+            state["anchors"][hi], state["baseline_by_hi"][hi], repl,
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
+            free_label=int(pcfg.free_label), grid=pcfg.grid,
+            precomputed_clear_mask=state["baseline_clear_by_hi"][hi],
+        )
+        if not np.array_equal(ref_pred, fast_pred):
+            neq = int(np.count_nonzero(ref_pred != fast_pred))
+            raise RuntimeError(f"runtime fast A1 compositor mismatch hi={hi} voxels={neq}")
+    print(
+        "RUNTIME EXACTNESS: components + Strong all-6 + rigid raster + A1 PASS",
+        flush=True,
+    )
 
 
 def _time_neural(model, state, device):
@@ -458,10 +529,10 @@ def _time_full_in_memory(model, state, pcfg, strong_cfg, device):
 
 def _time_source_extract(state, pcfg, strong_cfg):
     t0 = time.perf_counter()
-    cur = extract_instances(
+    cur = extract_instances_cropped_exact(
         state["current_sem"], state["current_pose"], grid=pcfg.grid, cfg=strong_cfg
     )
-    prv = extract_instances(
+    prv = extract_instances_cropped_exact(
         state["previous_sem"], state["previous_pose"], grid=pcfg.grid, cfg=strong_cfg
     )
     match_instances(
