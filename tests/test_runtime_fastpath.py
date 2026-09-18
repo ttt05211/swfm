@@ -8,10 +8,12 @@ from real_motion.rigid_transport import (
     compose_component_replacements_in_input_order,
 )
 from real_motion.runtime_fastpath import (
+    baseline_clear_flat_indices,
     component_lists_equal,
     compose_component_replacements_fast_exact,
     extract_instances_cropped_exact,
     inverse_warp_sequence_cuda_exact,
+    majority_fill_cuda_exact,
     majority_fill_sparse_5x5x1,
 )
 from real_motion.strong_w2det import (
@@ -82,6 +84,14 @@ def test_fast_a1_compositor_matches_reference():
     )
     assert np.array_equal(ref, fast)
 
+    clear_flat = baseline_clear_flat_indices([b1, b2], grid=grid)
+    fast_sparse = compose_component_replacements_fast_exact(
+        anchor, [b1,b2], [r1,r2],
+        dynamic_class_ids=(4,7), free_label=17, grid=grid,
+        precomputed_clear_flat_indices=clear_flat,
+    )
+    assert np.array_equal(ref, fast_sparse)
+
 
 def test_sparse_majority_fill_matches_reference_boundary_and_ties():
     sem = np.full((17, 19, 3), 17, dtype=np.uint8)
@@ -136,3 +146,23 @@ def test_cuda_inverse_warp_matches_reference_small_grid():
         ref_sem, ref_known = inverse_warp(sem, T, grid, 17)
         assert np.array_equal(ref_sem, fast_sem)
         assert np.array_equal(ref_known, fast_known)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime fast path")
+def test_cuda_majority_fill_matches_reference_random_and_dense_unknown():
+    rng = np.random.default_rng(20260918)
+    for density in (0.03, 0.15, 0.35):
+        for _ in range(4):
+            sem = rng.integers(0, 18, size=(31, 29, 5), dtype=np.uint8)
+            unknown = rng.random(sem.shape) < density
+            ref = majority_fill(
+                sem, unknown, kernel=(5, 5, 1), min_fraction=0.3
+            )
+            fast = majority_fill_cuda_exact(
+                sem,
+                unknown,
+                kernel=(5, 5, 1),
+                min_fraction=0.3,
+                device=torch.device("cuda"),
+            )
+            assert np.array_equal(ref, fast)
