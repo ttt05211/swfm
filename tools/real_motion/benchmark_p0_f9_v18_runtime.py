@@ -537,7 +537,9 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
     pred_res = out["residual_xy_m"].float().cpu().numpy()
     pred_yaw = out["yaw_delta_rad"].float().cpu().numpy()
     for hi in range(FUTURE_FRAMES):
-        repl = []
+        repl_ref = []
+        target_centers = []
+        yaw_values = []
         for i, comp in enumerate(state["current"]):
             cid = int(comp["class_id"])
             src_center = np.asarray(comp["centroid_world"], dtype=np.float64)
@@ -545,28 +547,55 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
             center = t0_xy_to_world_preserve_source_z(
                 xy, src_center, state["current_pose"]
             )
-            repl.append(_fast_rasterize_from_world(
+            yaw = renderer_yaw_delta(
+                cid, pred_yaw[i, hi], zero_two_wheel_yaw=False
+            )
+            target_centers.append(center)
+            yaw_values.append(yaw)
+            repl_ref.append(_fast_rasterize_from_world(
                 state["source_world_points"][i], cid, len(comp["voxel_indices"]),
-                src_center, center,
-                renderer_yaw_delta(cid, pred_yaw[i, hi], zero_two_wheel_yaw=False),
-                state["world_to_future"][hi], pcfg.grid,
+                src_center, center, yaw, state["world_to_future"][hi], pcfg.grid,
             ))
+
+        repl_fast = _rasterize_all_sources_horizon(
+            state["current"],
+            state["source_world_points"],
+            state["source_rel_xy"],
+            target_centers,
+            yaw_values,
+            state["world_to_future"][hi],
+            pcfg.grid,
+        )
+        if len(repl_ref) != len(repl_fast):
+            raise RuntimeError("runtime vectorized raster source-count mismatch")
+        for i, (rr, ff) in enumerate(zip(repl_ref, repl_fast)):
+            if (
+                int(rr.class_id) != int(ff.class_id)
+                or int(rr.source_voxel_count) != int(ff.source_voxel_count)
+                or not np.array_equal(rr.voxel_indices, ff.voxel_indices)
+            ):
+                raise RuntimeError(
+                    f"runtime vectorized rigid raster mismatch hi={hi} source={i}"
+                )
+
         ref_pred = compose_component_replacements_in_input_order(
-            state["anchors"][hi], state["baseline_by_hi"][hi], repl,
+            state["anchors"][hi], state["baseline_by_hi"][hi], repl_ref,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
             free_label=int(pcfg.free_label), grid=pcfg.grid,
         )
         fast_pred = compose_component_replacements_fast_exact(
-            state["anchors"][hi], state["baseline_by_hi"][hi], repl,
+            state["anchors"][hi], state["baseline_by_hi"][hi], repl_fast,
             dynamic_class_ids=DYNAMIC_CLASS_IDS,
             free_label=int(pcfg.free_label), grid=pcfg.grid,
             precomputed_clear_mask=state["baseline_clear_by_hi"][hi],
         )
         if not np.array_equal(ref_pred, fast_pred):
             neq = int(np.count_nonzero(ref_pred != fast_pred))
-            raise RuntimeError(f"runtime fast A1 compositor mismatch hi={hi} voxels={neq}")
+            raise RuntimeError(
+                f"runtime vectorized raster/A1 mismatch hi={hi} voxels={neq}"
+            )
     print(
-        "RUNTIME EXACTNESS: components + Strong all-6 + rigid raster + A1 PASS",
+        "RUNTIME EXACTNESS: components + Strong all-6 + vectorized rigid raster + A1 PASS",
         flush=True,
     )
 
