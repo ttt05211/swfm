@@ -21,6 +21,7 @@ from functools import lru_cache
 import numpy as np
 from scipy.ndimage import generate_binary_structure, label, uniform_filter
 import torch
+import torch.nn.functional as F
 
 from .metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from .rigid_transport import RasterizedRigidComponent
@@ -149,6 +150,159 @@ def majority_fill_sparse_5x5x1(
     out[fc[:, 0], fc[:, 1], fc[:, 2]] = best_label[fill]
     return out
 
+
+def _box_sum_5x5_torch_int32(x: torch.Tensor) -> torch.Tensor:
+    """Exact 5x5 zero-padded box sums for [B,X,Y] int32 tensors."""
+    if x.ndim != 3:
+        raise ValueError("box-sum input must be [B,X,Y]")
+    p = F.pad(x, (2, 2, 2, 2), mode="constant", value=0)
+    s = torch.cumsum(p, dim=1, dtype=torch.int32)
+    s = torch.cumsum(s, dim=2, dtype=torch.int32)
+    s = F.pad(s, (1, 0, 1, 0), mode="constant", value=0)
+    return (
+        s[:, 5:, 5:]
+        - s[:, :-5, 5:]
+        - s[:, 5:, :-5]
+        + s[:, :-5, :-5]
+    )
+
+
+def majority_fill_cuda_exact(
+    semantics: np.ndarray,
+    unknown_mask: np.ndarray,
+    *,
+    kernel: tuple[int, int, int] = (5, 5, 1),
+    min_fraction: float = 0.3,
+    device,
+) -> np.ndarray:
+    """CUDA integer-box-count majority fill with exact scipy edge replay.
+
+    All ordinary decisions use exact integer 5x5 counts on CUDA.  Only cells
+    whose result can depend on scipy float32 rounding/tie behavior are replayed
+    through the frozen scipy path on compact 5x5 CPU patches.  The integrated
+    benchmark still requires whole-grid np.array_equal agreement against the
+    frozen Strong/W2Det implementation before timing.
+    """
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return majority_fill_sparse_5x5x1(
+            semantics,
+            unknown_mask,
+            kernel=kernel,
+            min_fraction=min_fraction,
+        )
+    if tuple(int(x) for x in kernel) != (5, 5, 1):
+        raise ValueError("CUDA majority fill only supports frozen kernel=(5,5,1)")
+    if abs(float(min_fraction) - 0.3) > 1e-12:
+        raise ValueError("CUDA majority fill is frozen to min_fraction=0.3")
+
+    sem = np.asarray(semantics)
+    unknown = np.asarray(unknown_mask, dtype=bool)
+    if sem.shape != unknown.shape:
+        raise ValueError("semantics/unknown shape mismatch")
+    if sem.ndim != 3:
+        raise ValueError("semantic occupancy must be 3-D")
+    if not bool(unknown.any()):
+        return sem.copy()
+
+    known = ~unknown
+    classes = np.unique(sem[known]).astype(np.int64, copy=False)
+    if len(classes) == 0:
+        return sem.copy()
+
+    # Treat Z as batch because the frozen kernel has depth one.
+    sem_zyx = np.ascontiguousarray(np.transpose(sem, (2, 0, 1)))
+    known_zyx = np.ascontiguousarray(np.transpose(known, (2, 0, 1)))
+    unknown_zyx = np.ascontiguousarray(np.transpose(unknown, (2, 0, 1)))
+
+    sem_t = torch.from_numpy(sem_zyx.astype(np.int64, copy=False)).to(dev)
+    known_t = torch.from_numpy(known_zyx).to(dev)
+    unknown_t = torch.from_numpy(unknown_zyx).to(dev)
+    cls_t = torch.from_numpy(classes).to(dev)
+
+    denom = _box_sum_5x5_torch_int32(known_t.to(torch.int32))
+    masks = (
+        (sem_t[:, None, :, :] == cls_t[None, :, None, None])
+        & known_t[:, None, :, :]
+    )
+    Z, C, X, Y = [int(v) for v in masks.shape]
+    counts = _box_sum_5x5_torch_int32(
+        masks.reshape(Z * C, X, Y).to(torch.int32)
+    ).reshape(Z, C, X, Y)
+
+    max_count, best_idx = counts.max(dim=1)
+    tie_count = (counts == max_count[:, None, :, :]).sum(dim=1)
+    lhs = 10 * max_count
+    rhs = 3 * denom
+
+    fill_t = unknown_t & (lhs > rhs) & (tie_count == 1)
+    ambiguous_t = unknown_t & (
+        ((denom > 0) & (lhs == rhs))
+        | ((lhs > rhs) & (tie_count > 1))
+    )
+    best_label_t = cls_t[best_idx]
+
+    fill = np.transpose(fill_t.detach().cpu().numpy(), (1, 2, 0))
+    best_label = np.transpose(
+        best_label_t.detach().cpu().numpy(), (1, 2, 0)
+    ).astype(sem.dtype, copy=False)
+    ambiguous = np.transpose(
+        ambiguous_t.detach().cpu().numpy(), (1, 2, 0)
+    )
+
+    out = sem.copy()
+    out[fill] = best_label[fill]
+
+    # Exact replay only for threshold/tie edge cells.
+    coords = np.argwhere(ambiguous)
+    if len(coords):
+        Xs, Ys, _ = [int(v) for v in sem.shape]
+        offsets = np.asarray(
+            [(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)],
+            dtype=np.int64,
+        )
+        nx = coords[:, 0:1] + offsets[None, :, 0]
+        ny = coords[:, 1:2] + offsets[None, :, 1]
+        z = coords[:, 2:3]
+        inb = (nx >= 0) & (nx < Xs) & (ny >= 0) & (ny < Ys)
+        gx = np.clip(nx, 0, Xs - 1)
+        gy = np.clip(ny, 0, Ys - 1)
+        gz = np.broadcast_to(z, gx.shape)
+        patch_known = (
+            inb & known[gx, gy, gz]
+        ).reshape(len(coords), 5, 5)
+        patch_label = sem[gx, gy, gz].astype(
+            np.int64, copy=False
+        ).reshape(len(coords), 5, 5)
+
+        denom_f = uniform_filter(
+            patch_known.astype(np.float32),
+            size=(1, 5, 5),
+            mode="constant",
+        )[:, 2, 2]
+        denom_f = np.maximum(denom_f, np.float32(1e-6))
+        score_masks = (
+            (patch_label[:, None, :, :] == classes[None, :, None, None])
+            & patch_known[:, None, :, :]
+        ).astype(np.float32)
+        scores = uniform_filter(
+            score_masks,
+            size=(1, 1, 5, 5),
+            mode="constant",
+        )[:, :, 2, 2]
+        scores = scores / denom_f[:, None]
+        replay_best_idx = np.argmax(scores, axis=1)
+        replay_best_score = scores[np.arange(len(coords)), replay_best_idx]
+        replay_fill = replay_best_score >= float(min_fraction)
+        if bool(replay_fill.any()):
+            fc = coords[replay_fill]
+            labels = classes[replay_best_idx[replay_fill]].astype(
+                sem.dtype, copy=False
+            )
+            out[fc[:, 0], fc[:, 1], fc[:, 2]] = labels
+
+    return out
+
 def extract_instances_cropped_exact(
     semantics: np.ndarray,
     ego_to_world: np.ndarray,
@@ -237,6 +391,7 @@ def compose_component_replacements_fast_exact(
     free_label: int,
     grid,
     precomputed_clear_mask: np.ndarray | None = None,
+    precomputed_clear_flat_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     """Frozen A1 compositor without one dense mask allocation per component."""
     anchor = np.asarray(anchor_occ)
@@ -244,21 +399,30 @@ def compose_component_replacements_fast_exact(
         raise ValueError("anchor_occ shape differs from occupancy grid")
     out = anchor.copy()
 
-    if precomputed_clear_mask is None:
-        clear = np.zeros(grid.shape_hwd, dtype=bool)
-        for comp in baseline_components:
-            idx = np.asarray(comp.voxel_indices, dtype=np.int64)
-            if len(idx):
-                clear[idx[:, 0], idx[:, 1], idx[:, 2]] = True
-    else:
-        clear = np.asarray(precomputed_clear_mask, dtype=bool)
-        if clear.shape != anchor.shape:
-            raise ValueError("precomputed_clear_mask shape mismatch")
+    dyn_ids = np.asarray(tuple(int(x) for x in dynamic_class_ids), dtype=np.int64)
+    if dyn_ids.size == 0:
+        raise ValueError("dynamic_class_ids cannot be empty")
 
-    lut = np.zeros(256, dtype=bool)
-    for cid in dynamic_class_ids:
-        lut[int(cid)] = True
-    out[clear & lut[out.astype(np.uint8, copy=False)]] = int(free_label)
+    if precomputed_clear_flat_indices is not None:
+        clear_flat = np.asarray(precomputed_clear_flat_indices, dtype=np.int64)
+        out_flat = out.reshape(-1)
+        if len(clear_flat):
+            vals = out_flat[clear_flat]
+            clear_dyn = np.isin(vals, dyn_ids)
+            if bool(clear_dyn.any()):
+                out_flat[clear_flat[clear_dyn]] = int(free_label)
+    else:
+        if precomputed_clear_mask is None:
+            clear = np.zeros(grid.shape_hwd, dtype=bool)
+            for comp in baseline_components:
+                idx = np.asarray(comp.voxel_indices, dtype=np.int64)
+                if len(idx):
+                    clear[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+        else:
+            clear = np.asarray(precomputed_clear_mask, dtype=bool)
+            if clear.shape != anchor.shape:
+                raise ValueError("precomputed_clear_mask shape mismatch")
+        out[clear & np.isin(out, dyn_ids)] = int(free_label)
 
     # Preserve exact frozen source/input write order.
     for comp in replacement_components:
@@ -279,6 +443,23 @@ def baseline_clear_mask(
         if len(idx):
             clear[idx[:, 0], idx[:, 1], idx[:, 2]] = True
     return clear
+
+
+def baseline_clear_flat_indices(
+    baseline_components: Iterable[RasterizedRigidComponent],
+    *,
+    grid,
+) -> np.ndarray:
+    """Unique flat CLEAR indices, equivalent to baseline_clear_mask."""
+    _, Y, Z = [int(v) for v in grid.shape_hwd]
+    rows = []
+    for comp in baseline_components:
+        idx = np.asarray(comp.voxel_indices, dtype=np.int64)
+        if len(idx):
+            rows.append((idx[:, 0] * Y + idx[:, 1]) * Z + idx[:, 2])
+    if not rows:
+        return np.zeros((0,), dtype=np.int64)
+    return np.unique(np.concatenate(rows, axis=0)).astype(np.int64, copy=False)
 
 
 @lru_cache(maxsize=8)
