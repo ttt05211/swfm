@@ -940,7 +940,11 @@ def main():
     for j, state in enumerate(measured, start=1):
         source_counts.append(len(state["current"]))
         neural_ms.append(_time_neural(model, state, device))
-        core_ms.append(_time_forecast(model, state, pcfg, strong_cfg, device))
+        core_total, core_parts = _time_forecast(
+            model, state, pcfg, strong_cfg, device
+        )
+        core_ms.append(core_total)
+        core_breakdown_rows.append(core_parts)
         prior_total, prior_parts = _time_prior_rebuild(
             state, pcfg, strong_cfg, device
         )
