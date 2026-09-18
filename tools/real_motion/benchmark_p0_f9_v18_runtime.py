@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """Frozen runtime benchmark for the final Clean-E14 V18 SE(2) forecaster.
 
-This benchmark intentionally separates three timing boundaries:
+The benchmark exposes multiple timing boundaries instead of hiding preparation
+costs inside one FPS number:
 
 1) neural_model:
-   frozen causal source tensors already resident on GPU -> six-horizon
-   (dx, dy, dyaw, existence) prediction.
+   cached causal source tensors resident on GPU -> six-horizon motion outputs.
 
-2) prepared_forecast:
-   cached causal source representation + in-memory history occupancy/poses ->
-   six dense future occupancy grids.  This includes the Clean model, exact
-   Strong/KTA anchor reconstruction, SE(2) rigid transport and hard-A1
-   composition.  It excludes disk I/O, GT, metrics and bootstrap.  This is the
-   closest apples-to-apples boundary to OccFM's released cfm_eval CUDA timer,
-   which starts after its cached latent input has already been prepared.
+2) cached_representation_forecast_6frames (main OccFM-comparable boundary):
+   cached causal source representation + precomputed deterministic Strong/KTA
+   prior -> six dense future occupancy grids.  It includes Clean-E14 forward,
+   SE(2) rigid rendering and hard-A1 composition, while excluding disk I/O, GT
+   and metrics.  OccFM's released cfm_eval timer likewise starts after cached
+   latent preparation and includes its generative sampling + decoder.
 
-3) source_extract_match:
-   in-memory t-1/t0 occupancy + poses -> Strong connected components and causal
-   matching.  It is reported separately because V18's learned representation
-   cache is frozen/precomputed in the formal benchmark, just as OccFM evaluates
-   from cached latent inputs.
+3) full_causal_forecast_in_memory_6frames:
+   the above plus deterministic Strong/KTA prior reconstruction.
+
+4) source_extract_match:
+   t-1/t0 occupancy + poses -> Strong connected components and causal matching,
+   reported separately as representation/preparation cost.
 
 The first measured window performs exactness checks against the historical
 Strong-W2Det and rigid-raster implementations.  This file changes no model or
