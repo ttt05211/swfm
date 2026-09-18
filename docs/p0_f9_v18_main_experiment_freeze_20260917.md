@@ -40,11 +40,20 @@ which is equivalent to the GT box-centred planar rigid transform while preservin
 
 ## 3. Frozen clean training protocol
 
-Training mode: `clean_one_stage_from_scratch_v1`.
+The frozen primary checkpoint is **Clean-E14**. Its checkpoint metadata is
+`training_mode=clean_one_stage_from_scratch_v1_tail_continuation`.
 
-The model is trained from scratch with zero-initialized XY/yaw output heads. There is no V17->V18 continuation in the main method.
+The important methodological contract is still single-stage in architecture and
+objective: V18 is initialized from scratch with zero-initialized XY/yaw output
+heads, and there is **no V17->V18 weight warm-start** in the main method.  The
+initial clean run uses the cosine schedule in
+`train_p0_f9_v18_se2_clean.py`; the selected E14 checkpoint then continues
+that same clean model with restored AdamW state and a fixed tail LR using
+`continue_p0_f9_v18_se2_clean_tail.py`.  The tail continuation changes only
+the optimizer schedule duration; it does not change architecture, targets,
+losses, data population, or inference.
 
-Objective from step 1 to the end:
+Objective from step 1 through the tail:
 
 `L = L_trans + L_exist + 19.0 * L_yaw + 0.25 * L_shape_SE2`
 
@@ -55,7 +64,14 @@ where:
 - `L_yaw`: periodic yaw loss.
 - `L_shape_SE2`: differentiable GT-relative SE(2) source-footprint overlap loss.
 
-Optimizer/schedule are the frozen Clean protocol in `train_p0_f9_v18_se2_clean.py`; no long-tail sampler, anti-regret loss, confidence gate, extra scene CE, Lovasz, native-footprint replacement objective, voxel flow, or post-hoc two-wheel weighting belongs to the main method.
+The exact tail source checkpoint, tail LR, epoch/global-step and optimizer state
+are part of the frozen Clean-E14 checkpoint metadata.  Runtime and metric
+scripts must use the exact `clean_checkpoint` recorded in the frozen
+provenance JSON, not another tail epoch.
+
+No long-tail sampler, anti-regret loss, confidence gate, extra scene CE, Lovasz,
+native-footprint replacement objective, voxel flow, or post-hoc two-wheel
+weighting belongs to the main method.
 
 ### Training population
 
