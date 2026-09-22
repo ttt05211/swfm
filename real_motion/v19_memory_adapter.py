@@ -1,9 +1,9 @@
 """V19 memory-only adapter for the frozen Clean-E14 V18 source forecaster.
 
-The adapter is structurally gated.  A source observed at the current block
-anchor has gate=0, so its path is mathematically identical to Clean-E14 even
-after the memory adapter has been trained.  Only memory-only sources
-(dormant/persistent/predicted-birth) receive the new status embedding and
+The adapter is structurally gated. A source detected in the current block
+state has gate=0, so its path is mathematically identical to Clean-E14 even
+after the memory adapter has been trained. Real-observation age is tracked
+separately; only memory-only sources receive the new status embedding and
 zero-initialized residual heads.
 """
 from __future__ import annotations
@@ -125,8 +125,10 @@ class MemoryAdaptedV18SE2(LocalSpatialTemporalWorldModelV18SE2):
             }
 
         status = history_status.to(features.dtype)
-        # status[:,0] = 1 only when the source is truly observed at the current
-        # block anchor.  Such sources are protected from all new modules.
+        # status[:,0] = 1 when the source is detected in the current block
+        # state. This may be a real observation in block 1 or a re-detected
+        # source from generated occupancy in open-loop rollout. Such sources
+        # are protected from all new modules.
         gate = (1.0 - status[:, 0]).clamp(0.0, 1.0)
         status_emb = self.status_proj(status) * gate[:, None]
 
