@@ -26,6 +26,7 @@ from real_motion.v19_scene_memory import (
     StaticWorldMemory,
     build_dynamic_source_memory,
     protected_add_only,
+    render_static_history_mosaic,
 )
 
 
@@ -175,6 +176,38 @@ def test_static_memory_observed_free_clears_but_dynamic_does_not():
     mem.update(sem3, obs3, pose, grid=grid, free_label=free, frame_index=2)
     assert mem.render(pose, grid=grid, free_label=free)[1, 1, 0] == free
 
+
+
+def test_fast_static_mosaic_recent_free_wins_and_dynamic_does_not_clear():
+    grid = OccupancyGrid(
+        x_min=0.0,
+        y_min=0.0,
+        z_min=0.0,
+        voxel_size=(1.0, 1.0, 1.0),
+        shape_hwd=(4, 4, 2),
+    )
+    free = 17
+    hist = np.full((HISTORY_FRAMES, *grid.shape_hwd), free, dtype=np.uint8)
+    obs = np.zeros_like(hist, dtype=bool)
+    poses = [np.eye(4, dtype=np.float64) for _ in range(HISTORY_FRAMES)]
+
+    # Old static evidence.
+    hist[0, 1, 1, 0] = 11
+    obs[0, 1, 1, 0] = True
+    # Dynamic occluder does not clear the map.
+    hist[1, 1, 1, 0] = 4
+    obs[1, 1, 1, 0] = True
+    out = render_static_history_mosaic(
+        hist, obs, poses, poses[-1], grid=grid, free_label=free
+    )
+    assert out[1, 1, 0] == 11
+
+    # Newer genuinely observed free evidence does clear it.
+    obs[-1, 1, 1, 0] = True
+    out = render_static_history_mosaic(
+        hist, obs, poses, poses[-1], grid=grid, free_label=free
+    )
+    assert out[1, 1, 0] == free
 
 def test_protected_add_only_never_overwrites_base():
     free = 17
