@@ -157,3 +157,60 @@ exactness gate: rebuilding the causal source representation from raw occupancy
 must reproduce the frozen cached tensors (within 1e-6 for floating tensors) and
 all six dense Clean predictions exactly.  The second block then uses this same
 builder on first-block **predicted** occupancy.
+
+
+## 9. Completed frozen Clean-E14 zero-shot 6 s rollout
+
+The exact two-shard merge completed on all 3,469 long-window samples.
+
+| Horizon | IoU | mIoU | Moving-Macro | Moving-Micro |
+|---|---:|---:|---:|---:|
+| 1 s | 58.616 | 51.759 | 41.466 | 46.987 |
+| 2 s | 52.494 | 41.602 | 24.650 | 28.860 |
+| 3 s | 48.322 | 35.582 | 15.301 | 17.613 |
+| 4 s | 40.492 | 28.835 | 9.617 | 11.064 |
+| 5 s | 36.994 | 25.412 | 6.232 | 7.413 |
+| 6 s | 34.184 | 22.945 | 4.362 | 5.474 |
+
+Averages:
+- 1/2/3 s: IoU 53.1439, mIoU 42.9811, Moving-Macro 27.1391,
+  Moving-Micro 31.1535.
+- 4/5/6 s: IoU 37.2234, mIoU 25.7310, Moving-Macro 6.7371,
+  Moving-Micro 7.9839.
+
+Important observations:
+
+- There is no obvious catastrophic discontinuity exactly at the 3 -> 4 s
+  block boundary.  mIoU drops 6.020 pp from 2 -> 3 s and 6.747 pp from
+  3 -> 4 s; Moving-Micro drops more from 2 -> 3 s than from 3 -> 4 s.
+  Recursive predicted-history shift may still contribute, but the full result
+  does not support describing it as the sole or dominant long-horizon failure.
+- Long-horizon motion quality degrades substantially faster than conventional
+  occupancy quality.  At 6 s, mIoU remains 22.945 while Moving-Micro is 5.474.
+- The paired transportability diagnostic also shows that t0 observed-geometry
+  coverage falls strongly with horizon, so long-range scene innovation /
+  disocclusion is a separate structural limitation from recursive motion drift.
+- The two shard results are very similar and merge by exact summed raw
+  intersection/union counts; the merged result is the authoritative value.
+
+Output:
+`outputs/p0_f9_v18_zero_shot_long_rollout_3469.json`.
+
+## 10. Final causal diagnostic: teacher-forced second-block history
+
+The evaluator now supports:
+
+`--second-block-history gt`
+
+This diagnostic replaces only the second block's 0.5--3.0 s predicted-history
+occupancy with GT occupancy while keeping the same frozen Clean-E14 checkpoint,
+source extraction, KTA, local tube, future ego conditioning, SE(2) renderer and
+A1 composition.  It explicitly uses future GT occupancy as an input and is
+therefore diagnostic-only.
+
+Interpretation:
+- large GT-history gain at 4--6 s => recursive source/history drift is important;
+- small GT-history gain => the dominant ceiling is long-horizon prediction plus
+  newly revealed / non-transportable scene content rather than exposure error.
+
+Do not mix teacher-forced results with the formal zero-shot table.
