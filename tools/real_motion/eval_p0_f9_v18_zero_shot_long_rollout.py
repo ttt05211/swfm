@@ -497,6 +497,16 @@ def main():
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--shard-index", type=int, default=0)
+    p.add_argument(
+        "--second-block-history",
+        choices=("pred", "gt"),
+        default="pred",
+        help=(
+            "pred: formal open-loop rollout from first-block predictions; "
+            "gt: teacher-forced diagnostic using GT 0.5--3.0 s occupancy as "
+            "the second block history (future GT is then used for prediction)"
+        ),
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--progress-every", type=int, default=25)
     a = p.parse_args()
@@ -584,7 +594,12 @@ def main():
             _release_gpu_inputs(state1)
         stage_ms["block1_forecast"].append((time.perf_counter() - _t) * 1000.0)
 
-        # Block 2: exact same six-query model from its own six predicted frames.
+        # Block 2: reuse the exact same six-query model.
+        #
+        # Formal mode (pred): consume only the six first-block predictions.
+        # Diagnostic mode (gt): teacher-force the six 0.5--3.0 s GT occupancy
+        # frames to isolate recursive representation drift from the intrinsic
+        # 3.5--6.0 s forecasting / transport ceiling.
         poses1 = [
             np.asarray(source.pose(tok), dtype=np.float64)
             for tok in w.future_tokens[:6]
@@ -593,10 +608,21 @@ def main():
             np.asarray(source.pose(tok), dtype=np.float64)
             for tok in w.future_tokens[6:12]
         ]
+        if str(a.second_block_history) == "gt":
+            history2_occ = [
+                np.asarray(
+                    source.load_semantics(w.scene_name, tok),
+                    dtype=np.uint8,
+                )
+                for tok in w.future_tokens[:6]
+            ]
+        else:
+            history2_occ = pred1
+
         build_profile = {}
         _t = time.perf_counter()
         state2 = _build_block_state(
-            pred1, poses1, poses2, pcfg, strong_cfg, device,
+            history2_occ, poses1, poses2, pcfg, strong_cfg, device,
             profile=build_profile,
         )
         stage_ms["block2_build"].append((time.perf_counter() - _t) * 1000.0)
@@ -679,16 +705,33 @@ def main():
         "relative_future_frames_per_block": FUTURE_FRAMES,
         "rollout_blocks": 2,
         "report_horizons_s": list(REPORT_HORIZONS),
-        "future_gt_used_for_prediction": False,
+        "evaluation_mode": (
+            "teacher_forced_gt_second_block_history"
+            if str(a.second_block_history) == "gt"
+            else "open_loop_pred_second_block_history"
+        ),
+        "second_block_history": str(a.second_block_history),
+        "future_gt_used_for_prediction": bool(str(a.second_block_history) == "gt"),
         "future_ego_pose_used_through_s": 6.0,
         "conditioning_contract": (
             "same GT-future-ego information class as frozen V18/OccFM-Fut; "
-            "second block consumes only first-block predicted occupancies plus poses"
+            + (
+                "teacher-forced diagnostic additionally consumes GT occupancy "
+                "from 0.5--3.0 s as second-block history"
+                if str(a.second_block_history) == "gt"
+                else "formal second block consumes only first-block predicted "
+                     "occupancies plus poses"
+            )
         ),
         "rollout_contract": (
             "frozen Clean-E14 0.5--3.0 s parallel block, then rebuild causal "
-            "Strong sources/backward tracks/KTA/local semantic tubes from those "
-            "six predictions and reuse the same frozen checkpoint for 3.5--6.0 s"
+            "Strong sources/backward tracks/KTA/local semantic tubes from "
+            + (
+                "GT 0.5--3.0 s occupancy (teacher-forced diagnostic)"
+                if str(a.second_block_history) == "gt"
+                else "the six first-block predictions (formal open-loop rollout)"
+            )
+            + " and reuse the same frozen checkpoint for 3.5--6.0 s"
         ),
         "exactness_gate": (
             "first selected real-history window synthetic rebuild must reproduce "
@@ -708,7 +751,15 @@ def main():
     op.parent.mkdir(parents=True, exist_ok=True)
     op.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
-    print("\n=== V18 ZERO-SHOT BLOCK ROLLOUT 1--6s ===")
+    print(
+        "\n=== V18 "
+        + (
+            "TEACHER-FORCED GT-HISTORY DIAGNOSTIC"
+            if str(a.second_block_history) == "gt"
+            else "ZERO-SHOT BLOCK ROLLOUT"
+        )
+        + " 1--6s ==="
+    )
     print(
         f"{'horizon':>8s} {'IoU':>9s} {'mIoU':>9s} "
         f"{'MovMacro':>10s} {'MovMicro':>10s}"
