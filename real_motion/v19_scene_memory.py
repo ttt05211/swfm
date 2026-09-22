@@ -112,6 +112,7 @@ class SourceTrack:
     current_component_index: int | None = None
     last_component_voxel_count: int = 0
     last_real_observation_age_s_override: float | None = None
+    detected_at_anchor_override: bool | None = None
 
     def __post_init__(self):
         self.track_id = int(self.track_id)
@@ -143,11 +144,28 @@ class SourceTrack:
             )
             if self.last_real_observation_age_s_override < 0:
                 raise ValueError("last real observation age must be non-negative")
+        if self.detected_at_anchor_override is not None:
+            self.detected_at_anchor_override = bool(
+                self.detected_at_anchor_override
+            )
 
     @property
     def observed_at_anchor(self) -> bool:
+        """Whether a real causal observation exists at the block anchor."""
         if self.last_real_observation_age_s_override is not None:
             return self.last_real_observation_age_s_override <= 1e-8
+        return bool(self.valid_history[-1])
+
+    @property
+    def detected_at_anchor(self) -> bool:
+        """Whether the current scene state contains a detected source.
+
+        In the first real-history block this equals observed_at_anchor.
+        During open-loop rollout, a component re-detected from generated
+        occupancy may be present even though no new real observation exists.
+        """
+        if self.detected_at_anchor_override is not None:
+            return bool(self.detected_at_anchor_override)
         return bool(self.valid_history[-1])
 
     def state_age_s(self, frame_dt_s: float) -> float:
@@ -172,7 +190,7 @@ class SourceTrack:
         age = self.last_real_observation_age_s(frame_dt_s)
         return np.asarray(
             [
-                1.0 if self.observed_at_anchor else 0.0,
+                1.0 if self.detected_at_anchor else 0.0,
                 min(age / 1.5, 2.0),
                 float(np.clip(self.confidence, 0.0, 1.0)),
                 1.0 if self.provenance == PROVENANCE_PREDICTED_BIRTH else 0.0,
@@ -634,6 +652,7 @@ def persistent_tracks_from_v18_predictions(
                     comp.get("voxel_count", len(comp["voxel_indices"]))
                 ),
                 last_real_observation_age_s_override=real_age,
+                detected_at_anchor_override=False,
             )
         )
     return tracks
