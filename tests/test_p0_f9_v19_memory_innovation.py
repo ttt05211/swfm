@@ -26,11 +26,13 @@ from real_motion.v19_scene_memory import (
     SourceTrack,
     StaticWorldMemory,
     build_dynamic_source_memory,
+    persistent_tracks_from_v18_predictions,
     protected_add_only,
     render_static_history_mosaic,
 )
 from real_motion.v19_source_reconciliation import (
     SourceReconciliationConfig,
+    assign_detected_track_ids,
     effective_memory_confidence,
     reconcile_detected_sources,
     select_memory_only_tracks,
@@ -237,6 +239,66 @@ def test_source_reconciliation_never_matches_wrong_class_even_when_closer():
     assert rec.unmatched_detected == (0,)
     assert rec.unmatched_memory == (0,)
 
+
+
+def test_reconciliation_assigns_stable_ids_and_persistent_promotion_keeps_them():
+    memory = [
+        _memory_track(41, 4, (5.0, 5.0)),
+        _memory_track(57, 3, (10.0, 10.0)),
+    ]
+    detected = [
+        {"class_id": 4, "centroid_world": np.asarray([5.2, 5.0, 0.0])},
+        {"class_id": 6, "centroid_world": np.asarray([2.0, 2.0, 0.0])},
+    ]
+    rec = reconcile_detected_sources(
+        detected,
+        memory,
+        frame_dt_s=0.5,
+        config=SourceReconciliationConfig(max_center_distance_m=4.0),
+    )
+    ids = assign_detected_track_ids(
+        rec,
+        memory,
+        num_detected=len(detected),
+    )
+    assert ids.track_ids[0] == 41
+    assert ids.track_ids[1] > 57
+    assert ids.matched_memory_index == (0, None)
+
+    components = [
+        {
+            "class_id": 4,
+            "centroid_world": np.asarray([5.2, 5.0, 0.0]),
+            "voxel_indices": np.asarray([[1, 1, 0], [1, 2, 0]]),
+            "voxel_count": 2,
+        },
+        {
+            "class_id": 6,
+            "centroid_world": np.asarray([2.0, 2.0, 0.0]),
+            "voxel_indices": np.asarray([[2, 2, 0], [2, 3, 0]]),
+            "voxel_count": 2,
+        },
+    ]
+    source_world_points = [
+        np.asarray([[5.0, 5.0, 0.0], [5.5, 5.0, 0.0]]),
+        np.asarray([[2.0, 2.0, 0.0], [2.5, 2.0, 0.0]]),
+    ]
+    anchors = np.zeros((2, FUTURE_FRAMES, 2), dtype=np.float32)
+    for i, comp in enumerate(components):
+        anchors[i, :, 0] = float(comp["centroid_world"][0])
+        anchors[i, :, 1] = float(comp["centroid_world"][1])
+    promoted = persistent_tracks_from_v18_predictions(
+        components,
+        source_world_points,
+        np.eye(4, dtype=np.float64),
+        anchors,
+        np.zeros_like(anchors),
+        np.zeros((2, FUTURE_FRAMES), dtype=np.float32),
+        frame_dt_s=0.5,
+        track_ids=ids.track_ids,
+    )
+    assert [tr.track_id for tr in promoted] == list(ids.track_ids)
+    assert all(not tr.detected_at_anchor for tr in promoted)
 
 def test_memory_recovery_age_and_confidence_gates_are_causal():
     memory = [
