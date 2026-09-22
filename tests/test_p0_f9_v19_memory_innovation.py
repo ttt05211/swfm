@@ -22,11 +22,18 @@ from real_motion.v19_memory_adapter import (
 )
 from real_motion.v19_scene_memory import (
     PROVENANCE_OBSERVED_HISTORY,
+    PROVENANCE_PERSISTENT_PREDICTION,
     SourceTrack,
     StaticWorldMemory,
     build_dynamic_source_memory,
     protected_add_only,
     render_static_history_mosaic,
+)
+from real_motion.v19_source_reconciliation import (
+    SourceReconciliationConfig,
+    effective_memory_confidence,
+    reconcile_detected_sources,
+    select_memory_only_tracks,
 )
 
 
@@ -141,6 +148,128 @@ def test_source_memory_keeps_current_order_and_appends_dormant():
         for tr in tracks[1:]
     )
 
+
+
+def _memory_track(
+    track_id,
+    class_id,
+    center_xy,
+    *,
+    real_age_s=3.0,
+    confidence=1.0,
+):
+    centers = np.zeros((HISTORY_FRAMES, 3), dtype=np.float64)
+    centers[:, 0] = float(center_xy[0])
+    centers[:, 1] = float(center_xy[1])
+    valid = np.ones(HISTORY_FRAMES, dtype=bool)
+    return SourceTrack(
+        track_id=int(track_id),
+        class_id=int(class_id),
+        canonical_xyz_local=np.asarray(
+            [[-0.5, -0.5, 0.0], [0.5, 0.5, 0.0]],
+            dtype=np.float64,
+        ),
+        centers_world=centers,
+        valid_history=valid,
+        velocity_world=np.zeros(3, dtype=np.float64),
+        last_observed_frame=HISTORY_FRAMES - 1,
+        confidence=float(confidence),
+        provenance=PROVENANCE_PERSISTENT_PREDICTION,
+        last_component_voxel_count=2,
+        last_real_observation_age_s_override=float(real_age_s),
+        detected_at_anchor_override=False,
+    )
+
+
+def test_source_reconciliation_preserves_detection_order_and_only_recovers_unmatched():
+    memory = [
+        _memory_track(10, 4, (5.0, 5.0)),
+        _memory_track(11, 3, (10.0, 10.0)),
+        _memory_track(12, 4, (20.0, 20.0)),
+    ]
+    detected = [
+        {"class_id": 4, "centroid_world": np.asarray([5.5, 5.0, 0.0])},
+        {"class_id": 6, "centroid_world": np.asarray([2.0, 2.0, 0.0])},
+        {"class_id": 3, "centroid_world": np.asarray([10.2, 10.0, 0.0])},
+    ]
+    cfg = SourceReconciliationConfig(
+        max_center_distance_m=4.0,
+        max_memory_age_s=6.0,
+        confidence_tau_s=3.0,
+        min_memory_confidence=0.15,
+    )
+    rec = reconcile_detected_sources(
+        detected,
+        memory,
+        frame_dt_s=0.5,
+        config=cfg,
+    )
+    assert [m.detected_index for m in rec.matches] == [0, 2]
+    assert [m.memory_index for m in rec.matches] == [0, 1]
+    assert rec.unmatched_detected == (1,)
+    assert rec.unmatched_memory == (2,)
+
+    sel = select_memory_only_tracks(
+        memory,
+        rec,
+        frame_dt_s=0.5,
+        config=cfg,
+    )
+    assert sel.memory_indices == (2,)
+    assert len(sel.tracks) == 1
+    assert sel.tracks[0].track_id == 12
+    assert not sel.tracks[0].detected_at_anchor
+    assert sel.tracks[0].confidence < 1.0
+
+
+def test_source_reconciliation_never_matches_wrong_class_even_when_closer():
+    memory = [_memory_track(1, 4, (0.0, 0.0))]
+    detected = [
+        {"class_id": 3, "centroid_world": np.asarray([0.0, 0.0, 0.0])}
+    ]
+    rec = reconcile_detected_sources(
+        detected,
+        memory,
+        frame_dt_s=0.5,
+        config=SourceReconciliationConfig(max_center_distance_m=4.0),
+    )
+    assert rec.matches == ()
+    assert rec.unmatched_detected == (0,)
+    assert rec.unmatched_memory == (0,)
+
+
+def test_memory_recovery_age_and_confidence_gates_are_causal():
+    memory = [
+        _memory_track(1, 4, (0.0, 0.0), real_age_s=3.0, confidence=1.0),
+        _memory_track(2, 4, (10.0, 0.0), real_age_s=7.0, confidence=1.0),
+    ]
+    rec = reconcile_detected_sources(
+        [],
+        memory,
+        frame_dt_s=0.5,
+        config=SourceReconciliationConfig(max_center_distance_m=4.0),
+    )
+    cfg = SourceReconciliationConfig(
+        max_center_distance_m=4.0,
+        max_memory_age_s=6.0,
+        confidence_tau_s=3.0,
+        min_memory_confidence=0.30,
+    )
+    sel = select_memory_only_tracks(
+        memory,
+        rec,
+        frame_dt_s=0.5,
+        config=cfg,
+    )
+    # age=3, tau=3 -> exp(-1)=0.3679: retained; age=7: rejected.
+    assert sel.memory_indices == (0,)
+    assert sel.dropped_by_age == (1,)
+    assert np.isclose(
+        effective_memory_confidence(
+            memory[0], frame_dt_s=0.5, confidence_tau_s=3.0
+        ),
+        np.exp(-1.0),
+    )
 
 def test_static_memory_observed_free_clears_but_dynamic_does_not():
     grid = OccupancyGrid(
