@@ -207,3 +207,77 @@ Run in this order:
    dynamic births into SourceMemory.
 
 Do not train the full V19-MIR stack before gates 1--3 have been measured.
+
+
+## 6. Source reconciliation: detection remains authoritative
+
+The first persistent-source rollout ablation showed that replacing second-block
+Strong redetection with pure propagated source memory is not the intended final
+design. On the 32-window smoke, persistent memory changed average 4--6 s mIoU
+only slightly but reduced Moving-Macro/Micro relative to the matched V18
+redetection path.
+
+V19 therefore uses source memory as a lifecycle layer, not as a replacement for
+the current source state:
+
+    current/generated occupancy
+        -> frozen Strong source redetection
+        -> reconcile with SourceMemory
+             matched detected source -> exact frozen V18 path
+             unmatched detected      -> exact frozen V18 path + new identity
+             unmatched memory        -> confidence-gated add-only recovery
+
+Implementation:
+
+- real_motion/v19_source_reconciliation.py
+- tools/real_motion/eval_p0_f9_v19_memory_rollout.py
+
+The association is deterministic same-class nearest one-to-one matching in
+world XY. The frozen detected-source order is never changed.
+
+The memory recovery branch is evaluated separately from the frozen path.
+Therefore adding memory-only sources cannot numerically perturb current-source
+Clean-E14 predictions through batching or shared composition. Recovery output
+is restricted to dynamic semantics and is composed only into free voxels.
+
+Source state now separates two concepts:
+
+- detected_at_anchor: whether the current scene state has a source component;
+- age_since_real_observation: elapsed time since a real causal sensor
+  observation.
+
+This matters in open-loop rollout: a source can be re-detected from generated
+occupancy while its real-observation age continues to grow.
+
+Matched tracks preserve their stable track IDs. Newly detected sources receive
+fresh IDs. This provides the lifecycle contract required for future
+innovation-to-memory promotion without changing any V18 prediction tensor.
+
+## 7. Current evidence and design status
+
+Completed smoke evidence before the reconciliation implementation:
+
+- zero-training dormant KTA on 64 windows:
+  mIoU -0.069 pp, Moving-Micro -0.029 pp;
+- zero-training static memory on the same 64 windows:
+  IoU +0.545 pp, mIoU +0.195 pp, Moving unchanged;
+- on a matched 32-window 3--6 s rollout, replacing redetection with pure
+  persistent source memory changed average mIoU from 30.847 to 30.902 but
+  Moving-Micro from 10.079 to 8.924;
+- adding static memory on top of the persistent path increased average 4--6 s
+  mIoU from 30.902 to 34.304 while leaving its Moving metrics unchanged.
+
+Interpretation:
+
+1. Static memory has direct zero-training evidence and remains part of the
+   primary V19 hypothesis.
+2. Pure persistent dynamic replacement is a negative ablation.
+3. Dynamic source memory remains useful for lifecycle/recovery, but only through
+   reconciliation with the detected V18 state.
+4. Innovation remains justified by large perfect-add static/shape headroom, but
+   it is still gated by corrected decomposition diagnostics before training.
+
+The decomposition diagnostic was subsequently corrected to use the frozen
+Moving-IoU 0.5 m box margin for dynamic attribution. Dynamic category numbers
+from earlier smoke output must not be frozen until this corrected diagnostic is
+rerun.
