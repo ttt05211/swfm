@@ -83,7 +83,7 @@ from tools.real_motion.eval_p0_f9_v18_zero_shot_long_rollout import (
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 
 
-PROTOCOL = "p0_f9_v19_memory_zero_training_rollout_6s_v1"
+PROTOCOL = "p0_f9_v19_memory_zero_training_rollout_6s_v2"
 VARIANTS = (
     "v18_redetect_baseline",
     "v18_redetect_static",
