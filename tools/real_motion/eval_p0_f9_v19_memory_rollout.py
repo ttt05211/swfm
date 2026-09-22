@@ -69,6 +69,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.eval_p0_f9_v18_zero_shot_long_rollout import (
     REPORT_HORIZONS,
     REPORT_INDEX,
+    _build_block_state,
     _finalize,
     _new_raw,
     _update_raw,
@@ -77,7 +78,11 @@ from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOC
 
 
 PROTOCOL = "p0_f9_v19_memory_zero_training_rollout_6s_v1"
-VARIANTS = ("persistent_source", "persistent_source_static")
+VARIANTS = (
+    "v18_redetect_baseline",
+    "persistent_source",
+    "persistent_source_static",
+)
 
 
 class CachedSource(NuScenesWindowSource):
@@ -308,6 +313,25 @@ def main():
             np.asarray(source.pose(tok), dtype=np.float64)
             for tok in w.future_tokens[6:12]
         ]
+        # Matched formal V18 open-loop baseline on the exact same selected
+        # windows: rebuild the second block from predicted occupancy via
+        # component extraction + identity matching.
+        baseline_state2 = _build_block_state(
+            pred1,
+            poses1,
+            poses2,
+            pcfg,
+            strong_cfg,
+            device,
+        )
+        _stage_gpu_inputs(baseline_state2, device)
+        try:
+            pred2_baseline = _forecast_once(
+                model, baseline_state2, pcfg, strong_cfg, device
+            )
+        finally:
+            _release_gpu_inputs(baseline_state2)
+
         rec2 = prepare_causal_arrays_from_tracks(
             tracks,
             pred1,
@@ -382,11 +406,21 @@ def main():
                 grid=pcfg.grid,
             )
             if block == "first":
+                p_base = pred1[rel_idx]
                 p_source = pred1[rel_idx]
                 p_static = pred1[rel_idx]
             else:
+                p_base = pred2_baseline[rel_idx]
                 p_source = pred2[rel_idx]
                 p_static = pred2_static[rel_idx]
+            _update_raw(
+                raw["v18_redetect_baseline"],
+                hi,
+                p_base,
+                gt,
+                moving,
+                int(pcfg.free_label),
+            )
             _update_raw(
                 raw["persistent_source"],
                 hi,
@@ -428,6 +462,11 @@ def main():
         "future_gt_used_for_prediction": False,
         "future_ego_pose_used_through_s": 6.0,
         "variant_contracts": {
+            "v18_redetect_baseline": (
+                "matched original V18 zero-shot second block on the exact same "
+                "selected windows: predicted occupancy -> component extraction "
+                "and matching -> frozen Clean-E14"
+            ),
             "persistent_source": (
                 "first block frozen Clean-E14; second block reuses predicted "
                 "source trajectories/canonical geometry directly without "
