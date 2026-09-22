@@ -769,6 +769,71 @@ class StaticWorldMemory:
         return out
 
 
+
+def track_voxel_indices_in_ego(
+    track: SourceTrack,
+    center_world: np.ndarray,
+    ego_to_world: np.ndarray,
+    *,
+    grid,
+) -> np.ndarray:
+    """Rasterize a track's canonical point geometry into one ego grid."""
+    center = np.asarray(center_world, dtype=np.float64)
+    if center.shape != (3,):
+        raise ValueError("center_world must be [3]")
+    pts_world = center[None] + np.asarray(
+        track.canonical_xyz_local, dtype=np.float64
+    )
+    if len(pts_world) == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+    W2E = np.linalg.inv(np.asarray(ego_to_world, dtype=np.float64))
+    pts_ego = _transform_points(W2E, pts_world)
+    origin = np.asarray(
+        [grid.x_min, grid.y_min, grid.z_min], dtype=np.float64
+    )
+    step = np.asarray(grid.voxel_size, dtype=np.float64)
+    idx = np.floor((pts_ego - origin[None]) / step[None]).astype(np.int64)
+    shape = np.asarray(grid.shape_hwd, dtype=np.int64)
+    valid = np.all((idx >= 0) & (idx < shape[None]), axis=1)
+    idx = idx[valid]
+    if len(idx) == 0:
+        return idx.reshape(0, 3)
+    # Stable lexicographic de-duplication.
+    order = np.lexsort((idx[:, 2], idx[:, 1], idx[:, 0]))
+    s = idx[order]
+    keep = np.ones(len(s), dtype=bool)
+    keep[1:] = np.any(s[1:] != s[:-1], axis=1)
+    return s[keep]
+
+
+def render_track_kta_add_only(
+    base: np.ndarray,
+    track: SourceTrack,
+    future_ego_to_world: np.ndarray,
+    *,
+    horizon_s: float,
+    frame_dt_s: float,
+    grid,
+    free_label: int,
+) -> np.ndarray:
+    """Add one memory track under constant velocity without clearing anything."""
+    anchor = track.anchor_center_world(float(frame_dt_s))
+    target = anchor + np.asarray(track.velocity_world, dtype=np.float64) * float(
+        horizon_s
+    )
+    idx = track_voxel_indices_in_ego(
+        track,
+        target,
+        future_ego_to_world,
+        grid=grid,
+    )
+    out = np.asarray(base).copy()
+    if len(idx):
+        free = out[idx[:, 0], idx[:, 1], idx[:, 2]] == int(free_label)
+        q = idx[free]
+        out[q[:, 0], q[:, 1], q[:, 2]] = int(track.class_id)
+    return out
+
 def protected_add_only(
     base: np.ndarray,
     proposal: np.ndarray,
