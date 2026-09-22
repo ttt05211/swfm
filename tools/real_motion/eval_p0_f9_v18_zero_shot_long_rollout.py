@@ -70,6 +70,7 @@ from real_motion.runtime_config import (
 from real_motion.runtime_fastpath import (
     baseline_clear_flat_indices,
     baseline_clear_mask,
+    extract_instances_cropped_exact,
 )
 from real_motion.strong_w2det import (
     StrongW2DetConfig,
@@ -230,6 +231,7 @@ def _build_block_state(
     pcfg,
     strong_cfg,
     device,
+    profile=None,
 ):
     if len(history_occ) != HISTORY_FRAMES or len(history_poses) != HISTORY_FRAMES:
         raise ValueError("block history must contain six frames")
@@ -240,10 +242,23 @@ def _build_block_state(
     history_poses = [np.asarray(x, dtype=np.float64) for x in history_poses]
     future_poses = [np.asarray(x, dtype=np.float64) for x in future_poses]
 
+    _t = time.perf_counter()
+    # Runtime-proven exact fast path: class-local cropped connected components.
+    # It preserves the frozen component order, voxel indices and centroid values
+    # while avoiding eight full-grid scipy label passes per semantic class.
     components_by_frame = [
-        extract_instances(sem, pose, grid=pcfg.grid, cfg=strong_cfg)
+        extract_instances_cropped_exact(
+            sem, pose, grid=pcfg.grid, cfg=strong_cfg
+        )
         for sem, pose in zip(history_occ, history_poses)
     ]
+    if profile is not None:
+        profile["component_extract_ms"] = (
+            profile.get("component_extract_ms", 0.0)
+            + (time.perf_counter() - _t) * 1000.0
+        )
+
+    _t = time.perf_counter()
     current = components_by_frame[-1]
     previous = components_by_frame[-2]
     velocities = match_instances(
@@ -266,6 +281,11 @@ def _build_block_state(
         frame_dt_s=float(pcfg.frame_dt_s),
         grid=pcfg.grid,
     )
+    if profile is not None:
+        profile["track_features_ms"] = (
+            profile.get("track_features_ms", 0.0)
+            + (time.perf_counter() - _t) * 1000.0
+        )
     features = torch.from_numpy(features_np)
     source_xy, kta_np, anchors_np = _kta_tensors(
         current,
@@ -274,6 +294,7 @@ def _build_block_state(
         float(pcfg.frame_dt_s),
     )
     kta = torch.from_numpy(kta_np)
+    _t = time.perf_counter()
     offsets = history_offsets_from_features(features)
     tube_np = build_local_semantic_tubes(
         history_occ,
@@ -285,6 +306,11 @@ def _build_block_state(
         free_label=int(pcfg.free_label),
     )
     tube = torch.from_numpy(tube_np)
+    if profile is not None:
+        profile["local_tube_ms"] = (
+            profile.get("local_tube_ms", 0.0)
+            + (time.perf_counter() - _t) * 1000.0
+        )
     class_ids = torch.as_tensor(
         [int(c["class_id"]) for c in current], dtype=torch.long
     )
@@ -328,6 +354,7 @@ def _build_block_state(
         ],
         dtype=np.float64,
     )
+    _t = time.perf_counter()
     anchors, baseline_by_hi = _strong_all_horizons(
         current_sem,
         current_pose,
@@ -340,6 +367,11 @@ def _build_block_state(
         cfg=strong_cfg,
         runtime_device=device,
     )
+    if profile is not None:
+        profile["strong_prior_ms"] = (
+            profile.get("strong_prior_ms", 0.0)
+            + (time.perf_counter() - _t) * 1000.0
+        )
     baseline_clear_by_hi = [
         baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi
     ]
@@ -516,15 +548,31 @@ def main():
     raw = _new_raw()
     started = time.perf_counter()
     progress_path = str(Path(a.output).with_suffix(".progress.json"))
+    stage_ms = {
+        "block1_prepare": [],
+        "block1_forecast": [],
+        "block2_build": [],
+        "block2_forecast": [],
+        "metrics": [],
+        "block2_component_extract": [],
+        "block2_track_features": [],
+        "block2_local_tube": [],
+        "block2_strong_prior": [],
+    }
 
     for wi, (w, rec) in enumerate(selected, start=1):
         # Block 1: exact frozen deployment path from real history.
+        _t = time.perf_counter()
         state1 = _prepare_record(rec, source, pcfg, strong_cfg, device)
+        stage_ms["block1_prepare"].append((time.perf_counter() - _t) * 1000.0)
+
+        _t = time.perf_counter()
         _stage_gpu_inputs(state1, device)
         try:
             pred1 = _forecast_once(model, state1, pcfg, strong_cfg, device)
         finally:
             _release_gpu_inputs(state1)
+        stage_ms["block1_forecast"].append((time.perf_counter() - _t) * 1000.0)
 
         # Block 2: exact same six-query model from its own six predicted frames.
         poses1 = [
@@ -535,15 +583,30 @@ def main():
             np.asarray(source.pose(tok), dtype=np.float64)
             for tok in w.future_tokens[6:12]
         ]
+        build_profile = {}
+        _t = time.perf_counter()
         state2 = _build_block_state(
-            pred1, poses1, poses2, pcfg, strong_cfg, device
+            pred1, poses1, poses2, pcfg, strong_cfg, device,
+            profile=build_profile,
         )
+        stage_ms["block2_build"].append((time.perf_counter() - _t) * 1000.0)
+        for src, dst in (
+            ("component_extract_ms", "block2_component_extract"),
+            ("track_features_ms", "block2_track_features"),
+            ("local_tube_ms", "block2_local_tube"),
+            ("strong_prior_ms", "block2_strong_prior"),
+        ):
+            stage_ms[dst].append(float(build_profile.get(src, 0.0)))
+
+        _t = time.perf_counter()
         _stage_gpu_inputs(state2, device)
         try:
             pred2 = _forecast_once(model, state2, pcfg, strong_cfg, device)
         finally:
             _release_gpu_inputs(state2)
+        stage_ms["block2_forecast"].append((time.perf_counter() - _t) * 1000.0)
 
+        _t_metrics = time.perf_counter()
         for hi, h in enumerate(REPORT_HORIZONS):
             block, rel_idx = REPORT_INDEX[h]
             pred = pred1[rel_idx] if block == "first" else pred2[rel_idx]
@@ -567,6 +630,7 @@ def main():
                 moving,
                 int(pcfg.free_label),
             )
+        stage_ms["metrics"].append((time.perf_counter() - _t_metrics) * 1000.0)
 
         if wi == 1 or wi % int(max(a.progress_every, 1)) == 0 or wi == len(selected):
             elapsed = max(time.perf_counter() - started, 1e-9)
@@ -579,6 +643,14 @@ def main():
             _progress_snapshot(progress_path, wi, raw, len(selected))
 
     metrics = _finalize(raw)
+    timing_profile_ms = {
+        k: {
+            "mean": float(np.mean(v)) if v else float("nan"),
+            "median": float(np.median(v)) if v else float("nan"),
+            "p90": float(np.quantile(v, 0.9)) if v else float("nan"),
+        }
+        for k, v in stage_ms.items()
+    }
     result = {
         "protocol": PROTOCOL,
         "checkpoint": str(Path(a.checkpoint).resolve()),
@@ -611,6 +683,7 @@ def main():
             "that also have a frozen V18 validation-cache record"
         ),
         "metrics": metrics,
+        "stage_timing_ms": timing_profile_ms,
     }
     op = Path(a.output)
     op.parent.mkdir(parents=True, exist_ok=True)
@@ -629,6 +702,9 @@ def main():
         )
     print("AVG 1/2/3:", json.dumps(metrics["average_1s_2s_3s"]))
     print("AVG 4/5/6:", json.dumps(metrics["average_4s_5s_6s"]))
+    print("STAGE TIMING mean ms:")
+    for k, v in timing_profile_ms.items():
+        print(f"  {k:>26s}: {v['mean']:.3f}")
     print(f"saved {op}")
 
 
