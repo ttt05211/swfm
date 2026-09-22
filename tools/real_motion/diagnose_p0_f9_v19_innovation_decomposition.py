@@ -42,6 +42,7 @@ import torch
 from real_motion.geometry import quaternion_yaw, relative_transform, warp_mask
 from real_motion.local_st_world_model_v18_se2 import YAW_ENABLED_CLASS_IDS
 from real_motion.metrics.moving_miou_v2 import (
+    BOX_MARGIN_M,
     Box3D,
     DYNAMIC_CLASS_IDS,
     GridSpec,
@@ -413,7 +414,9 @@ def main():
             # Attribute dynamic future occupancy with GT boxes.
             for tok, ah in annh.items():
                 box = rasterize_oriented_box(
-                    _future_box(ah, fpose), metric_grid, margin=0.0
+                    _future_box(ah, fpose),
+                    metric_grid,
+                    margin=float(BOX_MARGIN_M),
                 )
                 support = box & (gt == int(ah["class_id"]))
                 if tok in represented:
