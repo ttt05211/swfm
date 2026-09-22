@@ -106,3 +106,54 @@ claim.
 
 The longer-forecast table should be labeled **zero-shot block rollout** and
 must not replace the frozen 1--3 s main table.
+
+
+## 7. Completed 1--6 s transportability result
+
+The full diagnostic completed on 3,469 windows from all 150 validation scenes.
+
+| Horizon | Occupied recall | Unexplained | Static recall | Dynamic recall | Birth dynamic* | Transport-oracle mIoU |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 s | 71.406 | 28.594 | 71.406 | 71.394 | 1.531 | 55.540 |
+| 2 s | 64.560 | 35.440 | 64.693 | 62.620 | 3.513 | 48.198 |
+| 3 s | 59.248 | 40.752 | 59.487 | 55.751 | 6.028 | 43.274 |
+| 4 s | 54.444 | 45.556 | 54.753 | 49.919 | 9.081 | 39.218 |
+| 5 s | 49.788 | 50.212 | 50.105 | 45.146 | 12.373 | 35.659 |
+| 6 s | 45.396 | 54.604 | 45.674 | 41.331 | 15.625 | 32.509 |
+
+Values are percentages except mIoU, which is also reported on the conventional
+0--100 scale.
+
+* `Birth dynamic` is the fraction of **future dynamic occupied voxels** lying
+inside boxes of future dynamic instances absent at t0.  It is not a fraction of
+all occupied voxels.
+
+Interpretation:
+
+- The strict claim that most 6 s future occupancy can be explained by
+  transporting t0 geometry is **not supported**: occupied recall is 45.396% at
+  6 s.
+- The drop is not only a dynamic-object issue.  Static recall falls from
+  71.406% at 1 s to 45.674% at 6 s, pointing to field-of-view shift,
+  disocclusion/newly revealed scene content, and other t0-geometry limitations.
+- Dynamic transportability degrades faster, from 71.394% to 41.331%; future
+  dynamic instances absent at t0 also become increasingly important.
+- Nevertheless, the exact observed-geometry+GT-motion contract still reaches
+  32.509 mIoU at 6 s on this population, so a zero-shot frozen rollout remains
+  worth measuring before considering a completion branch.
+
+The diagnostic result is:
+`outputs/p0_f9_long_horizon_transportability_6s_all.json`.
+
+## 8. Implemented zero-shot rollout evaluator
+
+`tools/real_motion/eval_p0_f9_v18_zero_shot_long_rollout.py` implements the
+two-block frozen Clean-E14 rollout described above.  It reports 1/2/3/4/5/6 s
+IoU, mIoU, Moving-Macro and Moving-Micro on one 6-history + 12-future
+population.
+
+Before evaluation, its first selected real-history window must pass an
+exactness gate: rebuilding the causal source representation from raw occupancy
+must reproduce the frozen cached tensors (within 1e-6 for floating tensors) and
+all six dense Clean predictions exactly.  The second block then uses this same
+builder on first-block **predicted** occupancy.
