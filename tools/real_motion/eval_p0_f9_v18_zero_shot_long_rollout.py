@@ -495,6 +495,8 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--expected-windows", type=int, default=3469)
     p.add_argument("--max-windows", type=int, default=0)
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--progress-every", type=int, default=25)
     a = p.parse_args()
@@ -531,14 +533,22 @@ def main():
             raise RuntimeError(f"{w.t0_token}: first-block future token mismatch")
         selected.append((w, rec))
 
-    if int(a.expected_windows) > 0 and len(selected) != int(a.expected_windows):
+    total_selected = len(selected)
+    if int(a.expected_windows) > 0 and total_selected != int(a.expected_windows):
         raise RuntimeError(
-            f"eligible 6+12 cached windows {len(selected)} != expected {a.expected_windows}"
+            f"eligible 6+12 cached windows {total_selected} != expected {a.expected_windows}"
         )
+    num_shards = int(a.num_shards)
+    shard_index = int(a.shard_index)
+    if num_shards <= 0:
+        raise ValueError("--num-shards must be >= 1")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard-index < num-shards")
+    selected = selected[shard_index::num_shards]
     if int(a.max_windows) > 0:
         selected = selected[: min(len(selected), int(a.max_windows))]
     if not selected:
-        raise RuntimeError("no eligible long-horizon windows")
+        raise RuntimeError("no eligible long-horizon windows in selected shard")
 
     # Validate the synthetic history builder against the frozen main path once.
     _gate_synthetic_builder(
@@ -657,8 +667,14 @@ def main():
         "checkpoint_epoch": int(ck.get("epoch", -1)),
         "checkpoint_global_step": int(ck.get("global_step", -1)),
         "val_cache": str(Path(a.val_cache).resolve()),
+        "population_total_windows": int(total_selected),
         "num_windows": int(len(selected)),
         "num_scenes": int(len({str(w.scene_name) for w, _ in selected})),
+        "shard": {
+            "num_shards": int(num_shards),
+            "shard_index": int(shard_index),
+            "selection": "global_selected[shard_index::num_shards]",
+        },
         "history_frames_per_block": HISTORY_FRAMES,
         "relative_future_frames_per_block": FUTURE_FRAMES,
         "rollout_blocks": 2,
@@ -683,6 +699,9 @@ def main():
             "that also have a frozen V18 validation-cache record"
         ),
         "metrics": metrics,
+        "raw_counts": {
+            k: np.asarray(v).tolist() for k, v in raw.items()
+        },
         "stage_timing_ms": timing_profile_ms,
     }
     op = Path(a.output)
