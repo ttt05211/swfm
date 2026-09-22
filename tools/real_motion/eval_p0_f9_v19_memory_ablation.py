@@ -38,9 +38,9 @@ from real_motion.runtime_config import (
 )
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_scene_memory import (
-    StaticWorldMemory,
     build_dynamic_source_memory,
     protected_add_only,
+    render_static_history_mosaic,
     render_track_kta_add_only,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
@@ -186,7 +186,6 @@ def main():
     raw_by_variant = {v: _new_raw() for v in VARIANTS}
     dormant_tracks_total = 0
     windows_with_dormant = 0
-    static_voxels_total = 0
     started = time.perf_counter()
 
     for wi, rec in enumerate(records, start=1):
@@ -216,15 +215,6 @@ def main():
         dormant_tracks_total += len(dormant)
         windows_with_dormant += int(bool(dormant))
 
-        static_mem = StaticWorldMemory.from_history(
-            raw["history_occ"],
-            raw["history_observed"],
-            raw["history_poses"],
-            grid=pcfg.grid,
-            free_label=int(pcfg.free_label),
-        )
-        static_voxels_total += len(static_mem)
-
         for hi, h in enumerate(HORIZONS):
             fi = REPORT[h]
             pred = np.asarray(pred_all[fi], dtype=np.uint8)
@@ -242,7 +232,10 @@ def main():
                     free_label=int(pcfg.free_label),
                 )
 
-            static_prop = static_mem.render(
+            static_prop = render_static_history_mosaic(
+                raw["history_occ"],
+                raw["history_observed"],
+                raw["history_poses"],
                 future_pose,
                 grid=pcfg.grid,
                 free_label=int(pcfg.free_label),
@@ -303,9 +296,6 @@ def main():
         "windows_with_dormant": int(windows_with_dormant),
         "mean_dormant_tracks_per_window": float(
             dormant_tracks_total / max(len(records), 1)
-        ),
-        "mean_static_world_voxels_per_window": float(
-            static_voxels_total / max(len(records), 1)
         ),
         "metrics": metrics,
         "delta_vs_base": {
