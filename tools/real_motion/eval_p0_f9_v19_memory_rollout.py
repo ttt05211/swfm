@@ -80,6 +80,7 @@ from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOC
 PROTOCOL = "p0_f9_v19_memory_zero_training_rollout_6s_v1"
 VARIANTS = (
     "v18_redetect_baseline",
+    "v18_redetect_static",
     "persistent_source",
     "persistent_source_static",
 )
@@ -372,6 +373,7 @@ def main():
                 np.asarray(source.pose(tok), dtype=np.float64)
             )
         pred2_static = []
+        pred2_baseline_static = []
         for h in range(FUTURE_FRAMES):
             proposal = render_static_history_mosaic(
                 hist_occ,
@@ -384,6 +386,13 @@ def main():
             pred2_static.append(
                 protected_add_only(
                     pred2[h],
+                    proposal,
+                    free_label=int(pcfg.free_label),
+                )
+            )
+            pred2_baseline_static.append(
+                protected_add_only(
+                    pred2_baseline[h],
                     proposal,
                     free_label=int(pcfg.free_label),
                 )
@@ -407,16 +416,26 @@ def main():
             )
             if block == "first":
                 p_base = pred1[rel_idx]
+                p_base_static = pred1[rel_idx]
                 p_source = pred1[rel_idx]
                 p_static = pred1[rel_idx]
             else:
                 p_base = pred2_baseline[rel_idx]
+                p_base_static = pred2_baseline_static[rel_idx]
                 p_source = pred2[rel_idx]
                 p_static = pred2_static[rel_idx]
             _update_raw(
                 raw["v18_redetect_baseline"],
                 hi,
                 p_base,
+                gt,
+                moving,
+                int(pcfg.free_label),
+            )
+            _update_raw(
+                raw["v18_redetect_static"],
+                hi,
+                p_base_static,
                 gt,
                 moving,
                 int(pcfg.free_label),
@@ -466,6 +485,10 @@ def main():
                 "matched original V18 zero-shot second block on the exact same "
                 "selected windows: predicted occupancy -> component extraction "
                 "and matching -> frozen Clean-E14"
+            ),
+            "v18_redetect_static": (
+                "matched original V18 redetect baseline plus add-only six-frame "
+                "lidar-observed non-dynamic static history mosaic"
             ),
             "persistent_source": (
                 "first block frozen Clean-E14; second block reuses predicted "
