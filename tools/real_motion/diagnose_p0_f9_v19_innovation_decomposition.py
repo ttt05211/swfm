@@ -9,9 +9,11 @@ The disjoint addable categories are:
   * history_source_recoverable
   * future_birth_dynamic
   * source_shape_innovation
+  * t0_unrepresented_dynamic
   * history_static_recoverable
+  * history_static_seen_mismatch
   * never_seen_static
-  * other_ambiguous
+  * dynamic/static other_ambiguous
 
 A voxel is "addable" only when GT is occupied and the frozen V18 prediction is
 free.  Each perfect oracle therefore only fills currently-free voxels and never
@@ -81,11 +83,14 @@ HORIZONS = tuple(REPORT)
 SEMANTIC_CLASSES = tuple(range(17))
 CATEGORIES = (
     "history_source_recoverable",
+    "t0_unrepresented_dynamic",
     "future_birth_dynamic",
     "source_shape_innovation",
+    "dynamic_other_ambiguous",
     "history_static_recoverable",
+    "history_static_seen_mismatch",
     "never_seen_static",
-    "other_ambiguous",
+    "static_other_ambiguous",
 )
 _DYNAMIC = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 _DYNAMIC_SET = set(_DYNAMIC)
@@ -368,6 +373,7 @@ def main():
             represented_transport = np.zeros(gt.shape, dtype=bool)
             represented_box = np.zeros(gt.shape, dtype=bool)
             history_dyn = np.zeros(gt.shape, dtype=bool)
+            t0_unrepresented_dyn = np.zeros(gt.shape, dtype=bool)
             birth_dyn = np.zeros(gt.shape, dtype=bool)
 
             # Exact GT-motion transport support of represented t0 sources.
@@ -412,8 +418,14 @@ def main():
                 support = box & (gt == int(ah["class_id"]))
                 if tok in represented:
                     represented_box |= support
-                elif tok not in t0_tokens:
-                    seen = _same_class_history_evidence(
+                else:
+                    # Memory recoverability is an occupancy/source-state
+                    # question, not an annotation-at-t0 question.  A future
+                    # instance may still have a t0 GT annotation while the
+                    # causal Strong source is missing at the block anchor.
+                    # If the same tracked instance had causal semantic
+                    # evidence before t0, it belongs to history recovery.
+                    seen_pre_t0 = _same_class_history_evidence(
                         tok,
                         int(ah["class_id"]),
                         tuple(w.history_tokens[:-1]),
@@ -422,19 +434,33 @@ def main():
                         ann_hist[:-1],
                         metric_grid,
                     )
-                    if seen:
+                    if seen_pre_t0:
                         history_dyn |= support
+                    elif tok in t0_tokens:
+                        # Present in GT at t0 but not represented by a frozen
+                        # current Strong source and not recoverable from the
+                        # preceding five occupancy frames under this proxy.
+                        t0_unrepresented_dyn |= support
                     else:
+                        # No t0 instance and no causal pre-t0 semantic
+                        # evidence for the same tracked instance.
                         birth_dyn |= support
 
             masks["history_source_recoverable"] = (
                 addable & gt_dynamic & history_dyn
+            )
+            masks["t0_unrepresented_dynamic"] = (
+                addable
+                & gt_dynamic
+                & t0_unrepresented_dyn
+                & ~masks["history_source_recoverable"]
             )
             masks["future_birth_dynamic"] = (
                 addable
                 & gt_dynamic
                 & birth_dyn
                 & ~masks["history_source_recoverable"]
+                & ~masks["t0_unrepresented_dynamic"]
             )
             masks["source_shape_innovation"] = (
                 addable
@@ -442,7 +468,16 @@ def main():
                 & represented_box
                 & ~represented_transport
                 & ~masks["history_source_recoverable"]
+                & ~masks["t0_unrepresented_dynamic"]
                 & ~masks["future_birth_dynamic"]
+            )
+            masks["dynamic_other_ambiguous"] = (
+                addable
+                & gt_dynamic
+                & ~masks["history_source_recoverable"]
+                & ~masks["t0_unrepresented_dynamic"]
+                & ~masks["future_birth_dynamic"]
+                & ~masks["source_shape_innovation"]
             )
 
             # History static memory uses only lidar-observed non-dynamic voxels.
@@ -470,6 +505,12 @@ def main():
                     relative_transform(hp, fpose),
                     grid=pcfg.grid,
                 )
+            masks["history_static_seen_mismatch"] = (
+                addable
+                & gt_static
+                & hist_coverage
+                & ~hist_static
+            )
             masks["never_seen_static"] = (
                 addable
                 & gt_static
@@ -481,11 +522,14 @@ def main():
             for cat in CATEGORIES[:-1]:
                 masks[cat] &= ~assigned
                 assigned |= masks[cat]
-            masks["other_ambiguous"] = addable & ~assigned
+            masks["static_other_ambiguous"] = (
+                addable & gt_static & ~assigned
+            )
+            assigned |= masks["static_other_ambiguous"]
 
-            if int(sum(int(m.sum()) for m in masks.values())) != int(
-                addable.sum()
-            ):
+            if int(assigned.sum()) != int(addable.sum()) or int(
+                sum(int(m.sum()) for m in masks.values())
+            ) != int(addable.sum()):
                 raise RuntimeError("innovation categories are not disjoint/exhaustive")
 
             moving, _, _ = gt_moving_support_for_horizon(
