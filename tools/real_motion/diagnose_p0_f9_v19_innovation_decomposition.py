@@ -62,7 +62,7 @@ from real_motion.runtime_config import (
     make_prepare_config,
 )
 from real_motion.strong_w2det import StrongW2DetConfig
-from real_motion.v19_scene_memory import StaticWorldMemory
+from real_motion.v19_scene_memory import render_static_history_mosaic
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.benchmark_p0_f9_v18_runtime import (
@@ -343,14 +343,6 @@ def main():
         )
         represented = {str(x) for x in source_tokens if x is not None}
 
-        static_mem = StaticWorldMemory.from_history(
-            history_occ,
-            history_obs,
-            history_poses,
-            grid=pcfg.grid,
-            free_label=int(pcfg.free_label),
-        )
-
         for hi, h in enumerate(HORIZONS):
             fi = REPORT[h]
             ftok = str(w.future_tokens[fi])
@@ -454,8 +446,13 @@ def main():
             )
 
             # History static memory uses only lidar-observed non-dynamic voxels.
-            static_render = static_mem.render(
-                fpose, grid=pcfg.grid, free_label=int(pcfg.free_label)
+            static_render = render_static_history_mosaic(
+                history_occ,
+                history_obs,
+                history_poses,
+                fpose,
+                grid=pcfg.grid,
+                free_label=int(pcfg.free_label),
             )
             hist_static = (
                 addable
