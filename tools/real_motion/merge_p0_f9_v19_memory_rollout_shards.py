@@ -40,6 +40,7 @@ def main():
             "population_total_windows",
             "future_gt_used_for_prediction",
             "future_ego_pose_used_through_s",
+            "reconciliation_config",
             "variant_contracts",
         ):
             if r.get(key) != ref.get(key):
@@ -73,6 +74,43 @@ def main():
             f"merged windows {num_windows} != expected {expected}"
         )
 
+
+    reconciliation_totals = None
+    if "reconciliation_totals" in ref:
+        sum_keys = (
+            "detected_sources",
+            "memory_sources",
+            "matched",
+            "unmatched_detected",
+            "unmatched_memory",
+            "selected_memory_only",
+            "dropped_memory_age",
+            "dropped_memory_confidence",
+            "match_distance_count",
+        )
+        reconciliation_totals = {
+            key: int(sum(int(r["reconciliation_totals"][key]) for r in rows))
+            for key in sum_keys
+        }
+        reconciliation_totals["match_distance_sum_m"] = float(
+            sum(
+                float(r["reconciliation_totals"]["match_distance_sum_m"])
+                for r in rows
+            )
+        )
+        reconciliation_totals["mean_match_distance_m"] = (
+            reconciliation_totals["match_distance_sum_m"]
+            / max(reconciliation_totals["match_distance_count"], 1)
+        )
+        reconciliation_totals["matched_fraction_of_detected"] = (
+            reconciliation_totals["matched"]
+            / max(reconciliation_totals["detected_sources"], 1)
+        )
+        reconciliation_totals["selected_memory_fraction"] = (
+            reconciliation_totals["selected_memory_only"]
+            / max(reconciliation_totals["memory_sources"], 1)
+        )
+
     metrics = {v: _finalize(merged[v]) for v in VARIANTS}
     result = {
         "protocol": PROTOCOL,
@@ -85,6 +123,8 @@ def main():
         "future_ego_pose_used_through_s": ref[
             "future_ego_pose_used_through_s"
         ],
+        "reconciliation_config": ref.get("reconciliation_config"),
+        "reconciliation_totals": reconciliation_totals,
         "variant_contracts": ref["variant_contracts"],
         "metrics": metrics,
         "raw_counts": {
