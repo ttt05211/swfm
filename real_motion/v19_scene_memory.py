@@ -570,6 +570,7 @@ def persistent_tracks_from_v18_predictions(
     *,
     frame_dt_s: float = 0.5,
     real_observation_age_at_block_end_s: float | None = None,
+    track_ids: Sequence[int] | None = None,
 ) -> list[SourceTrack]:
     """Promote one V18 block's source trajectories into persistent memory.
 
@@ -596,6 +597,14 @@ def persistent_tracks_from_v18_predictions(
         else np.asarray(pred_yaw_delta_rad)
     )
     N = len(current_components)
+    if track_ids is None:
+        track_ids = tuple(range(N))
+    else:
+        track_ids = tuple(int(x) for x in track_ids)
+        if len(track_ids) != N:
+            raise ValueError("track_ids count must match current components")
+        if len(set(track_ids)) != len(track_ids):
+            raise ValueError("track_ids must be unique")
     if anchors.shape != (N, FUTURE_FRAMES, 2):
         raise ValueError("anchors must be [N,6,2]")
     if residual.shape != anchors.shape or yaw.shape != (N, FUTURE_FRAMES):
@@ -638,7 +647,7 @@ def persistent_tracks_from_v18_predictions(
         vel = _last_velocity(centers, valid, float(frame_dt_s))
         tracks.append(
             SourceTrack(
-                track_id=i,
+                track_id=int(track_ids[i]),
                 class_id=int(comp["class_id"]),
                 canonical_xyz_local=canonical,
                 centers_world=centers,
