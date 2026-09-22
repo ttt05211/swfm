@@ -49,10 +49,10 @@ from real_motion.runtime_fastpath import (
 )
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_scene_memory import (
-    StaticWorldMemory,
     persistent_tracks_from_v18_predictions,
     prepare_causal_arrays_from_tracks,
     protected_add_only,
+    render_static_history_mosaic,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -347,16 +347,12 @@ def main():
             hist_poses.append(
                 np.asarray(source.pose(tok), dtype=np.float64)
             )
-        static_mem = StaticWorldMemory.from_history(
-            hist_occ,
-            hist_obs,
-            hist_poses,
-            grid=pcfg.grid,
-            free_label=int(pcfg.free_label),
-        )
         pred2_static = []
         for h in range(FUTURE_FRAMES):
-            proposal = static_mem.render(
+            proposal = render_static_history_mosaic(
+                hist_occ,
+                hist_obs,
+                hist_poses,
                 poses2[h],
                 grid=pcfg.grid,
                 free_label=int(pcfg.free_label),
@@ -413,7 +409,7 @@ def main():
             print(
                 f"v19_memory_rollout {wi}/{len(selected)} "
                 f"rate={wi/elapsed:.3f} win/s "
-                f"persistent_sources={len(tracks)} static_voxels={len(static_mem)}",
+                f"persistent_sources={len(tracks)}",
                 flush=True,
             )
 
