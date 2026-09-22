@@ -52,6 +52,7 @@ from .strong_w2det import StrongW2DetConfig
 PROVENANCE_OBSERVED_CURRENT = "observed_current"
 PROVENANCE_OBSERVED_HISTORY = "observed_history"
 PROVENANCE_PREDICTED_BIRTH = "predicted_birth"
+PROVENANCE_PERSISTENT_PREDICTION = "persistent_prediction"
 SOURCE_STATUS_DIM = 4
 
 _DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
@@ -109,6 +110,7 @@ class SourceTrack:
     provenance: str
     current_component_index: int | None = None
     last_component_voxel_count: int = 0
+    last_real_observation_age_s_override: float | None = None
 
     def __post_init__(self):
         self.track_id = int(self.track_id)
@@ -134,12 +136,22 @@ class SourceTrack:
         self.last_observed_frame = int(self.last_observed_frame)
         self.confidence = float(self.confidence)
         self.last_component_voxel_count = int(self.last_component_voxel_count)
+        if self.last_real_observation_age_s_override is not None:
+            self.last_real_observation_age_s_override = float(
+                self.last_real_observation_age_s_override
+            )
+            if self.last_real_observation_age_s_override < 0:
+                raise ValueError("last real observation age must be non-negative")
 
     @property
     def observed_at_anchor(self) -> bool:
+        if self.last_real_observation_age_s_override is not None:
+            return self.last_real_observation_age_s_override <= 1e-8
         return bool(self.valid_history[-1])
 
     def last_observed_age_s(self, frame_dt_s: float) -> float:
+        if self.last_real_observation_age_s_override is not None:
+            return float(self.last_real_observation_age_s_override)
         return float(
             (HISTORY_FRAMES - 1 - self.last_observed_frame)
             * float(frame_dt_s)
