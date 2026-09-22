@@ -198,9 +198,17 @@ def _finalize(raw):
 
 
 def _kta_tensors(current, velocities, current_pose, frame_dt_s):
+    """Rebuild frozen source/KTA/anchor tensors with the cache arithmetic order.
+
+    The cache builder computes each future anchor in float64 as
+    anchor = cur_t0 + v_t0 * dt and only then casts to float32.
+    Adding source_xy(float32) + kta(float32) changes the rounding order and
+    can differ by a few float32 ULPs.  Preserve the original construction.
+    """
     n = len(current)
     source_xy = np.zeros((n, 2), dtype=np.float32)
     kta = np.zeros((n, FUTURE_FRAMES, 2), dtype=np.float32)
+    anchors = np.zeros((n, FUTURE_FRAMES, 2), dtype=np.float32)
     for i, comp in enumerate(current):
         center = np.asarray(comp["centroid_world"], dtype=np.float64)
         c0 = world_points_to_t0(center[None], current_pose)[0, :2]
@@ -208,8 +216,11 @@ def _kta_tensors(current, velocities, current_pose, frame_dt_s):
         vw = np.asarray(velocities.get(i, np.zeros(3)), dtype=np.float64)
         vt0 = world_vec_to_t0(vw, current_pose)[:2]
         for h in range(FUTURE_FRAMES):
-            kta[i, h] = (vt0 * ((h + 1) * float(frame_dt_s))).astype(np.float32)
-    return source_xy, kta
+            dt = (h + 1) * float(frame_dt_s)
+            kd = vt0 * dt
+            kta[i, h] = kd.astype(np.float32)
+            anchors[i, h] = (c0 + kd).astype(np.float32)
+    return source_xy, kta, anchors
 
 
 def _build_block_state(
@@ -256,7 +267,7 @@ def _build_block_state(
         grid=pcfg.grid,
     )
     features = torch.from_numpy(features_np)
-    source_xy, kta_np = _kta_tensors(
+    source_xy, kta_np, anchors_np = _kta_tensors(
         current,
         velocities,
         history_poses[-1],
@@ -285,7 +296,7 @@ def _build_block_state(
         track_valid_t,
         features,
     )
-    anchors_xy = torch.from_numpy(source_xy[:, None, :] + kta_np)
+    anchors_xy = torch.from_numpy(anchors_np)
 
     rec = {
         "features": features,
