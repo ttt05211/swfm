@@ -540,6 +540,103 @@ def prepare_causal_arrays_from_tracks(
     }
 
 
+
+def persistent_tracks_from_v18_predictions(
+    current_components: Sequence[Mapping],
+    source_world_points: Sequence[np.ndarray],
+    current_pose: np.ndarray,
+    anchors_xy_t0_m: np.ndarray | torch.Tensor,
+    pred_residual_xy_m: np.ndarray | torch.Tensor,
+    pred_yaw_delta_rad: np.ndarray | torch.Tensor,
+    *,
+    frame_dt_s: float = 0.5,
+    real_observation_age_at_block_end_s: float | None = None,
+) -> list[SourceTrack]:
+    """Promote one V18 block's source trajectories into persistent memory.
+
+    The six predicted future centres become the next block's six-frame source
+    history directly.  No connected-component extraction or identity matching
+    is performed.  Canonical geometry is materialized at the last predicted
+    yaw so the next block can again predict a relative SE(2) motion.
+    """
+    from .local_st_world_model_v18_se2 import YAW_ENABLED_CLASS_IDS
+
+    anchors = (
+        anchors_xy_t0_m.detach().cpu().numpy()
+        if torch.is_tensor(anchors_xy_t0_m)
+        else np.asarray(anchors_xy_t0_m)
+    )
+    residual = (
+        pred_residual_xy_m.detach().cpu().numpy()
+        if torch.is_tensor(pred_residual_xy_m)
+        else np.asarray(pred_residual_xy_m)
+    )
+    yaw = (
+        pred_yaw_delta_rad.detach().cpu().numpy()
+        if torch.is_tensor(pred_yaw_delta_rad)
+        else np.asarray(pred_yaw_delta_rad)
+    )
+    N = len(current_components)
+    if anchors.shape != (N, FUTURE_FRAMES, 2):
+        raise ValueError("anchors must be [N,6,2]")
+    if residual.shape != anchors.shape or yaw.shape != (N, FUTURE_FRAMES):
+        raise ValueError("V18 prediction shape mismatch")
+    if len(source_world_points) != N:
+        raise ValueError("source_world_points count mismatch")
+
+    pose = np.asarray(current_pose, dtype=np.float64)
+    world_to_t0 = np.linalg.inv(pose)
+    real_age = (
+        FUTURE_FRAMES * float(frame_dt_s)
+        if real_observation_age_at_block_end_s is None
+        else float(real_observation_age_at_block_end_s)
+    )
+    tracks = []
+    yaw_enabled = set(int(x) for x in YAW_ENABLED_CLASS_IDS)
+    for i, comp in enumerate(current_components):
+        src_center = np.asarray(comp["centroid_world"], dtype=np.float64)
+        src_z_t0 = float((world_to_t0 @ np.r_[src_center, 1.0])[2])
+        centers = np.zeros((HISTORY_FRAMES, 3), dtype=np.float64)
+        for h in range(FUTURE_FRAMES):
+            xy = np.asarray(anchors[i, h], dtype=np.float64) + np.asarray(
+                residual[i, h], dtype=np.float64
+            )
+            p0 = np.asarray(
+                [xy[0], xy[1], src_z_t0, 1.0], dtype=np.float64
+            )
+            centers[h] = (pose @ p0)[:3]
+
+        pts_world = np.asarray(source_world_points[i], dtype=np.float64)
+        local = pts_world - src_center[None]
+        final_yaw = float(yaw[i, -1]) if int(comp["class_id"]) in yaw_enabled else 0.0
+        cy, sy = math.cos(final_yaw), math.sin(final_yaw)
+        R = np.asarray([[cy, -sy], [sy, cy]], dtype=np.float64)
+        canonical = local.copy()
+        if len(canonical):
+            canonical[:, :2] = canonical[:, :2] @ R.T
+
+        valid = np.ones(HISTORY_FRAMES, dtype=bool)
+        vel = _last_velocity(centers, valid, float(frame_dt_s))
+        tracks.append(
+            SourceTrack(
+                track_id=i,
+                class_id=int(comp["class_id"]),
+                canonical_xyz_local=canonical,
+                centers_world=centers,
+                valid_history=valid,
+                velocity_world=vel,
+                last_observed_frame=HISTORY_FRAMES - 1,
+                confidence=1.0,
+                provenance=PROVENANCE_PERSISTENT_PREDICTION,
+                current_component_index=i,
+                last_component_voxel_count=int(
+                    comp.get("voxel_count", len(comp["voxel_indices"]))
+                ),
+                last_real_observation_age_s_override=real_age,
+            )
+        )
+    return tracks
+
 @dataclass
 class StaticVoxelState:
     class_id: int
