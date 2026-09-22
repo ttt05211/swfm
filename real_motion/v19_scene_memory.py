@@ -28,6 +28,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 
+from .geometry import relative_transform, warp_mask, warp_semantic_grid
 from .local_st_world_model import (
     build_local_semantic_tubes,
     history_offsets_from_features,
@@ -636,6 +637,64 @@ def persistent_tracks_from_v18_predictions(
             )
         )
     return tracks
+
+
+def render_static_history_mosaic(
+    history_semantics: Sequence[np.ndarray],
+    history_observed: Sequence[np.ndarray],
+    history_poses: Sequence[np.ndarray],
+    future_ego_to_world: np.ndarray,
+    *,
+    grid,
+    free_label: int,
+) -> np.ndarray:
+    """Fast six-frame renderer for the short-term static world memory.
+
+    Frames are applied oldest -> newest.  Only lidar-observed, non-dynamic
+    cells participate.  A newer observed-free cell clears older static memory;
+    a dynamic observation is treated as an occluder and does not erase the
+    static world behind it.
+    """
+    if not (
+        len(history_semantics)
+        == len(history_observed)
+        == len(history_poses)
+        == HISTORY_FRAMES
+    ):
+        raise ValueError("static mosaic expects six semantic/obs/pose frames")
+    out = np.full(tuple(grid.shape_hwd), int(free_label), dtype=np.uint8)
+    fpose = np.asarray(future_ego_to_world, dtype=np.float64)
+    dyn_ids = np.asarray(_DYNAMIC_IDS, dtype=np.uint8)
+
+    for sem, obs, pose in zip(
+        history_semantics, history_observed, history_poses
+    ):
+        sem = np.asarray(sem, dtype=np.uint8)
+        obs = np.asarray(obs, dtype=bool)
+        if sem.shape != tuple(grid.shape_hwd) or obs.shape != sem.shape:
+            raise ValueError("static mosaic grid/observation shape mismatch")
+        dynamic = np.isin(sem, dyn_ids)
+        usable_obs = obs & ~dynamic
+        rel = relative_transform(
+            np.asarray(pose, dtype=np.float64), fpose
+        )
+        observed_future = warp_mask(usable_obs, rel, grid=grid)
+
+        static_sem = sem.copy()
+        static_sem[~usable_obs] = int(free_label)
+        static_sem[dynamic] = int(free_label)
+        semantic_future = warp_semantic_grid(
+            static_sem,
+            rel,
+            grid=grid,
+            free_label=int(free_label),
+        )
+
+        # Newer actual free evidence invalidates older map occupancy.
+        out[observed_future] = int(free_label)
+        occupied = semantic_future != int(free_label)
+        out[occupied] = semantic_future[occupied]
+    return out
 
 @dataclass
 class StaticVoxelState:
