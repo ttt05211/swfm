@@ -149,23 +149,26 @@ class SourceTrack:
             return self.last_real_observation_age_s_override <= 1e-8
         return bool(self.valid_history[-1])
 
-    def last_observed_age_s(self, frame_dt_s: float) -> float:
-        if self.last_real_observation_age_s_override is not None:
-            return float(self.last_real_observation_age_s_override)
+    def state_age_s(self, frame_dt_s: float) -> float:
         return float(
             (HISTORY_FRAMES - 1 - self.last_observed_frame)
             * float(frame_dt_s)
         )
 
+    def last_real_observation_age_s(self, frame_dt_s: float) -> float:
+        if self.last_real_observation_age_s_override is not None:
+            return float(self.last_real_observation_age_s_override)
+        return self.state_age_s(frame_dt_s)
+
     def anchor_center_world(self, frame_dt_s: float) -> np.ndarray:
         last = np.asarray(
             self.centers_world[self.last_observed_frame], dtype=np.float64
         )
-        age = self.last_observed_age_s(frame_dt_s)
+        age = self.state_age_s(frame_dt_s)
         return last + np.asarray(self.velocity_world, dtype=np.float64) * age
 
     def history_status(self, frame_dt_s: float) -> np.ndarray:
-        age = self.last_observed_age_s(frame_dt_s)
+        age = self.last_real_observation_age_s(frame_dt_s)
         return np.asarray(
             [
                 1.0 if self.observed_at_anchor else 0.0,
@@ -372,7 +375,7 @@ def build_dynamic_source_memory(
             tr.confidence = 1.0
             current_by_index[int(tr.current_component_index)] = tr
         else:
-            age = tr.last_observed_age_s(float(frame_dt_s))
+            age = tr.state_age_s(float(frame_dt_s))
             if age <= float(max_missing_s) + 1e-8:
                 tr.confidence = float(
                     math.exp(-age / max(float(confidence_tau_s), 1e-6))
