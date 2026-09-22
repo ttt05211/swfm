@@ -204,6 +204,64 @@ def select_memory_only_tracks(
     )
 
 
+
+@dataclass(frozen=True)
+class DetectedTrackAssignment:
+    """Stable identities for detected sources after reconciliation."""
+
+    track_ids: tuple[int, ...]
+    matched_memory_index: tuple[int | None, ...]
+    next_track_id: int
+
+
+def assign_detected_track_ids(
+    reconciliation: SourceReconciliationResult,
+    memory_tracks: Sequence[SourceTrack],
+    *,
+    num_detected: int,
+    next_track_id: int | None = None,
+) -> DetectedTrackAssignment:
+    """Preserve matched memory IDs and allocate IDs only to new detections.
+
+    This closes the lifecycle loop needed for multi-block rollout without
+    changing detected-source ordering or prediction tensors.
+    """
+    n = int(num_detected)
+    if n < 0:
+        raise ValueError("num_detected must be non-negative")
+    by_detected: list[int | None] = [None] * n
+    memory_index: list[int | None] = [None] * n
+    for match in reconciliation.matches:
+        di = int(match.detected_index)
+        mi = int(match.memory_index)
+        if di < 0 or di >= n:
+            raise ValueError("reconciliation detected index out of range")
+        if mi < 0 or mi >= len(memory_tracks):
+            raise ValueError("reconciliation memory index out of range")
+        if by_detected[di] is not None:
+            raise ValueError("duplicate detected assignment")
+        by_detected[di] = int(memory_tracks[mi].track_id)
+        memory_index[di] = mi
+
+    existing = [int(tr.track_id) for tr in memory_tracks]
+    fresh = max(existing, default=-1) + 1
+    if next_track_id is not None:
+        fresh = max(fresh, int(next_track_id))
+
+    for di in range(n):
+        if by_detected[di] is None:
+            by_detected[di] = int(fresh)
+            fresh += 1
+
+    ids = tuple(int(x) for x in by_detected)
+    if len(set(ids)) != len(ids):
+        raise RuntimeError("reconciled detected track IDs are not unique")
+    return DetectedTrackAssignment(
+        track_ids=ids,
+        matched_memory_index=tuple(memory_index),
+        next_track_id=int(fresh),
+    )
+
 def reconciliation_summary(
     result: SourceReconciliationResult,
     selection: MemoryOnlySelection | None = None,
