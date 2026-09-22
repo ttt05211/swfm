@@ -36,6 +36,7 @@ from real_motion.motion_transport import (
 )
 from real_motion.nuscenes_adapter import (
     NuScenesWindowSource,
+    dynamic_only_semantics,
     gt_moving_support_for_horizon,
 )
 from real_motion.runtime_config import (
@@ -53,6 +54,11 @@ from real_motion.v19_scene_memory import (
     prepare_causal_arrays_from_tracks,
     protected_add_only,
     render_static_history_mosaic,
+)
+from real_motion.v19_source_reconciliation import (
+    SourceReconciliationConfig,
+    reconcile_detected_sources,
+    select_memory_only_tracks,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -81,6 +87,8 @@ PROTOCOL = "p0_f9_v19_memory_zero_training_rollout_6s_v1"
 VARIANTS = (
     "v18_redetect_baseline",
     "v18_redetect_static",
+    "reconciled_memory",
+    "reconciled_memory_static",
     "persistent_source",
     "persistent_source_static",
 )
@@ -234,6 +242,10 @@ def main():
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--progress-every", type=int, default=25)
+    p.add_argument("--reconcile-max-distance-m", type=float, default=4.0)
+    p.add_argument("--memory-max-age-s", type=float, default=6.0)
+    p.add_argument("--memory-confidence-tau-s", type=float, default=3.0)
+    p.add_argument("--memory-min-confidence", type=float, default=0.15)
     a = p.parse_args()
 
     cfg = load_runtime_config(a.config, a.override)
@@ -247,6 +259,12 @@ def main():
     ck, model, _ = full._load_model(a.checkpoint, CLEAN_PROTOCOL, device)
     source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
+    reconcile_cfg = SourceReconciliationConfig(
+        max_center_distance_m=float(a.reconcile_max_distance_m),
+        max_memory_age_s=float(a.memory_max_age_s),
+        confidence_tau_s=float(a.memory_confidence_tau_s),
+        min_memory_confidence=float(a.memory_min_confidence),
+    )
 
     selected = []
     for w in source.iter_windows(
@@ -280,6 +298,18 @@ def main():
         raise RuntimeError("empty selected shard")
 
     raw = {name: _new_raw() for name in VARIANTS}
+    reconcile_totals = {
+        "detected_sources": 0,
+        "memory_sources": 0,
+        "matched": 0,
+        "unmatched_detected": 0,
+        "unmatched_memory": 0,
+        "selected_memory_only": 0,
+        "dropped_memory_age": 0,
+        "dropped_memory_confidence": 0,
+        "match_distance_sum_m": 0.0,
+        "match_distance_count": 0,
+    }
     started = time.perf_counter()
 
     for wi, (w, rec) in enumerate(selected, start=1):
@@ -333,6 +363,101 @@ def main():
         finally:
             _release_gpu_inputs(baseline_state2)
 
+        # Detection-authoritative reconciliation.  Matched and newly detected
+        # sources remain exactly on the original V18 redetection path.  Only a
+        # remembered source that is not re-detected can enter the extra branch.
+        reconciliation = reconcile_detected_sources(
+            baseline_state2["current"],
+            tracks,
+            frame_dt_s=float(pcfg.frame_dt_s),
+            config=reconcile_cfg,
+        )
+        memory_only = select_memory_only_tracks(
+            tracks,
+            reconciliation,
+            frame_dt_s=float(pcfg.frame_dt_s),
+            config=reconcile_cfg,
+        )
+        reconcile_totals["detected_sources"] += len(
+            baseline_state2["current"]
+        )
+        reconcile_totals["memory_sources"] += len(tracks)
+        reconcile_totals["matched"] += len(reconciliation.matches)
+        reconcile_totals["unmatched_detected"] += len(
+            reconciliation.unmatched_detected
+        )
+        reconcile_totals["unmatched_memory"] += len(
+            reconciliation.unmatched_memory
+        )
+        reconcile_totals["selected_memory_only"] += len(memory_only.tracks)
+        reconcile_totals["dropped_memory_age"] += len(
+            memory_only.dropped_by_age
+        )
+        reconcile_totals["dropped_memory_confidence"] += len(
+            memory_only.dropped_by_confidence
+        )
+        for mt in reconciliation.matches:
+            reconcile_totals["match_distance_sum_m"] += float(
+                mt.center_distance_m
+            )
+            reconcile_totals["match_distance_count"] += 1
+
+        pred2_reconciled = [
+            np.asarray(x, dtype=np.uint8).copy()
+            for x in pred2_baseline
+        ]
+        if memory_only.tracks:
+            memory_rec = prepare_causal_arrays_from_tracks(
+                memory_only.tracks,
+                pred1,
+                poses1,
+                grid=pcfg.grid,
+                free_label=int(pcfg.free_label),
+                frame_dt_s=float(pcfg.frame_dt_s),
+            )
+            memory_state2 = _state_from_persistent_tracks(
+                memory_only.tracks,
+                memory_rec,
+                pred1,
+                poses1,
+                poses2,
+                pcfg,
+                strong_cfg,
+                device,
+            )
+            _stage_gpu_inputs(memory_state2, device)
+            try:
+                pred2_memory = _forecast_once(
+                    model, memory_state2, pcfg, strong_cfg, device
+                )
+            finally:
+                _release_gpu_inputs(memory_state2)
+            for h in range(FUTURE_FRAMES):
+                proposal = dynamic_only_semantics(
+                    pred2_memory[h],
+                    free_label=int(pcfg.free_label),
+                )
+                pred2_reconciled[h] = protected_add_only(
+                    pred2_reconciled[h],
+                    proposal,
+                    free_label=int(pcfg.free_label),
+                )
+
+        # Hard invariant: reconciliation can never rewrite an occupied voxel
+        # produced by the frozen detected-source V18 path.
+        for h in range(FUTURE_FRAMES):
+            occupied = (
+                np.asarray(pred2_baseline[h])
+                != int(pcfg.free_label)
+            )
+            if not np.array_equal(
+                np.asarray(pred2_reconciled[h])[occupied],
+                np.asarray(pred2_baseline[h])[occupied],
+            ):
+                raise RuntimeError(
+                    "reconciliation overwrote frozen V18 occupied output"
+                )
+
         rec2 = prepare_causal_arrays_from_tracks(
             tracks,
             pred1,
@@ -374,6 +499,7 @@ def main():
             )
         pred2_static = []
         pred2_baseline_static = []
+        pred2_reconciled_static = []
         for h in range(FUTURE_FRAMES):
             proposal = render_static_history_mosaic(
                 hist_occ,
@@ -393,6 +519,13 @@ def main():
             pred2_baseline_static.append(
                 protected_add_only(
                     pred2_baseline[h],
+                    proposal,
+                    free_label=int(pcfg.free_label),
+                )
+            )
+            pred2_reconciled_static.append(
+                protected_add_only(
+                    pred2_reconciled[h],
                     proposal,
                     free_label=int(pcfg.free_label),
                 )
@@ -417,11 +550,15 @@ def main():
             if block == "first":
                 p_base = pred1[rel_idx]
                 p_base_static = pred1[rel_idx]
+                p_reconciled = pred1[rel_idx]
+                p_reconciled_static = pred1[rel_idx]
                 p_source = pred1[rel_idx]
                 p_static = pred1[rel_idx]
             else:
                 p_base = pred2_baseline[rel_idx]
                 p_base_static = pred2_baseline_static[rel_idx]
+                p_reconciled = pred2_reconciled[rel_idx]
+                p_reconciled_static = pred2_reconciled_static[rel_idx]
                 p_source = pred2[rel_idx]
                 p_static = pred2_static[rel_idx]
             _update_raw(
@@ -436,6 +573,22 @@ def main():
                 raw["v18_redetect_static"],
                 hi,
                 p_base_static,
+                gt,
+                moving,
+                int(pcfg.free_label),
+            )
+            _update_raw(
+                raw["reconciled_memory"],
+                hi,
+                p_reconciled,
+                gt,
+                moving,
+                int(pcfg.free_label),
+            )
+            _update_raw(
+                raw["reconciled_memory_static"],
+                hi,
+                p_reconciled_static,
                 gt,
                 moving,
                 int(pcfg.free_label),
@@ -462,7 +615,9 @@ def main():
             print(
                 f"v19_memory_rollout {wi}/{len(selected)} "
                 f"rate={wi/elapsed:.3f} win/s "
-                f"persistent_sources={len(tracks)}",
+                f"persistent_sources={len(tracks)} "
+                f"reconciled={len(reconciliation.matches)} "
+                f"memory_only={len(memory_only.tracks)}",
                 flush=True,
             )
 
@@ -480,6 +635,31 @@ def main():
         },
         "future_gt_used_for_prediction": False,
         "future_ego_pose_used_through_s": 6.0,
+        "reconciliation_config": {
+            "max_center_distance_m": float(
+                reconcile_cfg.max_center_distance_m
+            ),
+            "max_memory_age_s": float(reconcile_cfg.max_memory_age_s),
+            "confidence_tau_s": float(reconcile_cfg.confidence_tau_s),
+            "min_memory_confidence": float(
+                reconcile_cfg.min_memory_confidence
+            ),
+        },
+        "reconciliation_totals": {
+            **reconcile_totals,
+            "mean_match_distance_m": (
+                float(reconcile_totals["match_distance_sum_m"])
+                / max(int(reconcile_totals["match_distance_count"]), 1)
+            ),
+            "matched_fraction_of_detected": (
+                float(reconcile_totals["matched"])
+                / max(int(reconcile_totals["detected_sources"]), 1)
+            ),
+            "selected_memory_fraction": (
+                float(reconcile_totals["selected_memory_only"])
+                / max(int(reconcile_totals["memory_sources"]), 1)
+            ),
+        },
         "variant_contracts": {
             "v18_redetect_baseline": (
                 "matched original V18 zero-shot second block on the exact same "
@@ -489,6 +669,15 @@ def main():
             "v18_redetect_static": (
                 "matched original V18 redetect baseline plus add-only six-frame "
                 "lidar-observed non-dynamic static history mosaic"
+            ),
+            "reconciled_memory": (
+                "matched/newly-detected sources stay on the exact original V18 "
+                "redetection path; only unmatched age/confidence-gated memory "
+                "sources are forecast separately and added into free voxels"
+            ),
+            "reconciled_memory_static": (
+                "reconciled_memory plus add-only six-frame lidar-observed "
+                "non-dynamic static history mosaic"
             ),
             "persistent_source": (
                 "first block frozen Clean-E14; second block reuses predicted "
