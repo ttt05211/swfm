@@ -38,7 +38,6 @@ from real_motion.nuscenes_adapter import (
     NuScenesWindowSource,
     gt_moving_support_for_horizon,
 )
-from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import (
     add_config_args,
     load_runtime_config,
@@ -335,14 +334,23 @@ def main():
         finally:
             _release_gpu_inputs(state2)
 
-        # Static memory is built only from actual lidar-observed history.
-        raw_hist = load_nuscenes_window_raw(
-            source, w, pcfg, include_gt=False
-        )
+        # Static memory is built only from the six actual lidar-observed
+        # history frames.  Do not call load_nuscenes_window_raw on this 6+12
+        # window: the frozen OccFM trajectory loader is intentionally 6+6.
+        hist_occ, hist_obs, hist_poses = [], [], []
+        for tok in w.history_tokens:
+            sem, obs = source.load_occ3d(
+                w.scene_name, tok, require_lidar_mask=True
+            )
+            hist_occ.append(np.asarray(sem, dtype=np.uint8))
+            hist_obs.append(np.asarray(obs, dtype=bool))
+            hist_poses.append(
+                np.asarray(source.pose(tok), dtype=np.float64)
+            )
         static_mem = StaticWorldMemory.from_history(
-            raw_hist["history_occ"],
-            raw_hist["history_observed"],
-            raw_hist["history_poses"],
+            hist_occ,
+            hist_obs,
+            hist_poses,
             grid=pcfg.grid,
             free_label=int(pcfg.free_label),
         )
