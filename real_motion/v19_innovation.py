@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .geometry import relative_transform, warp_mask, warp_semantic_grid
+from .geometry import relative_transform, warp_semantic_and_mask
 from .local_st_world_model import SEMANTIC_CLASSES
 from .motion_transport import FUTURE_FRAMES, HISTORY_FRAMES
 
@@ -50,17 +50,16 @@ def _future_aligned_bev_summary(
         np.asarray(src_pose, dtype=np.float64),
         np.asarray(future_pose, dtype=np.float64),
     )
-    # Only genuinely observed occupied semantics are carried forward.  Free
-    # evidence is represented by the separately warped coverage mask.
-    observed_sem = sem.copy()
-    observed_sem[~obs] = int(free_label)
-    aligned_sem = warp_semantic_grid(
-        observed_sem,
+    # Warp semantic evidence and lidar coverage with one coordinate transform.
+    # This preserves the historical semantic collision rule while avoiding the
+    # second full mask warp.
+    aligned_sem, aligned_obs = warp_semantic_and_mask(
+        sem,
+        obs,
         T,
         grid=grid,
         free_label=int(free_label),
     )
-    aligned_obs = warp_mask(obs, T, grid=grid)
 
     occupied = (aligned_sem != int(free_label)) & aligned_obs
     has = occupied.any(axis=2)
