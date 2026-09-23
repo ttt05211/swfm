@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
+from real_motion.geometry import relative_transform
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.motion_transport import (
     dynamic_annotations,
@@ -78,7 +79,7 @@ from tools.real_motion.train_p0_f9_v18_se2_clean import (
 )
 
 
-PROTOCOL = "p0_f9_v19_ancestor_free_novelty_candidate_v1"
+PROTOCOL = "p0_f9_v19_ancestor_free_novelty_candidate_v2"
 SEMANTIC_CLASSES = tuple(range(17))
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 HORIZONS = tuple(0.5 * (i + 1) for i in range(6))
@@ -156,6 +157,55 @@ def _oracle(pred, gt, mask):
     return out
 
 
+def _history_grid_footprint_bev(
+    history_poses: np.ndarray,
+    future_pose: np.ndarray,
+    grid,
+) -> np.ndarray:
+    """Union of historical occupancy-grid XY footprints in a future ego frame.
+
+    This is deliberately geometric rather than LiDAR-visibility based.  It
+    separates genuinely new spatial field-of-view caused by ego motion from
+    content that lies inside an old grid footprint but was never directly
+    observed by LiDAR.
+
+    The future BEV cell centers are transformed back into every historical ego
+    frame and tested against the fixed Occ3D XY bounds.  z is fixed at 0
+    because only the XY footprint is being classified.
+    """
+    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
+    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
+    xs = float(grid.x_min) + (np.arange(X, dtype=np.float64) + 0.5) * vx
+    ys = float(grid.y_min) + (np.arange(Y, dtype=np.float64) + 0.5) * vy
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    pts_future = np.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            np.zeros(X * Y, dtype=np.float64),
+            np.ones(X * Y, dtype=np.float64),
+        ),
+        axis=1,
+    )
+
+    covered = np.zeros(X * Y, dtype=bool)
+    fpose = np.asarray(future_pose, dtype=np.float64)
+    for hpose in np.asarray(history_poses, dtype=np.float64):
+        # relative_transform(src, dst) maps src-frame points into dst frame.
+        future_to_history = relative_transform(fpose, hpose)
+        ph = (future_to_history @ pts_future.T).T
+        xh = ph[:, 0]
+        yh = ph[:, 1]
+        inside = (
+            (xh >= float(grid.x_min))
+            & (xh < float(grid.x_max))
+            & (yh >= float(grid.y_min))
+            & (yh < float(grid.y_max))
+        )
+        covered |= inside
+    return covered.reshape(X, Y)
+
+
 def _empty_horizon_stats():
     return {
         "static_positive_voxels": 0,
@@ -173,6 +223,16 @@ def _empty_horizon_stats():
         "birth_seen_voxels": 0,
         "birth_whole_unseen_bev_voxels": 0,
         "birth_positive_bev_whole_unseen": 0,
+        "history_grid_footprint_bev": 0,
+        "new_fov_bev": 0,
+        "static_new_fov_voxels": 0,
+        "static_new_fov_bev": 0,
+        "static_inside_history_footprint_voxels": 0,
+        "birth_new_fov_voxels": 0,
+        "birth_new_fov_bev": 0,
+        "birth_inside_history_footprint_voxels": 0,
+        "footprint_whole_lidar_unseen_bev": 0,
+        "static_in_footprint_whole_lidar_unseen_bev": 0,
     }
 
 
@@ -231,6 +291,45 @@ def _finalize_horizon_stats(row, grid_voxels_per_window, grid_bev_per_window, n)
             ),
             "whole_unseen_bev_fraction_of_grid": float(
                 whole_b / max(int(grid_bev_per_window) * int(n), 1)
+            ),
+            "history_grid_footprint_bev_fraction_of_grid": float(
+                r["history_grid_footprint_bev"]
+                / max(int(grid_bev_per_window) * int(n), 1)
+            ),
+            "new_fov_bev_fraction_of_grid": float(
+                r["new_fov_bev"]
+                / max(int(grid_bev_per_window) * int(n), 1)
+            ),
+            "static_new_fov_voxel_fraction": float(
+                r["static_new_fov_voxels"] / max(static_v, 1)
+            ),
+            "static_new_fov_bev_coverage": float(
+                r["static_new_fov_bev"] / max(static_b, 1)
+            ),
+            "static_bev_prevalence_in_new_fov": float(
+                r["static_new_fov_bev"] / max(r["new_fov_bev"], 1)
+            ),
+            "static_inside_history_footprint_voxel_fraction": float(
+                r["static_inside_history_footprint_voxels"]
+                / max(static_v, 1)
+            ),
+            "birth_new_fov_voxel_fraction": float(
+                r["birth_new_fov_voxels"] / max(birth_v, 1)
+            ),
+            "birth_new_fov_bev_coverage": float(
+                r["birth_new_fov_bev"] / max(birth_b, 1)
+            ),
+            "birth_inside_history_footprint_voxel_fraction": float(
+                r["birth_inside_history_footprint_voxels"]
+                / max(birth_v, 1)
+            ),
+            "footprint_whole_lidar_unseen_bev_fraction_of_grid": float(
+                r["footprint_whole_lidar_unseen_bev"]
+                / max(int(grid_bev_per_window) * int(n), 1)
+            ),
+            "static_coverage_by_footprint_whole_lidar_unseen_bev": float(
+                r["static_in_footprint_whole_lidar_unseen_bev"]
+                / max(static_b, 1)
             ),
         }
     )
@@ -478,6 +577,20 @@ def main():
                 ~coverage.any(axis=2)
             ) & free.any(axis=2)
 
+            history_grid_footprint_bev = _history_grid_footprint_bev(
+                history_poses,
+                future_poses[fi],
+                pcfg.grid,
+            )
+            new_fov_bev = (
+                ~history_grid_footprint_bev
+            ) & free.any(axis=2)
+            footprint_whole_lidar_unseen_bev = (
+                history_grid_footprint_bev
+                & ~coverage.any(axis=2)
+                & free.any(axis=2)
+            )
+
             static_bev = static_pos.any(axis=2)
             birth_bev = birth_pos.any(axis=2)
             free_bev = free.any(axis=2)
@@ -514,6 +627,46 @@ def main():
             )
             hs["birth_positive_bev_whole_unseen"] += int(
                 (birth_bev & whole_unseen_bev).sum()
+            )
+
+            new_fov_3d = np.broadcast_to(
+                new_fov_bev[..., None],
+                gt.shape,
+            )
+            footprint_3d = np.broadcast_to(
+                history_grid_footprint_bev[..., None],
+                gt.shape,
+            )
+            hs["history_grid_footprint_bev"] += int(
+                history_grid_footprint_bev.sum()
+            )
+            hs["new_fov_bev"] += int(new_fov_bev.sum())
+            hs["static_new_fov_voxels"] += int(
+                (static_pos & new_fov_3d).sum()
+            )
+            hs["static_new_fov_bev"] += int(
+                (static_bev & new_fov_bev).sum()
+            )
+            hs["static_inside_history_footprint_voxels"] += int(
+                (static_pos & footprint_3d).sum()
+            )
+            hs["birth_new_fov_voxels"] += int(
+                (birth_pos & new_fov_3d).sum()
+            )
+            hs["birth_new_fov_bev"] += int(
+                (birth_bev & new_fov_bev).sum()
+            )
+            hs["birth_inside_history_footprint_voxels"] += int(
+                (birth_pos & footprint_3d).sum()
+            )
+            hs["footprint_whole_lidar_unseen_bev"] += int(
+                footprint_whole_lidar_unseen_bev.sum()
+            )
+            hs["static_in_footprint_whole_lidar_unseen_bev"] += int(
+                (
+                    static_bev
+                    & footprint_whole_lidar_unseen_bev
+                ).sum()
             )
 
             for cid in SEMANTIC_CLASSES:
@@ -627,6 +780,23 @@ def main():
             ),
             "inference_safe": True,
         },
+        "spatial_origin_contract": {
+            "history_grid_footprint": (
+                "future BEV cell center falls inside the XY bounds of at least "
+                "one of the six historical Occ3D grids after exact ego-pose "
+                "transformation"
+            ),
+            "new_fov": (
+                "future BEV cell lies outside every historical grid footprint; "
+                "this isolates ego-motion-driven spatial reveal from ordinary "
+                "LiDAR sparsity/occlusion"
+            ),
+            "inside_footprint_unobserved": (
+                "future content is geometrically inside historical grid support "
+                "but lacks direct historical LiDAR observation; this is scene "
+                "completion/occlusion novelty rather than new-FOV novelty"
+            ),
+        },
         "birth_candidate_contract": {
             "hard_unknown_mask_used": False,
             "reason": (
@@ -702,7 +872,11 @@ def main():
             f"wholeBEV={100*r['whole_unseen_bev_fraction_of_grid']:6.2f}% "
             f"static_cov_whole={100*r['static_whole_unseen_bev_coverage']:6.2f}% "
             f"birth={r['birth_positive_voxels']:7d} "
-            f"birth_unknown={100*r['birth_unknown_voxel_fraction']:6.2f}%"
+            f"birth_unknown={100*r['birth_unknown_voxel_fraction']:6.2f}% "
+            f"newFOV={100*r['new_fov_bev_fraction_of_grid']:6.2f}% "
+            f"static_newFOV={100*r['static_new_fov_voxel_fraction']:6.2f}% "
+            f"newFOV_BEVprev={100*r['static_bev_prevalence_in_new_fov']:6.2f}% "
+            f"birth_newFOV={100*r['birth_new_fov_voxel_fraction']:6.2f}%"
         )
 
     print(
