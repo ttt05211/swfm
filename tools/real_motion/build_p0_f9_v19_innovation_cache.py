@@ -327,6 +327,11 @@ def main():
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--max-windows", type=int, default=0)
+    p.add_argument(
+        "--preserve-record-order",
+        action="store_true",
+        help="Disable default stable grouping by scene used to improve frame-cache reuse.",
+    )
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--shard-size", type=int, default=8)
@@ -367,12 +372,19 @@ def main():
             : min(len(records), int(a.max_windows))
         ]
     global_num_windows = int(len(records))
+    if not bool(a.preserve_record_order):
+        # Stable grouping preserves the original temporal order inside each
+        # scene while making overlapping history/future frames adjacent.  This
+        # materially improves the NuScenes LRU hit rate on full train caches.
+        records = sorted(
+            records,
+            key=lambda r: str(window_from_record(r).scene_name),
+        )
     if int(a.num_shards) > 1:
-        records = [
-            r
-            for ri, r in enumerate(records)
-            if ri % int(a.num_shards) == int(a.shard_index)
-        ]
+        n = len(records)
+        lo = n * int(a.shard_index) // int(a.num_shards)
+        hi = n * (int(a.shard_index) + 1) // int(a.num_shards)
+        records = records[lo:hi]
     if not records:
         raise RuntimeError("empty source cache shard")
 
@@ -422,13 +434,25 @@ def main():
     shard_rows = []
     scenes = set()
     started = time.perf_counter()
+    stage_s = {
+        "raw_load": 0.0,
+        "base_forecast": 0.0,
+        "ancestry_setup": 0.0,
+        "history_alignment": 0.0,
+        "future_targets_and_static": 0.0,
+        "pack_and_write": 0.0,
+    }
 
     for wi, rec in enumerate(records, start=1):
+        tw = time.perf_counter()
         w = window_from_record(rec)
         scenes.add(str(w.scene_name))
         raw = load_nuscenes_window_raw(
             source, w, pcfg, include_gt=True
         )
+        stage_s["raw_load"] += time.perf_counter() - tw
+
+        tw = time.perf_counter()
         state = _prepare_record(
             rec, source, pcfg, strong_cfg, device
         )
@@ -439,7 +463,9 @@ def main():
             )
         finally:
             _release_gpu_inputs(state)
+        stage_s["base_forecast"] += time.perf_counter() - tw
 
+        tw = time.perf_counter()
         history_occ = np.asarray(
             raw["history_occ"], dtype=np.uint8
         )
@@ -473,7 +499,9 @@ def main():
             for x in source_tokens
             if x is not None
         }
+        stage_s["ancestry_setup"] += time.perf_counter() - tw
 
+        tw = time.perf_counter()
         aligned_sem, aligned_geo, history_coverage_all = (
             build_future_aligned_history_bev_with_coverage(
                 history_occ,
@@ -484,7 +512,9 @@ def main():
                 free_label=int(pcfg.free_label),
             )
         )
+        stage_s["history_alignment"] += time.perf_counter() - tw
 
+        tw = time.perf_counter()
         explained_all = []
         add_targets = []
         semantic_targets = []
@@ -571,7 +601,9 @@ def main():
         vertical_targets = np.stack(
             vertical_targets, axis=0
         )
+        stage_s["future_targets_and_static"] += time.perf_counter() - tw
 
+        tw = time.perf_counter()
         row = {
             "future_aligned_semantic": torch.from_numpy(
                 aligned_sem.astype(np.uint8)
@@ -619,6 +651,7 @@ def main():
                 )
             )
             shard_rows = []
+        stage_s["pack_and_write"] += time.perf_counter() - tw
 
         if (
             wi == 1
@@ -697,6 +730,16 @@ def main():
         "totals": totals,
         "category_voxels": category_voxels,
         "shards": shards,
+        "timing_profile": {
+            "elapsed_s": float(max(time.perf_counter() - started, 1e-9)),
+            "windows_per_s": float(
+                len(records) / max(time.perf_counter() - started, 1e-9)
+            ),
+            "stage_seconds": {
+                k: float(v) for k, v in stage_s.items()
+            },
+            "scene_grouped": not bool(a.preserve_record_order),
+        },
     }
 
     (out_dir / "index.json").write_text(
