@@ -18,10 +18,25 @@ from typing import Mapping, Sequence
 import numpy as np
 
 
+# Legacy V19 training target retained for reproducibility of earlier experiments.
+# New work should use NOVELTY_POSITIVE_CATEGORIES: source-shape residuals have a
+# reliable current-source ancestor and therefore belong to Transport refinement,
+# not ancestor-free Novelty.
 INNOVATION_POSITIVE_CATEGORIES = (
     "future_birth_dynamic",
     "source_shape_innovation",
     "never_seen_static",
+)
+
+NOVELTY_POSITIVE_CATEGORIES = (
+    "never_seen_static",
+    "future_birth_dynamic",
+)
+
+TRANSPORT_REFINEMENT_CATEGORIES = (
+    "current_source_transportable_miss",
+    "source_shape_innovation",
+    "t0_unrepresented_dynamic",
 )
 
 MEMORY_ADDRESSABLE_CATEGORIES = (
@@ -55,6 +70,8 @@ DECOMPOSITION_CATEGORIES = (
 
 DECOMPOSITION_GROUPS = {
     "core_innovation": INNOVATION_POSITIVE_CATEGORIES,
+    "novelty": NOVELTY_POSITIVE_CATEGORIES,
+    "transport_refinement": TRANSPORT_REFINEMENT_CATEGORIES,
     "memory_addressable": MEMORY_ADDRESSABLE_CATEGORIES,
     "known_ancestor_model_miss": KNOWN_ANCESTOR_MODEL_MISS_CATEGORIES,
     "ambiguous": AMBIGUOUS_CATEGORIES,
