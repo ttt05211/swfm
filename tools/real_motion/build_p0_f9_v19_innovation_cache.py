@@ -327,6 +327,8 @@ def main():
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--max-windows", type=int, default=0)
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--shard-size", type=int, default=8)
     p.add_argument(
         "--match-max-distance-m",
@@ -344,6 +346,10 @@ def main():
 
     if int(a.shard_size) <= 0:
         raise ValueError("shard-size must be positive")
+    if int(a.num_shards) <= 0:
+        raise ValueError("num-shards must be positive")
+    if not 0 <= int(a.shard_index) < int(a.num_shards):
+        raise ValueError("shard-index must be in [0,num-shards)")
     positive_categories = tuple(POSITIVE_MODES[str(a.positive_mode)])
 
     out_dir = Path(a.output_dir)
@@ -360,8 +366,15 @@ def main():
         records = records[
             : min(len(records), int(a.max_windows))
         ]
+    global_num_windows = int(len(records))
+    if int(a.num_shards) > 1:
+        records = [
+            r
+            for ri, r in enumerate(records)
+            if ri % int(a.num_shards) == int(a.shard_index)
+        ]
     if not records:
-        raise RuntimeError("empty source cache")
+        raise RuntimeError("empty source cache shard")
 
     device = torch.device(
         a.device
@@ -647,6 +660,9 @@ def main():
             ck.get("epoch", -1)
         ),
         "num_windows": int(len(records)),
+        "global_num_windows_before_shard": int(global_num_windows),
+        "num_shards": int(a.num_shards),
+        "shard_index": int(a.shard_index),
         "num_scenes": int(len(scenes)),
         "scene_names": sorted(scenes),
         "future_frames": int(
