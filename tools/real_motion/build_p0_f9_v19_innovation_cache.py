@@ -321,6 +321,12 @@ def main():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument(
+        "--alignment-workers",
+        type=int,
+        default=4,
+        help="CPU threads across the six future-frame history alignments.",
+    )
+    p.add_argument(
         "--preserve-record-order",
         action="store_true",
         help="Disable default stable grouping by scene used to improve frame-cache reuse.",
@@ -344,6 +350,8 @@ def main():
 
     if int(a.shard_size) <= 0:
         raise ValueError("shard-size must be positive")
+    if int(a.alignment_workers) <= 0:
+        raise ValueError("alignment-workers must be positive")
     if int(a.num_shards) <= 0:
         raise ValueError("num-shards must be positive")
     if not 0 <= int(a.shard_index) < int(a.num_shards):
@@ -508,6 +516,7 @@ def main():
             grid=pcfg.grid,
             free_label=int(pcfg.free_label),
             dynamic_class_ids=_DYNAMIC,
+            workers=int(a.alignment_workers),
         )
         stage_s["history_alignment"] += time.perf_counter() - tw
 
@@ -737,6 +746,7 @@ def main():
                 k: float(v) for k, v in stage_s.items()
             },
             "scene_grouped": not bool(a.preserve_record_order),
+            "alignment_workers": int(a.alignment_workers),
         },
     }
 
