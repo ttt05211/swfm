@@ -28,7 +28,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 
-from .geometry import relative_transform, warp_mask, warp_semantic_grid
+from .geometry import relative_transform, warp_mask, warp_semantic_grid, warp_semantic_and_mask
 from .local_st_world_model import (
     build_local_semantic_tubes,
     history_offsets_from_features,
@@ -706,13 +706,9 @@ def render_static_history_mosaic(
         rel = relative_transform(
             np.asarray(pose, dtype=np.float64), fpose
         )
-        observed_future = warp_mask(usable_obs, rel, grid=grid)
-
-        static_sem = sem.copy()
-        static_sem[~usable_obs] = int(free_label)
-        static_sem[dynamic] = int(free_label)
-        semantic_future = warp_semantic_grid(
-            static_sem,
+        semantic_future, observed_future = warp_semantic_and_mask(
+            sem,
+            usable_obs,
             rel,
             grid=grid,
             free_label=int(free_label),
