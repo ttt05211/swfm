@@ -6,6 +6,14 @@ from tools.real_motion.diagnose_p0_f9_v19_true_motion_responsibility import (
 )
 
 from real_motion.v19_innovation import innovation_loss
+from real_motion.v19_innovation_training import (
+    build_true_motion_innovation_bev_supervision,
+)
+from real_motion.v19_innovation_v5 import (
+    decode_ordered_endpoints,
+    gaussian_endpoint_cross_entropy,
+    soft_interval_iou_loss,
+)
 from real_motion.v19_innovation_targets import DECOMPOSITION_CATEGORIES
 from real_motion.v19_innovation_training import (
     build_innovation_bev_supervision,
@@ -178,3 +186,77 @@ def test_true_motion_status_uses_instance_identity_not_spatial_overlap():
         common_tokens=common,
         moving_tokens=moving,
     ) == "unresolved"
+
+
+def test_true_motion_supervision_makes_resolved_other_responsibility_negative():
+    free = 17
+    gt = np.full((3, 3, 4), free, dtype=np.uint8)
+    base = np.full_like(gt, free)
+    gt[1, 1, 1] = 4
+    gt[2, 2, 1] = 4
+
+    cats = {
+        name: np.zeros_like(gt, dtype=bool)
+        for name in (
+            "history_source_recoverable",
+            "t0_unrepresented_dynamic",
+            "current_source_transportable_miss",
+            "future_birth_dynamic",
+            "source_shape_innovation",
+            "dynamic_other_ambiguous",
+            "history_static_recoverable",
+            "history_static_seen_mismatch",
+            "never_seen_static",
+            "static_other_ambiguous",
+        )
+    }
+    cats["source_shape_innovation"][1, 1, 1] = True
+    cats["current_source_transportable_miss"][2, 2, 1] = True
+    true_moving = np.zeros_like(gt, dtype=bool)
+    true_moving[1, 1, 1] = True
+
+    sup = build_true_motion_innovation_bev_supervision(
+        gt,
+        base,
+        cats,
+        true_moving,
+        free_label=free,
+    )
+    assert sup["add_target"][1, 1] == 1
+    # Resolved transport responsibility is no longer ignored: it is a negative.
+    assert sup["candidate_mask"][2, 2] == 1
+    assert sup["add_target"][2, 2] == 0
+
+
+def test_gaussian_endpoint_ce_prefers_nearby_error():
+    target = torch.tensor([5])
+    near = torch.full((1, 16), -4.0)
+    far = torch.full((1, 16), -4.0)
+    near[0, 6] = 4.0
+    far[0, 12] = 4.0
+    ln = gaussian_endpoint_cross_entropy(near, target, sigma=0.75)
+    lf = gaussian_endpoint_cross_entropy(far, target, sigma=0.75)
+    assert float(ln) < float(lf)
+
+
+def test_soft_interval_iou_rewards_matching_endpoints():
+    b = torch.full((1, 8), -5.0)
+    t = torch.full((1, 8), -5.0)
+    b[0, 2] = 5.0
+    t[0, 4] = 5.0
+    good = soft_interval_iou_loss(
+        b, t, torch.tensor([2]), torch.tensor([4])
+    )
+    bad = soft_interval_iou_loss(
+        b, t, torch.tensor([5]), torch.tensor([7])
+    )
+    assert float(good) < float(bad)
+
+
+def test_ordered_endpoint_decode_never_returns_top_below_bottom():
+    bottom = torch.zeros((1, 1, 4, 1, 1))
+    top = torch.zeros_like(bottom)
+    bottom[0, 0, 3, 0, 0] = 10.0
+    top[0, 0, 0, 0, 0] = 10.0
+    b, t = decode_ordered_endpoints(bottom, top)
+    assert int(t.item()) >= int(b.item())
