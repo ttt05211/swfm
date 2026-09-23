@@ -13,6 +13,8 @@ from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRA
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_innovation import (
     ResidualInnovationHead,
+    build_future_aligned_history_and_static_memory,
+    build_future_aligned_history_bev_with_coverage,
     decode_innovation,
     protected_add_only_torch,
 )
@@ -488,3 +490,79 @@ def test_innovation_head_shapes_and_torch_protection():
     merged = protected_add_only_torch(base, proposal, free_label=17)
     assert torch.all(merged[..., 0, 0, 0] == 4)
     assert torch.all(merged[..., 1, 1, 0] == 11)
+
+
+def test_fused_history_alignment_static_memory_matches_reference_paths():
+    grid = OccupancyGrid(
+        x_min=-4.0,
+        y_min=-4.0,
+        z_min=-1.0,
+        voxel_size=(0.4, 0.4, 0.4),
+        shape_hwd=(20, 20, 5),
+    )
+    free = 17
+    rng = np.random.default_rng(123)
+    hist = np.full(
+        (HISTORY_FRAMES, *grid.shape_hwd),
+        free,
+        dtype=np.uint8,
+    )
+    obs = rng.random(hist.shape) < 0.18
+    for t in range(HISTORY_FRAMES):
+        occ = obs[t] & (rng.random(grid.shape_hwd) < 0.22)
+        hist[t][occ] = rng.integers(
+            0, 17, size=int(occ.sum()), dtype=np.uint8
+        )
+
+    hposes = []
+    fposes = []
+    for i in range(HISTORY_FRAMES):
+        T = np.eye(4, dtype=np.float64)
+        T[0, 3] = 0.08 * i
+        T[1, 3] = -0.03 * i
+        hposes.append(T)
+    for i in range(FUTURE_FRAMES):
+        T = np.eye(4, dtype=np.float64)
+        T[0, 3] = 0.12 * (i + 1)
+        T[1, 3] = 0.04 * (i + 1)
+        fposes.append(T)
+
+    ref_sem, ref_geo, ref_cov = (
+        build_future_aligned_history_bev_with_coverage(
+            hist,
+            obs,
+            hposes,
+            fposes,
+            grid=grid,
+            free_label=free,
+        )
+    )
+    ref_static = np.stack(
+        [
+            render_static_history_mosaic(
+                hist,
+                obs,
+                hposes,
+                fp,
+                grid=grid,
+                free_label=free,
+            )
+            for fp in fposes
+        ],
+        axis=0,
+    )
+    got_sem, got_geo, got_cov, got_static = (
+        build_future_aligned_history_and_static_memory(
+            hist,
+            obs,
+            hposes,
+            fposes,
+            grid=grid,
+            free_label=free,
+            dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10),
+        )
+    )
+    assert np.array_equal(got_sem, ref_sem)
+    assert np.allclose(got_geo, ref_geo, atol=0.0, rtol=0.0)
+    assert np.array_equal(got_cov, ref_cov)
+    assert np.array_equal(got_static, ref_static)
