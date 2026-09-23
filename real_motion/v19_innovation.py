@@ -290,6 +290,7 @@ def innovation_loss(
     candidate_mask: torch.Tensor,
     weights: InnovationLossWeights = InnovationLossWeights(),
     positive_weight: float = 4.0,
+    vertical_positive_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Sparse innovation objective.
 
@@ -334,7 +335,16 @@ def innovation_loss(
         z_tgt = vertical_target.permute(0, 1, 3, 4, 2)[pos].to(
             z_rows.dtype
         )
-        vertical = F.binary_cross_entropy_with_logits(z_rows, z_tgt)
+        z_pw = torch.as_tensor(
+            float(vertical_positive_weight),
+            dtype=z_rows.dtype,
+            device=z_rows.device,
+        )
+        vertical = F.binary_cross_entropy_with_logits(
+            z_rows,
+            z_tgt,
+            pos_weight=z_pw,
+        )
     else:
         sem = sem_logits.sum() * 0.0
         vertical = z_logits.sum() * 0.0
