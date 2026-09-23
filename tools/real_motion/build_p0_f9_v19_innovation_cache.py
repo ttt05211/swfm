@@ -23,6 +23,7 @@ import torch
 
 from real_motion.local_st_world_model_v18_se2 import YAW_ENABLED_CLASS_IDS
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
+from real_motion.nuscenes_adapter import gt_moving_support_for_horizon
 from real_motion.motion_transport import (
     dynamic_annotations,
     match_sources_to_annotations,
@@ -48,6 +49,7 @@ from real_motion.v19_innovation_targets import (
 from real_motion.v19_innovation_training import (
     INNOVATION_CACHE_PROTOCOL,
     build_innovation_bev_supervision,
+    build_true_motion_innovation_bev_supervision,
     pack_vertical_occupancy,
     quantize_geometry,
 )
@@ -80,6 +82,9 @@ POSITIVE_MODES = {
         "future_birth_dynamic",
         "source_shape_innovation",
     ),
+    "true_motion_shape": (
+        "true_moving_source_shape_innovation",
+    ),
 }
 
 
@@ -106,6 +111,7 @@ def _category_masks_for_future(
     match_max_distance_m,
     history_coverage,
     static_render,
+    moving_tokens=None,
 ):
     gt = np.asarray(gt, dtype=np.uint8)
     pred = np.asarray(pred_v18, dtype=np.uint8)
@@ -168,6 +174,7 @@ def _category_masks_for_future(
         max_distance_m=float(match_max_distance_m),
     )
     dynamic_assigned = np.zeros(gt.shape, dtype=bool)
+    true_moving_shape = np.zeros(gt.shape, dtype=bool)
 
     for comp, (tok, _nearest_d) in zip(future_components, links):
         idx = np.asarray(comp["voxel_indices"], dtype=np.int64)
@@ -198,8 +205,12 @@ def _category_masks_for_future(
                 raise RuntimeError(
                     "represented future token lacks GT transport support"
                 )
-            masks["current_source_transportable_miss"] |= ca & tr
-            masks["source_shape_innovation"] |= ca & ~tr
+            transportable = ca & tr
+            shape_new = ca & ~tr
+            masks["current_source_transportable_miss"] |= transportable
+            masks["source_shape_innovation"] |= shape_new
+            if moving_tokens is not None and tok in moving_tokens:
+                true_moving_shape |= shape_new
             dynamic_assigned |= ca
             continue
 
@@ -263,7 +274,7 @@ def _category_masks_for_future(
             f"addable={int(addable.sum())}"
         )
 
-    return masks, static_render
+    return masks, static_render, true_moving_shape
 
 
 def _flush_shard(
@@ -431,6 +442,7 @@ def main():
     category_voxels = {
         cat: 0 for cat in DECOMPOSITION_CATEGORIES
     }
+    true_moving_shape_voxels = 0
     shards = []
     shard_rows = []
     scenes = set()
@@ -537,7 +549,23 @@ def main():
                 dtype=np.uint8,
             )
 
-            masks, static_render = (
+            moving_tokens = None
+            if str(a.positive_mode) == "true_motion_shape":
+                _moving_support, moving_records, _moving_excluded = (
+                    gt_moving_support_for_horizon(
+                        source.nusc,
+                        str(w.t0_token),
+                        str(w.future_tokens[fi]),
+                        float(fi + 1) * float(pcfg.frame_dt_s),
+                        grid=pcfg.grid,
+                    )
+                )
+                moving_tokens = {
+                    str(r["instance_token"])
+                    for r in moving_records
+                }
+
+            masks, static_render, true_moving_shape = (
                 _category_masks_for_future(
                     gt=gt,
                     pred_v18=pred_v18,
@@ -566,6 +594,7 @@ def main():
                     ),
                     history_coverage=history_coverage_all[fi],
                     static_render=static_render_all[fi],
+                    moving_tokens=moving_tokens,
                 )
             )
 
@@ -573,6 +602,7 @@ def main():
                 category_voxels[cat] += int(
                     masks[cat].sum()
                 )
+            true_moving_shape_voxels += int(true_moving_shape.sum())
 
             explained = protected_add_only(
                 pred_v18,
@@ -580,13 +610,22 @@ def main():
                 free_label=int(pcfg.free_label),
             )
 
-            sup = build_innovation_bev_supervision(
-                gt,
-                explained,
-                masks,
-                free_label=int(pcfg.free_label),
-                positive_categories=positive_categories,
-            )
+            if str(a.positive_mode) == "true_motion_shape":
+                sup = build_true_motion_innovation_bev_supervision(
+                    gt,
+                    explained,
+                    masks,
+                    true_moving_shape,
+                    free_label=int(pcfg.free_label),
+                )
+            else:
+                sup = build_innovation_bev_supervision(
+                    gt,
+                    explained,
+                    masks,
+                    free_label=int(pcfg.free_label),
+                    positive_categories=positive_categories,
+                )
             for k in totals:
                 totals[k] += int(sup[k])
 
@@ -729,10 +768,21 @@ def main():
         "future_gt_used_for_inference_input": False,
         "positive_mode": str(a.positive_mode),
         "positive_categories": list(positive_categories),
+        "true_moving_source_shape_voxels": int(
+            true_moving_shape_voxels
+        ),
         "responsibility_policy": (
-            "positive=" + "+".join(positive_categories)
-            + "; all other addable decomposition categories=ignore; "
-            "mixed BEV columns=ignore"
+            (
+                "positive=true-moving source-shape innovation; "
+                "all resolved non-positive responsibility and ordinary "
+                "background=negative; only ambiguous responsibility=ignore"
+            )
+            if str(a.positive_mode) == "true_motion_shape"
+            else (
+                "positive=" + "+".join(positive_categories)
+                + "; all other addable decomposition categories=ignore; "
+                "mixed BEV columns=ignore"
+            )
         ),
         "totals": totals,
         "category_voxels": category_voxels,
