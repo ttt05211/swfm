@@ -17,20 +17,17 @@ import numpy as np
 import torch
 
 from .v19_innovation_targets import (
-    AMBIGUOUS_CATEGORIES,
+    DECOMPOSITION_CATEGORIES,
     INNOVATION_POSITIVE_CATEGORIES,
-    KNOWN_ANCESTOR_MODEL_MISS_CATEGORIES,
-    MEMORY_ADDRESSABLE_CATEGORIES,
 )
 
 
 INNOVATION_CACHE_PROTOCOL = "p0_f9_v19_innovation_training_cache_v1"
 GEOMETRY_QUANTIZATION_LEVELS = 255.0
 
-EXCLUDED_FROM_INNOVATION_SUPERVISION = (
-    *MEMORY_ADDRESSABLE_CATEGORIES,
-    *KNOWN_ANCESTOR_MODEL_MISS_CATEGORIES,
-    *AMBIGUOUS_CATEGORIES,
+EXCLUDED_FROM_INNOVATION_SUPERVISION = tuple(
+    x for x in DECOMPOSITION_CATEGORIES
+    if x not in set(INNOVATION_POSITIVE_CATEGORIES)
 )
 
 
@@ -96,6 +93,7 @@ def build_innovation_bev_supervision(
     category_masks: Mapping[str, np.ndarray],
     *,
     free_label: int,
+    positive_categories: tuple[str, ...] = tuple(INNOVATION_POSITIVE_CATEGORIES),
 ) -> dict[str, np.ndarray | int]:
     """Build one future-frame BEV target with explicit ignore semantics.
 
@@ -122,14 +120,22 @@ def build_innovation_bev_supervision(
     if gt.shape != base.shape or gt.ndim != 3:
         raise ValueError("gt/explained occupancy must share [H,W,Z] shape")
 
+    positive_categories = tuple(str(x) for x in positive_categories)
+    unknown = sorted(set(positive_categories) - set(DECOMPOSITION_CATEGORIES))
+    if unknown:
+        raise ValueError(f"unknown positive innovation categories: {unknown}")
+    excluded_categories = tuple(
+        x for x in DECOMPOSITION_CATEGORIES
+        if x not in set(positive_categories)
+    )
     positive_raw = _union_masks(
         category_masks,
-        tuple(INNOVATION_POSITIVE_CATEGORIES),
+        positive_categories,
         gt.shape,
     )
     excluded = _union_masks(
         category_masks,
-        tuple(EXCLUDED_FROM_INNOVATION_SUPERVISION),
+        excluded_categories,
         gt.shape,
     )
 
