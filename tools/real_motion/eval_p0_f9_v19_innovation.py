@@ -53,6 +53,7 @@ def main():
     p.add_argument("--innovation-checkpoint",required=True); p.add_argument("--dataroot",required=True)
     p.add_argument("--info-pkl",required=True); p.add_argument("--output",required=True)
     p.add_argument("--max-windows",type=int,default=0)
+    p.add_argument("--preserve-record-order",action="store_true")
     p.add_argument("--num-shards",type=int,default=1)
     p.add_argument("--shard-index",type=int,default=0)
     p.add_argument("--add-threshold",type=float,default=.5)
@@ -62,10 +63,15 @@ def main():
     _,records=base.load_cache(a.val_cache)
     if a.max_windows>0: records=records[:min(len(records),a.max_windows)]
     global_num_windows=len(records)
+    if not a.preserve_record_order:
+        records=sorted(records,key=lambda r:str(window_from_record(r).scene_name))
     if a.num_shards<=0 or not 0<=a.shard_index<a.num_shards:
         raise ValueError("invalid shard specification")
     if a.num_shards>1:
-        records=[r for i,r in enumerate(records) if i%a.num_shards==a.shard_index]
+        n=len(records)
+        lo=n*a.shard_index//a.num_shards
+        hi=n*(a.shard_index+1)//a.num_shards
+        records=records[lo:hi]
     if not records: raise RuntimeError("empty validation cache shard")
     device=torch.device(a.device if a.device!="cuda" or torch.cuda.is_available() else "cpu")
     amp=device.type=="cuda" and not a.no_amp
