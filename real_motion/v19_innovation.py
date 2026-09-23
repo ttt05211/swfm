@@ -290,6 +290,7 @@ def innovation_loss(
     weights: InnovationLossWeights = InnovationLossWeights(),
     positive_weight: float = 4.0,
     vertical_positive_weight: float = 1.0,
+    presence_hard_negative_ratio: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Sparse innovation objective.
 
@@ -308,18 +309,50 @@ def innovation_loss(
     if vertical_target.shape != z_logits.shape:
         raise ValueError("vertical_target shape mismatch")
 
+    hard_negative_count = 0
     if bool(cand.any()):
-        target = pos.to(add_logits.dtype)
-        pw = torch.as_tensor(
-            float(positive_weight),
-            dtype=add_logits.dtype,
-            device=add_logits.device,
-        )
-        add = F.binary_cross_entropy_with_logits(
-            add_logits[cand],
-            target[cand],
-            pos_weight=pw,
-        )
+        if presence_hard_negative_ratio is None:
+            target = pos.to(add_logits.dtype)
+            pw = torch.as_tensor(
+                float(positive_weight),
+                dtype=add_logits.dtype,
+                device=add_logits.device,
+            )
+            add = F.binary_cross_entropy_with_logits(
+                add_logits[cand],
+                target[cand],
+                pos_weight=pw,
+            )
+        else:
+            ratio = float(presence_hard_negative_ratio)
+            if ratio <= 0:
+                raise ValueError("presence_hard_negative_ratio must be positive")
+            pos_rows = add_logits[pos & cand]
+            neg_rows = add_logits[cand & ~pos]
+            pos_loss = F.softplus(-pos_rows)
+            neg_loss_all = F.softplus(neg_rows)
+            npos = int(pos_rows.numel())
+            nneg = int(neg_rows.numel())
+            if npos > 0 and nneg > 0:
+                hard_negative_count = min(
+                    nneg,
+                    max(1, int(np.ceil(ratio * npos))),
+                )
+                neg_loss = torch.topk(
+                    neg_loss_all,
+                    k=hard_negative_count,
+                    largest=True,
+                    sorted=False,
+                ).values
+                add = torch.cat((pos_loss, neg_loss), dim=0).mean()
+            elif npos > 0:
+                add = pos_loss.mean()
+            elif nneg > 0:
+                # All-negative batch: keep a real anti-hallucination signal.
+                add = neg_loss_all.mean()
+                hard_negative_count = nneg
+            else:
+                add = add_logits.sum() * 0.0
     else:
         add = add_logits.sum() * 0.0
 
@@ -356,6 +389,7 @@ def innovation_loss(
         "vertical_bce": float(vertical.detach().cpu()),
         "positive_bev_cells": int(pos.sum().item()),
         "candidate_bev_cells": int(cand.sum().item()),
+        "hard_negative_bev_cells": int(hard_negative_count),
     }
 
 
