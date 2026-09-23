@@ -54,12 +54,14 @@ def main():
     p.add_argument("--innovation-checkpoint",required=True); p.add_argument("--dataroot",required=True)
     p.add_argument("--info-pkl",required=True); p.add_argument("--output",required=True)
     p.add_argument("--max-windows",type=int,default=0)
+    p.add_argument("--alignment-workers",type=int,default=4)
     p.add_argument("--preserve-record-order",action="store_true")
     p.add_argument("--num-shards",type=int,default=1)
     p.add_argument("--shard-index",type=int,default=0)
     p.add_argument("--add-threshold",type=float,default=.5)
     p.add_argument("--vertical-threshold",type=float,default=.5); p.add_argument("--device",default="cuda")
     p.add_argument("--no-amp",action="store_true"); a=p.parse_args()
+    if a.alignment_workers<=0: raise ValueError("alignment-workers must be positive")
     pcfg=make_prepare_config(load_runtime_config(a.config,a.override))
     _,records=base.load_cache(a.val_cache)
     if a.max_windows>0: records=records[:min(len(records),a.max_windows)]
@@ -97,6 +99,7 @@ def main():
             grid=pcfg.grid,
             free_label=int(pcfg.free_label),
             dynamic_class_ids=tuple(int(x) for x in DYNAMIC_CLASS_IDS),
+            workers=int(a.alignment_workers),
         )
         explained=[]
         for fi in range(len(raw["future_poses"])):
