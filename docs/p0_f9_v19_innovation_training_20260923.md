@@ -177,3 +177,81 @@ system logic and therefore do not need trainable weights.
 
 That later phase is for packaging/training cleanliness, not for changing the
 Transport / Memory / Innovation responsibility definitions.
+
+
+## 2026-09-23 update: dynamic-only v3 and fast-paths
+
+The first dynamic-only balanced-v2 smoke learned the semantic target well but
+over-generated badly: validation presence recall rose to 0.733 while precision
+fell to 0.127; vertical recall was about 0.935 with precision about 0.227. The
+64-window occupancy evaluation therefore regressed by -1.598 mIoU and -11.924
+Moving-Micro relative to the static-memory base.
+
+The next objective is intentionally conservative:
+
+- positives remain only `future_birth_dynamic + source_shape_innovation`;
+- presence uses all positives plus the hardest 4x negatives, with no large
+  positive BCE weight;
+- vertical occupancy uses symmetric BCE (`pos_weight=1`) by default;
+- `best.pt` is selected by validation presence F0.5 (precision-favouring),
+  while `best_loss.pt` is also retained.
+
+Trainer:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$PY" -u \
+  tools/real_motion/train_p0_f9_v19_innovation_hardneg.py \
+  --train-cache "$ROOT/data/p0_f9_v19_innovation_dynamic_train_smoke128" \
+  --val-cache "$ROOT/data/p0_f9_v19_innovation_dynamic_val_smoke64" \
+  --output-dir "$ROOT/outputs/p0_f9_v19_innovation_dynamic_hardneg_smoke128" \
+  --epochs 5 \
+  --batch-size 2 \
+  --hard-negative-ratio 4 \
+  --vertical-positive-weight 1 \
+  --device cuda
+```
+
+### Cache/eval acceleration
+
+Single-process geometry was reduced without changing the prediction contract:
+
+1. mask warps now use direct OR-scatter rather than semantic collision sorting;
+2. semantic + observation support are warped with one coordinate transform;
+3. cache generation reuses the already aligned 3D history coverage instead of
+   running a second 6x6 mask-warp pass.
+
+Exactness tests compare the fast mask/fused paths against the historical
+semantic-warp implementation.
+
+For large jobs, cache and evaluation also support deterministic window
+sharding. Example for 4 GPUs:
+
+```bash
+for i in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$i "$PY" -u \
+    tools/real_motion/build_p0_f9_v19_innovation_cache.py \
+    --source-cache "$TRAIN_V18" \
+    --checkpoint "$CLEAN_CKPT" \
+    --dataroot "$DATAROOT" \
+    --info-pkl "$TRAIN_INFO" \
+    --output-dir "$ROOT/data/p0_f9_v19_innovation_dynamic_train_full_part$i" \
+    --positive-mode dynamic \
+    --num-shards 4 \
+    --shard-index $i \
+    --shard-size 8 \
+    --device cuda > "$ROOT/outputs/v19_cache_part$i.log" 2>&1 &
+done
+wait
+
+"$PY" tools/real_motion/merge_p0_f9_v19_innovation_cache_shards.py \
+  --inputs \
+    "$ROOT/data/p0_f9_v19_innovation_dynamic_train_full_part0" \
+    "$ROOT/data/p0_f9_v19_innovation_dynamic_train_full_part1" \
+    "$ROOT/data/p0_f9_v19_innovation_dynamic_train_full_part2" \
+    "$ROOT/data/p0_f9_v19_innovation_dynamic_train_full_part3" \
+  --output-dir "$ROOT/data/p0_f9_v19_innovation_dynamic_train_full"
+```
+
+Evaluation uses the same `--num-shards/--shard-index` partition and can be
+merged with `merge_p0_f9_v19_innovation_eval_shards.py`. Because each process
+has its own model and NuScenes reader, this is intended for one process per GPU.
