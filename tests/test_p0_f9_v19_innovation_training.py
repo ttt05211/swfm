@@ -1,6 +1,10 @@
 import numpy as np
 import torch
 
+from tools.real_motion.diagnose_p0_f9_v19_true_motion_responsibility import (
+    _motion_status,
+)
+
 from real_motion.v19_innovation import innovation_loss
 from real_motion.v19_innovation_targets import DECOMPOSITION_CATEGORIES
 from real_motion.v19_innovation_training import (
@@ -149,3 +153,28 @@ def test_hard_negative_presence_keeps_bounded_negative_ratio():
     assert stats["hard_negative_bev_cells"] == 2
     loss.backward()
     assert add_logits.grad is not None
+
+
+def test_true_motion_status_uses_instance_identity_not_spatial_overlap():
+    common = {"moving-car", "parked-car"}
+    moving = {"moving-car"}
+    assert _motion_status(
+        "moving-car",
+        common_tokens=common,
+        moving_tokens=moving,
+    ) == "true_moving"
+    assert _motion_status(
+        "parked-car",
+        common_tokens=common,
+        moving_tokens=moving,
+    ) == "common_nonmoving"
+    assert _motion_status(
+        "future-birth",
+        common_tokens=common,
+        moving_tokens=moving,
+    ) == "not_common_unscored"
+    assert _motion_status(
+        None,
+        common_tokens=common,
+        moving_tokens=moving,
+    ) == "unresolved"
