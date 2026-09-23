@@ -25,7 +25,6 @@ from real_motion.v19_innovation import (
     ResidualInnovationHead,
     innovation_loss,
 )
-from real_motion.v19_innovation_targets import INNOVATION_POSITIVE_CATEGORIES
 from real_motion.v19_innovation_training import (
     dequantize_geometry_torch,
     unpack_vertical_occupancy_torch,
@@ -208,7 +207,9 @@ def _save(
             "innovation_state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "architecture": arch,
-            "positive_categories": list(INNOVATION_POSITIVE_CATEGORIES),
+            "positive_categories": list(
+                train_index.get("positive_categories", [])
+            ),
             "positive_weight": float(presence_positive_weight),
             "vertical_positive_weight": float(vertical_positive_weight),
             "base_checkpoint": train_index.get("base_checkpoint"),
