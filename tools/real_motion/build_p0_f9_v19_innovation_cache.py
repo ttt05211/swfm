@@ -21,7 +21,6 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from real_motion.geometry import relative_transform, warp_mask
 from real_motion.local_st_world_model_v18_se2 import YAW_ENABLED_CLASS_IDS
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.motion_transport import (
@@ -39,7 +38,7 @@ from real_motion.runtime_fastpath import extract_instances_cropped_exact
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_innovation import (
     base_explained_bev,
-    build_future_aligned_history_bev,
+    build_future_aligned_history_bev_with_coverage,
 )
 from real_motion.v19_innovation_targets import (
     DECOMPOSITION_CATEGORIES,
@@ -108,6 +107,7 @@ def _category_masks_for_future(
     future_component_cfg,
     metric_grid,
     match_max_distance_m,
+    history_coverage,
 ):
     gt = np.asarray(gt, dtype=np.uint8)
     pred = np.asarray(pred_v18, dtype=np.uint8)
@@ -237,16 +237,9 @@ def _category_masks_for_future(
     hist_static = addable & gt_static & (static_render == gt)
     masks["history_static_recoverable"] = hist_static
 
-    hist_coverage = np.zeros(gt.shape, dtype=bool)
-    for obs, hp in zip(history_obs, history_poses):
-        hist_coverage |= warp_mask(
-            obs,
-            relative_transform(
-                hp,
-                np.asarray(future_pose, dtype=np.float64),
-            ),
-            grid=pcfg.grid,
-        )
+    hist_coverage = np.asarray(history_coverage, dtype=bool)
+    if hist_coverage.shape != gt.shape:
+        raise ValueError("history coverage shape mismatch")
 
     masks["history_static_seen_mismatch"] = (
         addable & gt_static & hist_coverage & ~hist_static
@@ -468,8 +461,8 @@ def main():
             if x is not None
         }
 
-        aligned_sem, aligned_geo = (
-            build_future_aligned_history_bev(
+        aligned_sem, aligned_geo, history_coverage_all = (
+            build_future_aligned_history_bev_with_coverage(
                 history_occ,
                 history_obs,
                 history_poses,
@@ -522,6 +515,7 @@ def main():
                     match_max_distance_m=float(
                         a.match_max_distance_m
                     ),
+                    history_coverage=history_coverage_all[fi],
                 )
             )
 
