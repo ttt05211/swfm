@@ -38,7 +38,7 @@ from real_motion.runtime_fastpath import extract_instances_cropped_exact
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_innovation import (
     base_explained_bev,
-    build_future_aligned_history_bev_with_coverage,
+    build_future_aligned_history_and_static_memory,
 )
 from real_motion.v19_innovation_targets import (
     DECOMPOSITION_CATEGORIES,
@@ -51,10 +51,7 @@ from real_motion.v19_innovation_training import (
     pack_vertical_occupancy,
     quantize_geometry,
 )
-from real_motion.v19_scene_memory import (
-    protected_add_only,
-    render_static_history_mosaic,
-)
+from real_motion.v19_scene_memory import protected_add_only
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.benchmark_p0_f9_v18_runtime import (
@@ -108,6 +105,7 @@ def _category_masks_for_future(
     metric_grid,
     match_max_distance_m,
     history_coverage,
+    static_render,
 ):
     gt = np.asarray(gt, dtype=np.uint8)
     pred = np.asarray(pred_v18, dtype=np.uint8)
@@ -226,14 +224,9 @@ def _category_masks_for_future(
     if bool(residual_dynamic.any()):
         masks["dynamic_other_ambiguous"] |= residual_dynamic
 
-    static_render = render_static_history_mosaic(
-        history_occ,
-        history_obs,
-        history_poses,
-        np.asarray(future_pose, dtype=np.float64),
-        grid=pcfg.grid,
-        free_label=int(pcfg.free_label),
-    )
+    static_render = np.asarray(static_render, dtype=np.uint8)
+    if static_render.shape != gt.shape:
+        raise ValueError("static render shape mismatch")
     hist_static = addable & gt_static & (static_render == gt)
     masks["history_static_recoverable"] = hist_static
 
@@ -502,15 +495,19 @@ def main():
         stage_s["ancestry_setup"] += time.perf_counter() - tw
 
         tw = time.perf_counter()
-        aligned_sem, aligned_geo, history_coverage_all = (
-            build_future_aligned_history_bev_with_coverage(
-                history_occ,
-                history_obs,
-                history_poses,
-                future_poses,
-                grid=pcfg.grid,
-                free_label=int(pcfg.free_label),
-            )
+        (
+            aligned_sem,
+            aligned_geo,
+            history_coverage_all,
+            static_render_all,
+        ) = build_future_aligned_history_and_static_memory(
+            history_occ,
+            history_obs,
+            history_poses,
+            future_poses,
+            grid=pcfg.grid,
+            free_label=int(pcfg.free_label),
+            dynamic_class_ids=_DYNAMIC,
         )
         stage_s["history_alignment"] += time.perf_counter() - tw
 
@@ -559,6 +556,7 @@ def main():
                         a.match_max_distance_m
                     ),
                     history_coverage=history_coverage_all[fi],
+                    static_render=static_render_all[fi],
                 )
             )
 
