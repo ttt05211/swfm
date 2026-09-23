@@ -9,11 +9,12 @@ if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 import numpy as np
 import torch
 from real_motion.nuscenes_adapter import NuScenesWindowSource, gt_moving_support_for_horizon
+from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args,load_runtime_config,make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig
-from real_motion.v19_innovation import ResidualInnovationHead,base_explained_bev,build_future_aligned_history_bev,decode_innovation
-from real_motion.v19_scene_memory import protected_add_only,render_static_history_mosaic
+from real_motion.v19_innovation import ResidualInnovationHead,base_explained_bev,build_future_aligned_history_and_static_memory,decode_innovation
+from real_motion.v19_scene_memory import protected_add_only
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.benchmark_p0_f9_v18_runtime import _forecast_once,_prepare_record,_release_gpu_inputs,_stage_gpu_inputs
@@ -88,13 +89,26 @@ def main():
         state=_prepare_record(rec,source,pcfg,strong_cfg,device); _stage_gpu_inputs(state,device)
         try: pred_all=_forecast_once(base_model,state,pcfg,strong_cfg,device)
         finally: _release_gpu_inputs(state)
+        sem,geo,_,static_all=build_future_aligned_history_and_static_memory(
+            raw["history_occ"],
+            raw["history_observed"],
+            raw["history_poses"],
+            raw["future_poses"],
+            grid=pcfg.grid,
+            free_label=int(pcfg.free_label),
+            dynamic_class_ids=tuple(int(x) for x in DYNAMIC_CLASS_IDS),
+        )
         explained=[]
-        for fi,fpose in enumerate(raw["future_poses"]):
+        for fi in range(len(raw["future_poses"])):
             pred=np.asarray(pred_all[fi],dtype=np.uint8)
-            static=render_static_history_mosaic(raw["history_occ"],raw["history_observed"],raw["history_poses"],np.asarray(fpose,dtype=np.float64),grid=pcfg.grid,free_label=int(pcfg.free_label))
-            explained.append(protected_add_only(pred,static,free_label=int(pcfg.free_label)))
+            explained.append(
+                protected_add_only(
+                    pred,
+                    static_all[fi],
+                    free_label=int(pcfg.free_label),
+                )
+            )
         explained=np.stack(explained).astype(np.uint8)
-        sem,geo=build_future_aligned_history_bev(raw["history_occ"],raw["history_observed"],raw["history_poses"],raw["future_poses"],grid=pcfg.grid,free_label=int(pcfg.free_label))
         sem_t=torch.from_numpy(sem[None]).to(device); geo_t=torch.from_numpy(geo[None]).to(device)
         base_t=torch.from_numpy(base_explained_bev(explained,free_label=int(pcfg.free_label))[None]).to(device)
         with torch.inference_mode(),_autocast(device,amp): out=innovation(sem_t,geo_t,base_t)
