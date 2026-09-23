@@ -584,6 +584,7 @@ def test_interval_innovation_head_decodes_contiguous_vertical_extent():
     explained = torch.zeros(B, Fh, 1, H, W)
     with torch.inference_mode():
         out = model(sem, geo, explained)
+    out = {k: v.clone() for k, v in out.items()}
     assert out["bottom_logits"].shape == (B, Fh, Z, H, W)
     assert out["span_logits"].shape == (B, Fh, Z, H, W)
 
