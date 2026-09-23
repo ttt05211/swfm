@@ -5,6 +5,9 @@ from tools.real_motion.diagnose_p0_f9_v19_true_motion_responsibility import (
     _motion_status,
 )
 from tools.real_motion.diagnose_p0_f9_v19_novelty_candidate import (
+    _accumulate_geometry_stats,
+    _empty_geometry_stats,
+    _finalize_geometry_stats,
     _history_grid_footprint_bev,
 )
 from real_motion.geometry import OccupancyGrid
@@ -303,3 +306,33 @@ def test_history_grid_footprint_detects_new_forward_fov():
     # the previous [-2,2) grid footprint.
     assert covered[:3].all()
     assert not covered[3].any()
+
+
+
+def test_static_geometry_stats_detect_contiguity_and_semantic_purity():
+    mask = np.zeros((2, 2, 4), dtype=bool)
+    gt = np.full((2, 2, 4), 17, dtype=np.uint8)
+
+    # One pure contiguous road column of length 2.
+    mask[0, 0, 0:2] = True
+    gt[0, 0, 0:2] = 11
+
+    # One non-contiguous mixed-semantic column spanning 0..2.
+    mask[1, 1, 0] = True
+    mask[1, 1, 2] = True
+    gt[1, 1, 0] = 15
+    gt[1, 1, 2] = 16
+
+    stats = _empty_geometry_stats(4)
+    _accumulate_geometry_stats(stats, mask, gt)
+    out = _finalize_geometry_stats(stats)
+
+    assert out["positive_columns"] == 2
+    assert out["positive_voxels"] == 4
+    assert out["contiguous_columns"] == 1
+    assert out["contiguous_fraction"] == 0.5
+    assert out["single_semantic_columns"] == 1
+    assert out["single_semantic_column_fraction"] == 0.5
+    assert out["bottom_histogram"][0] == 2
+    assert out["top_histogram"][1] == 1
+    assert out["top_histogram"][2] == 1
