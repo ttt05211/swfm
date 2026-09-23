@@ -64,6 +64,7 @@ from real_motion.runtime_config import (
     load_runtime_config,
     make_prepare_config,
 )
+from real_motion.runtime_fastpath import extract_instances_cropped_exact
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_scene_memory import render_static_history_mosaic
 from tools.real_motion import eval_p0_f9_v18_se2 as base
@@ -78,13 +79,14 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 
 
-PROTOCOL = "p0_f9_v19_innovation_decomposition_perfect_add_v1"
+PROTOCOL = "p0_f9_v19_innovation_decomposition_perfect_add_v2"
 REPORT = {1.0: 1, 2.0: 3, 3.0: 5}
 HORIZONS = tuple(REPORT)
 SEMANTIC_CLASSES = tuple(range(17))
 CATEGORIES = (
     "history_source_recoverable",
     "t0_unrepresented_dynamic",
+    "current_source_transportable_miss",
     "future_birth_dynamic",
     "source_shape_innovation",
     "dynamic_other_ambiguous",
@@ -93,6 +95,33 @@ CATEGORIES = (
     "never_seen_static",
     "static_other_ambiguous",
 )
+
+GROUPS = {
+    # These are the only categories proposed as positive supervision for the
+    # first residual innovation head.
+    "core_innovation": (
+        "future_birth_dynamic",
+        "source_shape_innovation",
+        "never_seen_static",
+    ),
+    # Content with a causal ancestor should be handled by explicit state rather
+    # than learned generation.
+    "memory_addressable": (
+        "history_source_recoverable",
+        "history_static_recoverable",
+    ),
+    # Known/seen content that the current deterministic/source path failed to
+    # realize.  Keep it out of innovation supervision until that path is fixed.
+    "known_ancestor_model_miss": (
+        "t0_unrepresented_dynamic",
+        "current_source_transportable_miss",
+        "history_static_seen_mismatch",
+    ),
+    "ambiguous": (
+        "dynamic_other_ambiguous",
+        "static_other_ambiguous",
+    ),
+}
 _DYNAMIC = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 _DYNAMIC_SET = set(_DYNAMIC)
 
@@ -208,6 +237,54 @@ def _same_class_history_evidence(
     return False
 
 
+
+def _match_future_components_many_to_one(
+    components,
+    annotations,
+    *,
+    max_distance_m: float,
+):
+    """Independently link future GT occupancy components to same-class GT IDs.
+
+    This is diagnostic-only.  Many fragments may map to one instance token;
+    unlike deployment tracking, one-to-one matching would incorrectly leave
+    fragmented GT occupancy unattributed.
+    """
+    rows = []
+    anns = list(annotations.values())
+    for comp in components:
+        cid = int(comp["class_id"])
+        cc = np.asarray(comp["centroid_world"], dtype=np.float64)
+        candidates = []
+        for ann in anns:
+            if int(ann["class_id"]) != cid:
+                continue
+            ac = np.asarray(ann["center_world"], dtype=np.float64)
+            d = float(np.linalg.norm(cc[:2] - ac[:2]))
+            candidates.append((d, str(ann["instance_token"])))
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        if not candidates:
+            rows.append((None, float("inf")))
+            continue
+        d, tok = candidates[0]
+        rows.append(
+            (str(tok) if d <= float(max_distance_m) else None, float(d))
+        )
+    return rows
+
+
+def _distance_bin(d: float) -> str:
+    if not np.isfinite(d):
+        return "no_same_class_annotation"
+    if d <= 4.0:
+        return "le_4m"
+    if d <= 6.0:
+        return "4_to_6m"
+    if d <= 10.0:
+        return "6_to_10m"
+    return "gt_10m"
+
+
 def _raw_state():
     H = len(HORIZONS)
     return {
@@ -306,16 +383,43 @@ def main():
     ck, model, _ = full._load_model(a.checkpoint, CLEAN_PROTOCOL, device)
     source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
+    future_component_cfg = StrongW2DetConfig(
+        free_label=int(pcfg.free_label),
+        min_component_voxels=1,
+        max_match_speed_mps=float(strong_cfg.max_match_speed_mps),
+        connectivity=int(strong_cfg.connectivity),
+        fill_kernel=tuple(strong_cfg.fill_kernel),
+        fill_min_fraction=float(strong_cfg.fill_min_fraction),
+    )
     metric_grid = _grid_spec(pcfg.grid)
 
     states = {"base": _raw_state()}
     for cat in CATEGORIES:
         states[f"base_plus_{cat}"] = _raw_state()
+    for group in GROUPS:
+        states[f"base_plus_group_{group}"] = _raw_state()
     states["base_plus_all_addable"] = _raw_state()
 
     counts = {
         h: {cat: 0 for cat in CATEGORIES}
         for h in HORIZONS
+    }
+    group_counts = {
+        h: {group: 0 for group in GROUPS}
+        for h in HORIZONS
+    }
+    ambiguous_audit = {
+        "dynamic_other_voxels": 0,
+        "dynamic_other_moving_voxels": 0,
+        "dynamic_other_components": 0,
+        "nearest_same_class_annotation_distance_bins": {
+            "le_4m": 0,
+            "4_to_6m": 0,
+            "6_to_10m": 0,
+            "gt_10m": 0,
+            "no_same_class_annotation": 0,
+        },
+        "per_class_voxels": {str(cid): 0 for cid in _DYNAMIC},
     }
     total_addable = {h: 0 for h in HORIZONS}
     started = time.perf_counter()
@@ -371,15 +475,13 @@ def main():
             gt_static = gt_occ & ~gt_dynamic
 
             annh = _ann_map(source.nusc, ftok)
-            represented_transport = np.zeros(gt.shape, dtype=bool)
-            represented_box = np.zeros(gt.shape, dtype=bool)
-            history_dyn = np.zeros(gt.shape, dtype=bool)
-            t0_unrepresented_dyn = np.zeros(gt.shape, dtype=bool)
-            birth_dyn = np.zeros(gt.shape, dtype=bool)
 
-            # Exact GT-motion transport support of represented t0 sources.
-            for si, comp in enumerate(state["current"]):
-                tok = source_tokens[si]
+            # Per-instance GT-motion transport of the actually observed t0
+            # source geometry.  If an addable GT voxel is covered here, it has
+            # a reliable ancestor and is a transport/model miss, not innovation.
+            represented_transport_by_token = {}
+            for src_i, comp in enumerate(state["current"]):
+                tok = source_tokens[src_i]
                 if tok is None:
                     continue
                 tok = str(tok)
@@ -405,83 +507,93 @@ def main():
                     yaw_delta_rad=float(dyaw),
                     grid=pcfg.grid,
                 )
+                mask = represented_transport_by_token.setdefault(
+                    tok, np.zeros(gt.shape, dtype=bool)
+                )
                 idx = np.asarray(rc.voxel_indices, dtype=np.int64)
                 if len(idx):
-                    represented_transport[
-                        idx[:, 0], idx[:, 1], idx[:, 2]
-                    ] = True
+                    mask[idx[:, 0], idx[:, 1], idx[:, 2]] = True
 
-            # Attribute dynamic future occupancy with GT boxes.
-            for tok, ah in annh.items():
-                box = rasterize_oriented_box(
-                    _future_box(ah, fpose),
-                    metric_grid,
-                    margin=float(BOX_MARGIN_M),
-                )
-                support = box & (gt == int(ah["class_id"]))
-                if tok in represented:
-                    represented_box |= support
-                else:
-                    # Memory recoverability is an occupancy/source-state
-                    # question, not an annotation-at-t0 question.  A future
-                    # instance may still have a t0 GT annotation while the
-                    # causal Strong source is missing at the block anchor.
-                    # If the same tracked instance had causal semantic
-                    # evidence before t0, it belongs to history recovery.
-                    seen_pre_t0 = _same_class_history_evidence(
-                        tok,
-                        int(ah["class_id"]),
-                        tuple(w.history_tokens[:-1]),
-                        history_occ[:-1],
-                        history_poses[:-1],
-                        ann_hist[:-1],
-                        metric_grid,
+            # Attribute every future dynamic GT voxel through occupancy
+            # connected components first, rather than requiring every voxel to
+            # lie inside a rasterized annotation box.  min_component_voxels=1
+            # makes the decomposition exhaustive over dynamic GT occupancy.
+            future_components = extract_instances_cropped_exact(
+                gt,
+                fpose,
+                grid=pcfg.grid,
+                cfg=future_component_cfg,
+            )
+            comp_links = _match_future_components_many_to_one(
+                future_components,
+                annh,
+                max_distance_m=float(a.match_max_distance_m),
+            )
+            dynamic_assigned = np.zeros(gt.shape, dtype=bool)
+            unlinked_component_masks = []
+            for comp, (tok, nearest_d) in zip(future_components, comp_links):
+                idx = np.asarray(comp["voxel_indices"], dtype=np.int64)
+                if len(idx) == 0:
+                    continue
+                comp_mask = np.zeros(gt.shape, dtype=bool)
+                comp_mask[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+                comp_addable = comp_mask & addable & gt_dynamic
+                if not bool(comp_addable.any()):
+                    continue
+
+                if tok is None:
+                    masks["dynamic_other_ambiguous"] |= comp_addable
+                    dynamic_assigned |= comp_addable
+                    unlinked_component_masks.append(
+                        (comp_addable, int(comp["class_id"]), float(nearest_d))
                     )
-                    if seen_pre_t0:
-                        history_dyn |= support
-                    elif tok in t0_tokens:
-                        # Present in GT at t0 but not represented by a frozen
-                        # current Strong source and not recoverable from the
-                        # preceding five occupancy frames under this proxy.
-                        t0_unrepresented_dyn |= support
-                    else:
-                        # No t0 instance and no causal pre-t0 semantic
-                        # evidence for the same tracked instance.
-                        birth_dyn |= support
+                    continue
 
-            masks["history_source_recoverable"] = (
-                addable & gt_dynamic & history_dyn
-            )
-            masks["t0_unrepresented_dynamic"] = (
-                addable
-                & gt_dynamic
-                & t0_unrepresented_dyn
-                & ~masks["history_source_recoverable"]
-            )
-            masks["future_birth_dynamic"] = (
-                addable
-                & gt_dynamic
-                & birth_dyn
-                & ~masks["history_source_recoverable"]
-                & ~masks["t0_unrepresented_dynamic"]
-            )
-            masks["source_shape_innovation"] = (
-                addable
-                & gt_dynamic
-                & represented_box
-                & ~represented_transport
-                & ~masks["history_source_recoverable"]
-                & ~masks["t0_unrepresented_dynamic"]
-                & ~masks["future_birth_dynamic"]
-            )
-            masks["dynamic_other_ambiguous"] = (
-                addable
-                & gt_dynamic
-                & ~masks["history_source_recoverable"]
-                & ~masks["t0_unrepresented_dynamic"]
-                & ~masks["future_birth_dynamic"]
-                & ~masks["source_shape_innovation"]
-            )
+                tok = str(tok)
+                ah = annh.get(tok)
+                if ah is None:
+                    raise RuntimeError("linked future component token is missing")
+                if int(ah["class_id"]) != int(comp["class_id"]):
+                    raise RuntimeError("future component/annotation class mismatch")
+
+                if tok in represented:
+                    transport = represented_transport_by_token.get(tok)
+                    if transport is None:
+                        # A represented t0 source whose annotation vanishes
+                        # from the future cannot be linked here; reaching this
+                        # branch would indicate an ancestry bookkeeping bug.
+                        raise RuntimeError(
+                            "represented future token lacks GT transport support"
+                        )
+                    transportable = comp_addable & transport
+                    shape_new = comp_addable & ~transport
+                    masks["current_source_transportable_miss"] |= transportable
+                    masks["source_shape_innovation"] |= shape_new
+                    dynamic_assigned |= comp_addable
+                    continue
+
+                seen_pre_t0 = _same_class_history_evidence(
+                    tok,
+                    int(ah["class_id"]),
+                    tuple(w.history_tokens[:-1]),
+                    history_occ[:-1],
+                    history_poses[:-1],
+                    ann_hist[:-1],
+                    metric_grid,
+                )
+                if seen_pre_t0:
+                    masks["history_source_recoverable"] |= comp_addable
+                elif tok in t0_tokens:
+                    masks["t0_unrepresented_dynamic"] |= comp_addable
+                else:
+                    masks["future_birth_dynamic"] |= comp_addable
+                dynamic_assigned |= comp_addable
+
+            # Any remaining dynamic addable voxel would mean the min-size-1
+            # occupancy component extraction did not cover the semantic grid.
+            residual_dynamic = addable & gt_dynamic & ~dynamic_assigned
+            if bool(residual_dynamic.any()):
+                masks["dynamic_other_ambiguous"] |= residual_dynamic
 
             # History static memory uses only lidar-observed non-dynamic voxels.
             static_render = render_static_history_mosaic(
@@ -521,19 +633,31 @@ def main():
                 & ~hist_static
             )
 
-            assigned = np.zeros(gt.shape, dtype=bool)
-            for cat in CATEGORIES[:-1]:
-                masks[cat] &= ~assigned
-                assigned |= masks[cat]
+            # Dynamic categories above are already mutually exclusive by
+            # component ancestry.  Static categories are mutually exclusive by
+            # visibility/mosaic state.
             masks["static_other_ambiguous"] = (
-                addable & gt_static & ~assigned
+                addable
+                & gt_static
+                & ~masks["history_static_recoverable"]
+                & ~masks["history_static_seen_mismatch"]
+                & ~masks["never_seen_static"]
             )
-            assigned |= masks["static_other_ambiguous"]
 
-            if int(assigned.sum()) != int(addable.sum()) or int(
-                sum(int(m.sum()) for m in masks.values())
-            ) != int(addable.sum()):
-                raise RuntimeError("innovation categories are not disjoint/exhaustive")
+            assigned = np.zeros(gt.shape, dtype=bool)
+            for cat in CATEGORIES:
+                overlap = assigned & masks[cat]
+                if bool(overlap.any()):
+                    raise RuntimeError(
+                        f"innovation categories overlap at {cat}: "
+                        f"{int(overlap.sum())} voxels"
+                    )
+                assigned |= masks[cat]
+            if int(assigned.sum()) != int(addable.sum()):
+                raise RuntimeError(
+                    "innovation categories are not exhaustive: "
+                    f"assigned={int(assigned.sum())} addable={int(addable.sum())}"
+                )
 
             moving, _, _ = gt_moving_support_for_horizon(
                 source.nusc,
@@ -542,6 +666,22 @@ def main():
                 float(h),
                 grid=pcfg.grid,
             )
+            dynamic_other = masks["dynamic_other_ambiguous"]
+            ambiguous_audit["dynamic_other_voxels"] += int(
+                dynamic_other.sum()
+            )
+            ambiguous_audit["dynamic_other_moving_voxels"] += int(
+                (dynamic_other & moving).sum()
+            )
+            for comp_mask, cid, nearest_d in unlinked_component_masks:
+                ambiguous_audit["dynamic_other_components"] += 1
+                ambiguous_audit[
+                    "nearest_same_class_annotation_distance_bins"
+                ][_distance_bin(float(nearest_d))] += int(comp_mask.sum())
+                ambiguous_audit["per_class_voxels"][str(int(cid))] += int(
+                    comp_mask.sum()
+                )
+
             _update_raw(
                 states["base"],
                 hi,
@@ -562,6 +702,22 @@ def main():
                     moving,
                     int(pcfg.free_label),
                 )
+            for group, cats in GROUPS.items():
+                group_mask = np.zeros(gt.shape, dtype=bool)
+                for cat in cats:
+                    group_mask |= masks[cat]
+                group_counts[h][group] += int(group_mask.sum())
+                oracle = pred.copy()
+                oracle[group_mask] = gt[group_mask]
+                _update_raw(
+                    states[f"base_plus_group_{group}"],
+                    hi,
+                    oracle,
+                    gt,
+                    moving,
+                    int(pcfg.free_label),
+                )
+
             all_oracle = pred.copy()
             all_oracle[addable] = gt[addable]
             _update_raw(
@@ -600,6 +756,32 @@ def main():
             },
         }
 
+    group_report = {}
+    for group, cats in GROUPS.items():
+        group_report[group] = {
+            "categories": list(cats),
+            "addable_voxels": int(
+                sum(group_counts[h][group] for h in HORIZONS)
+            ),
+            "share_of_addable": float(
+                sum(group_counts[h][group] for h in HORIZONS)
+                / max(sum(total_addable.values()), 1)
+            ),
+            "perfect_add_metrics": reports[f"base_plus_group_{group}"],
+            "delta_vs_base": _delta(
+                reports[f"base_plus_group_{group}"], baseline
+            ),
+            "per_horizon_voxels": {
+                str(h): int(group_counts[h][group]) for h in HORIZONS
+            },
+        }
+
+    ambiguous_total = int(ambiguous_audit["dynamic_other_voxels"])
+    ambiguous_audit["moving_fraction"] = float(
+        ambiguous_audit["dynamic_other_moving_voxels"]
+        / max(ambiguous_total, 1)
+    )
+
     result = {
         "protocol": PROTOCOL,
         "analysis_only": True,
@@ -621,6 +803,24 @@ def main():
             ),
         },
         "categories": category_report,
+        "groups": group_report,
+        "dynamic_ambiguous_audit": ambiguous_audit,
+        "training_target_candidate": {
+            "positive_categories": list(GROUPS["core_innovation"]),
+            "excluded_memory_categories": list(
+                GROUPS["memory_addressable"]
+            ),
+            "excluded_known_ancestor_model_miss": list(
+                GROUPS["known_ancestor_model_miss"]
+            ),
+            "excluded_ambiguous_categories": list(GROUPS["ambiguous"]),
+            "contract": (
+                "first innovation training candidate uses only future-born "
+                "dynamic occupancy, new visible geometry of represented "
+                "sources, and never-seen static occupancy; all known-ancestor "
+                "misses and unresolved ambiguity remain excluded"
+            ),
+        },
         "per_horizon_total_addable_voxels": {
             str(h): int(total_addable[h]) for h in HORIZONS
         },
@@ -641,6 +841,18 @@ def main():
             f"d_mIoU={row['delta_vs_base']['mIoU']:+7.3f} "
             f"d_MovMicro={row['delta_vs_base']['MovingMicro']:+7.3f}"
         )
+    print("\nGROUP ORACLES:")
+    for group in GROUPS:
+        row = group_report[group]
+        print(
+            f"{group:28s} share={100*row['share_of_addable']:7.3f}% "
+            f"d_mIoU={row['delta_vs_base']['mIoU']:+7.3f} "
+            f"d_MovMicro={row['delta_vs_base']['MovingMicro']:+7.3f}"
+        )
+    print(
+        "DYNAMIC AMBIGUOUS AUDIT:",
+        json.dumps(ambiguous_audit),
+    )
     print(
         "ALL ADDABLE:",
         json.dumps(result["all_addable_perfect_oracle"]["delta_vs_base"]),
