@@ -66,6 +66,13 @@ from real_motion.runtime_config import (
 )
 from real_motion.runtime_fastpath import extract_instances_cropped_exact
 from real_motion.strong_w2det import StrongW2DetConfig
+from real_motion.v19_innovation_targets import (
+    DECOMPOSITION_CATEGORIES,
+    DECOMPOSITION_GROUPS,
+    INNOVATION_POSITIVE_CATEGORIES,
+    annotation_distance_bin,
+    match_future_components_many_to_one,
+)
 from real_motion.v19_scene_memory import render_static_history_mosaic
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -83,45 +90,8 @@ PROTOCOL = "p0_f9_v19_innovation_decomposition_perfect_add_v2"
 REPORT = {1.0: 1, 2.0: 3, 3.0: 5}
 HORIZONS = tuple(REPORT)
 SEMANTIC_CLASSES = tuple(range(17))
-CATEGORIES = (
-    "history_source_recoverable",
-    "t0_unrepresented_dynamic",
-    "current_source_transportable_miss",
-    "future_birth_dynamic",
-    "source_shape_innovation",
-    "dynamic_other_ambiguous",
-    "history_static_recoverable",
-    "history_static_seen_mismatch",
-    "never_seen_static",
-    "static_other_ambiguous",
-)
-
-GROUPS = {
-    # These are the only categories proposed as positive supervision for the
-    # first residual innovation head.
-    "core_innovation": (
-        "future_birth_dynamic",
-        "source_shape_innovation",
-        "never_seen_static",
-    ),
-    # Content with a causal ancestor should be handled by explicit state rather
-    # than learned generation.
-    "memory_addressable": (
-        "history_source_recoverable",
-        "history_static_recoverable",
-    ),
-    # Known/seen content that the current deterministic/source path failed to
-    # realize.  Keep it out of innovation supervision until that path is fixed.
-    "known_ancestor_model_miss": (
-        "t0_unrepresented_dynamic",
-        "current_source_transportable_miss",
-        "history_static_seen_mismatch",
-    ),
-    "ambiguous": (
-        "dynamic_other_ambiguous",
-        "static_other_ambiguous",
-    ),
-}
+CATEGORIES = DECOMPOSITION_CATEGORIES
+GROUPS = DECOMPOSITION_GROUPS
 _DYNAMIC = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 _DYNAMIC_SET = set(_DYNAMIC)
 
@@ -236,53 +206,6 @@ def _same_class_history_evidence(
             return True
     return False
 
-
-
-def _match_future_components_many_to_one(
-    components,
-    annotations,
-    *,
-    max_distance_m: float,
-):
-    """Independently link future GT occupancy components to same-class GT IDs.
-
-    This is diagnostic-only.  Many fragments may map to one instance token;
-    unlike deployment tracking, one-to-one matching would incorrectly leave
-    fragmented GT occupancy unattributed.
-    """
-    rows = []
-    anns = list(annotations.values())
-    for comp in components:
-        cid = int(comp["class_id"])
-        cc = np.asarray(comp["centroid_world"], dtype=np.float64)
-        candidates = []
-        for ann in anns:
-            if int(ann["class_id"]) != cid:
-                continue
-            ac = np.asarray(ann["center_world"], dtype=np.float64)
-            d = float(np.linalg.norm(cc[:2] - ac[:2]))
-            candidates.append((d, str(ann["instance_token"])))
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        if not candidates:
-            rows.append((None, float("inf")))
-            continue
-        d, tok = candidates[0]
-        rows.append(
-            (str(tok) if d <= float(max_distance_m) else None, float(d))
-        )
-    return rows
-
-
-def _distance_bin(d: float) -> str:
-    if not np.isfinite(d):
-        return "no_same_class_annotation"
-    if d <= 4.0:
-        return "le_4m"
-    if d <= 6.0:
-        return "4_to_6m"
-    if d <= 10.0:
-        return "6_to_10m"
-    return "gt_10m"
 
 
 def _raw_state():
@@ -524,7 +447,7 @@ def main():
                 grid=pcfg.grid,
                 cfg=future_component_cfg,
             )
-            comp_links = _match_future_components_many_to_one(
+            comp_links = match_future_components_many_to_one(
                 future_components,
                 annh,
                 max_distance_m=float(a.match_max_distance_m),
@@ -677,7 +600,9 @@ def main():
                 ambiguous_audit["dynamic_other_components"] += 1
                 ambiguous_audit[
                     "nearest_same_class_annotation_distance_bins"
-                ][_distance_bin(float(nearest_d))] += int(comp_mask.sum())
+                ][annotation_distance_bin(float(nearest_d))] += int(
+                    comp_mask.sum()
+                )
                 ambiguous_audit["per_class_voxels"][str(int(cid))] += int(
                     comp_mask.sum()
                 )
@@ -806,7 +731,7 @@ def main():
         "groups": group_report,
         "dynamic_ambiguous_audit": ambiguous_audit,
         "training_target_candidate": {
-            "positive_categories": list(GROUPS["core_innovation"]),
+            "positive_categories": list(INNOVATION_POSITIVE_CATEGORIES),
             "excluded_memory_categories": list(
                 GROUPS["memory_addressable"]
             ),
