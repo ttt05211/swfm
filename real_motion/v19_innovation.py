@@ -924,6 +924,19 @@ def decode_innovation(
             & (zidx <= top[..., None])
             & add[..., None]
         )
+    elif "bottom_logits" in outputs and "top_logits" in outputs:
+        from .v19_innovation_v5 import decode_ordered_endpoints
+        Z = int(outputs["bottom_logits"].shape[2])
+        bottom, top = decode_ordered_endpoints(
+            outputs["bottom_logits"],
+            outputs["top_logits"],
+        )
+        zidx = torch.arange(Z, device=add.device).view(1, 1, 1, 1, Z)
+        zmask = (
+            (zidx >= bottom[..., None])
+            & (zidx <= top[..., None])
+            & add[..., None]
+        )
     else:
         raise ValueError("unknown innovation vertical output parameterization")
     out = torch.full(
