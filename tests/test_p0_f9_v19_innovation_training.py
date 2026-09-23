@@ -4,6 +4,10 @@ import torch
 from tools.real_motion.diagnose_p0_f9_v19_true_motion_responsibility import (
     _motion_status,
 )
+from tools.real_motion.diagnose_p0_f9_v19_novelty_candidate import (
+    _history_grid_footprint_bev,
+)
+from real_motion.geometry import OccupancyGrid
 
 from real_motion.v19_innovation import innovation_loss
 from real_motion.v19_innovation_training import (
@@ -275,3 +279,27 @@ def test_ancestor_free_novelty_contract_excludes_known_source_shape():
     assert "source_shape_innovation" not in NOVELTY_POSITIVE_CATEGORIES
     assert "source_shape_innovation" in TRANSPORT_REFINEMENT_CATEGORIES
     assert "current_source_transportable_miss" in TRANSPORT_REFINEMENT_CATEGORIES
+
+
+
+def test_history_grid_footprint_detects_new_forward_fov():
+    grid = OccupancyGrid(
+        x_min=-2.0,
+        y_min=-2.0,
+        z_min=-1.0,
+        voxel_size=(1.0, 1.0, 1.0),
+        shape_hwd=(4, 4, 2),
+    )
+    history = np.eye(4, dtype=np.float64)[None, ...]
+    future = np.eye(4, dtype=np.float64)
+    future[0, 3] = 1.0
+    covered = _history_grid_footprint_bev(
+        history,
+        future,
+        grid,
+    )
+    assert covered.shape == (4, 4)
+    # The future ego moved +1 m in x, so its frontmost x row was outside
+    # the previous [-2,2) grid footprint.
+    assert covered[:3].all()
+    assert not covered[3].any()
