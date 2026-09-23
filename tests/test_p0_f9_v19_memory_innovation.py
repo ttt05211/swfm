@@ -13,6 +13,7 @@ from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRA
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_innovation import (
     ResidualInnovationHead,
+    ResidualInnovationIntervalHead,
     build_future_aligned_history_and_static_memory,
     build_future_aligned_history_bev_with_coverage,
     decode_innovation,
@@ -566,3 +567,44 @@ def test_fused_history_alignment_static_memory_matches_reference_paths():
     assert np.allclose(got_geo, ref_geo, atol=0.0, rtol=0.0)
     assert np.array_equal(got_cov, ref_cov)
     assert np.array_equal(got_static, ref_static)
+
+
+def test_interval_innovation_head_decodes_contiguous_vertical_extent():
+    B, Fh, T, H, W, Z = 1, 6, 6, 8, 8, 6
+    model = ResidualInnovationIntervalHead(
+        future_frames=Fh,
+        history_frames=T,
+        semantic_dim=4,
+        hidden_dim=8,
+        num_semantic_classes=17,
+        vertical_bins=Z,
+    ).eval()
+    sem = torch.randint(0, 18, (B, Fh, T, H, W))
+    geo = torch.rand(B, Fh, T, 4, H, W)
+    explained = torch.zeros(B, Fh, 1, H, W)
+    with torch.inference_mode():
+        out = model(sem, geo, explained)
+    assert out["bottom_logits"].shape == (B, Fh, Z, H, W)
+    assert out["span_logits"].shape == (B, Fh, Z, H, W)
+
+    # Make one deterministic proposal: bottom=2, span class=1 -> length 2.
+    out["add_presence_logits"].fill_(-10)
+    out["add_presence_logits"][0, 0, 3, 4] = 10
+    out["semantic_logits"].zero_()
+    out["semantic_logits"][0, 0, 5, 3, 4] = 10
+    out["bottom_logits"].zero_()
+    out["bottom_logits"][0, 0, 2, 3, 4] = 10
+    out["span_logits"].zero_()
+    out["span_logits"][0, 0, 1, 3, 4] = 10
+
+    proposal = decode_innovation(
+        out,
+        free_label=17,
+        add_threshold=0.5,
+        vertical_threshold=0.5,
+    )
+    col = proposal[0, 0, 3, 4]
+    assert torch.equal(
+        col,
+        torch.tensor([17, 17, 5, 5, 17, 17]),
+    )
