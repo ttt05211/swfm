@@ -37,9 +37,9 @@ from real_motion.v19_source_reconciliation import (
     reconcile_detected_sources,
     select_memory_only_tracks,
 )
-from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import (
-    _distance_bin,
-    _match_future_components_many_to_one,
+from real_motion.v19_innovation_targets import (
+    annotation_distance_bin,
+    match_future_components_many_to_one,
 )
 
 
@@ -448,14 +448,14 @@ def test_v19_future_component_attribution_is_many_to_one_and_class_safe():
             "center_world": np.asarray([0.0, 0.0, 0.0]),
         },
     }
-    rows = _match_future_components_many_to_one(
+    rows = match_future_components_many_to_one(
         comps, anns, max_distance_m=4.0
     )
     assert rows[0][0] == "car-a"
     assert rows[1][0] == "car-a"
     assert rows[2][0] == "bus-a"
     assert rows[3][0] is None
-    assert _distance_bin(rows[3][1]) == "gt_10m"
+    assert annotation_distance_bin(rows[3][1]) == "gt_10m"
 
 def test_innovation_head_shapes_and_torch_protection():
     B, Fh, T, H, W, Z = 2, 6, 6, 20, 20, 16
