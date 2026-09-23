@@ -22,8 +22,10 @@ import numpy as np
 import torch
 
 from real_motion.local_st_world_model_v18_se2 import YAW_ENABLED_CLASS_IDS
-from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
-from real_motion.nuscenes_adapter import gt_moving_support_for_horizon
+from real_motion.metrics.moving_miou_v2 import (
+    DYNAMIC_CLASS_IDS,
+    SPEED_THRESHOLD_MPS,
+)
 from real_motion.motion_transport import (
     dynamic_annotations,
     match_sources_to_annotations,
@@ -551,19 +553,26 @@ def main():
 
             moving_tokens = None
             if str(a.positive_mode) == "true_motion_shape":
-                _moving_support, moving_records, _moving_excluded = (
-                    gt_moving_support_for_horizon(
-                        source.nusc,
-                        str(w.t0_token),
-                        str(w.future_tokens[fi]),
-                        float(fi + 1) * float(pcfg.frame_dt_s),
-                        grid=pcfg.grid,
-                    )
+                ann_future = _ann_map(
+                    source.nusc,
+                    str(w.future_tokens[fi]),
                 )
-                moving_tokens = {
-                    str(r["instance_token"])
-                    for r in moving_records
-                }
+                dt_s = float(fi + 1) * float(pcfg.frame_dt_s)
+                moving_tokens = set()
+                for tok in set(ann0) & set(ann_future):
+                    c0 = np.asarray(
+                        ann0[tok]["center_world"],
+                        dtype=np.float64,
+                    )
+                    ch = np.asarray(
+                        ann_future[tok]["center_world"],
+                        dtype=np.float64,
+                    )
+                    speed = float(
+                        np.linalg.norm(ch[:2] - c0[:2]) / dt_s
+                    )
+                    if speed >= float(SPEED_THRESHOLD_MPS):
+                        moving_tokens.add(str(tok))
 
             masks, static_render, true_moving_shape = (
                 _category_masks_for_future(
