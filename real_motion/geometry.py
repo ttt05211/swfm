@@ -145,14 +145,77 @@ def warp_semantic_grid(
     return out
 
 
+def warp_semantic_and_mask(
+    semantics: np.ndarray,
+    mask: np.ndarray,
+    src_to_dst: np.ndarray,
+    grid: OccupancyGrid = OccupancyGrid(),
+    free_label: int = 17,
+) -> tuple[np.ndarray, np.ndarray]:
+    sem = np.asarray(semantics)
+    m = np.asarray(mask, dtype=bool)
+    if tuple(sem.shape) != tuple(grid.shape_hwd):
+        raise ValueError(f"semantic grid {sem.shape} != configured {grid.shape_hwd}")
+    if m.shape != sem.shape:
+        raise ValueError("semantic/mask shape mismatch")
+    out_sem = np.full_like(sem, int(free_label))
+    out_mask = np.zeros(tuple(grid.shape_hwd), dtype=bool)
+    src_idx = np.argwhere(m)
+    if len(src_idx) == 0:
+        return out_sem, out_mask
+
+    xyz = _occupied_indices_to_xyz(src_idx, grid)
+    T = np.asarray(src_to_dst, dtype=np.float64)
+    dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
+    ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+    if not bool(valid.any()):
+        return out_sem, out_mask
+
+    src_idx = src_idx[valid]
+    dst_xyz = dst_xyz[valid]
+    ix, iy, iz = ix[valid], iy[valid], iz[valid]
+    out_mask[ix, iy, iz] = True
+    vals = sem[tuple(src_idx.T)]
+    occupied = vals != int(free_label)
+    if not bool(occupied.any()):
+        return out_sem, out_mask
+
+    vals = vals[occupied]
+    sx, sy, sz = ix[occupied], iy[occupied], iz[occupied]
+    occupied_xyz = dst_xyz[occupied]
+    vx, vy, vz = grid.voxel_size
+    centers = np.stack([
+        grid.x_min + (sx + 0.5) * vx,
+        grid.y_min + (sy + 0.5) * vy,
+        grid.z_min + (sz + 0.5) * vz,
+    ], axis=1)
+    dist2 = np.sum((occupied_xyz - centers) ** 2, axis=1)
+    _, Y, Z = grid.shape_hwd
+    flat = (sx * Y + sy) * Z + sz
+    order = np.lexsort((dist2, flat))
+    flat_sorted = flat[order]
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = flat_sorted[1:] != flat_sorted[:-1]
+    chosen = order[first]
+    out_sem[sx[chosen], sy[chosen], sz[chosen]] = vals[chosen]
+    return out_sem, out_mask
+
+
 def warp_mask(mask: np.ndarray, src_to_dst: np.ndarray, grid: OccupancyGrid = OccupancyGrid()) -> np.ndarray:
     m = np.asarray(mask, dtype=bool)
     if tuple(m.shape) != tuple(grid.shape_hwd):
         raise ValueError("mask shape mismatch")
-    synthetic = np.zeros(grid.shape_hwd, dtype=np.uint8)
-    synthetic[m] = 1
-    warped = warp_semantic_grid(synthetic, src_to_dst, grid=grid, free_label=0)
-    return warped == 1
+    out = np.zeros(tuple(grid.shape_hwd), dtype=bool)
+    src_idx = np.argwhere(m)
+    if len(src_idx) == 0:
+        return out
+    xyz = _occupied_indices_to_xyz(src_idx, grid)
+    T = np.asarray(src_to_dst, dtype=np.float64)
+    dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
+    ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+    if bool(valid.any()):
+        out[ix[valid], iy[valid], iz[valid]] = True
+    return out
 
 
 def ego_compensate_sequence(
