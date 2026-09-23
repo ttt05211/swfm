@@ -39,7 +39,8 @@ def _future_aligned_bev_summary(
     *,
     grid,
     free_label: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_aligned_observed: bool = False,
+):
     """Return top semantic + geometric summary in one future ego frame."""
     sem = np.asarray(semantics, dtype=np.uint8)
     obs = np.asarray(observed, dtype=bool)
@@ -83,8 +84,10 @@ def _future_aligned_bev_summary(
 
     coverage = aligned_obs.any(axis=2).astype(np.float32)
     count = count / float(max(Z, 1))
-    geom = np.stack((coverage, top_h, bottom_h, count), axis=0)
-    return top_label, geom.astype(np.float32)
+    geom = np.stack((coverage, top_h, bottom_h, count), axis=0).astype(np.float32)
+    if return_aligned_observed:
+        return top_label, geom, aligned_obs
+    return top_label, geom
 
 
 def build_future_aligned_history_bev(
@@ -129,6 +132,61 @@ def build_future_aligned_history_bev(
     return (
         np.stack(labels, axis=0).astype(np.uint8),
         np.stack(geometry, axis=0).astype(np.float32),
+    )
+
+
+def build_future_aligned_history_bev_with_coverage(
+    history_semantics: Sequence[np.ndarray],
+    history_observed: Sequence[np.ndarray],
+    history_poses: Sequence[np.ndarray],
+    future_poses: Sequence[np.ndarray],
+    *,
+    grid,
+    free_label: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build Innovation inputs plus exact 3D historical observation coverage.
+
+    The coverage is accumulated from the same fused warps used to build the
+    network inputs, avoiding a second 6x6 mask-warp pass in cache generation.
+    """
+    if not (
+        len(history_semantics)
+        == len(history_observed)
+        == len(history_poses)
+        == HISTORY_FRAMES
+    ):
+        raise ValueError("expected six history semantic/obs/pose frames")
+    if len(future_poses) != FUTURE_FRAMES:
+        raise ValueError("expected six future poses")
+
+    labels = []
+    geometry = []
+    coverage_3d = []
+    for fpose in future_poses:
+        lf, gf = [], []
+        cov = np.zeros(tuple(grid.shape_hwd), dtype=bool)
+        for sem, obs, hpose in zip(
+            history_semantics, history_observed, history_poses
+        ):
+            lab, geo, aligned_obs = _future_aligned_bev_summary(
+                sem,
+                obs,
+                hpose,
+                fpose,
+                grid=grid,
+                free_label=int(free_label),
+                return_aligned_observed=True,
+            )
+            lf.append(lab)
+            gf.append(geo)
+            cov |= aligned_obs
+        labels.append(np.stack(lf, axis=0))
+        geometry.append(np.stack(gf, axis=0))
+        coverage_3d.append(cov)
+    return (
+        np.stack(labels, axis=0).astype(np.uint8),
+        np.stack(geometry, axis=0).astype(np.float32),
+        np.stack(coverage_3d, axis=0),
     )
 
 
