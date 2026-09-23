@@ -14,7 +14,11 @@ from real_motion.v19_innovation_v5 import (
     gaussian_endpoint_cross_entropy,
     soft_interval_iou_loss,
 )
-from real_motion.v19_innovation_targets import DECOMPOSITION_CATEGORIES
+from real_motion.v19_innovation_targets import (
+    DECOMPOSITION_CATEGORIES,
+    NOVELTY_POSITIVE_CATEGORIES,
+    TRANSPORT_REFINEMENT_CATEGORIES,
+)
 from real_motion.v19_innovation_training import (
     build_innovation_bev_supervision,
     dequantize_geometry_torch,
@@ -260,3 +264,14 @@ def test_ordered_endpoint_decode_never_returns_top_below_bottom():
     top[0, 0, 0, 0, 0] = 10.0
     b, t = decode_ordered_endpoints(bottom, top)
     assert int(t.item()) >= int(b.item())
+
+
+
+def test_ancestor_free_novelty_contract_excludes_known_source_shape():
+    assert set(NOVELTY_POSITIVE_CATEGORIES) == {
+        "never_seen_static",
+        "future_birth_dynamic",
+    }
+    assert "source_shape_innovation" not in NOVELTY_POSITIVE_CATEGORIES
+    assert "source_shape_innovation" in TRANSPORT_REFINEMENT_CATEGORIES
+    assert "current_source_transportable_miss" in TRANSPORT_REFINEMENT_CATEGORIES
