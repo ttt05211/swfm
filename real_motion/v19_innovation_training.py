@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from .v19_innovation_targets import (
+    AMBIGUOUS_CATEGORIES,
     DECOMPOSITION_CATEGORIES,
     INNOVATION_POSITIVE_CATEGORIES,
 )
@@ -174,4 +175,78 @@ def build_innovation_bev_supervision(
         "candidate_bev_cells": int(candidate.sum()),
         "mixed_responsibility_bev_cells": int(mixed_bev.sum()),
         "excluded_bev_cells": int(excluded_bev.sum()),
+    }
+
+
+
+def build_true_motion_innovation_bev_supervision(
+    gt_occ: np.ndarray,
+    explained_occ: np.ndarray,
+    category_masks: Mapping[str, np.ndarray],
+    true_moving_shape_mask: np.ndarray,
+    *,
+    free_label: int,
+) -> dict[str, np.ndarray | int]:
+    """Responsibility-complete supervision for true-motion shape Innovation.
+
+    Positive responsibility is only source-shape innovation belonging to a
+    true-moving t0/future instance.  Every *resolved* non-positive location is
+    an explicit negative for the BEV presence head.  Only genuinely ambiguous
+    V19 responsibility columns are ignored.
+
+    Future GT motion/identity is supervision-only; it is not an inference
+    input.
+    """
+    gt = np.asarray(gt_occ, dtype=np.uint8)
+    base = np.asarray(explained_occ, dtype=np.uint8)
+    pos_raw = np.asarray(true_moving_shape_mask, dtype=bool)
+    if gt.shape != base.shape or gt.ndim != 3:
+        raise ValueError("gt/explained occupancy must share [H,W,Z] shape")
+    if pos_raw.shape != gt.shape:
+        raise ValueError("true-moving shape mask mismatch")
+
+    ambiguous = _union_masks(
+        category_masks,
+        tuple(AMBIGUOUS_CATEGORIES),
+        gt.shape,
+    )
+    positive = pos_raw & (base == int(free_label))
+    blocked_positive_voxels = int((pos_raw & ~positive).sum())
+
+    ambiguous_bev = ambiguous.any(axis=2)
+    positive_bev_raw = positive.any(axis=2)
+    mixed_bev = ambiguous_bev & positive_bev_raw
+    free_capacity = (base == int(free_label)).any(axis=2)
+
+    # The key v5 change: resolved non-positive responsibility and ordinary
+    # background remain valid negatives.  Ignore only unresolved ambiguity.
+    candidate = free_capacity & ~ambiguous_bev
+    add_target = positive_bev_raw & candidate
+
+    positive = positive & add_target[..., None]
+    vertical_target = positive.astype(np.uint8)
+    semantic_target = np.full(gt.shape[:2], int(free_label), dtype=np.uint8)
+    if bool(add_target.any()):
+        rev = positive[:, :, ::-1]
+        z_top = gt.shape[2] - 1 - np.argmax(rev, axis=2)
+        ix, iy = np.nonzero(add_target)
+        semantic_target[ix, iy] = gt[ix, iy, z_top[ix, iy]]
+        if bool((semantic_target[ix, iy] == int(free_label)).any()):
+            raise RuntimeError(
+                "true-motion positive column received free semantic target"
+            )
+
+    return {
+        "add_target": add_target.astype(np.uint8),
+        "semantic_target": semantic_target,
+        "vertical_target": vertical_target,
+        "candidate_mask": candidate.astype(np.uint8),
+        "ignore_mask": (~candidate).astype(np.uint8),
+        "positive_voxels_raw": int(pos_raw.sum()),
+        "positive_voxels_actionable": int(positive.sum()),
+        "blocked_positive_voxels": blocked_positive_voxels,
+        "positive_bev_cells": int(add_target.sum()),
+        "candidate_bev_cells": int(candidate.sum()),
+        "mixed_responsibility_bev_cells": int(mixed_bev.sum()),
+        "excluded_bev_cells": int(ambiguous_bev.sum()),
     }
