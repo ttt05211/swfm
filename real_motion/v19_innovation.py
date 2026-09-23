@@ -573,6 +573,210 @@ class ResidualInnovationHead(nn.Module):
         }
 
 
+
+class ResidualInnovationIntervalHead(ResidualInnovationHead):
+    """Innovation head with compact vertical interval geometry.
+
+    The spatial/temporal trunk is identical to ResidualInnovationHead. Instead
+    of 16 independent occupancy bits, each positive BEV cell predicts:
+      * bottom z-bin (Z-way classification);
+      * span length 1..Z (Z-way classification).
+
+    This guarantees a contiguous decoded vertical extent.
+    """
+
+    def __init__(
+        self,
+        *,
+        future_frames: int = FUTURE_FRAMES,
+        history_frames: int = HISTORY_FRAMES,
+        semantic_dim: int = 8,
+        hidden_dim: int = 32,
+        num_semantic_classes: int = 17,
+        vertical_bins: int = 16,
+    ):
+        super().__init__(
+            future_frames=future_frames,
+            history_frames=history_frames,
+            semantic_dim=semantic_dim,
+            hidden_dim=hidden_dim,
+            num_semantic_classes=num_semantic_classes,
+            vertical_bins=vertical_bins,
+        )
+        out_ch = 1 + self.num_semantic_classes + 2 * self.vertical_bins
+        self.out_head = nn.Conv2d(hidden_dim, out_ch, 1)
+        nn.init.zeros_(self.out_head.weight)
+        nn.init.zeros_(self.out_head.bias)
+        with torch.no_grad():
+            self.out_head.bias[0] = -4.0
+
+    def forward(
+        self,
+        future_aligned_semantic: torch.Tensor,
+        future_aligned_geometry: torch.Tensor,
+        base_explained: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        lab = future_aligned_semantic.long()
+        geo = future_aligned_geometry
+        if lab.ndim != 5:
+            raise ValueError("future_aligned_semantic must be [B,F,T,H,W]")
+        B, Fh, T, H, W = lab.shape
+        if Fh != self.future_frames or T != self.history_frames:
+            raise ValueError("future/history frame count mismatch")
+        if geo.shape != (B, Fh, T, GEOMETRY_CHANNELS, H, W):
+            raise ValueError(
+                "future_aligned_geometry must be [B,F,T,4,H,W]"
+            )
+        if base_explained.shape != (B, Fh, 1, H, W):
+            raise ValueError("base_explained must be [B,F,1,H,W]")
+        if bool((lab < 0).any()) or bool((lab >= SEMANTIC_CLASSES).any()):
+            raise ValueError("semantic labels outside [0,17]")
+
+        emb = self.semantic_embedding(lab)
+        emb = emb.permute(0, 1, 2, 5, 3, 4)
+        x = torch.cat((emb, geo.to(emb.dtype)), dim=3)
+        x = x.reshape(B * Fh * T, x.shape[3], H, W)
+        x = self.frame_stem(x)
+        H2, W2 = x.shape[-2:]
+        x = x.reshape(B * Fh, T, -1, H2, W2).permute(
+            0, 2, 1, 3, 4
+        )
+        x = self.temporal_pw(self.temporal_dw(x))
+        x = x.mean(dim=2)
+        x = self.temporal_norm(x)
+
+        base = base_explained.reshape(B * Fh, 1, H, W).to(x.dtype)
+        x = x + self.base_proj(base)
+        time = self.future_time_embedding.expand(B, -1, -1).reshape(
+            B * Fh, -1
+        )
+        x = x + time[:, :, None, None].to(x.dtype)
+        x = self.decoder(x)
+        raw = self.out_head(x).reshape(B, Fh, -1, H, W)
+
+        s0 = 1
+        s1 = s0 + self.num_semantic_classes
+        s2 = s1 + self.vertical_bins
+        return {
+            "add_presence_logits": raw[:, :, 0],
+            "semantic_logits": raw[:, :, s0:s1],
+            "bottom_logits": raw[:, :, s1:s2],
+            "span_logits": raw[:, :, s2:],
+        }
+
+
+def innovation_interval_loss(
+    outputs: dict[str, torch.Tensor],
+    *,
+    add_target: torch.Tensor,
+    semantic_target: torch.Tensor,
+    vertical_target: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    weights = None,
+    presence_hard_negative_ratio: float = 4.0,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Hard-negative presence + semantic + bottom/span interval objective."""
+    if weights is None:
+        weights = InnovationLossWeights()
+    add_logits = outputs["add_presence_logits"]
+    sem_logits = outputs["semantic_logits"]
+    bottom_logits = outputs["bottom_logits"]
+    span_logits = outputs["span_logits"]
+    pos = add_target.bool()
+    cand = candidate_mask.bool()
+    if add_logits.shape != pos.shape or cand.shape != pos.shape:
+        raise ValueError("presence/candidate shape mismatch")
+    if semantic_target.shape != pos.shape:
+        raise ValueError("semantic_target shape mismatch")
+    if vertical_target.ndim != 5:
+        raise ValueError("vertical_target must be [B,F,Z,H,W]")
+    Z = int(vertical_target.shape[2])
+    if bottom_logits.shape[2] != Z or span_logits.shape[2] != Z:
+        raise ValueError("interval logits/vertical target bin mismatch")
+
+    ratio = float(presence_hard_negative_ratio)
+    if ratio <= 0:
+        raise ValueError("presence_hard_negative_ratio must be positive")
+    pos_rows = add_logits[pos & cand]
+    neg_rows = add_logits[cand & ~pos]
+    pos_loss = F.softplus(-pos_rows)
+    neg_loss_all = F.softplus(neg_rows)
+    npos = int(pos_rows.numel())
+    nneg = int(neg_rows.numel())
+    hard_negative_count = 0
+    if npos > 0 and nneg > 0:
+        hard_negative_count = min(
+            nneg,
+            max(1, int(np.ceil(ratio * npos))),
+        )
+        neg_loss = torch.topk(
+            neg_loss_all,
+            k=hard_negative_count,
+            largest=True,
+            sorted=False,
+        ).values
+        add = torch.cat((pos_loss, neg_loss), dim=0).mean()
+    elif npos > 0:
+        add = pos_loss.mean()
+    elif nneg > 0:
+        add = neg_loss_all.mean()
+        hard_negative_count = nneg
+    else:
+        add = add_logits.sum() * 0.0
+
+    if bool(pos.any()):
+        sem_rows = sem_logits.permute(0, 1, 3, 4, 2)[pos]
+        sem = F.cross_entropy(
+            sem_rows,
+            semantic_target[pos].long(),
+        )
+        z_rows = (
+            vertical_target.permute(0, 1, 3, 4, 2)[pos].bool()
+        )
+        if not bool(z_rows.any(dim=1).all()):
+            raise RuntimeError("positive BEV cell without vertical target")
+        idx = torch.arange(Z, device=z_rows.device)[None]
+        bottom_target = torch.where(
+            z_rows,
+            idx,
+            torch.full_like(idx, Z),
+        ).min(dim=1).values
+        top_target = torch.where(
+            z_rows,
+            idx,
+            torch.full_like(idx, -1),
+        ).max(dim=1).values
+        span_target = (top_target - bottom_target).long()
+
+        bottom_rows = bottom_logits.permute(0, 1, 3, 4, 2)[pos]
+        span_rows = span_logits.permute(0, 1, 3, 4, 2)[pos]
+        bottom = F.cross_entropy(bottom_rows, bottom_target.long())
+        span = F.cross_entropy(span_rows, span_target)
+        vertical = 0.5 * (bottom + span)
+    else:
+        sem = sem_logits.sum() * 0.0
+        bottom = bottom_logits.sum() * 0.0
+        span = span_logits.sum() * 0.0
+        vertical = bottom + span
+
+    total = (
+        add
+        + float(weights.semantic) * sem
+        + float(weights.vertical) * vertical
+    )
+    return total, {
+        "loss": float(total.detach().cpu()),
+        "add_bce": float(add.detach().cpu()),
+        "semantic_ce": float(sem.detach().cpu()),
+        "bottom_ce": float(bottom.detach().cpu()),
+        "span_ce": float(span.detach().cpu()),
+        "vertical_interval_ce": float(vertical.detach().cpu()),
+        "positive_bev_cells": int(pos.sum().item()),
+        "candidate_bev_cells": int(cand.sum().item()),
+        "hard_negative_bev_cells": int(hard_negative_count),
+    }
+
+
 @dataclass(frozen=True)
 class InnovationLossWeights:
     semantic: float = 1.0
@@ -702,18 +906,32 @@ def decode_innovation(
     """Decode add-only logits into [B,F,H,W,Z] semantic occupancy proposals."""
     add = torch.sigmoid(outputs["add_presence_logits"]) >= float(add_threshold)
     sem = outputs["semantic_logits"].argmax(dim=2)
-    z = torch.sigmoid(outputs["vertical_occupancy_logits"]) >= float(
-        vertical_threshold
-    )
     B, Fh, H, W = add.shape
-    Z = int(z.shape[2])
+    if "vertical_occupancy_logits" in outputs:
+        z = torch.sigmoid(outputs["vertical_occupancy_logits"]) >= float(
+            vertical_threshold
+        )
+        Z = int(z.shape[2])
+        zmask = z.permute(0, 1, 3, 4, 2) & add[..., None]
+    elif "bottom_logits" in outputs and "span_logits" in outputs:
+        Z = int(outputs["bottom_logits"].shape[2])
+        bottom = outputs["bottom_logits"].argmax(dim=2)
+        span = outputs["span_logits"].argmax(dim=2) + 1
+        top = torch.clamp(bottom + span - 1, max=Z - 1)
+        zidx = torch.arange(Z, device=add.device).view(1, 1, 1, 1, Z)
+        zmask = (
+            (zidx >= bottom[..., None])
+            & (zidx <= top[..., None])
+            & add[..., None]
+        )
+    else:
+        raise ValueError("unknown innovation vertical output parameterization")
     out = torch.full(
         (B, Fh, H, W, Z),
         int(free_label),
         dtype=torch.long,
         device=add.device,
     )
-    zmask = z.permute(0, 1, 3, 4, 2) & add[..., None]
     labels = sem[..., None].expand(B, Fh, H, W, Z)
     out[zmask] = labels[zmask]
     return out
