@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+from real_motion.v19_innovation import innovation_loss
 from real_motion.v19_innovation_targets import DECOMPOSITION_CATEGORIES
 from real_motion.v19_innovation_training import (
     build_innovation_bev_supervision,
@@ -113,3 +114,38 @@ def test_dynamic_only_mode_ignores_never_seen_static():
     assert sup["candidate_mask"][0, 0] == 1
     assert sup["candidate_mask"][1, 1] == 0
     assert sup["add_target"][1, 1] == 0
+
+
+def test_hard_negative_presence_keeps_bounded_negative_ratio():
+    add_logits = torch.tensor(
+        [[[[2.0, 1.5, 1.0], [0.5, 0.0, -0.5]]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    outputs = {
+        "add_presence_logits": add_logits,
+        "semantic_logits": torch.zeros((1, 1, 17, 2, 3)),
+        "vertical_occupancy_logits": torch.zeros((1, 1, 4, 2, 3)),
+    }
+    add_target = torch.zeros((1, 1, 2, 3), dtype=torch.bool)
+    add_target[0, 0, 0, 0] = True
+    semantic_target = torch.zeros((1, 1, 2, 3), dtype=torch.long)
+    vertical_target = torch.zeros((1, 1, 4, 2, 3))
+    vertical_target[0, 0, 0, 0, 0] = 1.0
+    candidate = torch.ones_like(add_target)
+
+    loss, stats = innovation_loss(
+        outputs,
+        add_target=add_target,
+        semantic_target=semantic_target,
+        vertical_target=vertical_target,
+        candidate_mask=candidate,
+        positive_weight=1.0,
+        vertical_positive_weight=1.0,
+        presence_hard_negative_ratio=2.0,
+    )
+    assert torch.isfinite(loss)
+    assert stats["positive_bev_cells"] == 1
+    assert stats["hard_negative_bev_cells"] == 2
+    loss.backward()
+    assert add_logits.grad is not None
