@@ -43,6 +43,7 @@ from real_motion.v19_innovation import (
 )
 from real_motion.v19_innovation_targets import (
     DECOMPOSITION_CATEGORIES,
+    INNOVATION_POSITIVE_CATEGORIES,
     match_future_components_many_to_one,
 )
 from real_motion.v19_innovation_training import (
@@ -77,6 +78,13 @@ from tools.real_motion.train_p0_f9_v18_se2_clean import (
 
 PROTOCOL = INNOVATION_CACHE_PROTOCOL
 _DYNAMIC = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
+POSITIVE_MODES = {
+    "core": tuple(INNOVATION_POSITIVE_CATEGORIES),
+    "dynamic": (
+        "future_birth_dynamic",
+        "source_shape_innovation",
+    ),
+}
 
 
 def _category_masks_for_future(
@@ -332,11 +340,18 @@ def main():
         type=float,
         default=4.0,
     )
+    p.add_argument(
+        "--positive-mode",
+        choices=tuple(POSITIVE_MODES),
+        default="core",
+        help="Innovation responsibility used to build add targets.",
+    )
     p.add_argument("--device", default="cuda")
     a = p.parse_args()
 
     if int(a.shard_size) <= 0:
         raise ValueError("shard-size must be positive")
+    positive_categories = tuple(POSITIVE_MODES[str(a.positive_mode)])
 
     out_dir = Path(a.output_dir)
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -526,6 +541,7 @@ def main():
                 explained,
                 masks,
                 free_label=int(pcfg.free_label),
+                positive_categories=positive_categories,
             )
             for k in totals:
                 totals[k] += int(sup[k])
@@ -661,9 +677,11 @@ def main():
             "deterministic_static_memory"
         ),
         "future_gt_used_for_inference_input": False,
+        "positive_mode": str(a.positive_mode),
+        "positive_categories": list(positive_categories),
         "responsibility_policy": (
-            "positive=core_innovation; "
-            "memory/known-ancestor/ambiguous=ignore; "
+            "positive=" + "+".join(positive_categories)
+            + "; all other addable decomposition categories=ignore; "
             "mixed BEV columns=ignore"
         ),
         "totals": totals,
