@@ -52,13 +52,21 @@ def main():
     p.add_argument("--val-cache",required=True); p.add_argument("--base-checkpoint",required=True)
     p.add_argument("--innovation-checkpoint",required=True); p.add_argument("--dataroot",required=True)
     p.add_argument("--info-pkl",required=True); p.add_argument("--output",required=True)
-    p.add_argument("--max-windows",type=int,default=0); p.add_argument("--add-threshold",type=float,default=.5)
+    p.add_argument("--max-windows",type=int,default=0)
+    p.add_argument("--num-shards",type=int,default=1)
+    p.add_argument("--shard-index",type=int,default=0)
+    p.add_argument("--add-threshold",type=float,default=.5)
     p.add_argument("--vertical-threshold",type=float,default=.5); p.add_argument("--device",default="cuda")
     p.add_argument("--no-amp",action="store_true"); a=p.parse_args()
     pcfg=make_prepare_config(load_runtime_config(a.config,a.override))
     _,records=base.load_cache(a.val_cache)
     if a.max_windows>0: records=records[:min(len(records),a.max_windows)]
-    if not records: raise RuntimeError("empty validation cache")
+    global_num_windows=len(records)
+    if a.num_shards<=0 or not 0<=a.shard_index<a.num_shards:
+        raise ValueError("invalid shard specification")
+    if a.num_shards>1:
+        records=[r for i,r in enumerate(records) if i%a.num_shards==a.shard_index]
+    if not records: raise RuntimeError("empty validation cache shard")
     device=torch.device(a.device if a.device!="cuda" or torch.cuda.is_available() else "cpu")
     amp=device.type=="cuda" and not a.no_amp
     base_ck,base_model,_=full._load_model(a.base_checkpoint,CLEAN_PROTOCOL,device)
@@ -99,7 +107,8 @@ def main():
         if wi==1 or wi%25==0 or wi==len(records):
             print(f"v19_innovation_eval {wi}/{len(records)} rate={wi/max(time.perf_counter()-started,1e-9):.3f} win/s",flush=True)
     metrics={v:_finalize(r) for v,r in raw_by_variant.items()}
-    result={"protocol":PROTOCOL,"num_windows":len(records),"base_checkpoint":str(Path(a.base_checkpoint).resolve()),"base_checkpoint_epoch":int(base_ck.get("epoch",-1)),"innovation_checkpoint":str(Path(a.innovation_checkpoint).resolve()),"innovation_epoch":int(innov_ck.get("epoch",-1)),"future_gt_used_for_prediction":False,"metrics":metrics,"delta_vs_v18":{v:_delta(metrics[v],metrics["v18"]) for v in VARIANTS if v!="v18"},"delta_innovation_vs_static":_delta(metrics["v18_static_innovation"],metrics["v18_static"]),"proposal_audit":{"proposed_voxels":proposed,"added_voxels_after_protection":added,"windows_with_additions":windows_with_additions}}
+    elapsed=max(time.perf_counter()-started,1e-9)
+    result={"protocol":PROTOCOL,"num_windows":len(records),"global_num_windows_before_shard":global_num_windows,"num_shards":int(a.num_shards),"shard_index":int(a.shard_index),"base_checkpoint":str(Path(a.base_checkpoint).resolve()),"base_checkpoint_epoch":int(base_ck.get("epoch",-1)),"innovation_checkpoint":str(Path(a.innovation_checkpoint).resolve()),"innovation_epoch":int(innov_ck.get("epoch",-1)),"future_gt_used_for_prediction":False,"metrics":metrics,"delta_vs_v18":{v:_delta(metrics[v],metrics["v18"]) for v in VARIANTS if v!="v18"},"delta_innovation_vs_static":_delta(metrics["v18_static_innovation"],metrics["v18_static"]),"proposal_audit":{"proposed_voxels":proposed,"added_voxels_after_protection":added,"windows_with_additions":windows_with_additions},"raw_counts":{v:{k:np.asarray(x).tolist() for k,x in raw_by_variant[v].items()} for v in VARIANTS},"timing":{"elapsed_s":elapsed,"windows_per_s":len(records)/elapsed}}
     op=Path(a.output); op.parent.mkdir(parents=True,exist_ok=True); op.write_text(json.dumps(result,indent=2),encoding="utf-8")
     print("\n=== V19 INNOVATION FROZEN-BASE EVAL ===")
     for v in VARIANTS:
