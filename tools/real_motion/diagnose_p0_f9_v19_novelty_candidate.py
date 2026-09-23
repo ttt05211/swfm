@@ -40,7 +40,6 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from real_motion.geometry import relative_transform
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.motion_transport import (
     dynamic_annotations,
@@ -57,6 +56,7 @@ from real_motion.v19_innovation import (
     build_future_aligned_history_and_static_memory,
 )
 from real_motion.v19_scene_memory import protected_add_only
+from real_motion.v19_static_novelty import history_grid_footprint_bev
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.benchmark_p0_f9_v18_runtime import (
@@ -255,55 +255,6 @@ def _finalize_geometry_stats(stats):
             r["non_groundlike_static_voxels"] / max(nvox, 1)
         ),
     }
-
-
-def _history_grid_footprint_bev(
-    history_poses: np.ndarray,
-    future_pose: np.ndarray,
-    grid,
-) -> np.ndarray:
-    """Union of historical occupancy-grid XY footprints in a future ego frame.
-
-    This is deliberately geometric rather than LiDAR-visibility based.  It
-    separates genuinely new spatial field-of-view caused by ego motion from
-    content that lies inside an old grid footprint but was never directly
-    observed by LiDAR.
-
-    The future BEV cell centers are transformed back into every historical ego
-    frame and tested against the fixed Occ3D XY bounds.  z is fixed at 0
-    because only the XY footprint is being classified.
-    """
-    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
-    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
-    xs = float(grid.x_min) + (np.arange(X, dtype=np.float64) + 0.5) * vx
-    ys = float(grid.y_min) + (np.arange(Y, dtype=np.float64) + 0.5) * vy
-    xx, yy = np.meshgrid(xs, ys, indexing="ij")
-    pts_future = np.stack(
-        (
-            xx.reshape(-1),
-            yy.reshape(-1),
-            np.zeros(X * Y, dtype=np.float64),
-            np.ones(X * Y, dtype=np.float64),
-        ),
-        axis=1,
-    )
-
-    covered = np.zeros(X * Y, dtype=bool)
-    fpose = np.asarray(future_pose, dtype=np.float64)
-    for hpose in np.asarray(history_poses, dtype=np.float64):
-        # relative_transform(src, dst) maps src-frame points into dst frame.
-        future_to_history = relative_transform(fpose, hpose)
-        ph = (future_to_history @ pts_future.T).T
-        xh = ph[:, 0]
-        yh = ph[:, 1]
-        inside = (
-            (xh >= float(grid.x_min))
-            & (xh < float(grid.x_max))
-            & (yh >= float(grid.y_min))
-            & (yh < float(grid.y_max))
-        )
-        covered |= inside
-    return covered.reshape(X, Y)
 
 
 def _empty_horizon_stats():
@@ -693,7 +644,7 @@ def main():
                 ~coverage.any(axis=2)
             ) & free.any(axis=2)
 
-            history_grid_footprint_bev = _history_grid_footprint_bev(
+            history_grid_footprint_bev = history_grid_footprint_bev(
                 history_poses,
                 future_poses[fi],
                 pcfg.grid,
