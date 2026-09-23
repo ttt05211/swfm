@@ -14,6 +14,7 @@ This file contains:
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -255,6 +256,7 @@ def build_future_aligned_history_and_static_memory(
     grid,
     free_label: int,
     dynamic_class_ids: Sequence[int],
+    workers: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Exact fused V19 history alignment + deterministic Static Memory render.
 
@@ -305,12 +307,8 @@ def build_future_aligned_history_and_static_memory(
             )
         )
 
-    all_labels = []
-    all_geometry = []
-    all_coverage = []
-    all_static = []
-
-    for fpose in future_poses:
+    nworkers = max(1, int(workers))
+    def _one_future(fpose):
         fpose = np.asarray(fpose, dtype=np.float64)
         lf, gf = [], []
         coverage = np.zeros(tuple(grid.shape_hwd), dtype=bool)
@@ -408,11 +406,23 @@ def build_future_aligned_history_and_static_memory(
             static_occ = static_sem != int(free_label)
             static_out[static_occ] = static_sem[static_occ]
 
-        all_labels.append(np.stack(lf, axis=0))
-        all_geometry.append(np.stack(gf, axis=0))
-        all_coverage.append(coverage)
-        all_static.append(static_out)
+        return (
+            np.stack(lf, axis=0).astype(np.uint8),
+            np.stack(gf, axis=0).astype(np.float32),
+            coverage,
+            static_out.astype(np.uint8),
+        )
 
+
+    if nworkers == 1:
+        rows = [_one_future(fpose) for fpose in future_poses]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(nworkers, len(future_poses))
+        ) as pool:
+            rows = list(pool.map(_one_future, future_poses))
+
+    all_labels, all_geometry, all_coverage, all_static = zip(*rows)
     return (
         np.stack(all_labels, axis=0).astype(np.uint8),
         np.stack(all_geometry, axis=0).astype(np.float32),
