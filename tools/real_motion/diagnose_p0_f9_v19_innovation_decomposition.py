@@ -7,13 +7,20 @@ add-only sense, and which causal mechanism could in principle supply them?
 
 The disjoint addable categories are:
   * history_source_recoverable
+  * t0_unrepresented_dynamic
+  * current_source_transportable_miss
   * future_birth_dynamic
   * source_shape_innovation
-  * t0_unrepresented_dynamic
+  * dynamic_other_ambiguous
   * history_static_recoverable
   * history_static_seen_mismatch
   * never_seen_static
-  * dynamic/static other_ambiguous
+  * static_other_ambiguous
+
+Dynamic GT occupancy is attributed through min-size-1 future occupancy
+components.  For already represented sources, exact GT-motion transport of the
+observed t0 source geometry separates known-ancestor transport/model misses
+from genuinely new visible source geometry.
 
 A voxel is "addable" only when GT is occupied and the frozen V18 prediction is
 free.  Each perfect oracle therefore only fills currently-free voxels and never
