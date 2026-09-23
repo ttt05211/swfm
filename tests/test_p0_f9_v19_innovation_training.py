@@ -8,9 +8,15 @@ from tools.real_motion.diagnose_p0_f9_v19_novelty_candidate import (
     _accumulate_geometry_stats,
     _empty_geometry_stats,
     _finalize_geometry_stats,
-    _history_grid_footprint_bev,
 )
 from real_motion.geometry import OccupancyGrid
+from real_motion.v19_static_novelty import (
+    StaticNewFOVHead,
+    decode_static_new_fov,
+    history_grid_footprint_bev,
+    majority_semantic_per_column,
+    static_new_fov_loss,
+)
 
 from real_motion.v19_innovation import innovation_loss
 from real_motion.v19_innovation_training import (
@@ -296,7 +302,7 @@ def test_history_grid_footprint_detects_new_forward_fov():
     history = np.eye(4, dtype=np.float64)[None, ...]
     future = np.eye(4, dtype=np.float64)
     future[0, 3] = 1.0
-    covered = _history_grid_footprint_bev(
+    covered = history_grid_footprint_bev(
         history,
         future,
         grid,
@@ -336,3 +342,72 @@ def test_static_geometry_stats_detect_contiguity_and_semantic_purity():
     assert out["bottom_histogram"][0] == 2
     assert out["top_histogram"][1] == 1
     assert out["top_histogram"][2] == 1
+
+
+
+def test_static_new_fov_majority_semantic_and_decode():
+    m = np.zeros((2, 2, 4), dtype=bool)
+    gt = np.full((2, 2, 4), 17, dtype=np.uint8)
+    m[0, 0, 0:3] = True
+    gt[0, 0, 0] = 11
+    gt[0, 0, 1:3] = 16
+    sem = majority_semantic_per_column(m, gt)
+    assert int(sem[0, 0]) == 16
+    assert int(sem[1, 1]) == 255
+
+    model = StaticNewFOVHead(
+        future_frames=1,
+        history_frames=1,
+        semantic_dim=4,
+        hidden_dim=8,
+        num_semantic_classes=17,
+        vertical_bins=4,
+    ).eval()
+    lab = torch.full((1, 1, 1, 2, 2), 17)
+    geo = torch.zeros((1, 1, 1, 4, 2, 2))
+    base = torch.zeros((1, 1, 1, 2, 2))
+    support = torch.ones((1, 1, 1, 2, 2))
+    with torch.inference_mode():
+        out = model(lab, geo, base, support)
+    assert out["occupancy_logits"].shape == (1, 1, 4, 2, 2)
+    assert out["semantic_logits"].shape == (1, 1, 17, 2, 2)
+
+    out = {k: v.clone() for k, v in out.items()}
+    out["occupancy_logits"].fill_(-10)
+    out["semantic_logits"].fill_(-10)
+    out["occupancy_logits"][0, 0, 1, 0, 0] = 10
+    out["semantic_logits"][0, 0, 11, 0, 0] = 10
+    base_free = torch.ones((1, 1, 4, 2, 2), dtype=torch.bool)
+    proposal = decode_static_new_fov(
+        out,
+        new_fov_mask=support,
+        base_free_mask=base_free,
+        free_label=17,
+        occupancy_threshold=0.5,
+    )
+    assert int(proposal[0, 0, 1, 0, 0]) == 11
+    assert int((proposal != 17).sum()) == 1
+
+
+def test_static_new_fov_loss_masks_outside_support():
+    occ_logits = torch.zeros((1, 1, 2, 1, 2))
+    sem_logits = torch.zeros((1, 1, 17, 1, 2))
+    target = torch.zeros_like(occ_logits, dtype=torch.bool)
+    target[0, 0, 0, 0, 0] = True
+    cand = torch.zeros_like(target)
+    cand[0, 0, :, 0, 0] = True
+    sem_tgt = torch.full((1, 1, 1, 2), 255, dtype=torch.long)
+    sem_tgt[0, 0, 0, 0] = 11
+    loss, stats = static_new_fov_loss(
+        {
+            "occupancy_logits": occ_logits,
+            "semantic_logits": sem_logits,
+        },
+        occupancy_target=target,
+        candidate_voxels=cand,
+        semantic_target=sem_tgt,
+        occupancy_positive_weight=1.0,
+    )
+    assert torch.isfinite(loss)
+    assert stats["candidate_voxels"] == 2
+    assert stats["positive_voxels"] == 1
