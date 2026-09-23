@@ -79,7 +79,7 @@ from tools.real_motion.train_p0_f9_v18_se2_clean import (
 )
 
 
-PROTOCOL = "p0_f9_v19_ancestor_free_novelty_candidate_v2"
+PROTOCOL = "p0_f9_v19_ancestor_free_novelty_candidate_v3"
 SEMANTIC_CLASSES = tuple(range(17))
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 HORIZONS = tuple(0.5 * (i + 1) for i in range(6))
@@ -155,6 +155,106 @@ def _oracle(pred, gt, mask):
     m = np.asarray(mask, dtype=bool)
     out[m] = np.asarray(gt)[m]
     return out
+
+
+STATIC_GROUNDLIKE_IDS = (11, 12, 13, 14)
+
+
+def _empty_geometry_stats(vertical_bins: int):
+    return {
+        "positive_columns": 0,
+        "positive_voxels": 0,
+        "span_voxels": 0,
+        "contiguous_columns": 0,
+        "single_semantic_columns": 0,
+        "unique_semantic_count_sum": 0,
+        "groundlike_voxels": 0,
+        "non_groundlike_static_voxels": 0,
+        "bottom_histogram": [0 for _ in range(int(vertical_bins))],
+        "top_histogram": [0 for _ in range(int(vertical_bins))],
+        "span_histogram": [0 for _ in range(int(vertical_bins))],
+        "voxel_class_histogram": {
+            str(cid): 0 for cid in SEMANTIC_CLASSES
+        },
+        "topmost_class_histogram": {
+            str(cid): 0 for cid in SEMANTIC_CLASSES
+        },
+    }
+
+
+def _accumulate_geometry_stats(stats, mask, gt):
+    """Accumulate BEV-column geometry/semantic structure for one target mask."""
+    m = np.asarray(mask, dtype=bool)
+    g = np.asarray(gt, dtype=np.uint8)
+    if m.shape != g.shape or m.ndim != 3:
+        raise ValueError("geometry stats require matching [X,Y,Z] mask/GT")
+    bev = m.any(axis=2)
+    if not bool(bev.any()):
+        return
+
+    rows = m[bev]
+    labels = g[bev]
+    Z = int(m.shape[2])
+    idx = np.arange(Z, dtype=np.int64)[None, :]
+    first = np.where(rows, idx, Z).min(axis=1)
+    last = np.where(rows, idx, -1).max(axis=1)
+    counts = rows.sum(axis=1).astype(np.int64)
+    spans = (last - first + 1).astype(np.int64)
+
+    stats["positive_columns"] += int(rows.shape[0])
+    stats["positive_voxels"] += int(counts.sum())
+    stats["span_voxels"] += int(spans.sum())
+    stats["contiguous_columns"] += int((counts == spans).sum())
+
+    ground = np.isin(labels, np.asarray(STATIC_GROUNDLIKE_IDS, dtype=np.uint8))
+    stats["groundlike_voxels"] += int((rows & ground).sum())
+    stats["non_groundlike_static_voxels"] += int((rows & ~ground).sum())
+
+    for b, t, sp in zip(first, last, spans):
+        stats["bottom_histogram"][int(b)] += 1
+        stats["top_histogram"][int(t)] += 1
+        stats["span_histogram"][int(sp) - 1] += 1
+
+    for row, lab, top in zip(rows, labels, last):
+        vals = lab[row]
+        uniq = np.unique(vals)
+        nuniq = int(len(uniq))
+        stats["unique_semantic_count_sum"] += nuniq
+        stats["single_semantic_columns"] += int(nuniq == 1)
+        top_cls = int(lab[int(top)])
+        stats["topmost_class_histogram"][str(top_cls)] += 1
+        for cid, n in zip(*np.unique(vals, return_counts=True)):
+            stats["voxel_class_histogram"][str(int(cid))] += int(n)
+
+
+def _finalize_geometry_stats(stats):
+    r = dict(stats)
+    ncol = int(r["positive_columns"])
+    nvox = int(r["positive_voxels"])
+    span = int(r["span_voxels"])
+    return {
+        **r,
+        "mean_positive_bins": float(nvox / max(ncol, 1)),
+        "mean_span_bins": float(span / max(ncol, 1)),
+        "fill_fraction_inside_minmax_span": float(
+            nvox / max(span, 1)
+        ),
+        "contiguous_fraction": float(
+            r["contiguous_columns"] / max(ncol, 1)
+        ),
+        "single_semantic_column_fraction": float(
+            r["single_semantic_columns"] / max(ncol, 1)
+        ),
+        "mean_unique_semantics_per_positive_column": float(
+            r["unique_semantic_count_sum"] / max(ncol, 1)
+        ),
+        "groundlike_voxel_fraction": float(
+            r["groundlike_voxels"] / max(nvox, 1)
+        ),
+        "non_groundlike_static_voxel_fraction": float(
+            r["non_groundlike_static_voxels"] / max(nvox, 1)
+        ),
+    }
 
 
 def _history_grid_footprint_bev(
@@ -403,12 +503,28 @@ def main():
     states = {
         "base_v18_static_memory": _raw_state(),
         "plus_never_seen_static": _raw_state(),
+        "plus_new_fov_static": _raw_state(),
+        "plus_in_footprint_static": _raw_state(),
         "plus_future_birth_dynamic": _raw_state(),
         "plus_all_novelty": _raw_state(),
     }
     horizon_stats = {
         str(h): _empty_horizon_stats()
         for h in HORIZONS
+    }
+    vertical_bins = int(pcfg.grid.shape_hwd[2])
+    geometry_stats = {
+        "new_fov_static": _empty_geometry_stats(vertical_bins),
+        "in_footprint_static": _empty_geometry_stats(vertical_bins),
+        "all_never_seen_static": _empty_geometry_stats(vertical_bins),
+        "per_horizon_new_fov_static": {
+            str(h): _empty_geometry_stats(vertical_bins)
+            for h in HORIZONS
+        },
+        "per_horizon_in_footprint_static": {
+            str(h): _empty_geometry_stats(vertical_bins)
+            for h in HORIZONS
+        },
     }
     static_class_hist = {
         str(cid): 0 for cid in SEMANTIC_CLASSES
@@ -637,6 +753,43 @@ def main():
                 history_grid_footprint_bev[..., None],
                 gt.shape,
             )
+            new_fov_static = static_pos & new_fov_3d
+            in_footprint_static = static_pos & footprint_3d
+            if bool((new_fov_static & in_footprint_static).any()):
+                raise RuntimeError("static spatial-origin split overlaps")
+            if not np.array_equal(
+                new_fov_static | in_footprint_static,
+                static_pos,
+            ):
+                raise RuntimeError(
+                    "static spatial-origin split is not exhaustive"
+                )
+
+            _accumulate_geometry_stats(
+                geometry_stats["new_fov_static"],
+                new_fov_static,
+                gt,
+            )
+            _accumulate_geometry_stats(
+                geometry_stats["in_footprint_static"],
+                in_footprint_static,
+                gt,
+            )
+            _accumulate_geometry_stats(
+                geometry_stats["all_never_seen_static"],
+                static_pos,
+                gt,
+            )
+            _accumulate_geometry_stats(
+                geometry_stats["per_horizon_new_fov_static"][str(h)],
+                new_fov_static,
+                gt,
+            )
+            _accumulate_geometry_stats(
+                geometry_stats["per_horizon_in_footprint_static"][str(h)],
+                in_footprint_static,
+                gt,
+            )
             hs["history_grid_footprint_bev"] += int(
                 history_grid_footprint_bev.sum()
             )
@@ -689,6 +842,20 @@ def main():
                 states["plus_never_seen_static"],
                 fi,
                 _oracle(explained, gt, static_pos),
+                gt,
+                pcfg.free_label,
+            )
+            _update_raw(
+                states["plus_new_fov_static"],
+                fi,
+                _oracle(explained, gt, new_fov_static),
+                gt,
+                pcfg.free_label,
+            )
+            _update_raw(
+                states["plus_in_footprint_static"],
+                fi,
+                _oracle(explained, gt, in_footprint_static),
                 gt,
                 pcfg.free_label,
             )
@@ -811,6 +978,14 @@ def main():
                 reports["plus_never_seen_static"],
                 baseline,
             ),
+            "new_fov_static": _delta(
+                reports["plus_new_fov_static"],
+                baseline,
+            ),
+            "in_footprint_static": _delta(
+                reports["plus_in_footprint_static"],
+                baseline,
+            ),
             "future_birth_dynamic": _delta(
                 reports["plus_future_birth_dynamic"],
                 baseline,
@@ -821,6 +996,30 @@ def main():
             ),
         },
         "per_horizon_candidate_stats": finalized,
+        "static_geometry_stats": {
+            "new_fov_static": _finalize_geometry_stats(
+                geometry_stats["new_fov_static"]
+            ),
+            "in_footprint_static": _finalize_geometry_stats(
+                geometry_stats["in_footprint_static"]
+            ),
+            "all_never_seen_static": _finalize_geometry_stats(
+                geometry_stats["all_never_seen_static"]
+            ),
+            "per_horizon_new_fov_static": {
+                str(h): _finalize_geometry_stats(
+                    geometry_stats["per_horizon_new_fov_static"][str(h)]
+                )
+                for h in HORIZONS
+            },
+            "per_horizon_in_footprint_static": {
+                str(h): _finalize_geometry_stats(
+                    geometry_stats["per_horizon_in_footprint_static"][str(h)]
+                )
+                for h in HORIZONS
+            },
+            "groundlike_class_ids": list(STATIC_GROUNDLIKE_IDS),
+        },
         "class_histograms": {
             "never_seen_static": static_class_hist,
             "future_birth_dynamic": birth_class_hist,
@@ -851,6 +1050,8 @@ def main():
     )
     for name in (
         "never_seen_static",
+        "new_fov_static",
+        "in_footprint_static",
         "future_birth_dynamic",
         "all_novelty",
     ):
@@ -877,6 +1078,35 @@ def main():
             f"static_newFOV={100*r['static_new_fov_voxel_fraction']:6.2f}% "
             f"newFOV_BEVprev={100*r['static_bev_prevalence_in_new_fov']:6.2f}% "
             f"birth_newFOV={100*r['birth_new_fov_voxel_fraction']:6.2f}%"
+        )
+
+    print("\nSTATIC GEOMETRY:")
+    for name in (
+        "new_fov_static",
+        "in_footprint_static",
+        "all_never_seen_static",
+    ):
+        g = result["static_geometry_stats"][name]
+        print(
+            f"{name:24s} "
+            f"cols={g['positive_columns']:8d} "
+            f"mean_bins={g['mean_positive_bins']:.3f} "
+            f"mean_span={g['mean_span_bins']:.3f} "
+            f"contig={100*g['contiguous_fraction']:6.2f}% "
+            f"single_sem={100*g['single_semantic_column_fraction']:6.2f}% "
+            f"groundlike={100*g['groundlike_voxel_fraction']:6.2f}%"
+        )
+
+    print("\nNEW-FOV GEOMETRY BY HORIZON:")
+    for h in HORIZONS:
+        g = result["static_geometry_stats"]["per_horizon_new_fov_static"][str(h)]
+        print(
+            f"{h:3.1f}s "
+            f"cols={g['positive_columns']:8d} "
+            f"mean_bins={g['mean_positive_bins']:.3f} "
+            f"span={g['mean_span_bins']:.3f} "
+            f"contig={100*g['contiguous_fraction']:6.2f}% "
+            f"single_sem={100*g['single_semantic_column_fraction']:6.2f}%"
         )
 
     print(
