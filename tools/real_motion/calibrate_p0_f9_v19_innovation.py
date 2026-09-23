@@ -94,6 +94,18 @@ def main():
     }
     semantic_correct = 0
     semantic_total = 0
+    vertical_only = {
+        zt: {"tp": 0, "fp": 0, "fn": 0}
+        for zt in z_ts
+    }
+    vertical_positive_columns = 0
+    vertical_contiguous_columns = 0
+    vertical_span_voxels = 0
+    vertical_positive_voxels = 0
+    presence_leakage = {
+        at: {"inside": 0, "outside": 0}
+        for at in add_ts
+    }
 
     with torch.inference_mode():
         for raw in _iter_batches(
@@ -131,8 +143,46 @@ def main():
                 semantic_total += int(pos.sum().item())
 
             target_3d = z_tgt & pos[..., None]
+            if bool(pos.any()):
+                z_true_rows = z_tgt[pos]
+                vertical_positive_columns += int(z_true_rows.shape[0])
+                vertical_positive_voxels += int(z_true_rows.sum().item())
+                idx = torch.arange(
+                    z_bins, device=device, dtype=torch.long
+                )[None]
+                first = torch.where(
+                    z_true_rows,
+                    idx,
+                    torch.full_like(idx, z_bins),
+                ).min(dim=1).values
+                last = torch.where(
+                    z_true_rows,
+                    idx,
+                    torch.full_like(idx, -1),
+                ).max(dim=1).values
+                span = (last - first + 1).clamp_min(0)
+                counts = z_true_rows.sum(dim=1)
+                vertical_span_voxels += int(span.sum().item())
+                vertical_contiguous_columns += int(
+                    (counts == span).sum().item()
+                )
+                z_prob_rows = z_prob[pos]
+                for zt in z_ts:
+                    zp = z_prob_rows >= float(zt)
+                    rr = vertical_only[zt]
+                    rr["tp"] += int((zp & z_true_rows).sum().item())
+                    rr["fp"] += int((zp & ~z_true_rows).sum().item())
+                    rr["fn"] += int((~zp & z_true_rows).sum().item())
+
             for at in add_ts:
-                add_pred = (add_prob >= float(at)) & cand
+                add_pred_all = add_prob >= float(at)
+                presence_leakage[at]["inside"] += int(
+                    (add_pred_all & cand).sum().item()
+                )
+                presence_leakage[at]["outside"] += int(
+                    (add_pred_all & ~cand).sum().item()
+                )
+                add_pred = add_pred_all & cand
                 bev_tp = add_pred & pos
                 bev_fp = add_pred & ~pos & cand
                 bev_fn = ~add_pred & pos
@@ -184,6 +234,32 @@ def main():
             }
         )
 
+    vertical_table = []
+    for zt, rr in vertical_only.items():
+        vp = rr["tp"] / max(rr["tp"] + rr["fp"], 1)
+        vr = rr["tp"] / max(rr["tp"] + rr["fn"], 1)
+        vertical_table.append(
+            {
+                "vertical_threshold": float(zt),
+                "precision_on_gt_positive_bev": float(vp),
+                "recall_on_gt_positive_bev": float(vr),
+                "f1_on_gt_positive_bev": float(_f_beta(vp, vr, 1.0)),
+            }
+        )
+    leakage_table = []
+    for at, rr in presence_leakage.items():
+        total_pred = rr["inside"] + rr["outside"]
+        leakage_table.append(
+            {
+                "add_threshold": float(at),
+                "predicted_bev_inside_supervised_candidate": int(rr["inside"]),
+                "predicted_bev_outside_supervised_candidate": int(rr["outside"]),
+                "outside_fraction": float(
+                    rr["outside"] / max(total_pred, 1)
+                ),
+            }
+        )
+
     by_f05 = sorted(
         table,
         key=lambda x: (
@@ -203,6 +279,27 @@ def main():
         "semantic_accuracy_on_positive_bev": float(
             semantic_correct / max(semantic_total, 1)
         ),
+        "vertical_target_geometry": {
+            "positive_columns": int(vertical_positive_columns),
+            "contiguous_fraction": float(
+                vertical_contiguous_columns
+                / max(vertical_positive_columns, 1)
+            ),
+            "mean_positive_bins": float(
+                vertical_positive_voxels
+                / max(vertical_positive_columns, 1)
+            ),
+            "mean_span_bins": float(
+                vertical_span_voxels
+                / max(vertical_positive_columns, 1)
+            ),
+            "fill_fraction_inside_minmax_span": float(
+                vertical_positive_voxels
+                / max(vertical_span_voxels, 1)
+            ),
+        },
+        "vertical_only_on_gt_positive_bev": vertical_table,
+        "presence_responsibility_leakage": leakage_table,
         "best_by_joint_voxel_f0_5": by_f05[0],
         "top10_by_joint_voxel_f0_5": by_f05[:10],
         "all": table,
@@ -216,6 +313,23 @@ def main():
         "semantic_accuracy_on_positive_bev="
         f"{result['semantic_accuracy_on_positive_bev']:.4f}"
     )
+    print(
+        "vertical_target_geometry="
+        + json.dumps(result["vertical_target_geometry"])
+    )
+    print("vertical_only:")
+    for row in vertical_table:
+        print(
+            "  z={vertical_threshold:.3f} P/R={precision_on_gt_positive_bev:.3f}/"
+            "{recall_on_gt_positive_bev:.3f} F1={f1_on_gt_positive_bev:.3f}"
+            .format(**row)
+        )
+    print("presence_responsibility_leakage:")
+    for row in leakage_table:
+        print(
+            "  add={add_threshold:.2f} outside_fraction={outside_fraction:.3f}"
+            .format(**row)
+        )
     for row in by_f05[:10]:
         print(
             "add={add_threshold:.2f} z={vertical_threshold:.2f} "
