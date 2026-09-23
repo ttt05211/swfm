@@ -85,3 +85,31 @@ def test_innovation_geometry_quantization_and_vertical_bitpack_roundtrip():
     )[0]
     out = out.permute(0, 2, 3, 1).bool().numpy()
     assert np.array_equal(out, m)
+
+
+def test_dynamic_only_mode_ignores_never_seen_static():
+    free = 17
+    shape = (2, 2, 4)
+    gt = np.full(shape, free, dtype=np.uint8)
+    base = np.full(shape, free, dtype=np.uint8)
+    masks = _masks(shape)
+
+    gt[0, 0, 1] = 4
+    masks["source_shape_innovation"][0, 0, 1] = True
+    gt[1, 1, 2] = 11
+    masks["never_seen_static"][1, 1, 2] = True
+
+    sup = build_innovation_bev_supervision(
+        gt,
+        base,
+        masks,
+        free_label=free,
+        positive_categories=(
+            "future_birth_dynamic",
+            "source_shape_innovation",
+        ),
+    )
+    assert sup["add_target"][0, 0] == 1
+    assert sup["candidate_mask"][0, 0] == 1
+    assert sup["candidate_mask"][1, 1] == 0
+    assert sup["add_target"][1, 1] == 0
