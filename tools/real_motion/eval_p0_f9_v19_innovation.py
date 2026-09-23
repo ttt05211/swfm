@@ -14,6 +14,7 @@ from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args,load_runtime_config,make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v19_innovation import ResidualInnovationHead,ResidualInnovationIntervalHead,base_explained_bev,build_future_aligned_history_and_static_memory,decode_innovation
+from real_motion.v19_innovation_v5 import ResidualInnovationEndpointHead
 from real_motion.v19_scene_memory import protected_add_only
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -47,6 +48,8 @@ def _load_innovation(path,device):
     head_type=str(ck.get("head_type","voxel_bins"))
     if head_type=="vertical_interval":
         model=ResidualInnovationIntervalHead(**dict(ck["architecture"])).to(device)
+    elif head_type=="vertical_endpoints_v5":
+        model=ResidualInnovationEndpointHead(**dict(ck["architecture"])).to(device)
     elif head_type=="voxel_bins":
         model=ResidualInnovationHead(**dict(ck["architecture"])).to(device)
     else:
