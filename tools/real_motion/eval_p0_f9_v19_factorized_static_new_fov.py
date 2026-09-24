@@ -37,6 +37,7 @@ from real_motion.runtime_fastpath import (
 from real_motion.strong_w2det import StrongW2DetConfig, match_instances
 from real_motion.v19_innovation import (
     base_explained_bev,
+    align_prepared_history_frame_to_future,
     build_future_aligned_history_and_static_memory,
     prepare_history_alignment_frame,
 )
@@ -138,6 +139,128 @@ class _HistoryAlignmentLRU:
         while len(self.data) > self.maxsize:
             self.data.popitem(last=False)
         return value
+
+
+class _HistoryFutureAlignmentLRU:
+    """Reuse exact history->future sparse alignment pairs across windows.
+
+    Consecutive stride-1 windows share 25/36 history/future frame pairs.  The
+    cache stores only BEV features plus sparse Static-Memory clear/write
+    indices, so reuse is exact without retaining dense per-pair 3D volumes.
+    """
+
+    def __init__(self, maxsize: int = 96):
+        self.maxsize = max(1, int(maxsize))
+        self.data = OrderedDict()
+
+    def get(self, scene, history_token, future_token):
+        key = (str(scene), str(history_token), str(future_token))
+        if key not in self.data:
+            return None
+        value = self.data.pop(key)
+        self.data[key] = value
+        return value
+
+    def put(self, scene, history_token, future_token, value):
+        key = (str(scene), str(history_token), str(future_token))
+        if key in self.data:
+            self.data.pop(key)
+        self.data[key] = value
+        while len(self.data) > self.maxsize:
+            self.data.popitem(last=False)
+
+
+def _build_history_static_from_pair_cache(
+    *,
+    scene,
+    history_tokens,
+    future_tokens,
+    prepared_history,
+    future_poses,
+    pair_cache,
+    grid,
+    free_label,
+    workers,
+):
+    """Build exact six-future history features/static memory with pair reuse."""
+    history_tokens = tuple(str(x) for x in history_tokens)
+    future_tokens = tuple(str(x) for x in future_tokens)
+    if len(history_tokens) != 6 or len(future_tokens) != 6:
+        raise ValueError("expected six history and six future tokens")
+    if len(prepared_history) != 6 or len(future_poses) != 6:
+        raise ValueError("prepared history/future pose count mismatch")
+
+    rows = {}
+    misses = []
+    for fi, ftok in enumerate(future_tokens):
+        for ti, htok in enumerate(history_tokens):
+            value = pair_cache.get(scene, htok, ftok)
+            key = (ti, fi)
+            if value is None:
+                misses.append((key, htok, ftok))
+            else:
+                rows[key] = value
+
+    def _build(item):
+        key, htok, ftok = item
+        ti, fi = key
+        value = align_prepared_history_frame_to_future(
+            prepared_history[ti],
+            future_poses[fi],
+            grid=grid,
+            free_label=int(free_label),
+            return_coverage=False,
+        )
+        return key, htok, ftok, value
+
+    if misses:
+        nworkers = max(1, min(int(workers), len(misses)))
+        if nworkers == 1:
+            built = [_build(x) for x in misses]
+        else:
+            with ThreadPoolExecutor(max_workers=nworkers) as pool:
+                built = list(pool.map(_build, misses))
+        for key, htok, ftok, value in built:
+            pair_cache.put(scene, htok, ftok, value)
+            rows[key] = value
+
+    shape = tuple(int(v) for v in grid.shape_hwd)
+    sem_futures = []
+    geo_futures = []
+    static_futures = []
+    for fi in range(6):
+        static_out = np.full(shape, int(free_label), dtype=np.uint8)
+        static_flat = static_out.reshape(-1)
+        sem_hist = []
+        geo_hist = []
+        for ti in range(6):
+            (
+                top_label,
+                geom,
+                _,
+                clear_flat,
+                write_flat,
+                write_vals,
+            ) = rows[(ti, fi)]
+            sem_hist.append(top_label)
+            geo_hist.append(geom)
+            if len(clear_flat):
+                static_flat[clear_flat] = int(free_label)
+            if len(write_flat):
+                static_flat[write_flat] = write_vals
+        sem_futures.append(np.stack(sem_hist, axis=0))
+        geo_futures.append(np.stack(geo_hist, axis=0))
+        static_futures.append(static_out)
+
+    return (
+        np.stack(sem_futures, axis=0).astype(np.uint8, copy=False),
+        np.stack(geo_futures, axis=0).astype(np.float32, copy=False),
+        np.stack(static_futures, axis=0).astype(np.uint8, copy=False),
+        {
+            "hits": int(36 - len(misses)),
+            "misses": int(len(misses)),
+        },
+    )
 
 
 class _ComponentLRU:
@@ -582,6 +705,7 @@ def main():
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     component_cache = _ComponentLRU(maxsize=1024)
     history_alignment_cache = _HistoryAlignmentLRU(maxsize=64)
+    history_future_pair_cache = _HistoryFutureAlignmentLRU(maxsize=96)
     raw_by_variant = {v: _new_raw() for v in VARIANTS}
     proposed = 0
     added = 0
@@ -591,6 +715,8 @@ def main():
     started = time.perf_counter()
     stage_profile = {}
     profiled_windows = 0
+    pair_cache_hits = 0
+    pair_cache_misses = 0
     profile_lo = int(a.profile_warmup_windows) + 1
     profile_hi = int(a.profile_warmup_windows) + int(a.profile_windows)
 
@@ -673,20 +799,21 @@ def main():
             )
             for ti, tok in enumerate(w.history_tokens)
         ]
-        sem, geo, _, static_all = (
-            build_future_aligned_history_and_static_memory(
-                raw["history_occ"],
-                raw["history_observed"],
-                raw["history_poses"],
-                raw["future_poses"],
+        sem, geo, static_all, pair_cache_stats = (
+            _build_history_static_from_pair_cache(
+                scene=str(w.scene_name),
+                history_tokens=w.history_tokens,
+                future_tokens=w.future_tokens,
+                prepared_history=prepared_history,
+                future_poses=raw["future_poses"],
+                pair_cache=history_future_pair_cache,
                 grid=pcfg.grid,
                 free_label=int(pcfg.free_label),
-                dynamic_class_ids=DYNAMIC_CLASS_IDS,
                 workers=int(a.alignment_workers),
-                return_coverage=False,
-                prepared_history=prepared_history,
             )
         )
+        pair_cache_hits += int(pair_cache_stats["hits"])
+        pair_cache_misses += int(pair_cache_stats["misses"])
         if profile_this:
             _profile_add(
                 stage_profile,
@@ -931,6 +1058,13 @@ def main():
             "windows_per_s": float(len(records) / elapsed),
         },
         "stage_timing_profile": profile_report,
+        "history_future_pair_cache": {
+            "hits": int(pair_cache_hits),
+            "misses": int(pair_cache_misses),
+            "hit_rate": float(
+                pair_cache_hits / max(pair_cache_hits + pair_cache_misses, 1)
+            ),
+        },
     }
     op = Path(a.output)
     op.parent.mkdir(parents=True, exist_ok=True)
