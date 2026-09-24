@@ -458,18 +458,66 @@ def _model_forward(model, gi, device):
         )
 
 
-def _prepare_record(rec, source, pcfg, strong_cfg, device):
+def _prepare_record(
+    rec,
+    source,
+    pcfg,
+    strong_cfg,
+    device,
+    *,
+    raw_window=None,
+):
     w = window_from_record(rec)
     scene = str(w.scene_name)
     current_token = str(w.t0_token)
     previous_token = str(w.history_tokens[-2])
-    current_sem = np.asarray(source.load_semantics(scene, current_token), dtype=np.uint8)
-    previous_sem = np.asarray(source.load_semantics(scene, previous_token), dtype=np.uint8)
-    current_pose = np.asarray(source.pose(current_token), dtype=np.float64)
-    previous_pose = np.asarray(source.pose(previous_token), dtype=np.float64)
-    future_poses = [
-        np.asarray(source.pose(str(tok)), dtype=np.float64) for tok in w.future_tokens
-    ]
+
+    if raw_window is None:
+        current_sem = np.asarray(
+            source.load_semantics(scene, current_token),
+            dtype=np.uint8,
+        )
+        previous_sem = np.asarray(
+            source.load_semantics(scene, previous_token),
+            dtype=np.uint8,
+        )
+        current_pose = np.asarray(
+            source.pose(current_token),
+            dtype=np.float64,
+        )
+        previous_pose = np.asarray(
+            source.pose(previous_token),
+            dtype=np.float64,
+        )
+        future_poses = [
+            np.asarray(source.pose(str(tok)), dtype=np.float64)
+            for tok in w.future_tokens
+        ]
+    else:
+        history_occ = np.asarray(
+            raw_window["history_occ"],
+            dtype=np.uint8,
+        )
+        history_poses = np.asarray(
+            raw_window["history_poses"],
+            dtype=np.float64,
+        )
+        raw_future_poses = np.asarray(
+            raw_window["future_poses"],
+            dtype=np.float64,
+        )
+        if history_occ.shape[0] < 2 or history_poses.shape[0] < 2:
+            raise ValueError("raw_window must contain at least two history frames")
+        if raw_future_poses.shape[0] != FUTURE_FRAMES:
+            raise ValueError("raw_window future pose count mismatch")
+        current_sem = history_occ[-1]
+        previous_sem = history_occ[-2]
+        current_pose = history_poses[-1]
+        previous_pose = history_poses[-2]
+        future_poses = [
+            np.asarray(x, dtype=np.float64)
+            for x in raw_future_poses
+        ]
     # Deployment/runtime path uses the cropped implementation.  Formal
     # exactness checks recompute the frozen full-grid reference extraction.
     current = extract_instances_cropped_exact(
