@@ -10,6 +10,7 @@ from tools.real_motion.diagnose_p0_f9_v19_novelty_candidate import (
     _finalize_geometry_stats,
 )
 from real_motion.geometry import OccupancyGrid
+from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.v19_static_novelty import (
     StaticNewFOVHead,
     copy_static_anchor_columns,
@@ -653,7 +654,7 @@ def test_sparse_fused_history_static_matches_legacy_reference():
             futures,
             grid=grid,
             free_label=free,
-            dynamic_class_ids=(2, 3, 4, 6, 7, 9, 10),
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
             workers=2,
             return_coverage=True,
         )
@@ -682,7 +683,7 @@ def test_sparse_fused_history_static_matches_legacy_reference():
             futures,
             grid=grid,
             free_label=free,
-            dynamic_class_ids=(2, 3, 4, 6, 7, 9, 10),
+            dynamic_class_ids=DYNAMIC_CLASS_IDS,
             workers=2,
             return_coverage=False,
         )
