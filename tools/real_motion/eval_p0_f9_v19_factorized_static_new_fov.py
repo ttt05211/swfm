@@ -346,6 +346,28 @@ def _build_anchor_context_sequence(
     )
 
 
+def _moving_support_sequence(source, window, *, grid, workers):
+    def _one(item):
+        hi, h = item
+        moving, _, _ = gt_moving_support_for_horizon(
+            source.nusc,
+            str(window.t0_token),
+            str(window.future_tokens[int(hi)]),
+            float(h),
+            grid=grid,
+        )
+        return moving
+
+    items = list(enumerate(HORIZONS))
+    nworkers = max(1, int(workers))
+    if nworkers == 1:
+        return [_one(x) for x in items]
+    with ThreadPoolExecutor(
+        max_workers=min(nworkers, len(items))
+    ) as pool:
+        return list(pool.map(_one, items))
+
+
 def _autocast(device, enabled):
     if enabled and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -813,16 +835,12 @@ def main():
             )
 
         t_moving = time.perf_counter()
-        moving_rows = []
-        for hi, h in enumerate(HORIZONS):
-            moving, _, _ = gt_moving_support_for_horizon(
-                source.nusc,
-                str(w.t0_token),
-                str(w.future_tokens[hi]),
-                float(h),
-                grid=pcfg.grid,
-            )
-            moving_rows.append(moving)
+        moving_rows = _moving_support_sequence(
+            source,
+            w,
+            grid=pcfg.grid,
+            workers=int(a.alignment_workers),
+        )
         if profile_this:
             _profile_add(
                 stage_profile,
