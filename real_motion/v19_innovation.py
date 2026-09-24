@@ -344,6 +344,41 @@ def _bev_summary_from_sorted_choices(
     return top_label, geom
 
 
+def prepare_history_alignment_frame(
+    semantics: np.ndarray,
+    observed: np.ndarray,
+    pose: np.ndarray,
+    *,
+    grid,
+    dynamic_class_ids: Sequence[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Sparsify one history frame once for repeated overlapping windows."""
+    sem = np.asarray(semantics, dtype=np.uint8)
+    obs = np.asarray(observed, dtype=bool)
+    shape = tuple(int(x) for x in grid.shape_hwd)
+    if sem.shape != shape or obs.shape != sem.shape:
+        raise ValueError("semantic/observed grid shape mismatch")
+    idx = np.argwhere(obs)
+    if len(idx):
+        xyz = _occupied_indices_to_xyz(idx, grid)
+        labels = sem[tuple(idx.T)]
+        dynamic_ids = np.asarray(
+            tuple(int(x) for x in dynamic_class_ids),
+            dtype=np.uint8,
+        )
+        usable_static = ~np.isin(labels, dynamic_ids)
+    else:
+        xyz = np.zeros((0, 3), dtype=np.float64)
+        labels = np.zeros((0,), dtype=np.uint8)
+        usable_static = np.zeros((0,), dtype=bool)
+    return (
+        np.asarray(pose, dtype=np.float64),
+        xyz,
+        labels,
+        usable_static,
+    )
+
+
 def build_future_aligned_history_and_static_memory(
     history_semantics: Sequence[np.ndarray],
     history_observed: Sequence[np.ndarray],
@@ -355,6 +390,9 @@ def build_future_aligned_history_and_static_memory(
     dynamic_class_ids: Sequence[int],
     workers: int = 1,
     return_coverage: bool = True,
+    prepared_history: Sequence[
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
     """Exact fused future-aligned history plus Static Memory, sparse fast path.
 
@@ -378,37 +416,25 @@ def build_future_aligned_history_and_static_memory(
 
     shape = tuple(int(x) for x in grid.shape_hwd)
     X, Y, Z = shape
-    dynamic_ids = np.asarray(
-        tuple(int(x) for x in dynamic_class_ids),
-        dtype=np.uint8,
-    )
-    prepared = []
-    for sem, obs, hpose in zip(
-        history_semantics,
-        history_observed,
-        history_poses,
-    ):
-        sem = np.asarray(sem, dtype=np.uint8)
-        obs = np.asarray(obs, dtype=bool)
-        if sem.shape != shape or obs.shape != sem.shape:
-            raise ValueError("semantic/observed grid shape mismatch")
-        idx = np.argwhere(obs)
-        if len(idx):
-            xyz = _occupied_indices_to_xyz(idx, grid)
-            labels = sem[tuple(idx.T)]
-            usable_static = ~np.isin(labels, dynamic_ids)
-        else:
-            xyz = np.zeros((0, 3), dtype=np.float64)
-            labels = np.zeros((0,), dtype=np.uint8)
-            usable_static = np.zeros((0,), dtype=bool)
-        prepared.append(
-            (
-                np.asarray(hpose, dtype=np.float64),
-                xyz,
-                labels,
-                usable_static,
+    if prepared_history is None:
+        prepared = [
+            prepare_history_alignment_frame(
+                sem,
+                obs,
+                hpose,
+                grid=grid,
+                dynamic_class_ids=dynamic_class_ids,
             )
-        )
+            for sem, obs, hpose in zip(
+                history_semantics,
+                history_observed,
+                history_poses,
+            )
+        ]
+    else:
+        if len(prepared_history) != HISTORY_FRAMES:
+            raise ValueError("prepared_history must contain six frames")
+        prepared = list(prepared_history)
 
     nworkers = max(1, int(workers))
 
