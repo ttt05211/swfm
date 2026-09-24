@@ -125,23 +125,79 @@ def _new_raw():
 
 
 def _update(raw, hi, pred, gt, moving, free_label):
-    p = np.asarray(pred)
-    g = np.asarray(gt)
+    """Vectorized exact confusion accumulation.
+
+    This replaces per-class full-volume boolean scans with bincount-based
+    histograms.  It is algebraically identical to the previous implementation
+    but substantially cheaper for full 3D validation.
+    """
+    p = np.asarray(pred, dtype=np.int64)
+    g = np.asarray(gt, dtype=np.int64)
     m = np.asarray(moving, dtype=bool)
-    po = p != int(free_label)
-    go = g != int(free_label)
-    raw["occ_inter"][hi] += int((po & go).sum())
-    raw["occ_union"][hi] += int((po | go).sum())
-    for j, cid in enumerate(SEM_CLASSES):
-        pp = p == int(cid)
-        gg = g == int(cid)
-        raw["sem_inter"][hi, j] += int((pp & gg).sum())
-        raw["sem_union"][hi, j] += int((pp | gg).sum())
-    for j, cid in enumerate(DYNAMIC_CLASS_IDS):
-        pp = (p == int(cid)) & m
-        gg = (g == int(cid)) & m
-        raw["mov_inter"][hi, j] += int((pp & gg).sum())
-        raw["mov_union"][hi, j] += int((pp | gg).sum())
+    if p.shape != g.shape or m.shape != g.shape:
+        raise ValueError("pred/gt/moving shape mismatch")
+
+    free = int(free_label)
+    po = p != free
+    go = g != free
+    raw["occ_inter"][hi] += int(np.count_nonzero(po & go))
+    raw["occ_union"][hi] += int(np.count_nonzero(po | go))
+
+    # Semantic IoU for classes 0..16.  Labels outside that range (free=17)
+    # simply do not contribute to per-class pred/GT histograms.
+    flat_p = p.ravel()
+    flat_g = g.ravel()
+    sem_n = len(SEM_CLASSES)
+    p_valid = (flat_p >= 0) & (flat_p < sem_n)
+    g_valid = (flat_g >= 0) & (flat_g < sem_n)
+    p_count = np.bincount(
+        flat_p[p_valid],
+        minlength=sem_n,
+    )[:sem_n]
+    g_count = np.bincount(
+        flat_g[g_valid],
+        minlength=sem_n,
+    )[:sem_n]
+    same = p_valid & g_valid & (flat_p == flat_g)
+    inter = np.bincount(
+        flat_p[same],
+        minlength=sem_n,
+    )[:sem_n]
+    raw["sem_inter"][hi] += inter.astype(np.int64, copy=False)
+    raw["sem_union"][hi] += (
+        p_count + g_count - inter
+    ).astype(np.int64, copy=False)
+
+    # Moving metric is the same class-wise IoU restricted to GT-moving support.
+    # Build one small histogram on that support, then gather dynamic class IDs.
+    mp = flat_p[m.ravel()]
+    mg = flat_g[m.ravel()]
+    if mp.size:
+        label_n = max(
+            free + 1,
+            max(int(x) for x in DYNAMIC_CLASS_IDS) + 1,
+        )
+        mp_valid = (mp >= 0) & (mp < label_n)
+        mg_valid = (mg >= 0) & (mg < label_n)
+        pc = np.bincount(
+            mp[mp_valid],
+            minlength=label_n,
+        )
+        gc = np.bincount(
+            mg[mg_valid],
+            minlength=label_n,
+        )
+        eq = mp_valid & mg_valid & (mp == mg)
+        ic = np.bincount(
+            mp[eq],
+            minlength=label_n,
+        )
+        for j, cid in enumerate(DYNAMIC_CLASS_IDS):
+            cid = int(cid)
+            raw["mov_inter"][hi, j] += int(ic[cid])
+            raw["mov_union"][hi, j] += int(
+                pc[cid] + gc[cid] - ic[cid]
+            )
 
 
 def _safe(i, u):
