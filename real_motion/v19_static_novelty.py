@@ -159,6 +159,54 @@ def history_grid_footprint_bev(
     return covered.reshape(X, Y)
 
 
+def history_grid_footprint_bev_all(
+    history_poses: np.ndarray,
+    future_poses: np.ndarray,
+    grid,
+) -> np.ndarray:
+    """Vectorized six-future history-grid footprint computation.
+
+    The historical single-future helper rebuilds the same BEV query grid for
+    every horizon.  This version constructs that grid once and reuses it across
+    all future poses while preserving the exact geometric contract.
+    """
+    hist = np.asarray(history_poses, dtype=np.float64)
+    fut = np.asarray(future_poses, dtype=np.float64)
+    if hist.ndim != 3 or hist.shape[1:] != (4, 4):
+        raise ValueError("history_poses must be [T,4,4]")
+    if fut.ndim != 3 or fut.shape[1:] != (4, 4):
+        raise ValueError("future_poses must be [F,4,4]")
+
+    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
+    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
+    xs = float(grid.x_min) + (np.arange(X, dtype=np.float64) + 0.5) * vx
+    ys = float(grid.y_min) + (np.arange(Y, dtype=np.float64) + 0.5) * vy
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    pts_future = np.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            np.zeros(X * Y, dtype=np.float64),
+            np.ones(X * Y, dtype=np.float64),
+        ),
+        axis=1,
+    )
+
+    out = np.zeros((len(fut), X * Y), dtype=bool)
+    for fi, fpose in enumerate(fut):
+        covered = out[fi]
+        for hpose in hist:
+            future_to_history = relative_transform(fpose, hpose)
+            ph = pts_future @ future_to_history.T
+            covered |= (
+                (ph[:, 0] >= float(grid.x_min))
+                & (ph[:, 0] < float(grid.x_max))
+                & (ph[:, 1] >= float(grid.y_min))
+                & (ph[:, 1] < float(grid.y_max))
+            )
+    return out.reshape(len(fut), X, Y)
+
+
 def nearest_static_anchor_map(
     static_render: np.ndarray,
     history_footprint_bev: np.ndarray,
