@@ -12,9 +12,11 @@ from tools.real_motion.diagnose_p0_f9_v19_novelty_candidate import (
 from real_motion.geometry import OccupancyGrid
 from real_motion.v19_static_novelty import (
     StaticNewFOVHead,
+    copy_static_anchor_columns,
     decode_static_new_fov,
     history_grid_footprint_bev,
     majority_semantic_per_column,
+    nearest_static_anchor_map,
     static_new_fov_loss,
 )
 
@@ -411,3 +413,67 @@ def test_static_new_fov_loss_masks_outside_support():
     assert torch.isfinite(loss)
     assert stats["candidate_voxels"] == 2
     assert stats["positive_voxels"] == 1
+
+
+
+def test_nearest_static_anchor_and_causal_copy_gate():
+    free = 17
+    static = np.full((5, 5, 3), free, dtype=np.uint8)
+    static[1, 2, 0] = 11
+    static[1, 2, 1] = 11
+    footprint = np.zeros((5, 5), dtype=bool)
+    footprint[:2, :] = True
+
+    dist, ax, ay, valid = nearest_static_anchor_map(
+        static,
+        footprint,
+        free_label=free,
+    )
+    assert valid.all()
+    assert int(ax[3, 2]) == 1
+    assert int(ay[3, 2]) == 2
+    assert abs(float(dist[3, 2]) - 2.0) < 1e-5
+
+    new_fov = ~footprint
+    prop_near = copy_static_anchor_columns(
+        static,
+        new_fov,
+        ax,
+        ay,
+        dist,
+        valid,
+        free_label=free,
+        voxel_size_xy_m=0.4,
+        max_distance_m=0.8,
+    )
+    assert int(prop_near[3, 2, 0]) == 11
+    assert int(prop_near[3, 2, 1]) == 11
+    assert int(prop_near[4, 2, 0]) == free
+
+    prop_all = copy_static_anchor_columns(
+        static,
+        new_fov,
+        ax,
+        ay,
+        dist,
+        valid,
+        free_label=free,
+        voxel_size_xy_m=0.4,
+        max_distance_m=None,
+    )
+    assert int(prop_all[4, 2, 0]) == 11
+
+
+def test_nearest_static_anchor_handles_empty_memory():
+    free = 17
+    static = np.full((3, 4, 2), free, dtype=np.uint8)
+    footprint = np.ones((3, 4), dtype=bool)
+    dist, ax, ay, valid = nearest_static_anchor_map(
+        static,
+        footprint,
+        free_label=free,
+    )
+    assert not valid.any()
+    assert np.isinf(dist).all()
+    assert ax.shape == (3, 4)
+    assert ay.shape == (3, 4)
