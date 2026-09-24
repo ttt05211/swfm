@@ -563,3 +563,27 @@ def test_anchor_distance_quantization_round_trip():
     assert abs(float(y[0, 1]) - 2.0) < 0.2
     assert abs(float(y[0, 2]) - 40.0) < 0.2
     assert abs(float(y[0, 3]) - 40.0) < 0.2
+
+
+
+def test_majority_semantic_per_column_vectorized_matches_reference():
+    rng = np.random.default_rng(20260924)
+    gt = rng.integers(0, 17, size=(11, 13, 7), dtype=np.uint8)
+    mask = rng.random((11, 13, 7)) < 0.31
+
+    got = majority_semantic_per_column(
+        mask,
+        gt,
+        num_classes=17,
+        ignore_label=255,
+    )
+
+    ref = np.full((11, 13), 255, dtype=np.uint8)
+    for x in range(11):
+        for y in range(13):
+            labels = gt[x, y][mask[x, y]]
+            if len(labels):
+                counts = np.bincount(labels.astype(np.int64), minlength=17)
+                ref[x, y] = np.uint8(int(np.argmax(counts)))
+
+    np.testing.assert_array_equal(got, ref)
