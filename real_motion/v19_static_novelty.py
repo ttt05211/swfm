@@ -1,0 +1,654 @@
+"""Static New-FOV Novelty model for the V19 Transport/Memory/Novelty split.
+
+The branch predicts only ancestor-free *static* occupancy in BEV columns that
+are geometrically outside every historical occupancy-grid footprint after exact
+future-ego alignment.
+
+The representation follows the measured target structure:
+- New-FOV static columns are not contiguous enough for a bottom/top interval
+  parameterization (about 75% contiguous in the current diagnostic);
+- but the semantic class is usually shared within a positive column (about 93%
+  single-semantic columns).
+
+So the head predicts:
+1. a direct Z-bin occupancy mask, allowing non-contiguous vertical structure;
+2. one static semantic class per positive BEV column.
+
+This is deliberately lighter than dense Z x C semantic logits while avoiding
+the interval bottleneck that failed on non-contiguous targets.
+"""
+from __future__ import annotations
+
+import math
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from typing import Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .geometry import relative_transform
+from .local_st_world_model import SEMANTIC_CLASSES
+from .motion_transport import FUTURE_FRAMES, HISTORY_FRAMES
+from .v19_innovation import GEOMETRY_CHANNELS
+
+
+STATIC_NEW_FOV_PROTOCOL = "v19_static_new_fov_direct_z_v1"
+
+
+@lru_cache(maxsize=8)
+def _bev_future_points_cached(
+    x_min: float,
+    y_min: float,
+    vx: float,
+    vy: float,
+    X: int,
+    Y: int,
+) -> np.ndarray:
+    xs = float(x_min) + (np.arange(int(X), dtype=np.float64) + 0.5) * float(vx)
+    ys = float(y_min) + (np.arange(int(Y), dtype=np.float64) + 0.5) * float(vy)
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    return np.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            np.zeros(int(X) * int(Y), dtype=np.float64),
+            np.ones(int(X) * int(Y), dtype=np.float64),
+        ),
+        axis=1,
+    )
+
+
+def history_grid_footprint_bev_sequence(
+    history_poses: np.ndarray,
+    future_poses: np.ndarray,
+    grid,
+    *,
+    workers: int = 1,
+) -> np.ndarray:
+    """Exact geometric history-footprint masks for all future frames.
+
+    Reuses one cached BEV point grid across the six futures and can evaluate
+    futures concurrently. The result is bit-identical to calling
+    history_grid_footprint_bev once per future.
+    """
+    hp = np.asarray(history_poses, dtype=np.float64)
+    fp = np.asarray(future_poses, dtype=np.float64)
+    if hp.ndim != 3 or hp.shape[1:] != (4, 4):
+        raise ValueError("history_poses must be [T,4,4]")
+    if fp.ndim != 3 or fp.shape[1:] != (4, 4):
+        raise ValueError("future_poses must be [F,4,4]")
+
+    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
+    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
+    pts_future = _bev_future_points_cached(
+        float(grid.x_min),
+        float(grid.y_min),
+        float(vx),
+        float(vy),
+        int(X),
+        int(Y),
+    )
+
+    def _one(fpose):
+        covered = np.zeros(X * Y, dtype=bool)
+        for hpose in hp:
+            future_to_history = relative_transform(
+                np.asarray(fpose, dtype=np.float64),
+                np.asarray(hpose, dtype=np.float64),
+            )
+            ph = pts_future @ future_to_history.T
+            covered |= (
+                (ph[:, 0] >= float(grid.x_min))
+                & (ph[:, 0] < float(grid.x_max))
+                & (ph[:, 1] >= float(grid.y_min))
+                & (ph[:, 1] < float(grid.y_max))
+            )
+        return covered.reshape(X, Y)
+
+    nworkers = max(1, int(workers))
+    if nworkers == 1:
+        rows = [_one(fpose) for fpose in fp]
+    else:
+        with ThreadPoolExecutor(max_workers=min(nworkers, len(fp))) as pool:
+            rows = list(pool.map(_one, fp))
+    return np.stack(rows, axis=0)
+
+
+def history_grid_footprint_bev(
+    history_poses: np.ndarray,
+    future_pose: np.ndarray,
+    grid,
+) -> np.ndarray:
+    """Return future BEV cells covered by at least one historical XY grid.
+
+    This uses only ego poses and fixed occupancy-grid geometry, so it is fully
+    causal given the same future-ego conditioning contract as frozen V18.
+    """
+    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
+    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
+    xs = float(grid.x_min) + (np.arange(X, dtype=np.float64) + 0.5) * vx
+    ys = float(grid.y_min) + (np.arange(Y, dtype=np.float64) + 0.5) * vy
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    pts_future = np.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            np.zeros(X * Y, dtype=np.float64),
+            np.ones(X * Y, dtype=np.float64),
+        ),
+        axis=1,
+    )
+
+    covered = np.zeros(X * Y, dtype=bool)
+    fpose = np.asarray(future_pose, dtype=np.float64)
+    for hpose in np.asarray(history_poses, dtype=np.float64):
+        future_to_history = relative_transform(
+            fpose,
+            np.asarray(hpose, dtype=np.float64),
+        )
+        ph = (future_to_history @ pts_future.T).T
+        covered |= (
+            (ph[:, 0] >= float(grid.x_min))
+            & (ph[:, 0] < float(grid.x_max))
+            & (ph[:, 1] >= float(grid.y_min))
+            & (ph[:, 1] < float(grid.y_max))
+        )
+    return covered.reshape(X, Y)
+
+
+def history_grid_footprint_bev_all(
+    history_poses: np.ndarray,
+    future_poses: np.ndarray,
+    grid,
+) -> np.ndarray:
+    """Vectorized six-future history-grid footprint computation.
+
+    The historical single-future helper rebuilds the same BEV query grid for
+    every horizon.  This version constructs that grid once and reuses it across
+    all future poses while preserving the exact geometric contract.
+    """
+    hist = np.asarray(history_poses, dtype=np.float64)
+    fut = np.asarray(future_poses, dtype=np.float64)
+    if hist.ndim != 3 or hist.shape[1:] != (4, 4):
+        raise ValueError("history_poses must be [T,4,4]")
+    if fut.ndim != 3 or fut.shape[1:] != (4, 4):
+        raise ValueError("future_poses must be [F,4,4]")
+
+    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
+    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
+    xs = float(grid.x_min) + (np.arange(X, dtype=np.float64) + 0.5) * vx
+    ys = float(grid.y_min) + (np.arange(Y, dtype=np.float64) + 0.5) * vy
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    pts_future = np.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            np.zeros(X * Y, dtype=np.float64),
+            np.ones(X * Y, dtype=np.float64),
+        ),
+        axis=1,
+    )
+
+    out = np.zeros((len(fut), X * Y), dtype=bool)
+    for fi, fpose in enumerate(fut):
+        covered = out[fi]
+        for hpose in hist:
+            future_to_history = relative_transform(fpose, hpose)
+            ph = pts_future @ future_to_history.T
+            covered |= (
+                (ph[:, 0] >= float(grid.x_min))
+                & (ph[:, 0] < float(grid.x_max))
+                & (ph[:, 1] >= float(grid.y_min))
+                & (ph[:, 1] < float(grid.y_max))
+            )
+    return out.reshape(len(fut), X, Y)
+
+
+def nearest_static_anchor_map(
+    static_render: np.ndarray,
+    history_footprint_bev: np.ndarray,
+    *,
+    free_label: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Nearest causal static-memory column for every BEV cell.
+
+    Anchors are occupied Static-Memory columns inside the union of historical
+    grid footprints.  For an external New-FOV query, the nearest occupied
+    historical column naturally lies on (or behind, when the boundary is
+    unobserved) the known-scene side of the geometric boundary.
+
+    Returns:
+      distance_cells [X,Y] Euclidean cell distance (inf if no anchor exists),
+      anchor_x / anchor_y [X,Y] nearest-anchor indices,
+      valid [X,Y] whether a static anchor exists.
+
+    SciPy's exact Euclidean distance transform is used when available.  A
+    deterministic 8-neighbour Dijkstra fallback keeps dependency-light tests
+    functional; the fallback is only expected for small/debug environments.
+    """
+    sem = np.asarray(static_render, dtype=np.uint8)
+    footprint = np.asarray(history_footprint_bev, dtype=bool)
+    if sem.ndim != 3 or footprint.shape != sem.shape[:2]:
+        raise ValueError("static render / footprint shape mismatch")
+    anchor = footprint & (sem != int(free_label)).any(axis=2)
+    X, Y = anchor.shape
+    if not bool(anchor.any()):
+        return (
+            np.full((X, Y), np.inf, dtype=np.float32),
+            np.zeros((X, Y), dtype=np.int32),
+            np.zeros((X, Y), dtype=np.int32),
+            np.zeros((X, Y), dtype=bool),
+        )
+
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        dist, inds = distance_transform_edt(
+            ~anchor,
+            return_indices=True,
+        )
+        return (
+            np.asarray(dist, dtype=np.float32),
+            np.asarray(inds[0], dtype=np.int32),
+            np.asarray(inds[1], dtype=np.int32),
+            np.ones((X, Y), dtype=bool),
+        )
+    except ImportError:
+        import heapq
+
+        inf = float("inf")
+        dist = np.full((X, Y), inf, dtype=np.float64)
+        ax = np.zeros((X, Y), dtype=np.int32)
+        ay = np.zeros((X, Y), dtype=np.int32)
+        heap = []
+        for x, y in np.argwhere(anchor):
+            x = int(x)
+            y = int(y)
+            dist[x, y] = 0.0
+            ax[x, y] = x
+            ay[x, y] = y
+            heapq.heappush(heap, (0.0, x, y, x, y))
+        steps = (
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, 2.0 ** 0.5),
+            (-1, 1, 2.0 ** 0.5),
+            (1, -1, 2.0 ** 0.5),
+            (1, 1, 2.0 ** 0.5),
+        )
+        eps = 1e-12
+        while heap:
+            d, x, y, sx, sy = heapq.heappop(heap)
+            if d > dist[x, y] + eps:
+                continue
+            for dx, dy, cost in steps:
+                nx = x + dx
+                ny = y + dy
+                if not (0 <= nx < X and 0 <= ny < Y):
+                    continue
+                nd = d + cost
+                replace = nd < dist[nx, ny] - eps
+                tie = (
+                    abs(nd - dist[nx, ny]) <= eps
+                    and (sx, sy) < (int(ax[nx, ny]), int(ay[nx, ny]))
+                )
+                if replace or tie:
+                    dist[nx, ny] = nd
+                    ax[nx, ny] = int(sx)
+                    ay[nx, ny] = int(sy)
+                    heapq.heappush(
+                        heap,
+                        (nd, nx, ny, int(sx), int(sy)),
+                    )
+        return (
+            dist.astype(np.float32),
+            ax,
+            ay,
+            np.ones((X, Y), dtype=bool),
+        )
+
+
+def copy_static_anchor_columns(
+    static_render: np.ndarray,
+    new_fov_bev: np.ndarray,
+    anchor_x: np.ndarray,
+    anchor_y: np.ndarray,
+    anchor_distance_cells: np.ndarray,
+    anchor_valid: np.ndarray,
+    *,
+    free_label: int,
+    voxel_size_xy_m: float,
+    max_distance_m: float | None,
+) -> np.ndarray:
+    """Copy nearest known static 3D columns into causal New-FOV support.
+
+    This is a deterministic diagnostic baseline, not a learned predictor.
+    No future GT is used.  A finite max_distance_m yields a conservative
+    boundary-continuation baseline; None copies over the entire New-FOV.
+    """
+    sem = np.asarray(static_render, dtype=np.uint8)
+    nf = np.asarray(new_fov_bev, dtype=bool)
+    ax = np.asarray(anchor_x, dtype=np.int64)
+    ay = np.asarray(anchor_y, dtype=np.int64)
+    dist = np.asarray(anchor_distance_cells, dtype=np.float32)
+    valid = np.asarray(anchor_valid, dtype=bool)
+    if sem.ndim != 3:
+        raise ValueError("static_render must be [X,Y,Z]")
+    if not (
+        nf.shape
+        == ax.shape
+        == ay.shape
+        == dist.shape
+        == valid.shape
+        == sem.shape[:2]
+    ):
+        raise ValueError("anchor/candidate shape mismatch")
+
+    eligible = nf & valid
+    if max_distance_m is not None:
+        eligible &= (
+            dist * float(voxel_size_xy_m)
+            <= float(max_distance_m) + 1e-6
+        )
+    out = np.full_like(sem, int(free_label))
+    if bool(eligible.any()):
+        copied = sem[ax, ay]
+        out[eligible] = copied[eligible]
+    return out
+
+
+def majority_semantic_per_column(
+    positive_mask: np.ndarray,
+    gt_occ: np.ndarray,
+    *,
+    num_classes: int = 17,
+    ignore_label: int = 255,
+) -> np.ndarray:
+    """Majority semantic class per positive BEV column, vectorized exactly."""
+    m = np.asarray(positive_mask, dtype=bool)
+    gt = np.asarray(gt_occ, dtype=np.uint8)
+    if m.shape != gt.shape or m.ndim != 3:
+        raise ValueError("positive mask and GT must share [X,Y,Z]")
+    classes = int(num_classes)
+    if classes <= 0:
+        raise ValueError("num_classes must be positive")
+
+    X, Y, Z = m.shape
+    out = np.full((X, Y), int(ignore_label), dtype=np.uint8)
+    pos_bev = m.any(axis=2)
+    if not bool(pos_bev.any()):
+        return out
+
+    flat_mask = m.reshape(X * Y, Z)
+    flat_gt = gt.reshape(X * Y, Z)
+    row_ids, z_ids = np.nonzero(flat_mask)
+    labels = flat_gt[row_ids, z_ids].astype(np.int64, copy=False)
+    if bool(((labels < 0) | (labels >= classes)).any()):
+        raise ValueError("positive semantic labels outside requested classes")
+
+    pair_ids = row_ids.astype(np.int64, copy=False) * classes + labels
+    counts = np.bincount(
+        pair_ids,
+        minlength=X * Y * classes,
+    ).reshape(X * Y, classes)
+    winners = counts.argmax(axis=1).astype(np.uint8, copy=False)
+    out_flat = out.reshape(-1)
+    pos_flat = pos_bev.reshape(-1)
+    out_flat[pos_flat] = winners[pos_flat]
+    return out
+
+
+class StaticNewFOVHead(nn.Module):
+    """Future-aligned temporal BEV head for static New-FOV completion."""
+
+    def __init__(
+        self,
+        *,
+        future_frames: int = FUTURE_FRAMES,
+        history_frames: int = HISTORY_FRAMES,
+        semantic_dim: int = 8,
+        hidden_dim: int = 32,
+        num_semantic_classes: int = 17,
+        vertical_bins: int = 16,
+    ):
+        super().__init__()
+        self.future_frames = int(future_frames)
+        self.history_frames = int(history_frames)
+        self.num_semantic_classes = int(num_semantic_classes)
+        self.vertical_bins = int(vertical_bins)
+        if min(
+            self.future_frames,
+            self.history_frames,
+            self.num_semantic_classes,
+            self.vertical_bins,
+            int(hidden_dim),
+        ) <= 0:
+            raise ValueError("invalid StaticNewFOVHead dimensions")
+
+        self.semantic_embedding = nn.Embedding(
+            SEMANTIC_CLASSES,
+            int(semantic_dim),
+        )
+        in_frame = int(semantic_dim) + int(GEOMETRY_CHANNELS)
+        self.frame_stem = nn.Sequential(
+            nn.Conv2d(in_frame, hidden_dim, 3, stride=2, padding=1),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+        )
+        self.temporal_dw = nn.Conv3d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=(3, 1, 1),
+            padding=(1, 0, 0),
+            groups=hidden_dim,
+        )
+        self.temporal_pw = nn.Conv3d(hidden_dim, hidden_dim, 1)
+        self.temporal_norm = nn.GroupNorm(1, hidden_dim)
+
+        # Both maps are causal/deployable:
+        #   channel 0: Transport+Memory already explains this BEV column;
+        #   channel 1: this future column lies in geometric New-FOV support.
+        self.context_proj = nn.Sequential(
+            nn.Conv2d(2, hidden_dim, 3, stride=2, padding=1),
+            nn.GroupNorm(1, hidden_dim),
+        )
+        self.future_time_embedding = nn.Parameter(
+            torch.zeros(1, self.future_frames, hidden_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Upsample(
+                scale_factor=2.0,
+                mode="bilinear",
+                align_corners=False,
+            ),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+        )
+        self.out_head = nn.Conv2d(
+            hidden_dim,
+            self.vertical_bins + self.num_semantic_classes,
+            1,
+        )
+
+        nn.init.trunc_normal_(self.future_time_embedding, std=0.02)
+        nn.init.zeros_(self.out_head.weight)
+        nn.init.zeros_(self.out_head.bias)
+        self.set_occupancy_prior(0.05)
+
+    def set_occupancy_prior(self, probability: float) -> None:
+        p = min(max(float(probability), 1e-4), 1.0 - 1e-4)
+        bias = math.log(p / (1.0 - p))
+        with torch.no_grad():
+            self.out_head.bias[: self.vertical_bins].fill_(float(bias))
+
+    def forward(
+        self,
+        future_aligned_semantic: torch.Tensor,
+        future_aligned_geometry: torch.Tensor,
+        base_explained: torch.Tensor,
+        new_fov_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        lab = future_aligned_semantic.long()
+        geo = future_aligned_geometry
+        if lab.ndim != 5:
+            raise ValueError(
+                "future_aligned_semantic must be [B,F,T,H,W]"
+            )
+        B, Fh, T, H, W = lab.shape
+        if Fh != self.future_frames or T != self.history_frames:
+            raise ValueError("future/history frame count mismatch")
+        if geo.shape != (
+            B,
+            Fh,
+            T,
+            GEOMETRY_CHANNELS,
+            H,
+            W,
+        ):
+            raise ValueError(
+                "future_aligned_geometry must be [B,F,T,4,H,W]"
+            )
+        if base_explained.shape != (B, Fh, 1, H, W):
+            raise ValueError("base_explained must be [B,F,1,H,W]")
+        if new_fov_mask.shape == (B, Fh, H, W):
+            new_fov_mask = new_fov_mask.unsqueeze(2)
+        if new_fov_mask.shape != (B, Fh, 1, H, W):
+            raise ValueError("new_fov_mask must be [B,F,1,H,W]")
+        if bool((lab < 0).any()) or bool(
+            (lab >= SEMANTIC_CLASSES).any()
+        ):
+            raise ValueError("semantic labels outside [0,17]")
+
+        emb = self.semantic_embedding(lab)
+        emb = emb.permute(0, 1, 2, 5, 3, 4)
+        x = torch.cat((emb, geo.to(emb.dtype)), dim=3)
+        x = x.reshape(B * Fh * T, x.shape[3], H, W)
+        x = self.frame_stem(x)
+        H2, W2 = x.shape[-2:]
+        x = x.reshape(B * Fh, T, -1, H2, W2).permute(
+            0, 2, 1, 3, 4
+        )
+        x = self.temporal_pw(self.temporal_dw(x))
+        x = self.temporal_norm(x.mean(dim=2))
+
+        ctx = torch.cat(
+            (
+                base_explained,
+                new_fov_mask.to(base_explained.dtype),
+            ),
+            dim=2,
+        ).reshape(B * Fh, 2, H, W)
+        x = x + self.context_proj(ctx.to(x.dtype))
+        time = self.future_time_embedding.expand(B, -1, -1).reshape(
+            B * Fh, -1
+        )
+        x = x + time[:, :, None, None].to(x.dtype)
+        x = self.decoder(x)
+        raw = self.out_head(x).reshape(B, Fh, -1, H, W)
+
+        z = self.vertical_bins
+        return {
+            "occupancy_logits": raw[:, :, :z],
+            "semantic_logits": raw[:, :, z:],
+        }
+
+
+def static_new_fov_loss(
+    outputs: dict[str, torch.Tensor],
+    *,
+    occupancy_target: torch.Tensor,
+    candidate_voxels: torch.Tensor,
+    semantic_target: torch.Tensor,
+    occupancy_positive_weight: float,
+    semantic_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Voxel occupancy BCE in causal New-FOV support + column semantic CE."""
+    occ_logits = outputs["occupancy_logits"]
+    sem_logits = outputs["semantic_logits"]
+    occ_tgt = occupancy_target.bool()
+    cand = candidate_voxels.bool()
+    if occ_logits.shape != occ_tgt.shape or cand.shape != occ_tgt.shape:
+        raise ValueError("occupancy logits/target/candidate mismatch")
+    if semantic_target.shape != occ_tgt.shape[:2] + occ_tgt.shape[3:]:
+        # occ target [B,F,Z,H,W], semantic [B,F,H,W]
+        raise ValueError("semantic target shape mismatch")
+
+    logits = occ_logits[cand]
+    target = occ_tgt[cand].to(occ_logits.dtype)
+    if logits.numel() == 0:
+        occ = occ_logits.sum() * 0.0
+    else:
+        pw = torch.as_tensor(
+            float(occupancy_positive_weight),
+            dtype=occ_logits.dtype,
+            device=occ_logits.device,
+        )
+        occ = F.binary_cross_entropy_with_logits(
+            logits,
+            target,
+            pos_weight=pw,
+        )
+
+    pos_bev = occ_tgt.any(dim=2)
+    if bool(pos_bev.any()):
+        rows = sem_logits.permute(0, 1, 3, 4, 2)[pos_bev]
+        sem = F.cross_entropy(
+            rows,
+            semantic_target[pos_bev].long(),
+        )
+    else:
+        sem = sem_logits.sum() * 0.0
+
+    total = occ + float(semantic_weight) * sem
+    return total, {
+        "loss": float(total.detach().cpu()),
+        "occupancy_bce": float(occ.detach().cpu()),
+        "semantic_ce": float(sem.detach().cpu()),
+        "positive_voxels": int((occ_tgt & cand).sum().item()),
+        "candidate_voxels": int(cand.sum().item()),
+        "positive_bev_columns": int(pos_bev.sum().item()),
+    }
+
+
+def decode_static_new_fov(
+    outputs: dict[str, torch.Tensor],
+    *,
+    new_fov_mask: torch.Tensor,
+    base_free_mask: torch.Tensor,
+    free_label: int,
+    occupancy_threshold: float,
+) -> torch.Tensor:
+    """Decode semantic 3D proposal, masked to causal support and base-free voxels."""
+    occ_prob = torch.sigmoid(outputs["occupancy_logits"].float())
+    occ = occ_prob >= float(occupancy_threshold)
+    sem = outputs["semantic_logits"].argmax(dim=2)
+    if new_fov_mask.ndim == 5:
+        new_fov_mask = new_fov_mask[:, :, 0]
+    support = (
+        new_fov_mask.bool().unsqueeze(2)
+        & base_free_mask.bool()
+    )
+    occ &= support
+
+    B, Fh, Z, H, W = occ.shape
+    proposal = torch.full(
+        (B, Fh, Z, H, W),
+        int(free_label),
+        dtype=torch.long,
+        device=occ.device,
+    )
+    cls = sem.unsqueeze(2).expand(B, Fh, Z, H, W)
+    proposal[occ] = cls[occ]
+    return proposal
