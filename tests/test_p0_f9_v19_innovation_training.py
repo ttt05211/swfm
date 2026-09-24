@@ -27,7 +27,12 @@ from real_motion.v19_static_novelty_factorized import (
     dequantize_anchor_distance_torch,
 )
 
-from real_motion.v19_innovation import innovation_loss
+from real_motion.v19_innovation import (
+    build_future_aligned_history_and_static_memory,
+    build_future_aligned_history_bev_with_coverage,
+    innovation_loss,
+)
+from real_motion.v19_scene_memory import render_static_history_mosaic
 from real_motion.v19_innovation_training import (
     build_true_motion_innovation_bev_supervision,
 )
@@ -587,3 +592,101 @@ def test_majority_semantic_per_column_vectorized_matches_reference():
                 ref[x, y] = np.uint8(int(np.argmax(counts)))
 
     np.testing.assert_array_equal(got, ref)
+
+
+
+def test_sparse_fused_history_static_matches_legacy_reference():
+    grid = OccupancyGrid(
+        x_min=-2.0,
+        y_min=-2.0,
+        z_min=-0.8,
+        voxel_size=(0.4, 0.4, 0.4),
+        shape_hwd=(10, 10, 4),
+    )
+    free = 17
+    rng = np.random.default_rng(12345)
+    history = []
+    observed = []
+    poses = []
+    futures = []
+
+    for t in range(6):
+        sem = np.full(grid.shape_hwd, free, dtype=np.uint8)
+        obs = rng.random(grid.shape_hwd) < 0.38
+        occ = rng.random(grid.shape_hwd) < 0.16
+        labels = rng.integers(0, 17, size=grid.shape_hwd, dtype=np.uint8)
+        sem[occ] = labels[occ]
+        history.append(sem)
+        observed.append(obs)
+
+        p = np.eye(4, dtype=np.float64)
+        ang = 0.012 * t
+        ca, sa = np.cos(ang), np.sin(ang)
+        p[:2, :2] = np.asarray([[ca, -sa], [sa, ca]])
+        p[0, 3] = 0.07 * t
+        p[1, 3] = -0.04 * t
+        poses.append(p)
+
+    for t in range(6):
+        p = np.eye(4, dtype=np.float64)
+        ang = 0.018 * (t + 1)
+        ca, sa = np.cos(ang), np.sin(ang)
+        p[:2, :2] = np.asarray([[ca, -sa], [sa, ca]])
+        p[0, 3] = 0.13 * (t + 1)
+        p[1, 3] = 0.05 * (t + 1)
+        futures.append(p)
+
+    ref_lab, ref_geo, ref_cov = build_future_aligned_history_bev_with_coverage(
+        history,
+        observed,
+        poses,
+        futures,
+        grid=grid,
+        free_label=free,
+    )
+    got_lab, got_geo, got_cov, got_static = (
+        build_future_aligned_history_and_static_memory(
+            history,
+            observed,
+            poses,
+            futures,
+            grid=grid,
+            free_label=free,
+            dynamic_class_ids=(2, 3, 4, 6, 7, 9, 10),
+            workers=2,
+            return_coverage=True,
+        )
+    )
+
+    np.testing.assert_array_equal(got_lab, ref_lab)
+    np.testing.assert_allclose(got_geo, ref_geo, rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(got_cov, ref_cov)
+
+    for fi, fpose in enumerate(futures):
+        ref_static = render_static_history_mosaic(
+            history,
+            observed,
+            poses,
+            fpose,
+            grid=grid,
+            free_label=free,
+        )
+        np.testing.assert_array_equal(got_static[fi], ref_static)
+
+    got_lab2, got_geo2, got_cov2, got_static2 = (
+        build_future_aligned_history_and_static_memory(
+            history,
+            observed,
+            poses,
+            futures,
+            grid=grid,
+            free_label=free,
+            dynamic_class_ids=(2, 3, 4, 6, 7, 9, 10),
+            workers=2,
+            return_coverage=False,
+        )
+    )
+    assert got_cov2 is None
+    np.testing.assert_array_equal(got_lab2, ref_lab)
+    np.testing.assert_allclose(got_geo2, ref_geo, rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(got_static2, got_static)
