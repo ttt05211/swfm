@@ -124,164 +124,101 @@ def _new_raw():
     }
 
 
-def _update(raw, hi, pred, gt, moving, free_label):
-    """Vectorized exact confusion accumulation.
-
-    This replaces per-class full-volume boolean scans with bincount-based
-    histograms.  It is algebraically identical to the previous implementation
-    but substantially cheaper for full 3D validation.
-    """
-    p = np.asarray(pred, dtype=np.int64)
-    g = np.asarray(gt, dtype=np.int64)
+def _confusion_counts(pred, gt, moving, free_label):
+    """Return exact full/moving label confusion matrices with two bincounts."""
+    p = np.asarray(pred)
+    g = np.asarray(gt)
     m = np.asarray(moving, dtype=bool)
     if p.shape != g.shape or m.shape != g.shape:
         raise ValueError("pred/gt/moving shape mismatch")
 
     free = int(free_label)
-    po = p != free
-    go = g != free
-    raw["occ_inter"][hi] += int(np.count_nonzero(po & go))
-    raw["occ_union"][hi] += int(np.count_nonzero(po | go))
-
-    # Semantic IoU for classes 0..16.  Labels outside that range (free=17)
-    # simply do not contribute to per-class pred/GT histograms.
-    flat_p = p.ravel()
-    flat_g = g.ravel()
-    sem_n = len(SEM_CLASSES)
-    p_valid = (flat_p >= 0) & (flat_p < sem_n)
-    g_valid = (flat_g >= 0) & (flat_g < sem_n)
-    p_count = np.bincount(
-        flat_p[p_valid],
-        minlength=sem_n,
-    )[:sem_n]
-    g_count = np.bincount(
-        flat_g[g_valid],
-        minlength=sem_n,
-    )[:sem_n]
-    same = p_valid & g_valid & (flat_p == flat_g)
-    inter = np.bincount(
-        flat_p[same],
-        minlength=sem_n,
-    )[:sem_n]
-    raw["sem_inter"][hi] += inter.astype(np.int64, copy=False)
-    raw["sem_union"][hi] += (
-        p_count + g_count - inter
-    ).astype(np.int64, copy=False)
-
-    # Moving metric is the same class-wise IoU restricted to GT-moving support.
-    # Build one small histogram on that support, then gather dynamic class IDs.
-    mp = flat_p[m.ravel()]
-    mg = flat_g[m.ravel()]
-    if mp.size:
-        label_n = max(
-            free + 1,
-            max(int(x) for x in DYNAMIC_CLASS_IDS) + 1,
-        )
-        mp_valid = (mp >= 0) & (mp < label_n)
-        mg_valid = (mg >= 0) & (mg < label_n)
-        pc = np.bincount(
-            mp[mp_valid],
-            minlength=label_n,
-        )
-        gc = np.bincount(
-            mg[mg_valid],
-            minlength=label_n,
-        )
-        eq = mp_valid & mg_valid & (mp == mg)
-        ic = np.bincount(
-            mp[eq],
-            minlength=label_n,
-        )
-        for j, cid in enumerate(DYNAMIC_CLASS_IDS):
-            cid = int(cid)
-            raw["mov_inter"][hi, j] += int(ic[cid])
-            raw["mov_union"][hi, j] += int(
-                pc[cid] + gc[cid] - ic[cid]
-            )
-
-
-
-def _update_many(raw_by_name, hi, pred_by_name, gt, moving, free_label):
-    """Exact multi-variant update with GT/moving preprocessing shared once."""
-    if set(raw_by_name) != set(pred_by_name):
-        raise ValueError("raw/pred variant names mismatch")
-
-    g = np.asarray(gt, dtype=np.int64)
-    m = np.asarray(moving, dtype=bool)
-    if g.shape != m.shape:
-        raise ValueError("gt/moving shape mismatch")
-
-    free = int(free_label)
-    flat_g = g.ravel()
-    flat_m = m.ravel()
-    go = flat_g != free
-
-    sem_n = len(SEM_CLASSES)
-    g_valid = (flat_g >= 0) & (flat_g < sem_n)
-    g_count = np.bincount(
-        flat_g[g_valid],
-        minlength=sem_n,
-    )[:sem_n]
-
-    mg = flat_g[flat_m]
     label_n = max(
         free + 1,
         max(int(x) for x in DYNAMIC_CLASS_IDS) + 1,
+        len(SEM_CLASSES) + 1,
     )
-    if mg.size:
-        mg_valid = (mg >= 0) & (mg < label_n)
-        mg_count = np.bincount(
-            mg[mg_valid],
-            minlength=label_n,
-        )
+    fp = p.reshape(-1).astype(np.int16, copy=False)
+    fg = g.reshape(-1).astype(np.int16, copy=False)
+    pair = fg * int(label_n) + fp
+    conf = np.bincount(
+        pair,
+        minlength=int(label_n) * int(label_n),
+    ).reshape(label_n, label_n)
+
+    fm = m.reshape(-1)
+    if bool(fm.any()):
+        mconf = np.bincount(
+            pair[fm],
+            minlength=int(label_n) * int(label_n),
+        ).reshape(label_n, label_n)
     else:
-        mg_valid = np.zeros((0,), dtype=bool)
-        mg_count = np.zeros((label_n,), dtype=np.int64)
+        mconf = np.zeros((label_n, label_n), dtype=np.int64)
+    return conf, mconf
 
+
+def _accumulate_confusion(raw, hi, conf, mconf, free_label):
+    free = int(free_label)
+    sem_n = len(SEM_CLASSES)
+
+    raw["occ_inter"][hi] += int(conf[:free, :free].sum())
+    raw["occ_union"][hi] += int(conf.sum() - conf[free, free])
+
+    diag = np.diag(conf)[:sem_n]
+    gt_count = conf[:sem_n, :].sum(axis=1)
+    pred_count = conf[:, :sem_n].sum(axis=0)
+    raw["sem_inter"][hi] += diag.astype(np.int64, copy=False)
+    raw["sem_union"][hi] += (
+        gt_count + pred_count - diag
+    ).astype(np.int64, copy=False)
+
+    for j, cid in enumerate(DYNAMIC_CLASS_IDS):
+        cid = int(cid)
+        inter = int(mconf[cid, cid])
+        union = int(
+            mconf[cid, :].sum()
+            + mconf[:, cid].sum()
+            - inter
+        )
+        raw["mov_inter"][hi, j] += inter
+        raw["mov_union"][hi, j] += union
+
+
+def _update(raw, hi, pred, gt, moving, free_label):
+    conf, mconf = _confusion_counts(
+        pred,
+        gt,
+        moving,
+        free_label,
+    )
+    _accumulate_confusion(
+        raw,
+        hi,
+        conf,
+        mconf,
+        free_label,
+    )
+
+
+def _update_many(raw_by_name, hi, pred_by_name, gt, moving, free_label):
+    """Exact multi-variant metrics using one compact confusion per variant."""
+    if set(raw_by_name) != set(pred_by_name):
+        raise ValueError("raw/pred variant names mismatch")
     for name, pred in pred_by_name.items():
-        raw = raw_by_name[name]
-        p = np.asarray(pred, dtype=np.int64)
-        if p.shape != g.shape:
-            raise ValueError(f"{name}: pred/gt shape mismatch")
-        flat_p = p.ravel()
-        po = flat_p != free
+        conf, mconf = _confusion_counts(
+            pred,
+            gt,
+            moving,
+            free_label,
+        )
+        _accumulate_confusion(
+            raw_by_name[name],
+            hi,
+            conf,
+            mconf,
+            free_label,
+        )
 
-        raw["occ_inter"][hi] += int(np.count_nonzero(po & go))
-        raw["occ_union"][hi] += int(np.count_nonzero(po | go))
-
-        p_valid = (flat_p >= 0) & (flat_p < sem_n)
-        p_count = np.bincount(
-            flat_p[p_valid],
-            minlength=sem_n,
-        )[:sem_n]
-        same = p_valid & g_valid & (flat_p == flat_g)
-        inter = np.bincount(
-            flat_p[same],
-            minlength=sem_n,
-        )[:sem_n]
-        raw["sem_inter"][hi] += inter.astype(np.int64, copy=False)
-        raw["sem_union"][hi] += (
-            p_count + g_count - inter
-        ).astype(np.int64, copy=False)
-
-        if mg.size:
-            mp = flat_p[flat_m]
-            mp_valid = (mp >= 0) & (mp < label_n)
-            mp_count = np.bincount(
-                mp[mp_valid],
-                minlength=label_n,
-            )
-            eq = mp_valid & mg_valid & (mp == mg)
-            mi = np.bincount(
-                mp[eq],
-                minlength=label_n,
-            )
-            for j, cid in enumerate(DYNAMIC_CLASS_IDS):
-                cid = int(cid)
-                raw["mov_inter"][hi, j] += int(mi[cid])
-                raw["mov_union"][hi, j] += int(
-                    mp_count[cid] + mg_count[cid] - mi[cid]
-                )
 
 def _safe(i, u):
     i = np.asarray(i, dtype=np.float64)
