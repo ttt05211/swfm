@@ -20,6 +20,8 @@ the interval bottleneck that failed on non-contiguous targets.
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Sequence
 
 import numpy as np
@@ -34,6 +36,85 @@ from .v19_innovation import GEOMETRY_CHANNELS
 
 
 STATIC_NEW_FOV_PROTOCOL = "v19_static_new_fov_direct_z_v1"
+
+
+@lru_cache(maxsize=8)
+def _bev_future_points_cached(
+    x_min: float,
+    y_min: float,
+    vx: float,
+    vy: float,
+    X: int,
+    Y: int,
+) -> np.ndarray:
+    xs = float(x_min) + (np.arange(int(X), dtype=np.float64) + 0.5) * float(vx)
+    ys = float(y_min) + (np.arange(int(Y), dtype=np.float64) + 0.5) * float(vy)
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    return np.stack(
+        (
+            xx.reshape(-1),
+            yy.reshape(-1),
+            np.zeros(int(X) * int(Y), dtype=np.float64),
+            np.ones(int(X) * int(Y), dtype=np.float64),
+        ),
+        axis=1,
+    )
+
+
+def history_grid_footprint_bev_sequence(
+    history_poses: np.ndarray,
+    future_poses: np.ndarray,
+    grid,
+    *,
+    workers: int = 1,
+) -> np.ndarray:
+    """Exact geometric history-footprint masks for all future frames.
+
+    Reuses one cached BEV point grid across the six futures and can evaluate
+    futures concurrently. The result is bit-identical to calling
+    history_grid_footprint_bev once per future.
+    """
+    hp = np.asarray(history_poses, dtype=np.float64)
+    fp = np.asarray(future_poses, dtype=np.float64)
+    if hp.ndim != 3 or hp.shape[1:] != (4, 4):
+        raise ValueError("history_poses must be [T,4,4]")
+    if fp.ndim != 3 or fp.shape[1:] != (4, 4):
+        raise ValueError("future_poses must be [F,4,4]")
+
+    X, Y, _ = tuple(int(x) for x in grid.shape_hwd)
+    vx, vy, _ = tuple(float(x) for x in grid.voxel_size)
+    pts_future = _bev_future_points_cached(
+        float(grid.x_min),
+        float(grid.y_min),
+        float(vx),
+        float(vy),
+        int(X),
+        int(Y),
+    )
+
+    def _one(fpose):
+        covered = np.zeros(X * Y, dtype=bool)
+        for hpose in hp:
+            future_to_history = relative_transform(
+                np.asarray(fpose, dtype=np.float64),
+                np.asarray(hpose, dtype=np.float64),
+            )
+            ph = pts_future @ future_to_history.T
+            covered |= (
+                (ph[:, 0] >= float(grid.x_min))
+                & (ph[:, 0] < float(grid.x_max))
+                & (ph[:, 1] >= float(grid.y_min))
+                & (ph[:, 1] < float(grid.y_max))
+            )
+        return covered.reshape(X, Y)
+
+    nworkers = max(1, int(workers))
+    if nworkers == 1:
+        rows = [_one(fpose) for fpose in fp]
+    else:
+        with ThreadPoolExecutor(max_workers=min(nworkers, len(fp))) as pool:
+            rows = list(pool.map(_one, fp))
+    return np.stack(rows, axis=0)
 
 
 def history_grid_footprint_bev(
