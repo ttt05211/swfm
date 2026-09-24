@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import json
 from pathlib import Path
@@ -21,20 +23,25 @@ from real_motion.nuscenes_adapter import (
     NuScenesWindowSource,
     gt_moving_support_for_horizon,
 )
+from real_motion.motion_transport import world_points_to_t0
 from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import (
     add_config_args,
     load_runtime_config,
     make_prepare_config,
 )
-from real_motion.strong_w2det import StrongW2DetConfig
+from real_motion.runtime_fastpath import (
+    baseline_clear_flat_indices,
+    extract_instances_cropped_exact,
+)
+from real_motion.strong_w2det import StrongW2DetConfig, match_instances
 from real_motion.v19_innovation import (
     base_explained_bev,
     build_future_aligned_history_and_static_memory,
 )
 from real_motion.v19_scene_memory import protected_add_only
 from real_motion.v19_static_novelty import (
-    history_grid_footprint_bev,
+    history_grid_footprint_bev_sequence,
     majority_semantic_per_column,
     nearest_static_anchor_map,
 )
@@ -46,9 +53,10 @@ from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.benchmark_p0_f9_v18_runtime import (
     _forecast_once,
-    _prepare_record,
+    _precompute_source_world,
     _release_gpu_inputs,
     _stage_gpu_inputs,
+    _strong_all_horizons,
 )
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.eval_p0_f9_v19_static_new_fov import (
@@ -56,7 +64,7 @@ from tools.real_motion.eval_p0_f9_v19_static_new_fov import (
     _delta,
     _finalize,
     _new_raw,
-    _update,
+    _update_many,
 )
 from tools.real_motion.train_p0_f9_v18_se2_clean import (
     PROTOCOL as CLEAN_PROTOCOL,
@@ -93,6 +101,212 @@ class CachedSource(NuScenesWindowSource):
     @lru_cache(maxsize=4096)
     def pose(self, token):
         return super().pose(token)
+
+
+class _ComponentLRU:
+    """Reuse exact Strong components for overlapping validation windows."""
+
+    def __init__(self, maxsize: int = 1024):
+        self.maxsize = max(1, int(maxsize))
+        self.data = OrderedDict()
+
+    def get_or_build(self, scene, token, semantics, pose, *, grid, cfg):
+        key = (str(scene), str(token))
+        if key in self.data:
+            value = self.data.pop(key)
+            self.data[key] = value
+            return value
+        value = extract_instances_cropped_exact(
+            np.asarray(semantics, dtype=np.uint8),
+            np.asarray(pose, dtype=np.float64),
+            grid=grid,
+            cfg=cfg,
+        )
+        self.data[key] = value
+        while len(self.data) > self.maxsize:
+            self.data.popitem(last=False)
+        return value
+
+
+def _prepare_record_from_raw(
+    rec,
+    raw,
+    source,
+    pcfg,
+    strong_cfg,
+    device,
+    component_cache,
+):
+    """Lean evaluator preparation using already-loaded raw window tensors."""
+    w = window_from_record(rec)
+    scene = str(w.scene_name)
+    current_sem = np.asarray(raw["history_occ"][-1], dtype=np.uint8)
+    previous_sem = np.asarray(raw["history_occ"][-2], dtype=np.uint8)
+    current_pose = np.asarray(raw["history_poses"][-1], dtype=np.float64)
+    previous_pose = np.asarray(raw["history_poses"][-2], dtype=np.float64)
+    future_poses = [
+        np.asarray(x, dtype=np.float64)
+        for x in raw["future_poses"]
+    ]
+
+    current = component_cache.get_or_build(
+        scene,
+        str(w.t0_token),
+        current_sem,
+        current_pose,
+        grid=pcfg.grid,
+        cfg=strong_cfg,
+    )
+    previous = component_cache.get_or_build(
+        scene,
+        str(w.history_tokens[-2]),
+        previous_sem,
+        previous_pose,
+        grid=pcfg.grid,
+        cfg=strong_cfg,
+    )
+    velocities = match_instances(
+        previous,
+        current,
+        float(pcfg.frame_dt_s),
+        max_speed_mps=strong_cfg.max_match_speed_mps,
+    )
+
+    if len(current) != int(rec["features"].shape[0]):
+        raise RuntimeError(
+            f"{rec['sample_id']}: Strong/source count mismatch"
+        )
+    got = [int(x["class_id"]) for x in current]
+    expected = [int(x) for x in rec["source_class_id"].tolist()]
+    if got != expected:
+        raise RuntimeError(
+            f"{rec['sample_id']}: Strong/source order mismatch"
+        )
+
+    source_world_points = _precompute_source_world(
+        current,
+        current_pose,
+        pcfg.grid,
+    )
+    source_rel_xy = [
+        np.asarray(pts, dtype=np.float64)[:, :2]
+        - np.asarray(comp["centroid_world"], dtype=np.float64)[None, :2]
+        for pts, comp in zip(source_world_points, current)
+    ]
+    source_z_t0 = np.asarray(
+        [
+            world_points_to_t0(
+                np.asarray(
+                    comp["centroid_world"],
+                    dtype=np.float64,
+                )[None],
+                current_pose,
+            )[0, 2]
+            for comp in current
+        ],
+        dtype=np.float64,
+    )
+
+    anchors, baseline_by_hi = _strong_all_horizons(
+        current_sem,
+        current_pose,
+        future_poses,
+        current,
+        velocities,
+        source_world_points,
+        frame_dt_s=float(pcfg.frame_dt_s),
+        grid=pcfg.grid,
+        cfg=strong_cfg,
+        runtime_device=device,
+    )
+    baseline_clear_flat_by_hi = [
+        baseline_clear_flat_indices(rows, grid=pcfg.grid)
+        for rows in baseline_by_hi
+    ]
+    world_to_future = [
+        np.linalg.inv(np.asarray(p, dtype=np.float64))
+        for p in future_poses
+    ]
+    return {
+        "rec": rec,
+        "window": w,
+        "scene": scene,
+        "current_pose": current_pose,
+        "future_poses": future_poses,
+        "current": current,
+        "velocities": velocities,
+        "source_world_points": source_world_points,
+        "source_rel_xy": source_rel_xy,
+        "source_z_t0": source_z_t0,
+        "anchors": anchors,
+        "baseline_by_hi": baseline_by_hi,
+        "baseline_clear_flat_by_hi": baseline_clear_flat_by_hi,
+        "world_to_future": world_to_future,
+        "gpu": None,
+    }
+
+
+def _build_anchor_context_sequence(
+    static_all,
+    footprints,
+    *,
+    free_label,
+    voxel_size_xy_m,
+    workers,
+):
+    static_all = np.asarray(static_all, dtype=np.uint8)
+    footprints = np.asarray(footprints, dtype=bool)
+    if static_all.ndim != 4:
+        raise ValueError("static_all must be [F,X,Y,Z]")
+    if footprints.shape != static_all.shape[:3]:
+        raise ValueError("footprint/static shape mismatch")
+
+    def _one(fi):
+        static_render = static_all[int(fi)]
+        footprint = footprints[int(fi)]
+        dist_cells, ax, ay, valid = nearest_static_anchor_map(
+            static_render,
+            footprint,
+            free_label=int(free_label),
+        )
+        static_occ = static_render != int(free_label)
+        sem_source = majority_semantic_per_column(
+            static_occ,
+            static_render,
+            num_classes=17,
+            ignore_label=int(free_label),
+        )
+        aq = np.full(
+            footprint.shape,
+            int(free_label),
+            dtype=np.uint8,
+        )
+        profile = np.zeros(static_occ.shape, dtype=bool)
+        if bool(valid.any()):
+            aq[valid] = sem_source[ax[valid], ay[valid]]
+            copied = static_occ[ax, ay]
+            profile[valid] = copied[valid]
+        dist_m = (
+            np.asarray(dist_cells, dtype=np.float32)
+            * float(voxel_size_xy_m)
+        )
+        return aq, profile, dist_m
+
+    ids = list(range(static_all.shape[0]))
+    nworkers = max(1, int(workers))
+    if nworkers == 1:
+        rows = [_one(i) for i in ids]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(nworkers, len(ids))
+        ) as pool:
+            rows = list(pool.map(_one, ids))
+    asem, aprof, adist = zip(*rows)
+    return (
+        np.stack(asem, axis=0),
+        np.stack(aprof, axis=0),
+        np.stack(adist, axis=0),
+    )
 
 
 def _autocast(device, enabled):
@@ -307,6 +521,7 @@ def main():
 
     source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
+    component_cache = _ComponentLRU(maxsize=1024)
     raw_by_variant = {v: _new_raw() for v in VARIANTS}
     proposed = 0
     added = 0
@@ -336,7 +551,15 @@ def main():
             )
 
         t = time.perf_counter()
-        state = _prepare_record(rec, source, pcfg, strong_cfg, device)
+        state = _prepare_record_from_raw(
+            rec,
+            raw,
+            source,
+            pcfg,
+            strong_cfg,
+            device,
+            component_cache,
+        )
         if profile_this:
             _profile_add(
                 stage_profile,
@@ -390,6 +613,7 @@ def main():
                     int(x) for x in DYNAMIC_CLASS_IDS
                 ),
                 workers=int(a.alignment_workers),
+                return_coverage=False,
             )
         )
         if profile_this:
