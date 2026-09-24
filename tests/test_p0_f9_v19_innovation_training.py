@@ -19,6 +19,13 @@ from real_motion.v19_static_novelty import (
     nearest_static_anchor_map,
     static_new_fov_loss,
 )
+from real_motion.v19_static_novelty_factorized import (
+    FactorizedStaticNewFOVHead,
+    decode_factorized_static_new_fov,
+    factorized_static_new_fov_loss,
+    quantize_anchor_distance_m,
+    dequantize_anchor_distance_torch,
+)
 
 from real_motion.v19_innovation import innovation_loss
 from real_motion.v19_innovation_training import (
@@ -477,3 +484,82 @@ def test_nearest_static_anchor_handles_empty_memory():
     assert np.isinf(dist).all()
     assert ax.shape == (3, 4)
     assert ay.shape == (3, 4)
+
+
+
+def test_factorized_static_new_fov_shapes_loss_and_decode():
+    model = FactorizedStaticNewFOVHead(
+        future_frames=1,
+        history_frames=1,
+        semantic_dim=4,
+        anchor_semantic_dim=3,
+        hidden_dim=8,
+        num_semantic_classes=17,
+        vertical_bins=4,
+        anchor_distance_max_m=40.0,
+    ).eval()
+    lab = torch.full((1, 1, 1, 2, 2), 17)
+    geo = torch.zeros((1, 1, 1, 4, 2, 2))
+    base = torch.zeros((1, 1, 1, 2, 2))
+    nf = torch.ones((1, 1, 2, 2), dtype=torch.bool)
+    asem = torch.full((1, 1, 2, 2), 11)
+    aprof = torch.zeros((1, 1, 4, 2, 2))
+    aprof[:, :, 0] = 1
+    adist = torch.ones((1, 1, 2, 2)) * 2.0
+    with torch.inference_mode():
+        out = model(lab, geo, base, nf, asem, aprof, adist)
+    assert out["presence_logits"].shape == (1, 1, 2, 2)
+    assert out["semantic_logits"].shape == (1, 1, 17, 2, 2)
+    assert out["vertical_logits"].shape == (1, 1, 4, 2, 2)
+
+    presence = torch.zeros((1, 1, 2, 2), dtype=torch.bool)
+    presence[0, 0, 0, 0] = True
+    candidate = nf.clone()
+    vertical = torch.zeros((1, 1, 4, 2, 2), dtype=torch.bool)
+    vertical[0, 0, 0:2, 0, 0] = True
+    base_free = torch.ones_like(vertical)
+    semantic = torch.full((1, 1, 2, 2), 255, dtype=torch.long)
+    semantic[0, 0, 0, 0] = 11
+    loss, stats = factorized_static_new_fov_loss(
+        out,
+        presence_target=presence,
+        candidate_bev=candidate,
+        semantic_target=semantic,
+        vertical_target=vertical,
+        base_free=base_free,
+        presence_positive_weight=1.0,
+        vertical_positive_weight=1.0,
+    )
+    assert torch.isfinite(loss)
+    assert stats["positive_bev_columns"] == 1
+    assert stats["positive_vertical_voxels"] == 2
+    assert stats["vertical_supervised_voxels"] == 4
+
+    forced = {k: v.clone() for k, v in out.items()}
+    forced["presence_logits"].fill_(-10)
+    forced["vertical_logits"].fill_(-10)
+    forced["semantic_logits"].fill_(-10)
+    forced["presence_logits"][0, 0, 0, 0] = 10
+    forced["vertical_logits"][0, 0, 1, 0, 0] = 10
+    forced["semantic_logits"][0, 0, 11, 0, 0] = 10
+    proposal = decode_factorized_static_new_fov(
+        forced,
+        new_fov_mask=nf,
+        base_free=base_free,
+        free_label=17,
+        presence_threshold=0.5,
+        vertical_threshold=0.5,
+    )
+    assert proposal.shape == (1, 1, 4, 2, 2)
+    assert int(proposal[0, 0, 1, 0, 0]) == 11
+    assert int((proposal != 17).sum()) == 1
+
+
+def test_anchor_distance_quantization_round_trip():
+    x = np.asarray([[0.0, 2.0, 40.0, 80.0]], dtype=np.float32)
+    q = quantize_anchor_distance_m(x, 40.0)
+    y = dequantize_anchor_distance_torch(torch.from_numpy(q), 40.0).numpy()
+    assert abs(float(y[0, 0]) - 0.0) < 0.2
+    assert abs(float(y[0, 1]) - 2.0) < 0.2
+    assert abs(float(y[0, 2]) - 40.0) < 0.2
+    assert abs(float(y[0, 3]) - 40.0) < 0.2
