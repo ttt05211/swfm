@@ -196,6 +196,74 @@ def build_future_aligned_history_bev_with_coverage(
     )
 
 
+def _semantic_choices_from_pretransformed(
+    labels: np.ndarray,
+    ix: np.ndarray,
+    iy: np.ndarray,
+    iz: np.ndarray,
+    dst_xyz: np.ndarray,
+    valid: np.ndarray,
+    select: np.ndarray,
+    *,
+    grid,
+    free_label: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve semantic collisions and return sparse chosen occupied voxels.
+
+    Returned rows are sorted by flattened [X,Y,Z] destination index. The
+    collision rule is bit-identical to the historical dense scatter helper:
+    for every destination voxel, choose the transformed source point nearest
+    the destination voxel center.
+    """
+    keep = np.asarray(valid, dtype=bool) & np.asarray(select, dtype=bool)
+    if not bool(keep.any()):
+        z_i = np.zeros((0,), dtype=np.int64)
+        z_v = np.zeros((0,), dtype=np.uint8)
+        return z_i, z_i, z_i, z_v, z_i
+
+    vals = np.asarray(labels, dtype=np.uint8)[keep]
+    sx = np.asarray(ix, dtype=np.int64)[keep]
+    sy = np.asarray(iy, dtype=np.int64)[keep]
+    sz = np.asarray(iz, dtype=np.int64)[keep]
+    pts = np.asarray(dst_xyz, dtype=np.float64)[keep]
+
+    occupied = vals != int(free_label)
+    if not bool(occupied.any()):
+        z_i = np.zeros((0,), dtype=np.int64)
+        z_v = np.zeros((0,), dtype=np.uint8)
+        return z_i, z_i, z_i, z_v, z_i
+
+    vals = vals[occupied]
+    sx = sx[occupied]
+    sy = sy[occupied]
+    sz = sz[occupied]
+    pts = pts[occupied]
+
+    vx, vy, vz = grid.voxel_size
+    centers = np.empty((len(sx), 3), dtype=np.float64)
+    centers[:, 0] = float(grid.x_min) + (sx + 0.5) * float(vx)
+    centers[:, 1] = float(grid.y_min) + (sy + 0.5) * float(vy)
+    centers[:, 2] = float(grid.z_min) + (sz + 0.5) * float(vz)
+    delta = pts - centers
+    dist2 = np.einsum("ij,ij->i", delta, delta)
+
+    _, Y, Z = (int(v) for v in grid.shape_hwd)
+    flat = (sx * Y + sy) * Z + sz
+    order = np.lexsort((dist2, flat))
+    flat_sorted = flat[order]
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = flat_sorted[1:] != flat_sorted[:-1]
+    chosen = order[first]
+
+    return (
+        sx[chosen],
+        sy[chosen],
+        sz[chosen],
+        vals[chosen],
+        flat[chosen],
+    )
+
+
 def _semantic_scatter_from_pretransformed(
     labels: np.ndarray,
     ix: np.ndarray,
@@ -210,41 +278,70 @@ def _semantic_scatter_from_pretransformed(
 ) -> np.ndarray:
     """Exact semantic collision resolution after a shared point transform."""
     out = np.full(tuple(grid.shape_hwd), int(free_label), dtype=np.uint8)
-    keep = np.asarray(valid, dtype=bool) & np.asarray(select, dtype=bool)
-    if not bool(keep.any()):
-        return out
-    vals = np.asarray(labels, dtype=np.uint8)[keep]
-    sx = np.asarray(ix)[keep]
-    sy = np.asarray(iy)[keep]
-    sz = np.asarray(iz)[keep]
-    pts = np.asarray(dst_xyz)[keep]
-
-    occupied = vals != int(free_label)
-    if not bool(occupied.any()):
-        return out
-    vals = vals[occupied]
-    sx, sy, sz = sx[occupied], sy[occupied], sz[occupied]
-    pts = pts[occupied]
-
-    vx, vy, vz = grid.voxel_size
-    centers = np.stack(
-        [
-            grid.x_min + (sx + 0.5) * vx,
-            grid.y_min + (sy + 0.5) * vy,
-            grid.z_min + (sz + 0.5) * vz,
-        ],
-        axis=1,
+    sx, sy, sz, vals, _ = _semantic_choices_from_pretransformed(
+        labels,
+        ix,
+        iy,
+        iz,
+        dst_xyz,
+        valid,
+        select,
+        grid=grid,
+        free_label=int(free_label),
     )
-    dist2 = np.sum((pts - centers) ** 2, axis=1)
-    _, Y, Z = grid.shape_hwd
-    flat = (sx * Y + sy) * Z + sz
-    order = np.lexsort((dist2, flat))
-    flat_sorted = flat[order]
-    first = np.ones(len(order), dtype=bool)
-    first[1:] = flat_sorted[1:] != flat_sorted[:-1]
-    chosen = order[first]
-    out[sx[chosen], sy[chosen], sz[chosen]] = vals[chosen]
+    if len(vals):
+        out[sx, sy, sz] = vals
     return out
+
+
+def _bev_summary_from_sorted_choices(
+    sx: np.ndarray,
+    sy: np.ndarray,
+    sz: np.ndarray,
+    vals: np.ndarray,
+    flat: np.ndarray,
+    observed_bev: np.ndarray,
+    *,
+    grid,
+    free_label: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build top semantic and four geometry channels without dense 3D."""
+    X, Y, Z = (int(v) for v in grid.shape_hwd)
+    top_label = np.full((X, Y), int(free_label), dtype=np.uint8)
+    top_h = np.zeros((X, Y), dtype=np.float32)
+    bottom_h = np.zeros((X, Y), dtype=np.float32)
+    count = np.zeros((X, Y), dtype=np.float32)
+
+    if len(vals):
+        col = np.asarray(flat, dtype=np.int64) // Z
+        change = np.empty(len(col), dtype=bool)
+        change[0] = True
+        change[1:] = col[1:] != col[:-1]
+        first_idx = np.flatnonzero(change)
+        last_idx = np.r_[first_idx[1:] - 1, len(col) - 1]
+
+        cols = col[first_idx]
+        bx = cols // Y
+        by = cols % Y
+        top_rows = last_idx
+
+        top_label[bx, by] = np.asarray(vals, dtype=np.uint8)[top_rows]
+        denom = float(max(Z - 1, 1))
+        top_h[bx, by] = np.asarray(sz, dtype=np.float32)[top_rows] / denom
+        bottom_h[bx, by] = np.asarray(sz, dtype=np.float32)[first_idx] / denom
+        count_flat = np.bincount(col, minlength=X * Y)
+        count = count_flat.reshape(X, Y).astype(np.float32) / float(max(Z, 1))
+
+    geom = np.stack(
+        (
+            np.asarray(observed_bev, dtype=np.float32),
+            top_h,
+            bottom_h,
+            count,
+        ),
+        axis=0,
+    ).astype(np.float32, copy=False)
+    return top_label, geom
 
 
 def build_future_aligned_history_and_static_memory(
@@ -257,18 +354,17 @@ def build_future_aligned_history_and_static_memory(
     free_label: int,
     dynamic_class_ids: Sequence[int],
     workers: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Exact fused V19 history alignment + deterministic Static Memory render.
+    return_coverage: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Exact fused future-aligned history plus Static Memory, sparse fast path.
 
-    Each observed history frame is sparsified once.  For each history/future
-    pair the point coordinates are transformed only once and reused for:
-      * Innovation semantic/geometric history input;
-      * full lidar-observation coverage;
-      * static-memory free clearing and static semantic rendering.
+    This preserves the transform and collision semantics while avoiding two
+    dense 3D intermediates for every history/future pair. Network BEV summaries
+    are built directly from sparse collision-resolved voxels. Static Memory
+    clears and writes sparse transformed indices in oldest-to-newest order.
 
-    The outputs are bit-equivalent to the previous separate
-    build_future_aligned_history_bev_with_coverage +
-    render_static_history_mosaic path.
+    Evaluation paths that do not consume exact 3D history coverage can set
+    return_coverage=False. Cache/decomposition builders keep the default True.
     """
     if not (
         len(history_semantics)
@@ -280,14 +376,21 @@ def build_future_aligned_history_and_static_memory(
     if len(future_poses) != FUTURE_FRAMES:
         raise ValueError("expected six future poses")
 
-    dynamic_ids = np.asarray(tuple(int(x) for x in dynamic_class_ids), dtype=np.uint8)
+    shape = tuple(int(x) for x in grid.shape_hwd)
+    X, Y, Z = shape
+    dynamic_ids = np.asarray(
+        tuple(int(x) for x in dynamic_class_ids),
+        dtype=np.uint8,
+    )
     prepared = []
     for sem, obs, hpose in zip(
-        history_semantics, history_observed, history_poses
+        history_semantics,
+        history_observed,
+        history_poses,
     ):
         sem = np.asarray(sem, dtype=np.uint8)
         obs = np.asarray(obs, dtype=bool)
-        if sem.shape != tuple(grid.shape_hwd) or obs.shape != sem.shape:
+        if sem.shape != shape or obs.shape != sem.shape:
             raise ValueError("semantic/observed grid shape mismatch")
         idx = np.argwhere(obs)
         if len(idx):
@@ -308,31 +411,31 @@ def build_future_aligned_history_and_static_memory(
         )
 
     nworkers = max(1, int(workers))
+
     def _one_future(fpose):
         fpose = np.asarray(fpose, dtype=np.float64)
         lf, gf = [], []
-        coverage = np.zeros(tuple(grid.shape_hwd), dtype=bool)
-        static_out = np.full(
-            tuple(grid.shape_hwd), int(free_label), dtype=np.uint8
-        )
+        coverage = np.zeros(shape, dtype=bool) if bool(return_coverage) else None
+        static_out = np.full(shape, int(free_label), dtype=np.uint8)
 
         for hpose, xyz, labels, usable_static in prepared:
-            if len(xyz) == 0:
-                aligned_sem = np.full(
-                    tuple(grid.shape_hwd), int(free_label), dtype=np.uint8
-                )
-                aligned_obs = np.zeros(tuple(grid.shape_hwd), dtype=bool)
-                static_sem = aligned_sem.copy()
-                static_obs = aligned_obs.copy()
-            else:
+            observed_bev = np.zeros((X, Y), dtype=bool)
+
+            if len(xyz):
                 T = relative_transform(hpose, fpose)
                 dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
                 ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+                valid = np.asarray(valid, dtype=bool)
 
-                aligned_obs = np.zeros(tuple(grid.shape_hwd), dtype=bool)
                 if bool(valid.any()):
-                    aligned_obs[ix[valid], iy[valid], iz[valid]] = True
-                aligned_sem = _semantic_scatter_from_pretransformed(
+                    vx = np.asarray(ix, dtype=np.int64)[valid]
+                    vy = np.asarray(iy, dtype=np.int64)[valid]
+                    vz = np.asarray(iz, dtype=np.int64)[valid]
+                    observed_bev[vx, vy] = True
+                    if coverage is not None:
+                        coverage[vx, vy, vz] = True
+
+                sx, sy, sz, vals, flat = _semantic_choices_from_pretransformed(
                     labels,
                     ix,
                     iy,
@@ -345,14 +448,14 @@ def build_future_aligned_history_and_static_memory(
                 )
 
                 static_valid = valid & usable_static
-                static_obs = np.zeros(tuple(grid.shape_hwd), dtype=bool)
                 if bool(static_valid.any()):
-                    static_obs[
-                        ix[static_valid],
-                        iy[static_valid],
-                        iz[static_valid],
-                    ] = True
-                static_sem = _semantic_scatter_from_pretransformed(
+                    static_out[
+                        np.asarray(ix, dtype=np.int64)[static_valid],
+                        np.asarray(iy, dtype=np.int64)[static_valid],
+                        np.asarray(iz, dtype=np.int64)[static_valid],
+                    ] = int(free_label)
+
+                ssx, ssy, ssz, svals, _ = _semantic_choices_from_pretransformed(
                     labels,
                     ix,
                     iy,
@@ -363,56 +466,31 @@ def build_future_aligned_history_and_static_memory(
                     grid=grid,
                     free_label=int(free_label),
                 )
+                if len(svals):
+                    static_out[ssx, ssy, ssz] = svals
+            else:
+                sx = sy = sz = flat = np.zeros((0,), dtype=np.int64)
+                vals = np.zeros((0,), dtype=np.uint8)
 
-            occupied = (aligned_sem != int(free_label)) & aligned_obs
-            has = occupied.any(axis=2)
-            X, Y, Z = aligned_sem.shape
-            top_label = np.full(
-                (X, Y), int(free_label), dtype=np.uint8
+            top_label, geom = _bev_summary_from_sorted_choices(
+                sx,
+                sy,
+                sz,
+                vals,
+                flat,
+                observed_bev,
+                grid=grid,
+                free_label=int(free_label),
             )
-            top_h = np.zeros((X, Y), dtype=np.float32)
-            bottom_h = np.zeros((X, Y), dtype=np.float32)
-            count = occupied.sum(axis=2).astype(np.float32)
-            if bool(has.any()):
-                rev = occupied[:, :, ::-1]
-                z_top = Z - 1 - np.argmax(rev, axis=2)
-                z_bottom = np.argmax(occupied, axis=2)
-                ax, ay = np.nonzero(has)
-                top_label[ax, ay] = aligned_sem[
-                    ax, ay, z_top[ax, ay]
-                ]
-                denom = max(Z - 1, 1)
-                top_h[ax, ay] = (
-                    z_top[ax, ay].astype(np.float32) / float(denom)
-                )
-                bottom_h[ax, ay] = (
-                    z_bottom[ax, ay].astype(np.float32) / float(denom)
-                )
-            geom = np.stack(
-                (
-                    aligned_obs.any(axis=2).astype(np.float32),
-                    top_h,
-                    bottom_h,
-                    count / float(max(Z, 1)),
-                ),
-                axis=0,
-            ).astype(np.float32)
             lf.append(top_label)
             gf.append(geom)
-            coverage |= aligned_obs
-
-            # Exact oldest->newest static mosaic semantics.
-            static_out[static_obs] = int(free_label)
-            static_occ = static_sem != int(free_label)
-            static_out[static_occ] = static_sem[static_occ]
 
         return (
-            np.stack(lf, axis=0).astype(np.uint8),
-            np.stack(gf, axis=0).astype(np.float32),
+            np.stack(lf, axis=0).astype(np.uint8, copy=False),
+            np.stack(gf, axis=0).astype(np.float32, copy=False),
             coverage,
-            static_out.astype(np.uint8),
+            static_out.astype(np.uint8, copy=False),
         )
-
 
     if nworkers == 1:
         rows = [_one_future(fpose) for fpose in future_poses]
@@ -423,11 +501,16 @@ def build_future_aligned_history_and_static_memory(
             rows = list(pool.map(_one_future, future_poses))
 
     all_labels, all_geometry, all_coverage, all_static = zip(*rows)
+    coverage_out = (
+        np.stack(all_coverage, axis=0)
+        if bool(return_coverage)
+        else None
+    )
     return (
-        np.stack(all_labels, axis=0).astype(np.uint8),
-        np.stack(all_geometry, axis=0).astype(np.float32),
-        np.stack(all_coverage, axis=0),
-        np.stack(all_static, axis=0).astype(np.uint8),
+        np.stack(all_labels, axis=0).astype(np.uint8, copy=False),
+        np.stack(all_geometry, axis=0).astype(np.float32, copy=False),
+        coverage_out,
+        np.stack(all_static, axis=0).astype(np.uint8, copy=False),
     )
 
 
