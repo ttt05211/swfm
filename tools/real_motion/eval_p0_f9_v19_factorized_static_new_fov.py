@@ -141,6 +141,18 @@ def main():
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--max-windows", type=int, default=0)
+    p.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="split the selected validation population into disjoint shards",
+    )
+    p.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="0-based shard index used with --num-shards",
+    )
     p.add_argument("--alignment-workers", type=int, default=6)
     p.add_argument(
         "--presence-threshold",
@@ -160,13 +172,23 @@ def main():
 
     if int(a.alignment_workers) <= 0:
         raise ValueError("alignment-workers must be positive")
+    if int(a.num_shards) <= 0:
+        raise ValueError("num-shards must be positive")
+    if not 0 <= int(a.shard_index) < int(a.num_shards):
+        raise ValueError("shard-index must be in [0,num-shards)")
 
     pcfg = make_prepare_config(load_runtime_config(a.config, a.override))
     _, records = base.load_cache(a.val_cache)
     if int(a.max_windows) > 0:
         records = records[: min(len(records), int(a.max_windows))]
+    selected_population = int(len(records))
+    if int(a.num_shards) > 1:
+        n = len(records)
+        lo = n * int(a.shard_index) // int(a.num_shards)
+        hi = n * (int(a.shard_index) + 1) // int(a.num_shards)
+        records = records[lo:hi]
     if not records:
-        raise RuntimeError("empty validation cache")
+        raise RuntimeError("empty validation cache shard")
 
     device = torch.device(
         a.device
@@ -440,6 +462,9 @@ def main():
     result = {
         "protocol": PROTOCOL,
         "num_windows": int(len(records)),
+        "selected_population_windows": int(selected_population),
+        "num_shards": int(a.num_shards),
+        "shard_index": int(a.shard_index),
         "base_checkpoint": str(Path(a.base_checkpoint).resolve()),
         "base_checkpoint_epoch": int(base_ck.get("epoch", -1)),
         "novelty_checkpoint": str(Path(a.novelty_checkpoint).resolve()),
