@@ -823,12 +823,14 @@ def main():
         t_causal = time.perf_counter()
         pred_stack = np.asarray(pred_all, dtype=np.uint8)
         static_all = np.asarray(static_all, dtype=np.uint8)
-        explained = protected_add_only(
-            pred_stack,
-            static_all,
-            free_label=int(pcfg.free_label),
+        free_label = int(pcfg.free_label)
+        explained = pred_stack.copy()
+        static_add = (
+            (static_all != free_label)
+            & (explained == free_label)
         )
-        base_free = explained == int(pcfg.free_label)
+        np.copyto(explained, static_all, where=static_add)
+        base_free = explained == free_label
 
         footprint_all = history_grid_footprint_bev_sequence(
             history_poses,
@@ -932,16 +934,13 @@ def main():
         )
         proposed += int((proposal != int(pcfg.free_label)).sum())
 
-        final = protected_add_only(
-            explained,
-            proposal,
-            free_label=int(pcfg.free_label),
-        )
-        added_mask = (
-            (final != int(pcfg.free_label))
-            & (explained == int(pcfg.free_label))
-        )
-        window_added = int(added_mask.sum())
+        # decode_factorized_static_new_fov already intersects the proposal
+        # with the exact base_free mask, so this is the same protected add-only
+        # composition without rescanning base occupancy a second time.
+        added_mask = proposal != free_label
+        final = explained.copy()
+        np.copyto(final, proposal, where=added_mask)
+        window_added = int(np.count_nonzero(added_mask))
         added += window_added
         windows_with_additions += int(window_added > 0)
         if profile_this:
