@@ -240,26 +240,37 @@ def majority_semantic_per_column(
     num_classes: int = 17,
     ignore_label: int = 255,
 ) -> np.ndarray:
-    """Majority occupied semantic class for each positive BEV column."""
+    """Majority semantic class per positive BEV column, vectorized exactly."""
     m = np.asarray(positive_mask, dtype=bool)
     gt = np.asarray(gt_occ, dtype=np.uint8)
     if m.shape != gt.shape or m.ndim != 3:
         raise ValueError("positive mask and GT must share [X,Y,Z]")
-    out = np.full(m.shape[:2], int(ignore_label), dtype=np.uint8)
+    classes = int(num_classes)
+    if classes <= 0:
+        raise ValueError("num_classes must be positive")
+
+    X, Y, Z = m.shape
+    out = np.full((X, Y), int(ignore_label), dtype=np.uint8)
     pos_bev = m.any(axis=2)
     if not bool(pos_bev.any()):
         return out
 
-    coords = np.argwhere(pos_bev)
-    for x, y in coords:
-        labels = gt[x, y][m[x, y]]
-        if len(labels) == 0:
-            continue
-        counts = np.bincount(
-            labels.astype(np.int64),
-            minlength=int(num_classes),
-        )[: int(num_classes)]
-        out[x, y] = np.uint8(int(np.argmax(counts)))
+    flat_mask = m.reshape(X * Y, Z)
+    flat_gt = gt.reshape(X * Y, Z)
+    row_ids, z_ids = np.nonzero(flat_mask)
+    labels = flat_gt[row_ids, z_ids].astype(np.int64, copy=False)
+    if bool(((labels < 0) | (labels >= classes)).any()):
+        raise ValueError("positive semantic labels outside requested classes")
+
+    pair_ids = row_ids.astype(np.int64, copy=False) * classes + labels
+    counts = np.bincount(
+        pair_ids,
+        minlength=X * Y * classes,
+    ).reshape(X * Y, classes)
+    winners = counts.argmax(axis=1).astype(np.uint8, copy=False)
+    out_flat = out.reshape(-1)
+    pos_flat = pos_bev.reshape(-1)
+    out_flat[pos_flat] = winners[pos_flat]
     return out
 
 
