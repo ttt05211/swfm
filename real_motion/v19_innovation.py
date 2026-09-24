@@ -379,6 +379,113 @@ def prepare_history_alignment_frame(
     )
 
 
+def align_prepared_history_frame_to_future(
+    prepared_frame,
+    future_pose: np.ndarray,
+    *,
+    grid,
+    free_label: int,
+    return_coverage: bool = False,
+):
+    """Exact sparse alignment for one history/future frame pair.
+
+    The returned sparse Static-Memory clear/write indices are sufficient to
+    reconstruct the same oldest-to-newest mosaic without retaining dense
+    per-pair 3D intermediates.  This pair-level contract is intentionally
+    cacheable across overlapping stride-1 validation windows.
+    """
+    hpose, xyz, labels, usable_static = prepared_frame
+    X, Y, Z = (int(v) for v in grid.shape_hwd)
+    observed_bev = np.zeros((X, Y), dtype=bool)
+    empty_i = np.zeros((0,), dtype=np.int32)
+    empty_v = np.zeros((0,), dtype=np.uint8)
+
+    if len(xyz) == 0:
+        top_label = np.full((X, Y), int(free_label), dtype=np.uint8)
+        geom = np.zeros((GEOMETRY_CHANNELS, X, Y), dtype=np.float32)
+        return (
+            top_label,
+            geom,
+            empty_i if bool(return_coverage) else None,
+            empty_i,
+            empty_i,
+            empty_v,
+        )
+
+    fpose = np.asarray(future_pose, dtype=np.float64)
+    T = relative_transform(np.asarray(hpose, dtype=np.float64), fpose)
+    dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
+    ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+    valid = np.asarray(valid, dtype=bool)
+    ix = np.asarray(ix, dtype=np.int64)
+    iy = np.asarray(iy, dtype=np.int64)
+    iz = np.asarray(iz, dtype=np.int64)
+
+    if bool(valid.any()):
+        vx = ix[valid]
+        vy = iy[valid]
+        vz = iz[valid]
+        observed_bev[vx, vy] = True
+        coverage_flat = (
+            (vx * Y + vy) * Z + vz
+        ).astype(np.int32, copy=False)
+    else:
+        coverage_flat = empty_i
+
+    sx, sy, sz, vals, flat = _semantic_choices_from_pretransformed(
+        labels,
+        ix,
+        iy,
+        iz,
+        dst_xyz,
+        valid,
+        np.ones(len(labels), dtype=bool),
+        grid=grid,
+        free_label=int(free_label),
+    )
+    top_label, geom = _bev_summary_from_sorted_choices(
+        sx,
+        sy,
+        sz,
+        vals,
+        flat,
+        observed_bev,
+        grid=grid,
+        free_label=int(free_label),
+    )
+
+    static_valid = valid & np.asarray(usable_static, dtype=bool)
+    if bool(static_valid.any()):
+        clear_flat = (
+            (ix[static_valid] * Y + iy[static_valid]) * Z
+            + iz[static_valid]
+        ).astype(np.int32, copy=False)
+    else:
+        clear_flat = empty_i
+
+    _, _, _, static_vals, static_flat = (
+        _semantic_choices_from_pretransformed(
+            labels,
+            ix,
+            iy,
+            iz,
+            dst_xyz,
+            valid,
+            usable_static,
+            grid=grid,
+            free_label=int(free_label),
+        )
+    )
+    return (
+        top_label,
+        geom,
+        coverage_flat if bool(return_coverage) else None,
+        clear_flat,
+        np.asarray(static_flat, dtype=np.int32),
+        np.asarray(static_vals, dtype=np.uint8),
+    )
+
+
 def build_future_aligned_history_and_static_memory(
     history_semantics: Sequence[np.ndarray],
     history_observed: Sequence[np.ndarray],
@@ -439,77 +546,35 @@ def build_future_aligned_history_and_static_memory(
     nworkers = max(1, int(workers))
 
     def _one_future(fpose):
-        fpose = np.asarray(fpose, dtype=np.float64)
         lf, gf = [], []
         coverage = np.zeros(shape, dtype=bool) if bool(return_coverage) else None
         static_out = np.full(shape, int(free_label), dtype=np.uint8)
+        static_flat_out = static_out.reshape(-1)
+        coverage_flat_out = coverage.reshape(-1) if coverage is not None else None
 
-        for hpose, xyz, labels, usable_static in prepared:
-            observed_bev = np.zeros((X, Y), dtype=bool)
-
-            if len(xyz):
-                T = relative_transform(hpose, fpose)
-                dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
-                ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
-                valid = np.asarray(valid, dtype=bool)
-
-                if bool(valid.any()):
-                    vx = np.asarray(ix, dtype=np.int64)[valid]
-                    vy = np.asarray(iy, dtype=np.int64)[valid]
-                    vz = np.asarray(iz, dtype=np.int64)[valid]
-                    observed_bev[vx, vy] = True
-                    if coverage is not None:
-                        coverage[vx, vy, vz] = True
-
-                sx, sy, sz, vals, flat = _semantic_choices_from_pretransformed(
-                    labels,
-                    ix,
-                    iy,
-                    iz,
-                    dst_xyz,
-                    valid,
-                    np.ones(len(labels), dtype=bool),
-                    grid=grid,
-                    free_label=int(free_label),
-                )
-
-                static_valid = valid & usable_static
-                if bool(static_valid.any()):
-                    static_out[
-                        np.asarray(ix, dtype=np.int64)[static_valid],
-                        np.asarray(iy, dtype=np.int64)[static_valid],
-                        np.asarray(iz, dtype=np.int64)[static_valid],
-                    ] = int(free_label)
-
-                ssx, ssy, ssz, svals, _ = _semantic_choices_from_pretransformed(
-                    labels,
-                    ix,
-                    iy,
-                    iz,
-                    dst_xyz,
-                    valid,
-                    usable_static,
-                    grid=grid,
-                    free_label=int(free_label),
-                )
-                if len(svals):
-                    static_out[ssx, ssy, ssz] = svals
-            else:
-                sx = sy = sz = flat = np.zeros((0,), dtype=np.int64)
-                vals = np.zeros((0,), dtype=np.uint8)
-
-            top_label, geom = _bev_summary_from_sorted_choices(
-                sx,
-                sy,
-                sz,
-                vals,
-                flat,
-                observed_bev,
+        for prepared_frame in prepared:
+            (
+                top_label,
+                geom,
+                coverage_flat,
+                clear_flat,
+                write_flat,
+                write_vals,
+            ) = align_prepared_history_frame_to_future(
+                prepared_frame,
+                fpose,
                 grid=grid,
                 free_label=int(free_label),
+                return_coverage=bool(return_coverage),
             )
             lf.append(top_label)
             gf.append(geom)
+            if coverage_flat_out is not None and coverage_flat is not None:
+                coverage_flat_out[coverage_flat] = True
+            if len(clear_flat):
+                static_flat_out[clear_flat] = int(free_label)
+            if len(write_flat):
+                static_flat_out[write_flat] = write_vals
 
         return (
             np.stack(lf, axis=0).astype(np.uint8, copy=False),
