@@ -623,67 +623,43 @@ def main():
                 time.perf_counter() - t,
             )
 
-        explained = []
-        base_free = []
-        new_fov = []
-        anchor_sem = []
-        anchor_profile = []
-        anchor_dist = []
         history_poses = np.asarray(
             raw["history_poses"],
             dtype=np.float64,
         )
+        future_poses = np.asarray(
+            raw["future_poses"],
+            dtype=np.float64,
+        )
 
         t_causal = time.perf_counter()
-        for fi in range(len(raw["future_poses"])):
-            pred = np.asarray(pred_all[fi], dtype=np.uint8)
-            static_render = np.asarray(static_all[fi], dtype=np.uint8)
-            exp = protected_add_only(
-                pred,
-                static_render,
-                free_label=int(pcfg.free_label),
-            )
-            explained.append(exp)
-            free = exp == int(pcfg.free_label)
-            base_free.append(free)
+        pred_stack = np.asarray(pred_all, dtype=np.uint8)
+        static_all = np.asarray(static_all, dtype=np.uint8)
+        explained = protected_add_only(
+            pred_stack,
+            static_all,
+            free_label=int(pcfg.free_label),
+        )
+        base_free = explained == int(pcfg.free_label)
 
-            footprint = history_grid_footprint_bev(
-                history_poses,
-                np.asarray(raw["future_poses"][fi], dtype=np.float64),
-                pcfg.grid,
-            )
-            nf = ~footprint
-            new_fov.append(nf)
-            new_fov_bev_columns += int(nf.sum())
+        footprint_all = history_grid_footprint_bev_sequence(
+            history_poses,
+            future_poses,
+            pcfg.grid,
+            workers=int(a.alignment_workers),
+        )
+        new_fov = ~footprint_all
+        new_fov_bev_columns += int(new_fov.sum())
 
-            dist_cells, ax, ay, valid = nearest_static_anchor_map(
-                static_render,
-                footprint,
+        anchor_sem, anchor_profile, anchor_dist = (
+            _build_anchor_context_sequence(
+                static_all,
+                footprint_all,
                 free_label=int(pcfg.free_label),
+                voxel_size_xy_m=float(pcfg.grid.voxel_size[0]),
+                workers=int(a.alignment_workers),
             )
-            static_occ = static_render != int(pcfg.free_label)
-            sem_source = majority_semantic_per_column(
-                static_occ,
-                static_render,
-                num_classes=17,
-                ignore_label=int(pcfg.free_label),
-            )
-            aq = np.full(
-                nf.shape,
-                int(pcfg.free_label),
-                dtype=np.uint8,
-            )
-            profile = np.zeros(static_occ.shape, dtype=bool)
-            if bool(valid.any()):
-                aq[valid] = sem_source[ax[valid], ay[valid]]
-                copied = static_occ[ax, ay]
-                profile[valid] = copied[valid]
-            anchor_sem.append(aq)
-            anchor_profile.append(profile)
-            anchor_dist.append(
-                np.asarray(dist_cells, dtype=np.float32)
-                * float(pcfg.grid.voxel_size[0])
-            )
+        )
         if profile_this:
             _profile_add(
                 stage_profile,
@@ -692,12 +668,6 @@ def main():
             )
 
         t = time.perf_counter()
-        explained = np.stack(explained, axis=0).astype(np.uint8)
-        base_free = np.stack(base_free, axis=0)
-        new_fov = np.stack(new_fov, axis=0)
-        anchor_sem = np.stack(anchor_sem, axis=0)
-        anchor_profile = np.stack(anchor_profile, axis=0)
-        anchor_dist = np.stack(anchor_dist, axis=0)
 
         sem_t = torch.from_numpy(sem[None]).to(device)
         geo_t = torch.from_numpy(geo[None]).to(device)
@@ -774,23 +744,17 @@ def main():
         )
         proposed += int((proposal != int(pcfg.free_label)).sum())
 
-        final = []
-        window_added = 0
-        for fi in range(len(explained)):
-            f = protected_add_only(
-                explained[fi],
-                proposal[fi],
-                free_label=int(pcfg.free_label),
-            )
-            n = int(
-                (
-                    (f != int(pcfg.free_label))
-                    & (explained[fi] == int(pcfg.free_label))
-                ).sum()
-            )
-            added += n
-            window_added += n
-            final.append(f)
+        final = protected_add_only(
+            explained,
+            proposal,
+            free_label=int(pcfg.free_label),
+        )
+        added_mask = (
+            (final != int(pcfg.free_label))
+            & (explained == int(pcfg.free_label))
+        )
+        window_added = int(added_mask.sum())
+        added += window_added
         windows_with_additions += int(window_added > 0)
         if profile_this:
             _profile_add(
@@ -821,19 +785,18 @@ def main():
         for hi, h in enumerate(HORIZONS):
             gt = np.asarray(raw["future_gt_occ"][hi], dtype=np.uint8)
             moving = moving_rows[hi]
-            for name, pred in (
-                ("v18", np.asarray(pred_all[hi], dtype=np.uint8)),
-                ("v18_static", explained[hi]),
-                ("v18_static_factorized_new_fov", final[hi]),
-            ):
-                _update(
-                    raw_by_variant[name],
-                    hi,
-                    pred,
-                    gt,
-                    moving,
-                    int(pcfg.free_label),
-                )
+            _update_many(
+                raw_by_variant,
+                hi,
+                {
+                    "v18": pred_stack[hi],
+                    "v18_static": explained[hi],
+                    "v18_static_factorized_new_fov": final[hi],
+                },
+                gt,
+                moving,
+                int(pcfg.free_label),
+            )
 
         if profile_this:
             _profile_add(
