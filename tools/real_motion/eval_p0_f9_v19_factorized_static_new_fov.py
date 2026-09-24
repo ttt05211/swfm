@@ -21,7 +21,7 @@ import torch
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.nuscenes_adapter import (
     NuScenesWindowSource,
-    gt_moving_support_for_horizon,
+    gt_moving_support_sequence,
 )
 from real_motion.motion_transport import world_points_to_t0
 from real_motion.prepared import load_nuscenes_window_raw
@@ -470,25 +470,15 @@ def _build_anchor_context_sequence(
 
 
 def _moving_support_sequence(source, window, *, grid, workers):
-    def _one(item):
-        hi, h = item
-        moving, _, _ = gt_moving_support_for_horizon(
-            source.nusc,
-            str(window.t0_token),
-            str(window.future_tokens[int(hi)]),
-            float(h),
-            grid=grid,
-        )
-        return moving
-
-    items = list(enumerate(HORIZONS))
-    nworkers = max(1, int(workers))
-    if nworkers == 1:
-        return [_one(x) for x in items]
-    with ThreadPoolExecutor(
-        max_workers=min(nworkers, len(items))
-    ) as pool:
-        return list(pool.map(_one, items))
+    rows = gt_moving_support_sequence(
+        source.nusc,
+        str(window.t0_token),
+        tuple(str(x) for x in window.future_tokens),
+        HORIZONS,
+        grid=grid,
+        workers=int(workers),
+    )
+    return [x[0] for x in rows]
 
 
 def _autocast(device, enabled):
