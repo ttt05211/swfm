@@ -4,6 +4,7 @@ No future annotation is exposed to the causal model-preparation path. Functions
 whose names contain ``gt_`` / ``metric`` are evaluation-or-target-only.
 """
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pickle
 import math
@@ -69,6 +70,83 @@ def gt_moving_support_for_horizon(nusc,t0_token,th_token,dt_s,grid=OccupancyGrid
     excluded={"birth_dynamic":len(set(dynh)-set(dyn0)),"death_dynamic":len(set(dyn0)-set(dynh)),"endpoint_common_dynamic":len(common),"moving_eligible":len(moving_records)}
     return support,moving_records,excluded
 
+
+
+def gt_moving_support_sequence(
+    nusc,
+    t0_token,
+    future_tokens,
+    horizons_s,
+    grid=OccupancyGrid(),
+    speed_threshold=SPEED_THRESHOLD_MPS,
+    margin=BOX_MARGIN_M,
+    workers=1,
+):
+    """Exact six-horizon Moving-support with shared t0 annotation preprocessing."""
+    future_tokens=tuple(str(x) for x in future_tokens)
+    horizons_s=tuple(float(x) for x in horizons_s)
+    if len(future_tokens)!=len(horizons_s):
+        raise ValueError("future token/horizon length mismatch")
+
+    a0=_annotation_map(nusc,str(t0_token))
+    dyn0={
+        k:v for k,v in a0.items()
+        if category_to_dynamic_class(v["category_name"]) is not None
+    }
+    metric_grid=GridSpec(
+        grid.x_min,grid.y_min,grid.z_min,grid.voxel_size,grid.shape_hwd
+    )
+
+    def _one(item):
+        th_token,dt_s=item
+        ah=_annotation_map(nusc,th_token)
+        target_pose=sample_ego_to_world(nusc,th_token)
+        support=np.zeros(grid.shape_hwd,dtype=bool)
+        moving_records=[]
+        dynh={
+            k:v for k,v in ah.items()
+            if category_to_dynamic_class(v["category_name"]) is not None
+        }
+        common=sorted(set(dyn0)&set(dynh))
+        for inst in common:
+            ann0,annh=dyn0[inst],dynh[inst]
+            cid=category_to_dynamic_class(annh["category_name"])
+            c0=np.asarray(ann0["translation"],dtype=np.float64)
+            ch=np.asarray(annh["translation"],dtype=np.float64)
+            speed=float(np.linalg.norm(ch[:2]-c0[:2])/float(dt_s))
+            if speed<speed_threshold:
+                continue
+            b0=_ann_to_future_ego_box(ann0,target_pose,cid)
+            bh=_ann_to_future_ego_box(annh,target_pose,cid)
+            inst_support=moving_support_from_world_motion(
+                c0,ch,b0,bh,dt_s,metric_grid,speed_threshold,margin
+            )
+            support|=inst_support
+            moving_records.append({
+                "instance_token":inst,
+                "class_id":int(cid),
+                "speed_mps":speed,
+                "center0_world":c0.tolist(),
+                "centerh_world":ch.tolist(),
+                "yaw0_world":quaternion_yaw(ann0["rotation"]),
+                "yawh_world":quaternion_yaw(annh["rotation"]),
+                "box0_future_ego":box3d_to_dict(b0),
+                "boxh_future_ego":box3d_to_dict(bh),
+            })
+        excluded={
+            "birth_dynamic":len(set(dynh)-set(dyn0)),
+            "death_dynamic":len(set(dyn0)-set(dynh)),
+            "endpoint_common_dynamic":len(common),
+            "moving_eligible":len(moving_records),
+        }
+        return support,moving_records,excluded
+
+    items=list(zip(future_tokens,horizons_s))
+    nworkers=max(1,min(int(workers),len(items))) if items else 1
+    if nworkers==1:
+        return [_one(x) for x in items]
+    with ThreadPoolExecutor(max_workers=nworkers) as pool:
+        return list(pool.map(_one,items))
 
 def dynamic_only_semantics(gt_semantics,free_label=17):
     gt=np.asarray(gt_semantics);out=np.full_like(gt,free_label);keep=np.isin(gt,np.asarray(DYNAMIC_CLASS_IDS));out[keep]=gt[keep];return out
