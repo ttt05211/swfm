@@ -38,6 +38,7 @@ from real_motion.strong_w2det import StrongW2DetConfig, match_instances
 from real_motion.v19_innovation import (
     base_explained_bev,
     build_future_aligned_history_and_static_memory,
+    prepare_history_alignment_frame,
 )
 from real_motion.v19_scene_memory import protected_add_only
 from real_motion.v19_static_novelty import (
@@ -101,6 +102,42 @@ class CachedSource(NuScenesWindowSource):
     @lru_cache(maxsize=4096)
     def pose(self, token):
         return super().pose(token)
+
+
+class _HistoryAlignmentLRU:
+    """Cache sparsified history frames across overlapping validation windows."""
+
+    def __init__(self, maxsize: int = 64):
+        self.maxsize = max(1, int(maxsize))
+        self.data = OrderedDict()
+
+    def get_or_build(
+        self,
+        scene,
+        token,
+        semantics,
+        observed,
+        pose,
+        *,
+        grid,
+        dynamic_class_ids,
+    ):
+        key = (str(scene), str(token))
+        if key in self.data:
+            value = self.data.pop(key)
+            self.data[key] = value
+            return value
+        value = prepare_history_alignment_frame(
+            semantics,
+            observed,
+            pose,
+            grid=grid,
+            dynamic_class_ids=dynamic_class_ids,
+        )
+        self.data[key] = value
+        while len(self.data) > self.maxsize:
+            self.data.popitem(last=False)
+        return value
 
 
 class _ComponentLRU:
@@ -522,6 +559,7 @@ def main():
     source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     component_cache = _ComponentLRU(maxsize=1024)
+    history_alignment_cache = _HistoryAlignmentLRU(maxsize=64)
     raw_by_variant = {v: _new_raw() for v in VARIANTS}
     proposed = 0
     added = 0
@@ -601,6 +639,18 @@ def main():
             _release_gpu_inputs(state)
 
         t = time.perf_counter()
+        prepared_history = [
+            history_alignment_cache.get_or_build(
+                str(w.scene_name),
+                str(tok),
+                raw["history_occ"][ti],
+                raw["history_observed"][ti],
+                raw["history_poses"][ti],
+                grid=pcfg.grid,
+                dynamic_class_ids=DYNAMIC_CLASS_IDS,
+            )
+            for ti, tok in enumerate(w.history_tokens)
+        ]
         sem, geo, _, static_all = (
             build_future_aligned_history_and_static_memory(
                 raw["history_occ"],
@@ -609,11 +659,10 @@ def main():
                 raw["future_poses"],
                 grid=pcfg.grid,
                 free_label=int(pcfg.free_label),
-                dynamic_class_ids=tuple(
-                    int(x) for x in DYNAMIC_CLASS_IDS
-                ),
+                dynamic_class_ids=DYNAMIC_CLASS_IDS,
                 workers=int(a.alignment_workers),
                 return_coverage=False,
+                prepared_history=prepared_history,
             )
         )
         if profile_this:
