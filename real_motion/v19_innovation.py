@@ -389,19 +389,20 @@ def build_future_aligned_history_and_static_memory(
     free_label: int,
     dynamic_class_ids: Sequence[int],
     workers: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Exact fused V19 history alignment + Static Memory render.
+    return_coverage: bool = True,
+    prepared_history: Sequence[
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Exact fused future-aligned history plus Static Memory, sparse fast path.
 
-    This sparse implementation is bit-equivalent to the historical dense
-    implementation but avoids allocating/scanning four dense 3D tensors for
-    every history/future pair.  Only the final coverage/static-memory volumes
-    remain dense because they are part of the public contract.
+    This preserves the transform and collision semantics while avoiding two
+    dense 3D intermediates for every history/future pair. Network BEV summaries
+    are built directly from sparse collision-resolved voxels. Static Memory
+    clears and writes sparse transformed indices in oldest-to-newest order.
 
-    Each history frame is sparsified once.  For every future frame we reuse one
-    transformed sparse point cloud for:
-      * BEV semantic/geometric history features;
-      * full lidar-observation coverage;
-      * deterministic Static-Memory free clearing and semantic rendering.
+    Evaluation paths that do not consume exact 3D history coverage can set
+    return_coverage=False. Cache/decomposition builders keep the default True.
     """
     if not (
         len(history_semantics)
@@ -413,57 +414,54 @@ def build_future_aligned_history_and_static_memory(
     if len(future_poses) != FUTURE_FRAMES:
         raise ValueError("expected six future poses")
 
-    prepared = [
-        prepare_history_alignment_frame(
-            sem,
-            obs,
-            pose,
-            grid=grid,
-            dynamic_class_ids=dynamic_class_ids,
-        )
-        for sem, obs, pose in zip(
-            history_semantics,
-            history_observed,
-            history_poses,
-        )
-    ]
-    shape = tuple(int(v) for v in grid.shape_hwd)
+    shape = tuple(int(x) for x in grid.shape_hwd)
     X, Y, Z = shape
+    if prepared_history is None:
+        prepared = [
+            prepare_history_alignment_frame(
+                sem,
+                obs,
+                hpose,
+                grid=grid,
+                dynamic_class_ids=dynamic_class_ids,
+            )
+            for sem, obs, hpose in zip(
+                history_semantics,
+                history_observed,
+                history_poses,
+            )
+        ]
+    else:
+        if len(prepared_history) != HISTORY_FRAMES:
+            raise ValueError("prepared_history must contain six frames")
+        prepared = list(prepared_history)
 
     nworkers = max(1, int(workers))
 
     def _one_future(fpose):
         fpose = np.asarray(fpose, dtype=np.float64)
         lf, gf = [], []
-        coverage = np.zeros(shape, dtype=bool)
+        coverage = np.zeros(shape, dtype=bool) if bool(return_coverage) else None
         static_out = np.full(shape, int(free_label), dtype=np.uint8)
 
         for hpose, xyz, labels, usable_static in prepared:
-            if len(xyz) == 0:
-                lf.append(
-                    np.full((X, Y), int(free_label), dtype=np.uint8)
-                )
-                gf.append(
-                    np.zeros((GEOMETRY_CHANNELS, X, Y), dtype=np.float32)
-                )
-                continue
+            observed_bev = np.zeros((X, Y), dtype=bool)
 
-            T = relative_transform(hpose, fpose)
-            dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
-            ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+            if len(xyz):
+                T = relative_transform(hpose, fpose)
+                dst_xyz = xyz @ T[:3, :3].T + T[:3, 3]
+                ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+                valid = np.asarray(valid, dtype=bool)
 
-            if bool(valid.any()):
-                vx = ix[valid]
-                vy = iy[valid]
-                vz = iz[valid]
-                coverage[vx, vy, vz] = True
-                observed_bev = np.zeros((X, Y), dtype=bool)
-                observed_bev[vx, vy] = True
-            else:
-                observed_bev = np.zeros((X, Y), dtype=bool)
+                if bool(valid.any()):
+                    vx = np.asarray(ix, dtype=np.int64)[valid]
+                    vy = np.asarray(iy, dtype=np.int64)[valid]
+                    vz = np.asarray(iz, dtype=np.int64)[valid]
+                    observed_bev[vx, vy] = True
+                    if coverage is not None:
+                        coverage[vx, vy, vz] = True
 
-            sx, sy, sz, vals, flat = (
-                _semantic_choices_from_pretransformed(
+                sx, sy, sz, vals, flat = _semantic_choices_from_pretransformed(
                     labels,
                     ix,
                     iy,
@@ -474,7 +472,32 @@ def build_future_aligned_history_and_static_memory(
                     grid=grid,
                     free_label=int(free_label),
                 )
-            )
+
+                static_valid = valid & usable_static
+                if bool(static_valid.any()):
+                    static_out[
+                        np.asarray(ix, dtype=np.int64)[static_valid],
+                        np.asarray(iy, dtype=np.int64)[static_valid],
+                        np.asarray(iz, dtype=np.int64)[static_valid],
+                    ] = int(free_label)
+
+                ssx, ssy, ssz, svals, _ = _semantic_choices_from_pretransformed(
+                    labels,
+                    ix,
+                    iy,
+                    iz,
+                    dst_xyz,
+                    valid,
+                    usable_static,
+                    grid=grid,
+                    free_label=int(free_label),
+                )
+                if len(svals):
+                    static_out[ssx, ssy, ssz] = svals
+            else:
+                sx = sy = sz = flat = np.zeros((0,), dtype=np.int64)
+                vals = np.zeros((0,), dtype=np.uint8)
+
             top_label, geom = _bev_summary_from_sorted_choices(
                 sx,
                 sy,
@@ -487,34 +510,6 @@ def build_future_aligned_history_and_static_memory(
             )
             lf.append(top_label)
             gf.append(geom)
-
-            # Exact oldest->newest static mosaic semantics.  Every valid
-            # non-dynamic observation first clears stale Static Memory,
-            # including observed free space; occupied static choices then write
-            # semantic content using the same collision rule as before.
-            static_valid = valid & usable_static
-            if bool(static_valid.any()):
-                static_out[
-                    ix[static_valid],
-                    iy[static_valid],
-                    iz[static_valid],
-                ] = int(free_label)
-
-            ssx, ssy, ssz, svals, _ = (
-                _semantic_choices_from_pretransformed(
-                    labels,
-                    ix,
-                    iy,
-                    iz,
-                    dst_xyz,
-                    valid,
-                    usable_static,
-                    grid=grid,
-                    free_label=int(free_label),
-                )
-            )
-            if len(svals):
-                static_out[ssx, ssy, ssz] = svals
 
         return (
             np.stack(lf, axis=0).astype(np.uint8, copy=False),
@@ -532,12 +527,18 @@ def build_future_aligned_history_and_static_memory(
             rows = list(pool.map(_one_future, future_poses))
 
     all_labels, all_geometry, all_coverage, all_static = zip(*rows)
+    coverage_out = (
+        np.stack(all_coverage, axis=0)
+        if bool(return_coverage)
+        else None
+    )
     return (
         np.stack(all_labels, axis=0).astype(np.uint8, copy=False),
         np.stack(all_geometry, axis=0).astype(np.float32, copy=False),
-        np.stack(all_coverage, axis=0),
+        coverage_out,
         np.stack(all_static, axis=0).astype(np.uint8, copy=False),
     )
+
 
 def base_explained_bev(
     base_future_occ: np.ndarray,
