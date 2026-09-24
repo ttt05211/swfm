@@ -5,6 +5,7 @@ from tools.real_motion.eval_p0_f9_v19_static_new_fov import (
     SEM_CLASSES,
     _new_raw,
     _update,
+    _update_many,
 )
 
 
@@ -42,3 +43,26 @@ def test_vectorized_v19_metric_update_matches_reference():
 
     for key in got:
         np.testing.assert_array_equal(got[key], ref[key])
+
+
+
+def test_multi_variant_v19_metric_update_matches_repeated_updates():
+    rng = np.random.default_rng(20260925)
+    free = 17
+    gt = rng.integers(0, 18, size=(8, 9, 6), dtype=np.uint8)
+    moving = rng.random((8, 9, 6)) < 0.31
+    preds = {
+        "a": rng.integers(0, 18, size=gt.shape, dtype=np.uint8),
+        "b": rng.integers(0, 18, size=gt.shape, dtype=np.uint8),
+        "c": rng.integers(0, 18, size=gt.shape, dtype=np.uint8),
+    }
+
+    got = {k: _new_raw() for k in preds}
+    ref = {k: _new_raw() for k in preds}
+    _update_many(got, 2, preds, gt, moving, free)
+    for name, pred in preds.items():
+        _update(ref[name], 2, pred, gt, moving, free)
+
+    for name in preds:
+        for key in got[name]:
+            np.testing.assert_array_equal(got[name][key], ref[name][key])
