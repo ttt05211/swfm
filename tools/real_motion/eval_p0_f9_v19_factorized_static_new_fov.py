@@ -578,7 +578,13 @@ def main():
         t_moving = time.perf_counter()
         moving_rows = []
         for hi, h in enumerate(HORIZONS):
-            moving = moving_rows[hi]
+            moving, _, _ = gt_moving_support_for_horizon(
+                source.nusc,
+                str(w.t0_token),
+                str(w.future_tokens[hi]),
+                float(h),
+                grid=pcfg.grid,
+            )
             moving_rows.append(moving)
         if profile_this:
             _profile_add(
@@ -590,13 +596,7 @@ def main():
         t_metric = time.perf_counter()
         for hi, h in enumerate(HORIZONS):
             gt = np.asarray(raw["future_gt_occ"][hi], dtype=np.uint8)
-            moving, _, _ = gt_moving_support_for_horizon(
-                source.nusc,
-                str(w.t0_token),
-                str(w.future_tokens[hi]),
-                float(h),
-                grid=pcfg.grid,
-            )
+            moving = moving_rows[hi]
             for name, pred in (
                 ("v18", np.asarray(pred_all[hi], dtype=np.uint8)),
                 ("v18_static", explained[hi]),
