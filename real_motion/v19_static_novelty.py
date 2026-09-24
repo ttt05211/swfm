@@ -78,6 +78,161 @@ def history_grid_footprint_bev(
     return covered.reshape(X, Y)
 
 
+def nearest_static_anchor_map(
+    static_render: np.ndarray,
+    history_footprint_bev: np.ndarray,
+    *,
+    free_label: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Nearest causal static-memory column for every BEV cell.
+
+    Anchors are occupied Static-Memory columns inside the union of historical
+    grid footprints.  For an external New-FOV query, the nearest occupied
+    historical column naturally lies on (or behind, when the boundary is
+    unobserved) the known-scene side of the geometric boundary.
+
+    Returns:
+      distance_cells [X,Y] Euclidean cell distance (inf if no anchor exists),
+      anchor_x / anchor_y [X,Y] nearest-anchor indices,
+      valid [X,Y] whether a static anchor exists.
+
+    SciPy's exact Euclidean distance transform is used when available.  A
+    deterministic 8-neighbour Dijkstra fallback keeps dependency-light tests
+    functional; the fallback is only expected for small/debug environments.
+    """
+    sem = np.asarray(static_render, dtype=np.uint8)
+    footprint = np.asarray(history_footprint_bev, dtype=bool)
+    if sem.ndim != 3 or footprint.shape != sem.shape[:2]:
+        raise ValueError("static render / footprint shape mismatch")
+    anchor = footprint & (sem != int(free_label)).any(axis=2)
+    X, Y = anchor.shape
+    if not bool(anchor.any()):
+        return (
+            np.full((X, Y), np.inf, dtype=np.float32),
+            np.zeros((X, Y), dtype=np.int32),
+            np.zeros((X, Y), dtype=np.int32),
+            np.zeros((X, Y), dtype=bool),
+        )
+
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        dist, inds = distance_transform_edt(
+            ~anchor,
+            return_indices=True,
+        )
+        return (
+            np.asarray(dist, dtype=np.float32),
+            np.asarray(inds[0], dtype=np.int32),
+            np.asarray(inds[1], dtype=np.int32),
+            np.ones((X, Y), dtype=bool),
+        )
+    except ImportError:
+        import heapq
+
+        inf = float("inf")
+        dist = np.full((X, Y), inf, dtype=np.float64)
+        ax = np.zeros((X, Y), dtype=np.int32)
+        ay = np.zeros((X, Y), dtype=np.int32)
+        heap = []
+        for x, y in np.argwhere(anchor):
+            x = int(x)
+            y = int(y)
+            dist[x, y] = 0.0
+            ax[x, y] = x
+            ay[x, y] = y
+            heapq.heappush(heap, (0.0, x, y, x, y))
+        steps = (
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, 2.0 ** 0.5),
+            (-1, 1, 2.0 ** 0.5),
+            (1, -1, 2.0 ** 0.5),
+            (1, 1, 2.0 ** 0.5),
+        )
+        eps = 1e-12
+        while heap:
+            d, x, y, sx, sy = heapq.heappop(heap)
+            if d > dist[x, y] + eps:
+                continue
+            for dx, dy, cost in steps:
+                nx = x + dx
+                ny = y + dy
+                if not (0 <= nx < X and 0 <= ny < Y):
+                    continue
+                nd = d + cost
+                replace = nd < dist[nx, ny] - eps
+                tie = (
+                    abs(nd - dist[nx, ny]) <= eps
+                    and (sx, sy) < (int(ax[nx, ny]), int(ay[nx, ny]))
+                )
+                if replace or tie:
+                    dist[nx, ny] = nd
+                    ax[nx, ny] = int(sx)
+                    ay[nx, ny] = int(sy)
+                    heapq.heappush(
+                        heap,
+                        (nd, nx, ny, int(sx), int(sy)),
+                    )
+        return (
+            dist.astype(np.float32),
+            ax,
+            ay,
+            np.ones((X, Y), dtype=bool),
+        )
+
+
+def copy_static_anchor_columns(
+    static_render: np.ndarray,
+    new_fov_bev: np.ndarray,
+    anchor_x: np.ndarray,
+    anchor_y: np.ndarray,
+    anchor_distance_cells: np.ndarray,
+    anchor_valid: np.ndarray,
+    *,
+    free_label: int,
+    voxel_size_xy_m: float,
+    max_distance_m: float | None,
+) -> np.ndarray:
+    """Copy nearest known static 3D columns into causal New-FOV support.
+
+    This is a deterministic diagnostic baseline, not a learned predictor.
+    No future GT is used.  A finite max_distance_m yields a conservative
+    boundary-continuation baseline; None copies over the entire New-FOV.
+    """
+    sem = np.asarray(static_render, dtype=np.uint8)
+    nf = np.asarray(new_fov_bev, dtype=bool)
+    ax = np.asarray(anchor_x, dtype=np.int64)
+    ay = np.asarray(anchor_y, dtype=np.int64)
+    dist = np.asarray(anchor_distance_cells, dtype=np.float32)
+    valid = np.asarray(anchor_valid, dtype=bool)
+    if sem.ndim != 3:
+        raise ValueError("static_render must be [X,Y,Z]")
+    if not (
+        nf.shape
+        == ax.shape
+        == ay.shape
+        == dist.shape
+        == valid.shape
+        == sem.shape[:2]
+    ):
+        raise ValueError("anchor/candidate shape mismatch")
+
+    eligible = nf & valid
+    if max_distance_m is not None:
+        eligible &= (
+            dist * float(voxel_size_xy_m)
+            <= float(max_distance_m) + 1e-6
+        )
+    out = np.full_like(sem, int(free_label))
+    if bool(eligible.any()):
+        copied = sem[ax, ay]
+        out[eligible] = copied[eligible]
+    return out
+
+
 def majority_semantic_per_column(
     positive_mask: np.ndarray,
     gt_occ: np.ndarray,
