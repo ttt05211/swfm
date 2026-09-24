@@ -15,6 +15,7 @@ from real_motion.v19_static_novelty import (
     copy_static_anchor_columns,
     decode_static_new_fov,
     history_grid_footprint_bev,
+    history_grid_footprint_bev_sequence,
     majority_semantic_per_column,
     nearest_static_anchor_map,
     static_new_fov_loss,
@@ -690,3 +691,47 @@ def test_sparse_fused_history_static_matches_legacy_reference():
     np.testing.assert_array_equal(got_lab2, ref_lab)
     np.testing.assert_allclose(got_geo2, ref_geo, rtol=0.0, atol=0.0)
     np.testing.assert_array_equal(got_static2, got_static)
+
+
+
+def test_history_grid_footprint_sequence_matches_scalar():
+    grid = OccupancyGrid(
+        x_min=-4.0,
+        y_min=-4.0,
+        z_min=-1.0,
+        voxel_size=(0.4, 0.4, 0.4),
+        shape_hwd=(20, 20, 4),
+    )
+    hp = []
+    fp = []
+    for t in range(6):
+        p = np.eye(4, dtype=np.float64)
+        a = 0.01 * t
+        ca, sa = np.cos(a), np.sin(a)
+        p[:2, :2] = np.asarray([[ca, -sa], [sa, ca]])
+        p[0, 3] = 0.1 * t
+        p[1, 3] = -0.06 * t
+        hp.append(p)
+    for t in range(6):
+        p = np.eye(4, dtype=np.float64)
+        a = -0.015 * (t + 1)
+        ca, sa = np.cos(a), np.sin(a)
+        p[:2, :2] = np.asarray([[ca, -sa], [sa, ca]])
+        p[0, 3] = 0.18 * (t + 1)
+        p[1, 3] = 0.03 * (t + 1)
+        fp.append(p)
+
+    got = history_grid_footprint_bev_sequence(
+        np.stack(hp),
+        np.stack(fp),
+        grid,
+        workers=3,
+    )
+    ref = np.stack(
+        [
+            history_grid_footprint_bev(np.stack(hp), f, grid)
+            for f in fp
+        ],
+        axis=0,
+    )
+    np.testing.assert_array_equal(got, ref)
