@@ -1073,6 +1073,10 @@ def main():
     print("factorized_vs_static", json.dumps(delta))
     print("effective_addition", json.dumps(effective))
     print("proposal_audit", json.dumps(result["proposal_audit"]))
+    print(
+        "history_future_pair_cache",
+        json.dumps(result["history_future_pair_cache"]),
+    )
     if profile_report is not None:
         print("\n=== STAGE TIMING PROFILE ===")
         print(
