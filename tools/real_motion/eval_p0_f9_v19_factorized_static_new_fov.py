@@ -131,6 +131,48 @@ def _effective_addition_quality(base_raw, variant_raw):
     }
 
 
+def _cuda_sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _profile_add(profile, name, elapsed_s):
+    row = profile.setdefault(
+        str(name),
+        {"total_s": 0.0, "calls": 0},
+    )
+    row["total_s"] += float(elapsed_s)
+    row["calls"] += 1
+
+
+def _profile_finalize(profile, measured_windows):
+    total = sum(float(v["total_s"]) for v in profile.values())
+    rows = {}
+    for name, row in sorted(
+        profile.items(),
+        key=lambda kv: float(kv[1]["total_s"]),
+        reverse=True,
+    ):
+        s = float(row["total_s"])
+        calls = int(row["calls"])
+        rows[name] = {
+            "total_s": s,
+            "share_pct": float(100.0 * s / max(total, 1e-12)),
+            "mean_ms_per_window": float(
+                1000.0 * s / max(int(measured_windows), 1)
+            ),
+            "mean_ms_per_call": float(
+                1000.0 * s / max(calls, 1)
+            ),
+            "calls": calls,
+        }
+    return {
+        "measured_windows": int(measured_windows),
+        "summed_stage_s": float(total),
+        "stages": rows,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     add_config_args(p)
@@ -155,6 +197,29 @@ def main():
     )
     p.add_argument("--alignment-workers", type=int, default=6)
     p.add_argument(
+        "--profile-windows",
+        type=int,
+        default=0,
+        help=(
+            "measure exact stage wall time on this many windows after warmup; "
+            "CUDA stages are synchronized only while profiling"
+        ),
+    )
+    p.add_argument(
+        "--profile-warmup-windows",
+        type=int,
+        default=2,
+        help="unmeasured warmup windows before stage profiling starts",
+    )
+    p.add_argument(
+        "--profile-only",
+        action="store_true",
+        help=(
+            "when profiling, evaluate only warmup+profile windows and exit "
+            "after reporting the stage breakdown"
+        ),
+    )
+    p.add_argument(
         "--presence-threshold",
         type=float,
         default=-1.0,
@@ -172,6 +237,10 @@ def main():
 
     if int(a.alignment_workers) <= 0:
         raise ValueError("alignment-workers must be positive")
+    if int(a.profile_windows) < 0 or int(a.profile_warmup_windows) < 0:
+        raise ValueError("profile window counts must be non-negative")
+    if bool(a.profile_only) and int(a.profile_windows) <= 0:
+        raise ValueError("--profile-only requires --profile-windows > 0")
     if int(a.num_shards) <= 0:
         raise ValueError("num-shards must be positive")
     if not 0 <= int(a.shard_index) < int(a.num_shards):
@@ -189,6 +258,9 @@ def main():
         records = records[lo:hi]
     if not records:
         raise RuntimeError("empty validation cache shard")
+    if bool(a.profile_only):
+        need = int(a.profile_warmup_windows) + int(a.profile_windows)
+        records = records[: min(len(records), need)]
 
     device = torch.device(
         a.device
@@ -242,12 +314,51 @@ def main():
     active_bev_columns = 0
     new_fov_bev_columns = 0
     started = time.perf_counter()
+    stage_profile = {}
+    profiled_windows = 0
+    profile_lo = int(a.profile_warmup_windows) + 1
+    profile_hi = int(a.profile_warmup_windows) + int(a.profile_windows)
 
     for wi, rec in enumerate(records, start=1):
+        profile_this = (
+            int(a.profile_windows) > 0
+            and profile_lo <= wi <= profile_hi
+        )
         w = window_from_record(rec)
+
+        t = time.perf_counter()
         raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=True)
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "raw_window_load",
+                time.perf_counter() - t,
+            )
+
+        t = time.perf_counter()
         state = _prepare_record(rec, source, pcfg, strong_cfg, device)
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "v18_prepare_record",
+                time.perf_counter() - t,
+            )
+
+        if profile_this:
+            _cuda_sync(device)
+        t = time.perf_counter()
         _stage_gpu_inputs(state, device)
+        if profile_this:
+            _cuda_sync(device)
+            _profile_add(
+                stage_profile,
+                "v18_gpu_stage_inputs",
+                time.perf_counter() - t,
+            )
+
+        if profile_this:
+            _cuda_sync(device)
+        t = time.perf_counter()
         try:
             pred_all = _forecast_once(
                 base_model,
@@ -256,9 +367,17 @@ def main():
                 strong_cfg,
                 device,
             )
+            if profile_this:
+                _cuda_sync(device)
+                _profile_add(
+                    stage_profile,
+                    "v18_forecast_6frames",
+                    time.perf_counter() - t,
+                )
         finally:
             _release_gpu_inputs(state)
 
+        t = time.perf_counter()
         sem, geo, _, static_all = (
             build_future_aligned_history_and_static_memory(
                 raw["history_occ"],
@@ -273,6 +392,12 @@ def main():
                 workers=int(a.alignment_workers),
             )
         )
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "history_align_and_static_memory",
+                time.perf_counter() - t,
+            )
 
         explained = []
         base_free = []
@@ -285,6 +410,7 @@ def main():
             dtype=np.float64,
         )
 
+        t_causal = time.perf_counter()
         for fi in range(len(raw["future_poses"])):
             pred = np.asarray(pred_all[fi], dtype=np.uint8)
             static_render = np.asarray(static_all[fi], dtype=np.uint8)
@@ -334,7 +460,14 @@ def main():
                 np.asarray(dist_cells, dtype=np.float32)
                 * float(pcfg.grid.voxel_size[0])
             )
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "new_fov_anchor_context",
+                time.perf_counter() - t_causal,
+            )
 
+        t = time.perf_counter()
         explained = np.stack(explained, axis=0).astype(np.uint8)
         base_free = np.stack(base_free, axis=0)
         new_fov = np.stack(new_fov, axis=0)
@@ -359,7 +492,17 @@ def main():
         free_t = torch.from_numpy(
             base_free.transpose(0, 3, 1, 2)[None]
         ).to(device)
+        if profile_this:
+            _cuda_sync(device)
+            _profile_add(
+                stage_profile,
+                "novelty_tensor_staging",
+                time.perf_counter() - t,
+            )
 
+        if profile_this:
+            _cuda_sync(device)
+        t = time.perf_counter()
         with torch.inference_mode(), _autocast(device, amp):
             out = novelty(
                 sem_t,
@@ -389,7 +532,15 @@ def main():
                 presence_threshold=presence_threshold,
                 vertical_threshold=vertical_threshold,
             )
+        if profile_this:
+            _cuda_sync(device)
+            _profile_add(
+                stage_profile,
+                "novelty_forward_and_decode",
+                time.perf_counter() - t,
+            )
 
+        t = time.perf_counter()
         proposal = (
             proposal_zxy[0]
             .permute(0, 2, 3, 1)
@@ -417,7 +568,26 @@ def main():
             window_added += n
             final.append(f)
         windows_with_additions += int(window_added > 0)
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "proposal_cpu_and_compose",
+                time.perf_counter() - t,
+            )
 
+        t_moving = time.perf_counter()
+        moving_rows = []
+        for hi, h in enumerate(HORIZONS):
+            moving = moving_rows[hi]
+            moving_rows.append(moving)
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "moving_support_gt_metric_prep",
+                time.perf_counter() - t_moving,
+            )
+
+        t_metric = time.perf_counter()
         for hi, h in enumerate(HORIZONS):
             gt = np.asarray(raw["future_gt_occ"][hi], dtype=np.uint8)
             moving, _, _ = gt_moving_support_for_horizon(
@@ -441,6 +611,14 @@ def main():
                     int(pcfg.free_label),
                 )
 
+        if profile_this:
+            _profile_add(
+                stage_profile,
+                "metric_accumulation_3_variants",
+                time.perf_counter() - t_metric,
+            )
+            profiled_windows += 1
+
         if wi == 1 or wi % 25 == 0 or wi == len(records):
             elapsed = max(time.perf_counter() - started, 1e-9)
             print(
@@ -459,6 +637,11 @@ def main():
         raw_by_variant["v18_static_factorized_new_fov"],
     )
     elapsed = max(time.perf_counter() - started, 1e-9)
+    profile_report = (
+        _profile_finalize(stage_profile, profiled_windows)
+        if profiled_windows > 0
+        else None
+    )
     result = {
         "protocol": PROTOCOL,
         "num_windows": int(len(records)),
@@ -493,6 +676,7 @@ def main():
             "elapsed_s": float(elapsed),
             "windows_per_s": float(len(records) / elapsed),
         },
+        "stage_timing_profile": profile_report,
     }
     op = Path(a.output)
     op.parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +696,19 @@ def main():
     print("factorized_vs_static", json.dumps(delta))
     print("effective_addition", json.dumps(effective))
     print("proposal_audit", json.dumps(result["proposal_audit"]))
+    if profile_report is not None:
+        print("\n=== STAGE TIMING PROFILE ===")
+        print(
+            f"measured_windows={profile_report['measured_windows']} "
+            f"summed_stage_s={profile_report['summed_stage_s']:.3f}"
+        )
+        for name, row in profile_report["stages"].items():
+            print(
+                f"{name:34s} "
+                f"{row['share_pct']:6.2f}% "
+                f"{row['mean_ms_per_window']:9.2f} ms/window "
+                f"calls={row['calls']}"
+            )
     print(f"saved {op}")
 
 
