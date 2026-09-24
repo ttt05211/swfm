@@ -28,6 +28,8 @@ import torch
 
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.motion_transport import (
+    FUTURE_FRAMES,
+    HISTORY_FRAMES,
     dynamic_annotations,
     match_sources_to_annotations,
 )
@@ -82,35 +84,216 @@ PROTOCOL = "p0_f9_v19_factorized_static_new_fov_cache_v1"
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 
 
+TENSOR_KEYS = (
+    "future_aligned_semantic",
+    "future_aligned_geometry_q",
+    "base_explained",
+    "base_free_bits",
+    "new_fov_mask",
+    "presence_target",
+    "vertical_target_bits",
+    "semantic_target",
+    "anchor_semantic",
+    "anchor_profile_bits",
+    "anchor_distance_q",
+    "gt_occupied_bits",
+)
+
+
 def _flush_shard(out_dir: Path, shard_id: int, rows: list[dict]) -> dict:
+    """Atomically write one shard for deterministic crash recovery."""
     if not rows:
         raise ValueError("cannot flush empty factorized New-FOV shard")
     name = f"shard_{int(shard_id):05d}.pt"
-    tensor_keys = (
-        "future_aligned_semantic",
-        "future_aligned_geometry_q",
-        "base_explained",
-        "base_free_bits",
-        "new_fov_mask",
-        "presence_target",
-        "vertical_target_bits",
-        "semantic_target",
-        "anchor_semantic",
-        "anchor_profile_bits",
-        "anchor_distance_q",
-        "gt_occupied_bits",
-    )
+    final = out_dir / name
+    tmp = out_dir / f".{name}.tmp"
     payload = {
         "protocol": PROTOCOL,
         **{
             k: torch.stack([r[k] for r in rows])
-            for k in tensor_keys
+            for k in TENSOR_KEYS
         },
         "scene_name": [r["scene_name"] for r in rows],
         "t0_token": [r["t0_token"] for r in rows],
     }
-    torch.save(payload, out_dir / name)
+    try:
+        if tmp.exists():
+            tmp.unlink()
+        torch.save(payload, tmp)
+        tmp.replace(final)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return {"file": name, "count": len(rows)}
+
+
+def _unpack_bits_numpy(bits: torch.Tensor, z: int) -> np.ndarray:
+    x = bits.detach().cpu().numpy().astype(np.uint16, copy=False)
+    shifts = np.arange(int(z), dtype=np.uint16)
+    return ((x[..., None] >> shifts) & np.uint16(1)).astype(bool)
+
+
+def _load_shard_for_resume(path: Path) -> dict:
+    try:
+        return torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+    except TypeError:
+        return torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+
+def _recover_existing_shards(
+    out_dir: Path,
+    records: list,
+    *,
+    shard_size: int,
+    free_label: int,
+    vertical_bins: int,
+) -> tuple[list[dict], dict, dict[str, int], set[str], int]:
+    """Validate existing shards, drop a corrupt tail, and rebuild counts."""
+    for tmp in out_dir.glob(".shard_*.pt.tmp"):
+        tmp.unlink(missing_ok=True)
+
+    shard_paths = sorted(out_dir.glob("shard_*.pt"))
+    shards: list[dict] = []
+    totals = {
+        "candidate_bev_columns": 0,
+        "positive_bev_columns": 0,
+        "vertical_supervised_voxels": 0,
+        "positive_vertical_voxels": 0,
+        "target_voxels": 0,
+        "anchor_valid_candidate_columns": 0,
+        "baseline_occ_inter": 0,
+        "baseline_occ_union": 0,
+    }
+    semantic_hist = {str(i): 0 for i in range(17)}
+    scenes: set[str] = set()
+    processed = 0
+    invalid_from: int | None = None
+
+    for file_i, path in enumerate(shard_paths):
+        expected_name = f"shard_{file_i:05d}.pt"
+        if path.name != expected_name:
+            invalid_from = file_i
+            print(
+                f"resume: non-contiguous shard sequence at {path.name}; "
+                f"expected {expected_name}",
+                flush=True,
+            )
+            break
+        try:
+            obj = _load_shard_for_resume(path)
+            if obj.get("protocol") != PROTOCOL:
+                raise RuntimeError(
+                    f"protocol={obj.get('protocol')!r}"
+                )
+            n = len(obj.get("t0_token", []))
+            if n <= 0 or n > int(shard_size):
+                raise RuntimeError(f"invalid shard count={n}")
+            if processed + n > len(records):
+                raise RuntimeError("shard exceeds selected record population")
+            if file_i < len(shard_paths) - 1 and n != int(shard_size):
+                raise RuntimeError(
+                    f"non-tail shard count {n} != shard_size {shard_size}"
+                )
+            for k in TENSOR_KEYS:
+                if k not in obj or int(obj[k].shape[0]) != n:
+                    raise RuntimeError(f"bad tensor batch for {k}")
+
+            expected_tokens = [
+                str(window_from_record(records[processed + j]).t0_token)
+                for j in range(n)
+            ]
+            got_tokens = [str(x) for x in obj["t0_token"]]
+            if got_tokens != expected_tokens:
+                raise RuntimeError(
+                    "cached t0 tokens do not match current selected record order"
+                )
+
+            base_free = _unpack_bits_numpy(
+                obj["base_free_bits"],
+                vertical_bins,
+            )
+            vertical = _unpack_bits_numpy(
+                obj["vertical_target_bits"],
+                vertical_bins,
+            )
+            gt_occ = _unpack_bits_numpy(
+                obj["gt_occupied_bits"],
+                vertical_bins,
+            )
+            new_fov = (
+                obj["new_fov_mask"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(bool)
+            )
+            presence = (
+                obj["presence_target"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(bool)
+            )
+            semantic = obj["semantic_target"].detach().cpu().numpy()
+            anchor_sem = obj["anchor_semantic"].detach().cpu().numpy()
+
+            candidate = new_fov & base_free.any(axis=-1)
+            supervised_vertical = presence[..., None] & base_free
+            base_occ = ~base_free
+
+            totals["candidate_bev_columns"] += int(candidate.sum())
+            totals["positive_bev_columns"] += int(presence.sum())
+            totals["vertical_supervised_voxels"] += int(
+                supervised_vertical.sum()
+            )
+            totals["positive_vertical_voxels"] += int(vertical.sum())
+            totals["target_voxels"] += int(vertical.sum())
+            totals["anchor_valid_candidate_columns"] += int(
+                ((anchor_sem != int(free_label)) & candidate).sum()
+            )
+            totals["baseline_occ_inter"] += int(
+                (base_occ & gt_occ).sum()
+            )
+            totals["baseline_occ_union"] += int(
+                (base_occ | gt_occ).sum()
+            )
+            for cid in range(17):
+                semantic_hist[str(cid)] += int(
+                    (presence & (semantic == int(cid))).sum()
+                )
+
+            scenes.update(str(x) for x in obj.get("scene_name", []))
+            shards.append({"file": path.name, "count": int(n)})
+            processed += int(n)
+            del obj
+        except Exception as exc:
+            invalid_from = file_i
+            print(
+                f"resume: dropping invalid tail from {path.name}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            break
+
+    if invalid_from is not None:
+        for path in shard_paths[invalid_from:]:
+            path.unlink(missing_ok=True)
+
+    print(
+        f"resume: recovered {processed}/{len(records)} windows "
+        f"from {len(shards)} valid shards",
+        flush=True,
+    )
+    return shards, totals, semantic_hist, scenes, processed
 
 
 def main():
@@ -128,6 +311,14 @@ def main():
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--shard-size", type=int, default=8)
     p.add_argument("--match-max-distance-m", type=float, default=4.0)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "resume a partial cache after validating existing shards; "
+            "a corrupt/incomplete tail shard is deleted and recomputed"
+        ),
+    )
     p.add_argument("--device", default="cuda")
     a = p.parse_args()
 
@@ -141,8 +332,14 @@ def main():
         raise ValueError("shard-index must be in [0,num-shards)")
 
     out_dir = Path(a.output_dir)
-    if out_dir.exists() and any(out_dir.iterdir()):
-        raise FileExistsError(f"refusing non-empty output dir: {out_dir}")
+    if (
+        out_dir.exists()
+        and any(out_dir.iterdir())
+        and not bool(a.resume)
+    ):
+        raise FileExistsError(
+            f"refusing non-empty output dir without --resume: {out_dir}"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pcfg = make_prepare_config(load_runtime_config(a.config, a.override))
@@ -162,6 +359,37 @@ def main():
         records = records[lo:hi]
     if not records:
         raise RuntimeError("empty source cache shard")
+    selected_num_windows = int(len(records))
+
+    if bool(a.resume):
+        (
+            shards,
+            totals,
+            semantic_column_hist,
+            scenes,
+            processed_windows,
+        ) = _recover_existing_shards(
+            out_dir,
+            records,
+            shard_size=int(a.shard_size),
+            free_label=int(pcfg.free_label),
+            vertical_bins=int(pcfg.grid.shape_hwd[2]),
+        )
+    else:
+        totals = {
+            "candidate_bev_columns": 0,
+            "positive_bev_columns": 0,
+            "vertical_supervised_voxels": 0,
+            "positive_vertical_voxels": 0,
+            "target_voxels": 0,
+            "anchor_valid_candidate_columns": 0,
+            "baseline_occ_inter": 0,
+            "baseline_occ_union": 0,
+        }
+        semantic_column_hist = {str(i): 0 for i in range(17)}
+        shards = []
+        scenes = set()
+        processed_windows = 0
 
     device = torch.device(
         a.device
@@ -181,23 +409,14 @@ def main():
     )
     metric_grid = _grid_spec(pcfg.grid)
 
-    totals = {
-        "candidate_bev_columns": 0,
-        "positive_bev_columns": 0,
-        "vertical_supervised_voxels": 0,
-        "positive_vertical_voxels": 0,
-        "target_voxels": 0,
-        "anchor_valid_candidate_columns": 0,
-        "baseline_occ_inter": 0,
-        "baseline_occ_union": 0,
-    }
-    semantic_column_hist = {str(i): 0 for i in range(17)}
-    shards = []
     shard_rows = []
-    scenes = set()
     started = time.perf_counter()
 
-    for wi, rec in enumerate(records, start=1):
+    remaining_records = records[processed_windows:]
+    for wi, rec in enumerate(
+        remaining_records,
+        start=processed_windows + 1,
+    ):
         w = window_from_record(rec)
         scenes.add(str(w.scene_name))
         raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=True)
@@ -437,11 +656,11 @@ def main():
             shards.append(_flush_shard(out_dir, len(shards), shard_rows))
             shard_rows = []
 
-        if wi == 1 or wi % 25 == 0 or wi == len(records):
+        if wi == 1 or wi % 25 == 0 or wi == selected_num_windows:
             elapsed = max(time.perf_counter() - started, 1e-9)
             print(
-                f"v19_factorized_new_fov_cache {wi}/{len(records)} "
-                f"rate={wi/elapsed:.3f} win/s",
+                f"v19_factorized_new_fov_cache {wi}/{selected_num_windows} "
+                f"rate={(wi-processed_windows)/elapsed:.3f} new-win/s",
                 flush=True,
             )
 
@@ -460,12 +679,12 @@ def main():
         "source_cache_metadata_keys": sorted(str(k) for k in source_meta.keys()),
         "base_checkpoint": str(Path(a.checkpoint).resolve()),
         "base_checkpoint_epoch": int(ck.get("epoch", -1)),
-        "num_windows": int(len(records)),
+        "num_windows": int(selected_num_windows),
         "global_num_windows_before_shard": int(global_num_windows),
         "num_scenes": int(len(scenes)),
         "scene_names": sorted(scenes),
-        "future_frames": int(len(future_poses)),
-        "history_frames": int(len(history_poses)),
+        "future_frames": int(FUTURE_FRAMES),
+        "history_frames": int(HISTORY_FRAMES),
         "grid_shape_hwd": [int(x) for x in pcfg.grid.shape_hwd],
         "free_label": int(pcfg.free_label),
         "target": "never_seen_static_intersect_geometric_new_fov",
@@ -494,10 +713,15 @@ def main():
         "baseline_occ_iou": float(inter / max(union, 1)),
         "semantic_positive_column_histogram": semantic_column_hist,
         "shards": shards,
+        "resume": {
+            "enabled": bool(a.resume),
+            "recovered_windows": int(processed_windows),
+            "new_windows": int(len(remaining_records)),
+        },
         "timing": {
             "elapsed_s": float(max(time.perf_counter() - started, 1e-9)),
             "windows_per_s": float(
-                len(records)
+                len(remaining_records)
                 / max(time.perf_counter() - started, 1e-9)
             ),
             "alignment_workers": int(a.alignment_workers),
