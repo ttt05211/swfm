@@ -198,13 +198,17 @@ def _train_window(
     poses = [np.asarray(x, dtype=np.float64) for x in raw["history_poses"]]
 
     if synthetic_current_index is None:
+        source_sem = [
+            np.where(o, s, int(pcfg.free_label)).astype(np.uint8)
+            for s, o in zip(history_sem, history_obs)
+        ]
         tracks, _ = build_dynamic_source_memory(
-            history_sem, poses, grid=pcfg.grid, strong_cfg=strong_cfg,
+            source_sem, poses, grid=pcfg.grid, strong_cfg=strong_cfg,
             frame_dt_s=float(pcfg.frame_dt_s),
         )
         _, dormant = split_current_and_dormant_tracks(tracks)
         tracks_use = list(dormant)
-        sem_use, obs_use = history_sem, history_obs
+        sem_use, obs_use = source_sem, history_obs
         if not tracks_use:
             return None
         arrays = prepare_causal_arrays_from_tracks(
@@ -325,8 +329,16 @@ def main():
             if int(a.synthetic_per_window) > 0:
                 # Select current sources from a clean causal rebuild, then each
                 # synthetic sample goes through the full recomputation helper.
+                clean_sem = [
+                    np.where(
+                        np.asarray(raw["history_observed"][ti], dtype=bool),
+                        np.asarray(raw["history_occ"][ti], dtype=np.uint8),
+                        int(pcfg.free_label),
+                    ).astype(np.uint8)
+                    for ti in range(6)
+                ]
                 clean_tracks, clean_comps = build_dynamic_source_memory(
-                    [np.asarray(x) for x in raw["history_occ"]],
+                    clean_sem,
                     [np.asarray(x) for x in raw["history_poses"]],
                     grid=pcfg.grid, strong_cfg=strong_cfg,
                     frame_dt_s=float(pcfg.frame_dt_s),
