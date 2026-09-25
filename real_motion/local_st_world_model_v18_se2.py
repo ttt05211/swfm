@@ -195,7 +195,7 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             }
             if return_latents:
                 out["history_source_context"] = features.new_empty(
-                    (0, 0, int(cfg.d_model))
+                    (0, int(cfg.d_model))
                 )
                 out["future_transport_queries"] = features.new_empty(
                     (0, FUTURE_FRAMES, int(cfg.d_model))
@@ -235,7 +235,7 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             # V20 observation-only interface.  These tensors are computed from
             # the exact frozen V18 path; exposing them does not modify q or any
             # default prediction.  No future semantic observation enters here.
-            out["history_source_context"] = context
+            out["history_source_context"] = context.mean(dim=1)
             out["future_transport_queries"] = q
         return out
 
