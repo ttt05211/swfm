@@ -15,6 +15,28 @@ from .v20_scene_model import V20HistoryWorldModel, V20SceneConfig
 
 CHECKPOINT_PROTOCOL = "p0_f9_v20_checkpoint_v1"
 
+_DYNAMIC_TO_LOCAL = {int(cid): i for i, cid in enumerate(DYNAMIC_IDS)}
+
+
+def dynamic_global_to_local(class_id: torch.Tensor) -> torch.Tensor:
+    """Map frozen Occ3D dynamic semantic IDs to Birth-local [0,K) IDs."""
+    out = torch.full_like(class_id.long(), -1)
+    for cid, local in _DYNAMIC_TO_LOCAL.items():
+        out[class_id.long() == int(cid)] = int(local)
+    if bool((out < 0).any()):
+        bad = torch.unique(class_id[out < 0]).detach().cpu().tolist()
+        raise ValueError(f"Birth target contains non-dynamic class IDs: {bad}")
+    return out
+
+
+def dynamic_local_to_global(class_id: torch.Tensor) -> torch.Tensor:
+    """Inverse map for Birth rendering/evaluation; no-object is not accepted."""
+    lut = torch.as_tensor(DYNAMIC_IDS, dtype=torch.long, device=class_id.device)
+    x = class_id.long()
+    if bool(((x < 0) | (x >= len(DYNAMIC_IDS))).any()):
+        raise ValueError("Birth local class index outside dynamic taxonomy")
+    return lut[x]
+
 
 def static_semantic_loss(
     logits: torch.Tensor,
@@ -118,7 +140,8 @@ def _pair_cost(
     if N == 0:
         return pred_class_logits.new_empty((Q, 0))
     prob = pred_class_logits.softmax(-1)
-    cls = -prob[:, target_class.long()]  # Q,N
+    target_local = dynamic_global_to_local(target_class)
+    cls = -prob[:, target_local.long()]  # Q,N
     pe = torch.sigmoid(pred_exist_logits)[:, None, :]
     te = target_exist.to(pe.dtype)[None, :, :]
     exist = (pe - te).abs().mean(dim=-1)
@@ -183,7 +206,7 @@ def birth_set_loss(
         if qi.numel() == 0:
             continue
         tgt = targets[b]
-        cls_tgt[b, qi] = tgt["class_id"].long()[ti]
+        cls_tgt[b, qi] = dynamic_global_to_local(tgt["class_id"].long()[ti])
         ex = tgt["existence"].to(outputs["existence_logits"].dtype)[ti]
         exist_loss = exist_loss + F.binary_cross_entropy_with_logits(
             outputs["existence_logits"][b, qi], ex
