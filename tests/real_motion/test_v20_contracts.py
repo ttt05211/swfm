@@ -44,7 +44,7 @@ def test_v18_optional_latents_do_not_change_default_predictions():
     for key in base:
         assert torch.equal(base[key], exposed[key])
     assert exposed["future_transport_queries"].shape == (B, FUTURE_FRAMES, cfg.d_model)
-    assert exposed["history_source_context"].shape[0] == B
+    assert exposed["history_source_context"].shape == (B, cfg.d_model)
 
 
 def test_observed_free_and_unknown_are_distinct_after_one_alignment():
@@ -60,6 +60,7 @@ def test_observed_free_and_unknown_are_distinct_after_one_alignment():
         history_semantic=sem,
         history_observed=obs,
         history_ego_to_world=poses,
+        t0_ego_to_world=np.eye(4),
         native_origin_xyz_m=(0, 0, 0),
         native_voxel_size_xyz_m=(1, 1, 1),
     )
@@ -74,7 +75,7 @@ def test_future_union_query_reports_oob_instead_of_silent_clipping():
     poses[-1, 0, 3] = 100.0
     report = future_union_query_mask(
         lattice,
-        future_ego_to_world=poses,
+        future_ego_to_canonical=poses,
         native_shape_xyz=(2, 2, 2),
         native_origin_xyz_m=(-1, -1, -1),
         native_voxel_size_xyz_m=(1, 1, 1),
