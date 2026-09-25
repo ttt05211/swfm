@@ -243,7 +243,7 @@ class BirthQueryHead(nn.Module):
         scene_dim: int,
         cfg: V20SceneConfig = V20SceneConfig(),
         *,
-        shape_size_xyz: tuple[int, int, int] = (12, 12, 8),
+        shape_size_xyz: tuple[int, int, int] = (36, 18, 12),
     ):
         super().__init__()
         self.cfg = cfg
