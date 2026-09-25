@@ -147,6 +147,17 @@ class StaticWorldHead(nn.Module):
             nn.GELU(),
             nn.Conv3d(td, SEMANTIC_CLASSES, 1),
         )
+        # Zero-contribution initialization: before training, Static decodes to
+        # free everywhere. This is stronger than merely disabling the branch.
+        nn.init.zeros_(self.coarse_head.weight)
+        nn.init.zeros_(self.coarse_head.bias)
+        with torch.no_grad():
+            self.coarse_head.bias[FREE_LABEL] = 8.0
+        last = self.tile_refine[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+        with torch.no_grad():
+            last.bias[FREE_LABEL] = 8.0
 
     def forward_coarse(self, scene: torch.Tensor) -> torch.Tensor:
         return self.coarse_head(scene)
@@ -206,6 +217,7 @@ class DormantSourceHead(nn.Module):
         self.exist = nn.Linear(h, 1)
         nn.init.zeros_(self.xy.weight); nn.init.zeros_(self.xy.bias)
         nn.init.zeros_(self.yaw.weight); nn.init.zeros_(self.yaw.bias)
+        nn.init.zeros_(self.exist.weight); nn.init.constant_(self.exist.bias, -8.0)
 
     def forward(self, source_token: torch.Tensor, local_scene: torch.Tensor) -> dict[str, torch.Tensor]:
         h = self.fusion(source_token, local_scene)
@@ -259,6 +271,15 @@ class BirthQueryHead(nn.Module):
         self.traj_head = nn.Linear(h, FUTURE_FRAMES * 3)  # x,y,yaw
         sx, sy, sz = self.shape_size_xyz
         self.shape_head = nn.Linear(h, sx * sy * sz)
+        # No-object/no-existence initialization makes Birth render nothing.
+        nn.init.zeros_(self.class_head.weight)
+        nn.init.zeros_(self.class_head.bias)
+        nn.init.zeros_(self.exist_head.weight)
+        nn.init.constant_(self.exist_head.bias, -8.0)
+        nn.init.zeros_(self.shape_head.weight)
+        nn.init.constant_(self.shape_head.bias, -8.0)
+        with torch.no_grad():
+            self.class_head.bias[int(cfg.dynamic_classes)] = 8.0
 
     def forward(self, scene: torch.Tensor) -> dict[str, torch.Tensor]:
         if scene.ndim != 5:
