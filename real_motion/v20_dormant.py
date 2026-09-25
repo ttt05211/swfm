@@ -74,8 +74,14 @@ def recompute_synthetic_t0_occlusion(
     if any(a.shape != b.shape for a, b in zip(sem, obs)):
         raise ValueError("semantic/observed shape mismatch")
 
+    # V20 Dormant ancestry means genuinely observed source evidence. Unknown
+    # semantic GT cells are not allowed to instantiate memory tracks.
+    source_sem = [
+        np.where(o, s, int(free_label)).astype(np.uint8)
+        for s, o in zip(sem, obs)
+    ]
     clean_tracks, clean_comps = build_dynamic_source_memory(
-        sem,
+        source_sem,
         history_poses,
         grid=grid,
         strong_cfg=strong_cfg,
@@ -91,12 +97,13 @@ def recompute_synthetic_t0_occlusion(
     if vox.ndim != 2 or vox.shape[1] != 3 or len(vox) == 0:
         raise RuntimeError("selected t0 source has no voxel geometry")
     sem[-1][vox[:, 0], vox[:, 1], vox[:, 2]] = int(free_label)
+    source_sem[-1][vox[:, 0], vox[:, 1], vox[:, 2]] = int(free_label)
     # Removing the observation itself is essential: observed-free would claim
     # evidence that the object is absent, which is not the intended occlusion.
     obs[-1][vox[:, 0], vox[:, 1], vox[:, 2]] = False
 
     rebuilt_tracks, rebuilt_comps = build_dynamic_source_memory(
-        sem,
+        source_sem,
         history_poses,
         grid=grid,
         strong_cfg=strong_cfg,
@@ -114,7 +121,7 @@ def recompute_synthetic_t0_occlusion(
 
     arrays = prepare_causal_arrays_from_tracks(
         [dormant],
-        sem,
+        source_sem,
         history_poses,
         grid=grid,
         free_label=int(free_label),
