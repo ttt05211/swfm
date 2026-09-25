@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from .local_st_world_model import SEMANTIC_CLASSES
 from .v20_history_world import DYNAMIC_IDS
+from .v19_static_novelty_factorized import FactorizedStaticNewFOVHead
 
 PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_v1"
 
@@ -121,3 +122,50 @@ def decode_per_z_semantic(
     active = candidate_vertical.bool()
     out[active] = cls[active]
     return out
+
+
+class FrozenFactorizedFeatureAdapter(nn.Module):
+    """Expose the frozen V19 decoder feature without changing its predictions."""
+
+    def __init__(self, factorized: FactorizedStaticNewFOVHead):
+        super().__init__()
+        self.factorized = factorized
+        for p in self.factorized.parameters():
+            p.requires_grad = False
+        self.factorized.eval()
+        self._last_feature: torch.Tensor | None = None
+        self._hook = self.factorized.decoder.register_forward_hook(
+            self._capture_decoder_feature
+        )
+
+    def _capture_decoder_feature(self, module, inputs, output):
+        self._last_feature = output
+
+    @property
+    def feature_channels(self) -> int:
+        # The final decoder Conv2d preserves hidden_dim.
+        for m in reversed(list(self.factorized.decoder.modules())):
+            if isinstance(m, nn.Conv2d):
+                return int(m.out_channels)
+        raise RuntimeError("cannot infer frozen Factorized decoder channels")
+
+    def forward(self, *args, **kwargs):
+        self._last_feature = None
+        with torch.no_grad():
+            outputs = self.factorized(*args, **kwargs)
+        feat = self._last_feature
+        if feat is None:
+            raise RuntimeError("Factorized decoder feature hook did not fire")
+        B = int(args[0].shape[0])
+        Fh = int(args[0].shape[1])
+        if feat.shape[0] != B * Fh:
+            raise RuntimeError("unexpected Factorized decoder batch shape")
+        feat = feat.reshape(B, Fh, feat.shape[1], feat.shape[2], feat.shape[3])
+        return outputs, feat
+
+    def train(self, mode: bool = True):
+        # Wrapper may be put in train mode by callers, but frozen V19 must stay eval.
+        super().train(mode)
+        self.factorized.eval()
+        return self
+
