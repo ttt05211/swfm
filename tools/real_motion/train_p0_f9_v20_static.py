@@ -25,6 +25,12 @@ from real_motion.v20_history_world import (
     native_sparse_to_canonical_indices,
 )
 from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+from real_motion.v20_stage1_codec import (
+    unpack_bool,
+    unpack_history_semantic,
+    unpack_static_indices_and_labels,
+    unpack_static_labels,
+)
 from real_motion.v20_training import checkpoint_payload
 from tools.real_motion.build_p0_f9_v20_history_cache import PROTOCOL as CACHE_PROTOCOL
 
@@ -48,13 +54,6 @@ def _lattice(d):
     )
 
 
-def _unpack(bits, shape):
-    a = np.asarray(bits.cpu(), dtype=np.uint8)
-    n = int(np.prod(shape))
-    x = np.unpackbits(a, bitorder="little", count=n)
-    return x.reshape(shape).astype(bool)
-
-
 def _iter_rows(root, idx, shuffle, seed):
     order = list(range(len(idx["shards"])))
     rng = random.Random(int(seed))
@@ -72,9 +71,10 @@ def _iter_rows(root, idx, shuffle, seed):
 
 def _row_history(row, device):
     shape = (6,) + tuple(int(x) for x in row["coarse_shape_xyz"])
-    obs = _unpack(row["history_observed_bits"], shape)
-    free = _unpack(row["history_observed_free_bits"], shape)
-    sem = row["history_semantic_coarse"].to(device).unsqueeze(0)
+    obs = unpack_bool(row["history_observed_bits"], shape)
+    free = unpack_bool(row["history_observed_free_bits"], shape)
+    sem_np = unpack_history_semantic(row, obs, free)
+    sem = torch.from_numpy(sem_np).to(device).unsqueeze(0)
     return (
         sem,
         torch.from_numpy(obs).to(device).unsqueeze(0),
@@ -83,7 +83,9 @@ def _row_history(row, device):
     )
 
 
-def _aggregate_sparse_targets(row, lattice, native_origin, native_step):
+def _aggregate_sparse_targets(
+    row, lattice, native_shape, native_origin, native_step
+):
     """Merge six future observed static/free labels in canonical coordinates.
 
     Disagreeing labels at one canonical cell are ignored instead of forcing a
@@ -92,8 +94,9 @@ def _aggregate_sparse_targets(row, lattice, native_origin, native_step):
     table = {}
     rel = np.asarray(row["future_ego_to_t0"], dtype=np.float64)
     for fi, sup in enumerate(row["static_supervision"]):
-        native = np.asarray(sup["indices_xyz"], dtype=np.int64)
-        labels = np.asarray(sup["semantic"], dtype=np.int64)
+        native, labels = unpack_static_indices_and_labels(
+            sup, native_shape
+        )
         if len(native) == 0:
             continue
         idx, valid = native_sparse_to_canonical_indices(
@@ -135,7 +138,7 @@ def _class_weights(root, idx):
     hist = np.zeros(18, dtype=np.int64)
     for row in _iter_rows(root, idx, False, 0):
         for sup in row["static_supervision"]:
-            y = np.asarray(sup["semantic"], dtype=np.int64)
+            y = unpack_static_labels(sup).astype(np.int64, copy=False)
             hist += np.bincount(y, minlength=18)[:18]
     allowed = [i for i in range(18) if i not in DYNAMIC_SET and hist[i] > 0]
     ref = float(np.median([hist[i] for i in allowed])) if allowed else 1.0
@@ -229,7 +232,10 @@ def _autocast(device, enabled):
     return nullcontext()
 
 
-def _epoch(model, root, idx, high, coarse, native_origin, native_step, device, weights, *, optimizer, tile_size, seed, amp):
+def _epoch(
+    model, root, idx, high, coarse, native_shape, native_origin, native_step,
+    device, weights, *, optimizer, tile_size, seed, amp
+):
     train = optimizer is not None
     model.train(train)
     # Dormant/Birth are not part of Stage 2.
@@ -239,8 +245,12 @@ def _epoch(model, root, idx, high, coarse, native_origin, native_step, device, w
     n = 0
     for row in _iter_rows(root, idx, train, seed):
         sem, obs, free, obs_np = _row_history(row, device)
-        coarse_idx, coarse_y = _aggregate_sparse_targets(row, coarse, native_origin, native_step)
-        high_idx, high_y = _aggregate_sparse_targets(row, high, native_origin, native_step)
+        coarse_idx, coarse_y = _aggregate_sparse_targets(
+            row, coarse, native_shape, native_origin, native_step
+        )
+        high_idx, high_y = _aggregate_sparse_targets(
+            row, high, native_shape, native_origin, native_step
+        )
         with _autocast(device, amp):
             scene = model.encode_history(sem, obs, free)
             clogits = model.static.forward_coarse(scene)
@@ -319,8 +329,12 @@ def main():
     )
     amp = device.type == "cuda" and not bool(a.no_amp)
     tile_size = tuple(int(x) for x in a.tile_size.split(","))
-    native_origin = (-40.0, -40.0, -1.0)
-    native_step = (0.4, 0.4, 0.4)
+    native = dict(tr_idx["native_grid"])
+    if dict(va_idx["native_grid"]) != native:
+        raise RuntimeError("train/val native grid mismatch")
+    native_shape = tuple(int(x) for x in native["shape_xyz"])
+    native_origin = tuple(float(x) for x in native["origin_xyz_m"])
+    native_step = tuple(float(x) for x in native["voxel_size_xyz_m"])
 
     out = Path(a.output_dir)
     if out.exists() and any(out.iterdir()):
@@ -329,13 +343,13 @@ def main():
     history = []
     for epoch in range(1, int(a.epochs) + 1):
         tr = _epoch(
-            model, tr_root, tr_idx, high, coarse, native_origin, native_step,
+            model, tr_root, tr_idx, high, coarse, native_shape, native_origin, native_step,
             device, weights, optimizer=optimizer, tile_size=tile_size,
             seed=int(a.seed) + epoch, amp=amp,
         )
         with torch.no_grad():
             va = _epoch(
-                model, va_root, va_idx, high, coarse, native_origin, native_step,
+                model, va_root, va_idx, high, coarse, native_shape, native_origin, native_step,
                 device, weights, optimizer=None, tile_size=tile_size,
                 seed=int(a.seed), amp=amp,
             )

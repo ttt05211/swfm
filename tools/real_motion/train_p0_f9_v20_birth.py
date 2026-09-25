@@ -21,6 +21,7 @@ import torch
 from real_motion.v20_birth import birth_targets_from_cache_row
 from real_motion.v20_runtime import v18_birth_condition_from_record
 from real_motion.v20_scene_model import BirthQueryHead
+from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
 from real_motion.v20_training import birth_set_loss, checkpoint_payload, load_v20_checkpoint
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -49,11 +50,6 @@ def _iter_rows(root, idx, shuffle, rng):
         yield from rows
 
 
-def _unpack(bits, shape):
-    arr = np.asarray(bits.cpu(), dtype=np.uint8)
-    return np.unpackbits(arr, bitorder="little", count=int(np.prod(shape))).reshape(shape).astype(bool)
-
-
 def _record_map(cache_path):
     _, records = base.load_cache(cache_path)
     out = {}
@@ -67,9 +63,10 @@ def _record_map(cache_path):
 
 def _scene(model, row, device):
     shape = (6,) + tuple(int(x) for x in row["coarse_shape_xyz"])
-    obs = _unpack(row["history_observed_bits"], shape)
-    free = _unpack(row["history_observed_free_bits"], shape)
-    sem = row["history_semantic_coarse"].to(device).unsqueeze(0)
+    obs = unpack_bool(row["history_observed_bits"], shape)
+    free = unpack_bool(row["history_observed_free_bits"], shape)
+    sem_np = unpack_history_semantic(row, obs, free)
+    sem = torch.from_numpy(sem_np).to(device).unsqueeze(0)
     with torch.no_grad():
         return model.encode_history(
             sem,

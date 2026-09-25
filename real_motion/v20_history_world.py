@@ -285,9 +285,8 @@ def align_history_once_to_canonical(
     poses = np.stack([world_to_t0 @ p for p in poses_world], axis=0)
 
     native_shape = sem.shape[1:]
-    local = grid_centers_xyz(
-        native_shape, native_origin_xyz_m, native_voxel_size_xyz_m
-    ).reshape(-1, 3)
+    native_origin = np.asarray(native_origin_xyz_m, dtype=np.float64)
+    native_step = np.asarray(native_voxel_size_xyz_m, dtype=np.float64)
     cshape = (HISTORY_FRAMES,) + tuple(lattice.shape_xyz)
     out_sem = np.full(cshape, int(free_label), dtype=np.uint8)
     out_obs = np.zeros(cshape, dtype=bool)
@@ -295,17 +294,27 @@ def align_history_once_to_canonical(
     oob = 0
 
     for t in range(HISTORY_FRAMES):
+        # Only lidar-observed native voxels can contribute evidence.  Mapping
+        # every unknown voxel wastes most of the Stage-1 build time.  flatnonzero
+        # preserves native C-order, so collision/first-label semantics stay exact.
         src_sem = sem[t].reshape(-1)
         src_obs = obs[t].reshape(-1)
+        src_id = np.flatnonzero(src_obs)
+        if src_id.size == 0:
+            continue
+        native_idx = np.column_stack(
+            np.unravel_index(src_id, native_shape)
+        ).astype(np.float64, copy=False)
+        local = native_origin[None] + (native_idx + 0.5) * native_step[None]
         world = transform_points(poses[t], local)
         idx, in_bounds = lattice.world_to_index(world)
-        oob += int((src_obs & ~in_bounds).sum())
+        oob += int((~in_bounds).sum())
         frame_sem, frame_obs, frame_conflict = (
             _rasterize_observed_frame_vectorized(
                 idx,
                 in_bounds,
-                src_sem,
-                src_obs,
+                src_sem[src_id],
+                np.ones(src_id.size, dtype=bool),
                 canonical_shape_xyz=lattice.shape_xyz,
                 free_label=int(free_label),
             )

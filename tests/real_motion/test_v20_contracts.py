@@ -18,6 +18,14 @@ from real_motion.v20_history_world import (
     protected_add_only,
     _rasterize_observed_frame_vectorized,
 )
+from real_motion.v20_stage1_codec import (
+    pack_bool,
+    pack_history_semantic,
+    pack_static_supervision,
+    unpack_bool,
+    unpack_history_semantic,
+    unpack_static_indices_and_labels,
+)
 from real_motion.v20_scene_model import (
     BirthQueryHead,
     HistoricalEvidence3DEncoder,
@@ -563,3 +571,95 @@ def test_fresh_v20_heads_are_zero_contribution_before_training():
         free_label=17,
     )
     assert_zero_contribution_identity(base, combined)
+
+
+def test_stage1_v2_history_codec_roundtrip_is_exact():
+    rng = np.random.default_rng(31)
+    shape = (6, 4, 3, 2)
+    obs = rng.random(shape) > 0.45
+    sem = rng.integers(0, 17, size=shape, dtype=np.uint8)
+    free = obs & (rng.random(shape) > 0.65)
+    sem[~obs] = 17
+    sem[free] = 17
+    occupied = obs & ~free
+    # Ensure occupied locations never use the free label.
+    sem[occupied] %= 17
+    packed = pack_history_semantic(sem, obs, free)
+    row = dict(packed)
+    obs2 = unpack_bool(pack_bool(obs), shape)
+    free2 = unpack_bool(pack_bool(free), shape)
+    sem2 = unpack_history_semantic(row, obs2, free2)
+    assert np.array_equal(obs2, obs)
+    assert np.array_equal(free2, free)
+    assert np.array_equal(sem2, sem)
+
+
+def test_stage1_v2_static_supervision_codec_roundtrip_is_exact():
+    rng = np.random.default_rng(37)
+    shape = (5, 4, 3)
+    gt = rng.integers(0, 18, size=shape, dtype=np.uint8)
+    obs = rng.random(shape) > 0.30
+    sup = pack_static_supervision(gt, obs)
+    idx, labels = unpack_static_indices_and_labels(sup, shape)
+    dyn = np.isin(gt, np.asarray(DYNAMIC_CLASS_IDS, dtype=np.uint8))
+    valid = obs & ~dyn
+    assert np.array_equal(idx, np.argwhere(valid))
+    assert np.array_equal(labels.astype(np.uint8), gt[valid])
+
+
+def test_sparse_observed_history_alignment_matches_full_mapping_reference():
+    rng = np.random.default_rng(41)
+    native_shape = (4, 3, 2)
+    lattice = CanonicalLattice((-1, -1, -1), (1, 1, 1), (7, 7, 5))
+    sem = rng.integers(
+        0, 18, size=(HISTORY_FRAMES,) + native_shape, dtype=np.uint8
+    )
+    obs = rng.random(sem.shape) > 0.55
+    poses = np.repeat(np.eye(4)[None], HISTORY_FRAMES, axis=0)
+    poses[:, 0, 3] = np.linspace(0.0, 0.4, HISTORY_FRAMES)
+
+    got = align_history_once_to_canonical(
+        lattice,
+        history_semantic=sem,
+        history_observed=obs,
+        history_ego_to_world=poses,
+        t0_ego_to_world=poses[-1],
+        native_origin_xyz_m=(0, 0, 0),
+        native_voxel_size_xyz_m=(1, 1, 1),
+        free_label=17,
+    )
+
+    # Reference uses the previous dense-grid mapping formulation.
+    local = np.stack(
+        np.meshgrid(
+            np.arange(native_shape[0], dtype=np.float64) + 0.5,
+            np.arange(native_shape[1], dtype=np.float64) + 0.5,
+            np.arange(native_shape[2], dtype=np.float64) + 0.5,
+            indexing="ij",
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    ref_sem = np.full_like(got.semantic, 17)
+    ref_obs = np.zeros_like(got.observed)
+    ref_conflict = np.zeros_like(got.conflict)
+    world_to_t0 = np.linalg.inv(poses[-1])
+    ref_oob = 0
+    for t in range(HISTORY_FRAMES):
+        T = world_to_t0 @ poses[t]
+        world = local @ T[:3, :3].T + T[:3, 3]
+        idx, valid = lattice.world_to_index(world)
+        src_obs = obs[t].reshape(-1)
+        ref_oob += int((src_obs & ~valid).sum())
+        a, b, c = _rasterize_observed_frame_vectorized(
+            idx,
+            valid,
+            sem[t].reshape(-1),
+            src_obs,
+            canonical_shape_xyz=lattice.shape_xyz,
+            free_label=17,
+        )
+        ref_sem[t], ref_obs[t], ref_conflict[t] = a, b, c
+    assert np.array_equal(got.semantic, ref_sem)
+    assert np.array_equal(got.observed, ref_obs)
+    assert np.array_equal(got.conflict, ref_conflict)
+    assert got.out_of_bounds_samples == ref_oob

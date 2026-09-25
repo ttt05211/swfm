@@ -42,14 +42,18 @@ from real_motion.v20_history_world import (
     CanonicalLattice,
     DynamicResponsibility,
     align_history_once_to_canonical,
-    future_union_query_mask,
     poses_to_t0_canonical,
+)
+from real_motion.v20_stage1_codec import (
+    pack_bool,
+    pack_history_semantic,
+    pack_static_supervision,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import CachedSource
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 
-PROTOCOL = "p0_f9_v20_stage1_history_cache_v1"
+PROTOCOL = "p0_f9_v20_stage1_history_cache_v2"
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 
 
@@ -86,11 +90,6 @@ def _coarse_lattice(cfg):
         coarse_shape,
     )
     return high, coarse
-
-
-def _pack_bool(x):
-    arr = np.asarray(x, dtype=np.uint8)
-    return np.packbits(arr.reshape(-1), bitorder="little")
 
 
 def _ann_by_instance(nusc, token):
@@ -198,20 +197,18 @@ def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
 
 def _static_sparse_supervision(source, w, raw, free_label):
     rows = []
-    for fi, token in enumerate(w.future_tokens):
-        gt, obs = source.load_occ3d(str(w.scene_name), str(token), require_lidar_mask=True)
-        gt = np.asarray(gt, dtype=np.uint8)
-        obs = np.asarray(obs, dtype=bool)
-        dyn = np.isin(gt, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
-        valid = obs & ~dyn
-        idx = np.argwhere(valid).astype(np.int16)
-        lab = gt[valid].astype(np.uint8)
-        rows.append({
-            "indices_xyz": torch.from_numpy(idx),
-            "semantic": torch.from_numpy(lab),
-            "observed_count": int(valid.sum()),
-            "observed_free_count": int((valid & (gt == int(free_label))).sum()),
-        })
+    for token in w.future_tokens:
+        gt, obs = source.load_occ3d(
+            str(w.scene_name), str(token), require_lidar_mask=True
+        )
+        rows.append(
+            pack_static_supervision(
+                np.asarray(gt, dtype=np.uint8),
+                np.asarray(obs, dtype=bool),
+                dynamic_class_ids=DYNAMIC_IDS,
+                free_label=int(free_label),
+            )
+        )
     return rows
 
 
@@ -229,6 +226,17 @@ def main():
     a = p.parse_args()
 
     v20 = _load_v20(a.v20_config)
+    extent = v20["canonical_lattice"]
+    for key in (
+        "extent_train_future_oob_voxels",
+        "extent_dev_future_oob_voxels",
+        "extent_train_history_oob_voxels",
+        "extent_dev_history_oob_voxels",
+    ):
+        if int(extent.get(key, -1)) != 0:
+            raise RuntimeError(
+                f"Stage-1 v2 requires frozen zero-OOB proof: {key}"
+            )
     high, coarse = _coarse_lattice(v20)
     pcfg = make_prepare_config(load_runtime_config(a.config, a.override))
     _, records = base.load_cache(a.source_cache)
@@ -250,6 +258,8 @@ def main():
     window_compute_seconds = []
     started = time.perf_counter()
     oob_query = oob_history = 0
+    history_semantic_values = 0
+    static_semantic_values = 0
     dyn_totals = {x.name: 0 for x in DynamicResponsibility}
     scene_names = set()
     for wi, rec in enumerate(records, start=1):
@@ -274,13 +284,6 @@ def main():
             native_voxel_size_xyz_m=pcfg.grid.voxel_size,
             free_label=int(pcfg.free_label),
         )
-        q = future_union_query_mask(
-            coarse,
-            future_ego_to_canonical=future_rel,
-            native_shape_xyz=pcfg.grid.shape_hwd,
-            native_origin_xyz_m=(pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min),
-            native_voxel_size_xyz_m=pcfg.grid.voxel_size,
-        )
         _, matched, ambiguous = _history_source_evidence(
             source, w, raw, pcfg, strong_cfg, float(a.match_max_distance_m)
         )
@@ -289,21 +292,31 @@ def main():
             dyn_totals[k] += int(v)
 
         static_sup = _static_sparse_supervision(source, w, raw, int(pcfg.free_label))
-        oob_query += int(q.out_of_bounds_voxels)
+        # Future query OOB was already proven zero by the frozen full-population
+        # Omega audit. Stage-1 v2 deliberately does not re-rasterize 3.84M
+        # future native points per window just to reproduce that proof.
         oob_history += int(aligned.out_of_bounds_samples)
+        packed_history = pack_history_semantic(
+            aligned.semantic,
+            aligned.observed,
+            aligned.observed_free,
+            free_label=int(pcfg.free_label),
+        )
+        history_semantic_values += int(
+            packed_history["history_semantic_count"]
+        )
+        static_semantic_values += int(
+            sum(int(x["semantic_count"]) for x in static_sup)
+        )
         rows.append({
             "scene_name": str(w.scene_name),
             "t0_token": str(w.t0_token),
-            "history_tokens": tuple(str(x) for x in w.history_tokens),
-            "future_tokens": tuple(str(x) for x in w.future_tokens),
-            "history_semantic_coarse": torch.from_numpy(aligned.semantic),
-            "history_observed_bits": torch.from_numpy(_pack_bool(aligned.observed)),
-            "history_observed_free_bits": torch.from_numpy(_pack_bool(aligned.observed_free)),
-            "history_conflict_bits": torch.from_numpy(_pack_bool(aligned.conflict)),
+            **packed_history,
+            "history_observed_bits": pack_bool(aligned.observed),
+            "history_observed_free_bits": pack_bool(aligned.observed_free),
             "coarse_shape_xyz": tuple(int(x) for x in coarse.shape_xyz),
-            "query_mask_bits": torch.from_numpy(_pack_bool(q.mask)),
             "future_ego_to_t0": torch.from_numpy(future_rel.astype(np.float32)),
-            "query_oob_voxels": int(q.out_of_bounds_voxels),
+            "query_oob_voxels": 0,
             "history_oob_observed_samples": int(aligned.out_of_bounds_samples),
             "static_supervision": static_sup,
             "dynamic_supervision": dyn,
@@ -346,10 +359,42 @@ def main():
             "voxel_size_xyz_m": list(coarse.voxel_size_xyz_m),
             "shape_xyz": list(coarse.shape_xyz),
         },
+        "native_grid": {
+            "shape_xyz": [int(x) for x in pcfg.grid.shape_hwd],
+            "origin_xyz_m": [
+                float(pcfg.grid.x_min),
+                float(pcfg.grid.y_min),
+                float(pcfg.grid.z_min),
+            ],
+            "voxel_size_xyz_m": [float(x) for x in pcfg.grid.voxel_size],
+        },
+        "cache_layout": {
+            "version": 2,
+            "history_semantic": (
+                "5-bit labels at observed occupied coarse cells; "
+                "positions reconstructed from observed/free masks"
+            ),
+            "static_supervision": (
+                "packed native valid mask + 4-bit remapped static/free labels "
+                "in C-order"
+            ),
+            "omitted_recomputable_fields": [
+                "query_mask_bits",
+                "history_conflict_bits",
+                "history_tokens",
+                "future_tokens",
+            ],
+            "query_oob_source": (
+                "frozen full-population Omega-max audit; no per-window "
+                "future query rasterization during cache build"
+            ),
+        },
         "inference_fields_use_future_semantics": False,
         "dynamic_identity_is_supervision_only": True,
         "query_out_of_bounds_voxels": int(oob_query),
         "history_out_of_bounds_observed_samples": int(oob_history),
+        "compressed_history_semantic_values": int(history_semantic_values),
+        "compressed_static_semantic_values": int(static_semantic_values),
         "dynamic_partition_counts": dyn_totals,
         "build_profile": {
             "elapsed_seconds": float(time.perf_counter() - started),
