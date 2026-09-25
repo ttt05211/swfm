@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .local_st_world_model import SEMANTIC_CLASSES
+from .v20_history_world import DYNAMIC_IDS
 
 PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_v1"
 
@@ -94,8 +95,12 @@ def per_z_semantic_loss(
     mask = supervised_candidate.bool()
     if not bool(mask.any()):
         return logits.sum() * 0.0
-    rows = logits.permute(0, 2, 3, 4, 1)[mask]
+    rows = logits.permute(0, 2, 3, 4, 1)[mask].clone()
     target = target_semantic.long()[mask]
+    # Stage 0 evaluates static New-FOV only. Dynamic logits are prohibited even
+    # if numerical noise would otherwise make them win argmax.
+    dyn = torch.as_tensor(DYNAMIC_IDS, dtype=torch.long, device=rows.device)
+    rows[:, dyn] = torch.finfo(rows.dtype).min
     return F.cross_entropy(rows, target, weight=class_weight)
 
 
@@ -108,7 +113,10 @@ def decode_per_z_semantic(
     """Return [B,Z,H,W] semantic proposal under frozen V19 geometry."""
     if logits.ndim != 5 or candidate_vertical.ndim != 4:
         raise ValueError("unexpected Stage-0 tensor rank")
-    cls = logits.argmax(dim=1)
+    masked = logits.clone()
+    dyn = torch.as_tensor(DYNAMIC_IDS, dtype=torch.long, device=masked.device)
+    masked[:, dyn] = torch.finfo(masked.dtype).min
+    cls = masked.argmax(dim=1)
     out = torch.full_like(cls, int(free_label))
     active = candidate_vertical.bool()
     out[active] = cls[active]
