@@ -160,6 +160,8 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         kta_displacement_xy_m: torch.Tensor,
         frame_motion_features: torch.Tensor | None = None,
         target_source_mask_tube: torch.Tensor | None = None,
+        *,
+        return_latents: bool = False,
     ) -> dict[str, torch.Tensor]:
         cfg = self.config
         if features.ndim != 2 or features.shape[-1] != FEATURE_DIM:
@@ -186,11 +188,19 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             raise ValueError("target source mask must be binary")
 
         if B == 0:
-            return {
+            out = {
                 "residual_xy_m": features.new_empty((0, FUTURE_FRAMES, 2)),
                 "existence_logits": features.new_empty((0, FUTURE_FRAMES)),
                 "yaw_delta_rad": features.new_empty((0, FUTURE_FRAMES)),
             }
+            if return_latents:
+                out["history_source_context"] = features.new_empty(
+                    (0, 0, int(cfg.d_model))
+                )
+                out["future_transport_queries"] = features.new_empty(
+                    (0, FUTURE_FRAMES, int(cfg.d_model))
+                )
+            return out
 
         emb = self.semantic_embedding(labels) + self.source_mask_embedding(mask_labels)
         x = emb.permute(0, 1, 4, 2, 3).reshape(
@@ -216,11 +226,18 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         for block in self.decoder:
             q = block(q, context)
 
-        return {
+        out = {
             "residual_xy_m": self.residual_head(q),
             "existence_logits": self.existence_head(q)[..., 0],
             "yaw_delta_rad": self.yaw_head(q)[..., 0],
         }
+        if return_latents:
+            # V20 observation-only interface.  These tensors are computed from
+            # the exact frozen V18 path; exposing them does not modify q or any
+            # default prediction.  No future semantic observation enters here.
+            out["history_source_context"] = context
+            out["future_transport_queries"] = q
+        return out
 
 
 def periodic_yaw_loss(
