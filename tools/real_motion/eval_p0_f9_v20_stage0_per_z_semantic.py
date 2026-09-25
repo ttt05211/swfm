@@ -30,6 +30,7 @@ from real_motion.v20_stage0_voxel_semantic import (
     FrozenFactorizedFeatureAdapter,
     PerZSemanticHead,
     decode_per_z_semantic,
+    frozen_factorized_support,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -65,7 +66,7 @@ from tools.real_motion.train_p0_f9_v20_stage0_per_z_semantic import (
     PROTOCOL as STAGE0_TRAIN_PROTOCOL,
 )
 
-PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_eval_v1"
+PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_eval_v2"
 VARIANTS = (
     "v18",
     "v18_static",
@@ -244,7 +245,17 @@ def main():
                 presence_threshold=pth,
                 vertical_threshold=vth,
             )
-            support = original_zxy.ne(free_label)
+            support = frozen_factorized_support(
+                fout,
+                new_fov_mask=nf_t,
+                base_free=free_t,
+                presence_threshold=pth,
+                vertical_threshold=vth,
+            )
+            if not torch.equal(support, original_zxy.ne(free_label)):
+                raise RuntimeError(
+                    "column decoder geometry disagrees with frozen V19 support"
+                )
             B, Fh, C, H, W = feature.shape
             feat = feature.reshape(B * Fh, C, H, W)
             support_bf = support.reshape(B * Fh, support.shape[2], H, W)
@@ -303,6 +314,8 @@ def main():
         "presence_threshold": pth,
         "vertical_threshold": vth,
         "future_gt_used_for_prediction": False,
+        "stage0_geometry_source": "frozen_v19_predicted_presence_and_vertical_support",
+        "gt_vertical_target_used_as_model_input": False,
         "geometry_identity_check": {
             "original_proposed_voxels": proposed_original,
             "stage0_proposed_voxels": proposed_stage0,

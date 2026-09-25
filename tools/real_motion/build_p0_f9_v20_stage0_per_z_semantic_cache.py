@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Augment frozen V19 Factorized New-FOV cache with per-Z GT semantics.
+"""Build a label-only Stage-0 sidecar for frozen V19 Factorized caches.
 
-Stage 0 intentionally keeps V19 presence, vertical support, candidate geometry
-and composition unchanged.  This tool only adds supervision needed to train a
-voxel-wise semantic head. Future GT semantics are written to the supervision
-cache only and never become model inputs.
+The parent V19 cache remains the sole source of inference tensors.  This tool
+writes only per-Z future semantic supervision and identity metadata, so future
+GT cannot travel through the model-input dictionary by construction.
 """
 from __future__ import annotations
 
@@ -24,15 +23,15 @@ from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.v19_innovation_training import unpack_vertical_occupancy_torch
+from real_motion.v20_stage0_voxel_semantic import LABEL_SIDECAR_PROTOCOL
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import CachedSource
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.build_p0_f9_v19_factorized_static_new_fov_cache import (
     PROTOCOL as V19_CACHE_PROTOCOL,
-    TENSOR_KEYS as V19_TENSOR_KEYS,
 )
 
-PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_cache_v1"
+PROTOCOL = LABEL_SIDECAR_PROTOCOL
 IGNORE_LABEL = 255
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 
@@ -42,10 +41,10 @@ def _record_map(source_cache: str):
     out = {}
     for rec in records:
         w = window_from_record(rec)
-        token = str(w.t0_token)
-        if token in out:
-            raise RuntimeError(f"duplicate t0 token in source cache: {token}")
-        out[token] = (rec, w)
+        key = (str(w.scene_name), str(w.t0_token))
+        if key in out:
+            raise RuntimeError(f"duplicate scene/t0 pair in source cache: {key}")
+        out[key] = (rec, w)
     return out
 
 
@@ -83,24 +82,41 @@ def main():
     out_shards = []
     class_hist = {str(i): 0 for i in range(17)}
     supervised_voxels = 0
+    sidecar_bytes = 0
     for shard_id, row in enumerate(idx["shards"]):
-        obj = torch.load(src_root / row["file"], map_location="cpu", weights_only=False)
+        parent_name = str(row["file"])
+        obj = torch.load(
+            src_root / parent_name,
+            map_location="cpu",
+            weights_only=False,
+        )
         if obj.get("protocol") != V19_CACHE_PROTOCOL:
-            raise RuntimeError(f"bad shard protocol: {row['file']}")
+            raise RuntimeError(f"bad shard protocol: {parent_name}")
         n = int(row["count"])
+        if len(obj["scene_name"]) != n or len(obj["t0_token"]) != n:
+            raise RuntimeError(f"malformed V19 shard identities: {parent_name}")
+
         voxel_targets = []
         for bi in range(n):
+            scene = str(obj["scene_name"][bi])
             token = str(obj["t0_token"][bi])
-            if token not in records:
-                raise KeyError(f"t0 token not in source cache: {token}")
-            rec, w = records[token]
+            key = (scene, token)
+            if key not in records:
+                raise KeyError(f"scene/t0 pair not in source cache: {key}")
+            _, w = records[key]
+            if str(w.scene_name) != scene or str(w.t0_token) != token:
+                raise RuntimeError(f"source-cache identity mismatch: {key}")
+
             raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=True)
             gt = np.asarray(raw["future_gt_occ"], dtype=np.uint8)
             if gt.shape != (6,) + tuple(pcfg.grid.shape_hwd):
-                raise RuntimeError(f"future GT shape mismatch for {token}: {gt.shape}")
+                raise RuntimeError(f"future GT shape mismatch for {key}: {gt.shape}")
+
+            # vertical_target_bits is GT-derived supervision from the frozen V19
+            # cache.  It is used only to choose which semantic labels are valid;
+            # it is never copied to the sidecar and never becomes a model input.
             target_bits = obj["vertical_target_bits"][bi : bi + 1]
             target = unpack_vertical_occupancy_torch(target_bits, z)[0]
-            # unpack helper returns [F,Z,H,W]; GT/cache native layout is [F,H,W,Z].
             target = target.permute(0, 2, 3, 1).bool().numpy()
             sem = np.full(gt.shape, IGNORE_LABEL, dtype=np.uint8)
             sem[target] = gt[target]
@@ -108,7 +124,7 @@ def main():
             bad_dyn = target & np.isin(gt, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
             if bool(bad_free.any()) or bool(bad_dyn.any()):
                 raise RuntimeError(
-                    f"Stage-0 target contract violated for {token}: "
+                    f"Stage-0 target contract violated for {key}: "
                     f"free={int(bad_free.sum())} dynamic={int(bad_dyn.sum())}"
                 )
             for cid in range(17):
@@ -118,36 +134,66 @@ def main():
 
         payload = {
             "protocol": PROTOCOL,
-            **{k: obj[k] for k in V19_TENSOR_KEYS},
+            "parent_v19_shard": parent_name,
+            "count": n,
             "voxel_semantic_target": torch.stack(voxel_targets),
             "scene_name": list(obj["scene_name"]),
             "t0_token": list(obj["t0_token"]),
         }
         name = f"shard_{shard_id:05d}.pt"
         torch.save(payload, out_dir / name)
-        out_shards.append({"file": name, "count": n})
+        nbytes = int((out_dir / name).stat().st_size)
+        sidecar_bytes += nbytes
+        out_shards.append(
+            {
+                "file": name,
+                "count": n,
+                "parent_v19_shard": parent_name,
+                "bytes": nbytes,
+            }
+        )
 
     out_idx = {
-        **idx,
         "protocol": PROTOCOL,
         "parent_v19_cache": str(src_root.resolve()),
+        "parent_v19_protocol": V19_CACHE_PROTOCOL,
         "source_cache": str(Path(source_cache).resolve()),
+        "num_windows": int(idx["num_windows"]),
+        "num_scenes": int(idx.get("num_scenes", len(set(idx.get("scene_names", []))))),
+        "scene_names": list(idx.get("scene_names", [])),
+        "grid_shape_hwd": [int(x) for x in idx["grid_shape_hwd"]],
+        "free_label": int(idx.get("free_label", free_label)),
+        "anchor_distance_max_m": float(idx.get("anchor_distance_max_m", 40.0)),
         "future_gt_semantic_is_supervision_only": True,
+        "label_only_sidecar": True,
+        "model_input_tensors_copied_from_v19": False,
+        "pairing_contract": "shard + scene_name + t0_token exact order",
         "stage0_frozen_geometry_contract": (
-            "V19 Factorized presence + vertical + New-FOV support + protected composition unchanged"
+            "presence/vertical support is recomputed from the frozen V19 "
+            "checkpoint during train/eval; GT vertical_target is label-only"
         ),
         "voxel_semantic_ignore_label": IGNORE_LABEL,
         "voxel_semantic_supervised_voxels": int(supervised_voxels),
         "voxel_semantic_class_histogram": class_hist,
+        "sidecar_bytes": int(sidecar_bytes),
         "shards": out_shards,
     }
-    (out_dir / "index.json").write_text(json.dumps(out_idx, indent=2), encoding="utf-8")
-    print(json.dumps({
-        "protocol": PROTOCOL,
-        "num_windows": idx["num_windows"],
-        "supervised_voxels": supervised_voxels,
-        "class_histogram": class_hist,
-    }, indent=2))
+    (out_dir / "index.json").write_text(
+        json.dumps(out_idx, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {
+                "protocol": PROTOCOL,
+                "num_windows": int(idx["num_windows"]),
+                "supervised_voxels": int(supervised_voxels),
+                "sidecar_bytes": int(sidecar_bytes),
+                "class_histogram": class_hist,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

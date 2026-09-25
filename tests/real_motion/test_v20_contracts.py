@@ -17,6 +17,14 @@ from real_motion.v20_history_world import (
     protected_add_only,
 )
 from real_motion.v20_scene_model import HistoricalEvidence3DEncoder, V20SceneConfig
+from real_motion.v20_stage0_voxel_semantic import (
+    LABEL_SIDECAR_PROTOCOL,
+    PerZSemanticHead,
+    decode_per_z_semantic,
+    frozen_factorized_support,
+    per_z_semantic_loss,
+    validate_stage0_sidecar_pair,
+)
 from real_motion.v20_training import choose_birth_query_count
 
 
@@ -141,3 +149,98 @@ def test_birth_q_selection_reports_gt_truncation():
     assert s["Q"] >= 1
     assert s["truncated_gt_fraction"] <= 0.1 + 1e-12
     assert s["windows_ge3"] == 2
+
+
+def test_stage0_future_gt_changes_loss_not_model_inputs_or_geometry():
+    torch.manual_seed(17)
+    B, Fh, Z, H, W = 1, 2, 3, 2, 2
+    frozen = {
+        "presence_logits": torch.full((B, Fh, H, W), 8.0),
+        "vertical_logits": torch.full((B, Fh, Z, H, W), 8.0),
+    }
+    new_fov = torch.ones((B, Fh, H, W), dtype=torch.bool)
+    base_free = torch.ones((B, Fh, Z, H, W), dtype=torch.bool)
+
+    support_a = frozen_factorized_support(
+        frozen,
+        new_fov_mask=new_fov,
+        base_free=base_free,
+        presence_threshold=0.5,
+        vertical_threshold=0.5,
+    )
+    # Future GT is deliberately changed after the inference inputs are fixed.
+    static_ids = [cid for cid in range(17) if cid not in set(DYNAMIC_CLASS_IDS)]
+    assert len(static_ids) >= 2
+    target_a = torch.full((B * Fh, Z, H, W), static_ids[0], dtype=torch.long)
+    target_b = torch.full((B * Fh, Z, H, W), static_ids[1], dtype=torch.long)
+
+    support_b = frozen_factorized_support(
+        frozen,
+        new_fov_mask=new_fov,
+        base_free=base_free,
+        presence_threshold=0.5,
+        vertical_threshold=0.5,
+    )
+    assert torch.equal(support_a, support_b)
+
+    feature = torch.randn(B * Fh, 4, H, W)
+    head = PerZSemanticHead(
+        bev_feature_channels=4,
+        vertical_bins=Z,
+        hidden_dim=4,
+    ).eval()
+    with torch.no_grad():
+        pred_a = decode_per_z_semantic(
+            head(feature, support_a.reshape(B * Fh, Z, H, W)),
+            support_a.reshape(B * Fh, Z, H, W),
+            free_label=17,
+        )
+        pred_b = decode_per_z_semantic(
+            head(feature, support_b.reshape(B * Fh, Z, H, W)),
+            support_b.reshape(B * Fh, Z, H, W),
+            free_label=17,
+        )
+    assert torch.equal(pred_a, pred_b)
+    assert torch.equal(pred_a.ne(17), support_a.reshape(B * Fh, Z, H, W))
+
+    logits = torch.zeros((B * Fh, 17, Z, H, W))
+    logits[:, static_ids[0]] = 3.0
+    logits[:, static_ids[1]] = -2.0
+    supervised = support_a.reshape(B * Fh, Z, H, W)
+    loss_a = per_z_semantic_loss(logits, target_a, supervised)
+    loss_b = per_z_semantic_loss(logits, target_b, supervised)
+    assert not torch.equal(loss_a, loss_b)
+
+
+def test_stage0_sidecar_pair_is_label_only_and_identity_checked():
+    v19 = {
+        "scene_name": ["scene-a", "scene-b"],
+        "t0_token": ["t0-a", "t0-b"],
+        "future_aligned_semantic": torch.zeros(2, 1),
+    }
+    labels = {
+        "protocol": LABEL_SIDECAR_PROTOCOL,
+        "parent_v19_shard": "shard_00000.pt",
+        "count": 2,
+        "voxel_semantic_target": torch.zeros((2, 6, 2, 2, 2), dtype=torch.uint8),
+        "scene_name": ["scene-a", "scene-b"],
+        "t0_token": ["t0-a", "t0-b"],
+    }
+    assert validate_stage0_sidecar_pair(
+        v19,
+        labels,
+        expected_parent_shard="shard_00000.pt",
+    ) == 2
+
+    leaked = dict(labels)
+    leaked["vertical_target_bits"] = torch.zeros(1)
+    try:
+        validate_stage0_sidecar_pair(
+            v19,
+            leaked,
+            expected_parent_shard="shard_00000.pt",
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Stage-0 sidecar accepted a copied V19/GT tensor")

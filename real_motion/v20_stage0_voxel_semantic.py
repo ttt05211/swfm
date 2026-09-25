@@ -10,6 +10,8 @@ Factorized New-FOV ceiling.
 """
 from __future__ import annotations
 
+from typing import Mapping
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +21,93 @@ from .v20_history_world import DYNAMIC_IDS
 from .v19_static_novelty_factorized import FactorizedStaticNewFOVHead
 
 PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_v1"
+LABEL_SIDECAR_PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_labels_v2"
+LABEL_SIDECAR_KEYS = frozenset(
+    {
+        "protocol",
+        "parent_v19_shard",
+        "count",
+        "voxel_semantic_target",
+        "scene_name",
+        "t0_token",
+    }
+)
+
+
+def frozen_factorized_support(
+    outputs: Mapping[str, torch.Tensor],
+    *,
+    new_fov_mask: torch.Tensor,
+    base_free: torch.Tensor,
+    presence_threshold: float,
+    vertical_threshold: float,
+) -> torch.Tensor:
+    """Return the frozen V19 predicted occupancy support [B,F,Z,H,W].
+
+    This is the only geometry input allowed into the Stage-0 semantic head.
+    It depends on frozen V19 presence/vertical predictions plus causal
+    New-FOV/base-free masks; no future semantic or vertical GT is accepted.
+    """
+    if "presence_logits" not in outputs or "vertical_logits" not in outputs:
+        raise KeyError("frozen V19 outputs require presence_logits and vertical_logits")
+    pres = outputs["presence_logits"]
+    vert = outputs["vertical_logits"]
+    if pres.ndim != 4 or vert.ndim != 5:
+        raise ValueError("unexpected frozen V19 presence/vertical rank")
+    if vert.shape[:2] != pres.shape[:2] or vert.shape[-2:] != pres.shape[-2:]:
+        raise ValueError("frozen V19 presence/vertical spatial mismatch")
+    if new_fov_mask.ndim == 5:
+        if new_fov_mask.shape[2] != 1:
+            raise ValueError("5D new_fov_mask must have singleton channel")
+        new_fov_mask = new_fov_mask[:, :, 0]
+    if new_fov_mask.shape != pres.shape:
+        raise ValueError("new_fov_mask must match frozen presence logits")
+    if base_free.shape != vert.shape:
+        raise ValueError("base_free must match frozen vertical logits")
+    active = (
+        torch.sigmoid(pres.float()) >= float(presence_threshold)
+    ) & new_fov_mask.bool()
+    z_support = torch.sigmoid(vert.float()) >= float(vertical_threshold)
+    return active.unsqueeze(2) & z_support & base_free.bool()
+
+
+def validate_stage0_sidecar_pair(
+    v19_shard: Mapping[str, object],
+    label_shard: Mapping[str, object],
+    *,
+    expected_parent_shard: str,
+) -> int:
+    """Validate a label-only Stage-0 sidecar against one frozen V19 shard."""
+    if label_shard.get("protocol") != LABEL_SIDECAR_PROTOCOL:
+        raise RuntimeError(
+            f"unexpected Stage-0 label protocol: {label_shard.get('protocol')}"
+        )
+    extra = set(label_shard) - set(LABEL_SIDECAR_KEYS)
+    if extra:
+        raise RuntimeError(
+            "Stage-0 sidecar must be label-only; unexpected keys: "
+            + ", ".join(sorted(str(x) for x in extra))
+        )
+    if str(label_shard.get("parent_v19_shard")) != str(expected_parent_shard):
+        raise RuntimeError("Stage-0 sidecar parent shard mismatch")
+    scenes = list(v19_shard.get("scene_name", []))
+    tokens = list(v19_shard.get("t0_token", []))
+    side_scenes = list(label_shard.get("scene_name", []))
+    side_tokens = list(label_shard.get("t0_token", []))
+    if scenes != side_scenes:
+        raise RuntimeError("Stage-0 sidecar scene order mismatch")
+    if tokens != side_tokens:
+        raise RuntimeError("Stage-0 sidecar t0-token order mismatch")
+    n = len(tokens)
+    if len(scenes) != n:
+        raise RuntimeError("malformed V19 shard identity arrays")
+    if int(label_shard.get("count", -1)) != n:
+        raise RuntimeError("Stage-0 sidecar count mismatch")
+    target = label_shard.get("voxel_semantic_target")
+    if not isinstance(target, torch.Tensor) or int(target.shape[0]) != n:
+        raise RuntimeError("Stage-0 sidecar target batch mismatch")
+    return n
+
 
 
 class PerZSemanticHead(nn.Module):
