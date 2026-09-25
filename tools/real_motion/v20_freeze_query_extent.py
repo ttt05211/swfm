@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 import yaml
 
 SCAN_PROTOCOL = "p0_f9_v20_query_extent_scan_v2"
-AUDIT_PROTOCOL = "p0_f9_v20_query_extent_audit_v2"
+AUDIT_PROTOCOL = "p0_f9_v20_query_extent_audit_v3"
 
 
 def _load_json(path, protocol):
@@ -54,10 +54,10 @@ def main():
     if not _same_lattice(scan, train) or not _same_lattice(scan, dev):
         raise RuntimeError("train/dev audits were not run on the scan-recommended lattice")
     for split_name, report in (("train", train), ("dev", dev)):
-        if int(report["future_query"]["out_of_bounds_voxels"]) != 0:
-            raise RuntimeError(f"{split_name} future-query OOB is non-zero")
-        if int(report["history_view"]["out_of_bounds_voxels"]) != 0:
-            raise RuntimeError(f"{split_name} history-view OOB is non-zero")
+        if int(report["future_query"]["windows_with_oob"]) != 0:
+            raise RuntimeError(f"{split_name} future-query containment failed")
+        if int(report["history_view"]["windows_with_oob"]) != 0:
+            raise RuntimeError(f"{split_name} history-view containment failed")
 
     lc = cfg["canonical_lattice"]
     lc["origin_xyz_m"] = [float(x) for x in scan["recommended_origin_xyz_m"]]
