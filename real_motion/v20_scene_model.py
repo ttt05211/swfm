@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from .local_st_world_model import SEMANTIC_CLASSES
 from .motion_transport import FUTURE_FRAMES, HISTORY_FRAMES
-from .v20_history_world import FREE_LABEL
+from .v20_history_world import DYNAMIC_IDS, FREE_LABEL
 
 V20_MODEL_PROTOCOL = "p0_f9_v20_3d_history_model_v1"
 
@@ -32,7 +32,7 @@ class V20SceneConfig:
     tile_dim: int = 48
     birth_queries: int = 8
     vertical_bins: int = 16
-    dynamic_classes: int = 8
+    dynamic_classes: int = len(DYNAMIC_IDS)
 
 
 class HistoricalEvidence3DEncoder(nn.Module):
@@ -233,6 +233,11 @@ class BirthQueryHead(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.Q = int(cfg.birth_queries)
+        if int(cfg.dynamic_classes) != len(DYNAMIC_IDS):
+            raise ValueError(
+                "birth dynamic_classes must match frozen DYNAMIC_IDS "
+                f"({len(DYNAMIC_IDS)})"
+            )
         self.shape_size_xyz = tuple(int(x) for x in shape_size_xyz)
         h = 2 * int(cfg.base_dim)
         self.query = nn.Parameter(torch.zeros(1, self.Q, h))
