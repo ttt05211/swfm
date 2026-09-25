@@ -268,7 +268,7 @@ class BirthQueryHead(nn.Module):
         self.query_mixer = nn.TransformerEncoder(enc, num_layers=1)
         self.class_head = nn.Linear(h, int(cfg.dynamic_classes) + 1)  # + no-object
         self.exist_head = nn.Linear(h, FUTURE_FRAMES)
-        self.traj_head = nn.Linear(h, FUTURE_FRAMES * 3)  # x,y,yaw
+        self.traj_head = nn.Linear(h, FUTURE_FRAMES * 4)  # x,y,z,yaw
         sx, sy, sz = self.shape_size_xyz
         self.shape_head = nn.Linear(h, sx * sy * sz)
         # No-object/no-existence initialization makes Birth render nothing.
@@ -289,14 +289,14 @@ class BirthQueryHead(nn.Module):
         q = q + self.global_proj(pooled).unsqueeze(1)
         q = self.query_mixer(q)
         traj = self.traj_head(q).reshape(
-            scene.shape[0], self.Q, FUTURE_FRAMES, 3
+            scene.shape[0], self.Q, FUTURE_FRAMES, 4
         )
         sx, sy, sz = self.shape_size_xyz
         shape = self.shape_head(q).reshape(scene.shape[0], self.Q, sx, sy, sz)
         return {
             "class_logits": self.class_head(q),
             "existence_logits": self.exist_head(q),
-            "trajectory_xy_yaw": traj,
+            "trajectory_xyz_yaw": traj,
             "shape_logits": shape,
         }
 
