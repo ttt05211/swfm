@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+import math
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -159,3 +160,133 @@ def assert_current_source_predictions_unchanged(
         if not torch.equal(frozen_v18[key], combined_current[key]):
             n = int((frozen_v18[key] != combined_current[key]).sum().item())
             raise AssertionError(f"Dormant path changed current V18 {key}: {n} entries")
+
+
+@dataclass(frozen=True)
+class DormantRenderReport:
+    future_semantic: np.ndarray
+    tracks: int
+    active_track_horizons: int
+    rendered_voxels: int
+    out_of_bounds_voxels: int
+    collision_voxels: int
+
+
+def _deduplicate_indices(idx: np.ndarray) -> np.ndarray:
+    x = np.asarray(idx, dtype=np.int64)
+    if x.size == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+    order = np.lexsort((x[:, 2], x[:, 1], x[:, 0]))
+    s = x[order]
+    keep = np.ones(len(s), dtype=bool)
+    keep[1:] = np.any(s[1:] != s[:-1], axis=1)
+    return s[keep]
+
+
+def render_dormant_sources(
+    outputs: Mapping[str, torch.Tensor],
+    tracks: Sequence[SourceTrack],
+    *,
+    kta_displacement_xy_m: torch.Tensor | np.ndarray,
+    t0_ego_to_world: np.ndarray,
+    future_ego_to_world: np.ndarray,
+    grid,
+    frame_dt_s: float,
+    existence_threshold: float = 0.5,
+    free_label: int = 17,
+) -> DormantRenderReport:
+    """Render learned Dormant trajectories with the frozen source geometry.
+
+    The target convention exactly matches Stage-3 training:
+      anchor_t0_xy + KTA displacement + learned residual.
+    Yaw is a residual around each track's last observed source geometry.
+    No GT identity, future semantic occupancy, or future observation mask is
+    consumed here.
+    """
+    n = len(tracks)
+    res = outputs["residual_xy_m"].detach().float().cpu().numpy()
+    yaw = outputs["yaw_delta_rad"].detach().float().cpu().numpy()
+    exist = torch.sigmoid(
+        outputs["existence_logits"].detach().float()
+    ).cpu().numpy()
+    if res.shape != (n, 6, 2) or yaw.shape != (n, 6) or exist.shape != (n, 6):
+        raise ValueError("Dormant output/track count mismatch")
+    kta = np.asarray(
+        kta_displacement_xy_m.detach().cpu().numpy()
+        if isinstance(kta_displacement_xy_m, torch.Tensor)
+        else kta_displacement_xy_m,
+        dtype=np.float64,
+    )
+    if kta.shape != (n, 6, 2):
+        raise ValueError("kta_displacement_xy_m must be [N,6,2]")
+    t0 = np.asarray(t0_ego_to_world, dtype=np.float64)
+    futures = np.asarray(future_ego_to_world, dtype=np.float64)
+    if t0.shape != (4, 4) or futures.shape != (6, 4, 4):
+        raise ValueError("Dormant render poses must be t0[4,4], future[6,4,4]")
+    inv_t0 = np.linalg.inv(t0)
+    inv_future = np.stack([np.linalg.inv(x) for x in futures], axis=0)
+    origin = np.asarray(
+        [grid.x_min, grid.y_min, grid.z_min], dtype=np.float64
+    )
+    step = np.asarray(grid.voxel_size, dtype=np.float64)
+    shape = np.asarray(grid.shape_hwd, dtype=np.int64)
+    out = np.full((6,) + tuple(shape.tolist()), int(free_label), dtype=np.uint8)
+
+    anchors_t0 = []
+    for tr in tracks:
+        aw = tr.anchor_center_world(float(frame_dt_s))
+        anchors_t0.append((inv_t0 @ np.r_[aw, 1.0])[:3])
+    anchors_t0 = (
+        np.asarray(anchors_t0, dtype=np.float64)
+        if anchors_t0 else np.zeros((0, 3), dtype=np.float64)
+    )
+
+    order = sorted(
+        range(n),
+        key=lambda i: (-float(tracks[i].confidence), int(tracks[i].track_id)),
+    )
+    active_h = rendered = oob = collisions = 0
+    for i in order:
+        tr = tracks[i]
+        local = np.asarray(tr.canonical_xyz_local, dtype=np.float64)
+        if local.ndim != 2 or local.shape[1] != 3:
+            raise ValueError("Dormant track canonical geometry must be [N,3]")
+        if len(local) == 0:
+            continue
+        for h in range(6):
+            if float(exist[i, h]) < float(existence_threshold):
+                continue
+            active_h += 1
+            target_t0 = anchors_t0[i].copy()
+            target_t0[:2] += kta[i, h] + res[i, h]
+            target_world = (t0 @ np.r_[target_t0, 1.0])[:3]
+            theta = float(yaw[i, h])
+            c, s = math.cos(theta), math.sin(theta)
+            moved_local = local.copy()
+            moved_local[:, 0] = c * local[:, 0] - s * local[:, 1]
+            moved_local[:, 1] = s * local[:, 0] + c * local[:, 1]
+            world = moved_local + target_world[None]
+            ego = (
+                world @ inv_future[h, :3, :3].T
+                + inv_future[h, :3, 3][None]
+            )
+            idx = np.floor((ego - origin[None]) / step[None]).astype(np.int64)
+            valid = ((idx >= 0) & (idx < shape[None])).all(axis=1)
+            oob += int((~valid).sum())
+            idx = _deduplicate_indices(idx[valid])
+            if len(idx) == 0:
+                continue
+            free = out[h, idx[:, 0], idx[:, 1], idx[:, 2]] == int(free_label)
+            collisions += int((~free).sum())
+            good = idx[free]
+            if len(good):
+                out[h, good[:, 0], good[:, 1], good[:, 2]] = int(tr.class_id)
+                rendered += int(len(good))
+    return DormantRenderReport(
+        future_semantic=out,
+        tracks=int(n),
+        active_track_horizons=int(active_h),
+        rendered_voxels=int(rendered),
+        out_of_bounds_voxels=int(oob),
+        collision_voxels=int(collisions),
+    )

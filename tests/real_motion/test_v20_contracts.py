@@ -18,6 +18,8 @@ from real_motion.v20_history_world import (
     protected_add_only,
 )
 from real_motion.v20_scene_model import HistoricalEvidence3DEncoder, V20SceneConfig
+from real_motion.v20_dormant import render_dormant_sources
+from real_motion.v19_scene_memory import SourceTrack
 from real_motion.v20_stage0_voxel_semantic import (
     LABEL_SIDECAR_PROTOCOL,
     PerZSemanticHead,
@@ -288,3 +290,53 @@ def test_stage0_sidecar_allows_strict_parent_prefix_for_smoke():
         labels,
         expected_parent_shard="shard_00000.pt",
     ) == 2
+
+
+def test_dormant_renderer_uses_kta_plus_residual_and_existence():
+    class Grid:
+        x_min = -2.0
+        y_min = -2.0
+        z_min = -1.0
+        voxel_size = (1.0, 1.0, 1.0)
+        shape_hwd = (6, 6, 3)
+
+    centers = np.zeros((HISTORY_FRAMES, 3), dtype=np.float64)
+    centers[:, 0] = np.arange(HISTORY_FRAMES, dtype=np.float64) * 0.1
+    valid = np.ones(HISTORY_FRAMES, dtype=bool)
+    tr = SourceTrack(
+        track_id=7,
+        class_id=int(DYNAMIC_CLASS_IDS[0]),
+        canonical_xyz_local=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        centers_world=centers,
+        valid_history=valid,
+        velocity_world=np.zeros(3, dtype=np.float64),
+        last_observed_frame=HISTORY_FRAMES - 2,
+        confidence=1.0,
+        provenance="observed_history",
+        current_component_index=None,
+        last_component_voxel_count=1,
+    )
+    out = {
+        "residual_xy_m": torch.zeros((1, FUTURE_FRAMES, 2)),
+        "yaw_delta_rad": torch.zeros((1, FUTURE_FRAMES)),
+        "existence_logits": torch.full((1, FUTURE_FRAMES), -10.0),
+    }
+    out["existence_logits"][0, 0] = 10.0
+    kta = torch.zeros((1, FUTURE_FRAMES, 2))
+    kta[0, 0, 0] = 1.0
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    report = render_dormant_sources(
+        out,
+        [tr],
+        kta_displacement_xy_m=kta,
+        t0_ego_to_world=np.eye(4),
+        future_ego_to_world=poses,
+        grid=Grid(),
+        frame_dt_s=0.5,
+        existence_threshold=0.5,
+        free_label=17,
+    )
+    assert report.active_track_horizons == 1
+    assert report.rendered_voxels == 1
+    assert np.count_nonzero(report.future_semantic != 17) == 1
+    assert np.count_nonzero(report.future_semantic[1:] != 17) == 0

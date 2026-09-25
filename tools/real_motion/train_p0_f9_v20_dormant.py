@@ -116,7 +116,10 @@ def _targets_for_tracks(tracks, tokens, arrays, source, w, t0_pose):
         last_yaw = float(quaternion_yaw(last_ann["rotation"]))
         anchor_world = tr.anchor_center_world(0.5)
         anchor_t0 = (inv_t0 @ np.r_[anchor_world, 1.0])[:3]
-        any_future = False
+        # A history track with a reliable GT identity is supervised even when
+        # it never reappears in the future block.  Such tracks are essential
+        # real negatives for the Dormant existence head.
+        supervised[i] = True
         for h, fmap in enumerate(future):
             if token not in fmap:
                 continue
@@ -128,12 +131,10 @@ def _targets_for_tracks(tracks, tokens, arrays, source, w, t0_pose):
             desired = pt0[:2] - anchor_t0[:2]
             xy[i, h] = (desired - kta[i, h]).astype(np.float32)
             exists[i, h] = 1.0
-            any_future = True
             if int(tr.class_id) in YAW_SET:
                 d = float(quaternion_yaw(ann["rotation"])) - last_yaw
                 yaw[i, h] = float((d + math.pi) % (2 * math.pi) - math.pi)
                 yaw_valid[i, h] = True
-        supervised[i] = any_future
     return {
         "target_xy": torch.from_numpy(xy),
         "target_yaw": torch.from_numpy(yaw),
@@ -254,7 +255,14 @@ def _train_window(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.dormant.parameters(), 5.0)
         optimizer.step()
+    selected_exists = targets["target_exists"].index_select(0, ids)
     stats["sources"] = int(ids.numel())
+    stats["future_negative_sources"] = int(
+        selected_exists.sum(dim=1).eq(0).sum().item()
+    )
+    stats["future_positive_sources"] = int(
+        selected_exists.sum(dim=1).gt(0).sum().item()
+    )
     stats["synthetic"] = bool(synthetic_current_index is not None)
     return stats
 
@@ -376,6 +384,12 @@ def main():
                 "translation": mean(stats, "translation"),
                 "yaw": mean(stats, "yaw"),
                 "source_batches": len(stats),
+                "future_negative_sources": int(sum(
+                    int(x.get("future_negative_sources", 0)) for x in stats
+                )),
+                "future_positive_sources": int(sum(
+                    int(x.get("future_positive_sources", 0)) for x in stats
+                )),
             },
             "val": {
                 "loss": mean(val_stats, "loss"),
@@ -383,6 +397,12 @@ def main():
                 "translation": mean(val_stats, "translation"),
                 "yaw": mean(val_stats, "yaw"),
                 "source_batches": len(val_stats),
+                "future_negative_sources": int(sum(
+                    int(x.get("future_negative_sources", 0)) for x in val_stats
+                )),
+                "future_positive_sources": int(sum(
+                    int(x.get("future_positive_sources", 0)) for x in val_stats
+                )),
             },
         }
         history.append(row); print(json.dumps(row))
