@@ -267,3 +267,24 @@ def test_stage0_sparse_labels_expand_in_parent_mask_order():
     assert dense[1, 0, 0, 1, 0].item() == 6
     assert dense[1, 0, 1, 1, 1].item() == 9
     assert torch.all(dense[~mask] == 255)
+
+
+def test_stage0_sidecar_allows_strict_parent_prefix_for_smoke():
+    v19 = {
+        "scene_name": ["scene-a", "scene-a", "scene-b"],
+        "t0_token": ["t0-a", "t0-b", "t0-c"],
+    }
+    labels = {
+        "protocol": LABEL_SIDECAR_PROTOCOL,
+        "parent_v19_shard": "shard_00000.pt",
+        "count": 2,
+        "semantic_values": torch.tensor([4, 5], dtype=torch.uint8),
+        "semantic_offsets": torch.tensor([0, 1, 2], dtype=torch.int64),
+        "scene_name": ["scene-a", "scene-a"],
+        "t0_token": ["t0-a", "t0-b"],
+    }
+    assert validate_stage0_sidecar_pair(
+        v19,
+        labels,
+        expected_parent_shard="shard_00000.pt",
+    ) == 2

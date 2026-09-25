@@ -95,15 +95,17 @@ def validate_stage0_sidecar_pair(
     tokens = list(v19_shard.get("t0_token", []))
     side_scenes = list(label_shard.get("scene_name", []))
     side_tokens = list(label_shard.get("t0_token", []))
-    if scenes != side_scenes:
-        raise RuntimeError("Stage-0 sidecar scene order mismatch")
-    if tokens != side_tokens:
-        raise RuntimeError("Stage-0 sidecar t0-token order mismatch")
-    n = len(tokens)
-    if len(scenes) != n:
+    if len(scenes) != len(tokens):
         raise RuntimeError("malformed V19 shard identity arrays")
-    if int(label_shard.get("count", -1)) != n:
-        raise RuntimeError("Stage-0 sidecar count mismatch")
+    n = int(label_shard.get("count", -1))
+    if n < 0 or n > len(tokens):
+        raise RuntimeError("Stage-0 sidecar count outside parent shard")
+    if len(side_scenes) != n or len(side_tokens) != n:
+        raise RuntimeError("Stage-0 sidecar identity count mismatch")
+    if scenes[:n] != side_scenes:
+        raise RuntimeError("Stage-0 sidecar scene prefix mismatch")
+    if tokens[:n] != side_tokens:
+        raise RuntimeError("Stage-0 sidecar t0-token prefix mismatch")
     values = label_shard.get("semantic_values")
     offsets = label_shard.get("semantic_offsets")
     if not isinstance(values, torch.Tensor) or values.ndim != 1:

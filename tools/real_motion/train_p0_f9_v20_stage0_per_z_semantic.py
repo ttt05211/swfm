@@ -77,13 +77,16 @@ def _load_pair(v19_path, label_path):
         )
     if not bool(lidx.get("label_only_sidecar")):
         raise RuntimeError("Stage-0 labels must use the label-only sidecar contract")
-    for key in ("num_windows", "grid_shape_hwd"):
-        if lidx.get(key) != vidx.get(key):
-            raise RuntimeError(f"Stage-0 V19/label index mismatch: {key}")
-    if list(lidx.get("scene_names", [])) != list(vidx.get("scene_names", [])):
-        raise RuntimeError("Stage-0 V19/label scene list mismatch")
-    if len(lidx.get("shards", [])) != len(vidx.get("shards", [])):
-        raise RuntimeError("Stage-0 V19/label shard count mismatch")
+    if lidx.get("grid_shape_hwd") != vidx.get("grid_shape_hwd"):
+        raise RuntimeError("Stage-0 V19/label grid mismatch")
+    if int(lidx.get("num_windows", 0)) <= 0:
+        raise RuntimeError("Stage-0 label sidecar is empty")
+    if int(lidx["num_windows"]) > int(vidx["num_windows"]):
+        raise RuntimeError("Stage-0 label sidecar exceeds parent V19 cache")
+    parent_shards = {str(x["file"]): x for x in vidx.get("shards", [])}
+    for row in lidx.get("shards", []):
+        if str(row.get("parent_v19_shard")) not in parent_shards:
+            raise RuntimeError("Stage-0 label sidecar references unknown V19 shard")
     return vroot, vidx, lroot, lidx
 
 
@@ -97,14 +100,18 @@ def _iter_batches(
     seed,
 ):
     rng = np.random.default_rng(int(seed))
-    shard_order = np.arange(len(vidx["shards"]))
+    shard_order = np.arange(len(lidx["shards"]))
     if shuffle:
         rng.shuffle(shard_order)
     for si in shard_order.tolist():
-        vrow = vidx["shards"][int(si)]
         lrow = lidx["shards"][int(si)]
-        if str(lrow.get("parent_v19_shard")) != str(vrow["file"]):
-            raise RuntimeError(f"Stage-0 index shard pairing mismatch at {si}")
+        parent_name = str(lrow.get("parent_v19_shard"))
+        vrow = next(
+            (x for x in vidx["shards"] if str(x["file"]) == parent_name),
+            None,
+        )
+        if vrow is None:
+            raise RuntimeError(f"Stage-0 parent V19 shard missing: {parent_name}")
         vobj = torch.load(
             vroot / vrow["file"],
             map_location="cpu",
@@ -122,7 +129,7 @@ def _iter_batches(
             lobj,
             expected_parent_shard=str(vrow["file"]),
         )
-        if n != int(vrow["count"]) or n != int(lrow["count"]):
+        if n != int(lrow["count"]) or n > int(vrow["count"]):
             raise RuntimeError("Stage-0 paired shard count mismatch")
         order = np.arange(n)
         if shuffle:
@@ -366,8 +373,8 @@ def main():
     val = _load_pair(a.val_v19_cache, a.val_label_cache)
     train_root, train_idx, train_label_root, train_label_idx = train
     val_root, val_idx, val_label_root, val_label_idx = val
-    overlap = set(train_idx.get("scene_names", [])) & set(
-        val_idx.get("scene_names", [])
+    overlap = set(train_label_idx.get("scene_names", [])) & set(
+        val_label_idx.get("scene_names", [])
     )
     if overlap:
         raise RuntimeError(

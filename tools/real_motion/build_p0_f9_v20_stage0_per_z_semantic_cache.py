@@ -57,6 +57,12 @@ def main():
     p.add_argument("--dataroot", required=True)
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output-dir", required=True)
+    p.add_argument(
+        "--max-windows",
+        type=int,
+        default=0,
+        help="Smoke mode: build only the first N V19 windows; 0 means all.",
+    )
     a = p.parse_args()
 
     src_root = Path(a.v19_cache)
@@ -84,7 +90,14 @@ def main():
     class_hist = {str(i): 0 for i in range(17)}
     supervised_voxels = 0
     sidecar_bytes = 0
+    processed_windows = 0
+    selected_scenes = set()
+    max_windows = int(a.max_windows)
+    if max_windows < 0:
+        raise ValueError("--max-windows must be >= 0")
     for shard_id, row in enumerate(idx["shards"]):
+        if max_windows > 0 and processed_windows >= max_windows:
+            break
         parent_name = str(row["file"])
         obj = torch.load(
             src_root / parent_name,
@@ -93,9 +106,17 @@ def main():
         )
         if obj.get("protocol") != V19_CACHE_PROTOCOL:
             raise RuntimeError(f"bad shard protocol: {parent_name}")
-        n = int(row["count"])
-        if len(obj["scene_name"]) != n or len(obj["t0_token"]) != n:
+        parent_n = int(row["count"])
+        if len(obj["scene_name"]) != parent_n or len(obj["t0_token"]) != parent_n:
             raise RuntimeError(f"malformed V19 shard identities: {parent_name}")
+        remaining = (
+            parent_n
+            if max_windows <= 0
+            else min(parent_n, max_windows - processed_windows)
+        )
+        n = int(remaining)
+        if n <= 0:
+            break
 
         values_per_window = []
         offsets = [0]
@@ -103,6 +124,7 @@ def main():
             scene = str(obj["scene_name"][bi])
             token = str(obj["t0_token"][bi])
             key = (scene, token)
+            selected_scenes.add(scene)
             if key not in records:
                 raise KeyError(f"scene/t0 pair not in source cache: {key}")
             _, w = records[key]
@@ -148,8 +170,8 @@ def main():
             "count": n,
             "semantic_values": semantic_values,
             "semantic_offsets": torch.as_tensor(offsets, dtype=torch.int64),
-            "scene_name": list(obj["scene_name"]),
-            "t0_token": list(obj["t0_token"]),
+            "scene_name": list(obj["scene_name"][:n]),
+            "t0_token": list(obj["t0_token"][:n]),
         }
         name = f"shard_{shard_id:05d}.pt"
         torch.save(payload, out_dir / name)
@@ -164,9 +186,10 @@ def main():
                 "bytes": nbytes,
             }
         )
+        processed_windows += n
 
     dense_raw_bytes = (
-        int(idx["num_windows"])
+        int(processed_windows)
         * 6
         * int(np.prod(np.asarray(idx["grid_shape_hwd"], dtype=np.int64)))
     )
@@ -175,9 +198,14 @@ def main():
         "parent_v19_cache": str(src_root.resolve()),
         "parent_v19_protocol": V19_CACHE_PROTOCOL,
         "source_cache": str(Path(source_cache).resolve()),
-        "num_windows": int(idx["num_windows"]),
-        "num_scenes": int(idx.get("num_scenes", len(set(idx.get("scene_names", []))))),
-        "scene_names": list(idx.get("scene_names", [])),
+        "num_windows": int(processed_windows),
+        "parent_num_windows": int(idx["num_windows"]),
+        "smoke_prefix_subset": bool(
+            max_windows > 0 and processed_windows < int(idx["num_windows"])
+        ),
+        "max_windows_requested": int(max_windows),
+        "num_scenes": int(len(selected_scenes)),
+        "scene_names": sorted(selected_scenes),
         "grid_shape_hwd": [int(x) for x in idx["grid_shape_hwd"]],
         "free_label": int(idx.get("free_label", free_label)),
         "anchor_distance_max_m": float(idx.get("anchor_distance_max_m", 40.0)),
@@ -209,7 +237,7 @@ def main():
         json.dumps(
             {
                 "protocol": PROTOCOL,
-                "num_windows": int(idx["num_windows"]),
+                "num_windows": int(processed_windows),
                 "supervised_voxels": int(supervised_voxels),
                 "sidecar_bytes": int(sidecar_bytes),
                 "dense_uint8_equivalent_bytes": int(dense_raw_bytes),
