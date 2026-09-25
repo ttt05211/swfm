@@ -11,7 +11,7 @@ history:
   semantic_classes: 18
   free_label: 17
   require_mask_lidar: true
-  canonical_alignment: t0_world_canonical
+  canonical_alignment: t0_ego_canonical
   distinguish_observed_free_from_unknown: true
   align_history_once: true
 
