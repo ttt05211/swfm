@@ -275,7 +275,13 @@ def main():
     p.add_argument("--static-checkpoint", required=True)
     p.add_argument("--base-checkpoint", required=True)
     p.add_argument("--dataroot", required=True)
-    p.add_argument("--info-pkl", required=True)
+    p.add_argument(
+        "--info-pkl",
+        default="",
+        help="Backward-compatible fallback used for both splits.",
+    )
+    p.add_argument("--train-info-pkl", default="")
+    p.add_argument("--val-info-pkl", default="")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -306,7 +312,19 @@ def main():
         )
 
     pcfg = make_prepare_config(load_runtime_config(a.config, a.override))
-    source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
+    train_info = str(a.train_info_pkl or a.info_pkl)
+    val_info = str(a.val_info_pkl or a.info_pkl)
+    if not train_info or not val_info:
+        raise RuntimeError(
+            "Dormant training requires --train-info-pkl and --val-info-pkl "
+            "(or legacy --info-pkl for both)."
+        )
+    train_source = CachedSource(
+        a.dataroot, info_pkl=train_info, verbose=False
+    )
+    val_source = CachedSource(
+        a.dataroot, info_pkl=val_info, verbose=False
+    )
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     _, train_records = base.load_cache(a.train_cache)
     _, val_records = base.load_cache(a.val_cache)
@@ -327,9 +345,9 @@ def main():
         stats = []
         for ri in order:
             rec = train_records[ri]; w = window_from_record(rec)
-            raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=False)
+            raw = load_nuscenes_window_raw(train_source, w, pcfg, include_gt=False)
             s = _train_window(
-                model, v18, source, w, raw, pcfg, strong_cfg, coarse, device, amp,
+                model, v18, train_source, w, raw, pcfg, strong_cfg, coarse, device, amp,
                 optimizer,
             )
             if s is not None: stats.append(s)
@@ -365,9 +383,11 @@ def main():
         with torch.no_grad():
             for rec in val_records:
                 w = window_from_record(rec)
-                raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=False)
+                raw = load_nuscenes_window_raw(
+                    val_source, w, pcfg, include_gt=False
+                )
                 s = _train_window(
-                    model, v18, source, w, raw, pcfg, strong_cfg, coarse,
+                    model, v18, val_source, w, raw, pcfg, strong_cfg, coarse,
                     device, amp, None,
                 )
                 if s is not None: val_stats.append(s)
