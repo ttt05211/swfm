@@ -3,10 +3,12 @@
 
 Input JSONL rows must contain the t0 pose and six future ego poses:
   {"scene": "...", "t0_ego_to_world": [[...4x4...]],
+   "history_ego_to_world": [[[...4x4...]], ... six ...],
    "future_ego_to_world": [[[...4x4...]], ... six ...]}
 
-The scanner first converts every future pose to the per-window t0-ego
-canonical frame. No future semantic/mask/identity is read.
+The scanner converts both historical evidence views and future query views to
+the per-window t0-ego canonical frame and freezes one Ωmax covering their
+union. No semantic/mask/identity information is read.
 """
 from __future__ import annotations
 
@@ -64,12 +66,20 @@ def main():
             if not line.strip():
                 continue
             row = json.loads(line)
-            poses_world = np.asarray(row["future_ego_to_world"], dtype=np.float64)
+            history_world = np.asarray(row["history_ego_to_world"], dtype=np.float64)
+            future_world = np.asarray(row["future_ego_to_world"], dtype=np.float64)
             t0_pose = np.asarray(row["t0_ego_to_world"], dtype=np.float64)
-            if poses_world.shape != (FUTURE_FRAMES, 4, 4) or t0_pose.shape != (4, 4):
-                raise ValueError("expected t0 [4,4] and future poses [6,4,4]")
-            poses = poses_to_t0_canonical(poses_world, t0_pose)
-            for T in poses:
+            if (
+                history_world.shape != (FUTURE_FRAMES, 4, 4)
+                or future_world.shape != (FUTURE_FRAMES, 4, 4)
+                or t0_pose.shape != (4, 4)
+            ):
+                raise ValueError(
+                    "expected t0 [4,4], history [6,4,4], future [6,4,4]"
+                )
+            history = poses_to_t0_canonical(history_world, t0_pose)
+            future = poses_to_t0_canonical(future_world, t0_pose)
+            for T in np.concatenate((history, future), axis=0):
                 w = transform_points(T, corners)
                 mins = np.minimum(mins, w.min(axis=0))
                 maxs = np.maximum(maxs, w.max(axis=0))
@@ -85,13 +95,15 @@ def main():
     maxs += margin
     size = np.ceil((maxs - mins) / step).astype(np.int64)
     report = {
-        "protocol": "p0_f9_v20_query_extent_scan_v1",
+        "protocol": "p0_f9_v20_query_extent_scan_v2",
         "windows": windows,
         "scenes": len(scenes),
         "native_shape_xyz": shape.tolist(),
         "native_origin_xyz_m": origin.tolist(),
         "voxel_size_xyz_m": step.tolist(),
         "margin_m": margin,
+        "extent_views_per_window": 12,
+        "extent_contract": "union_of_6_history_evidence_views_and_6_future_query_views",
         "observed_world_min_xyz_m": mins.tolist(),
         "observed_world_max_xyz_m": maxs.tolist(),
         "recommended_origin_xyz_m": mins.tolist(),

@@ -56,6 +56,7 @@ def main():
                 "scene": str(w.scene_name),
                 "t0_token": str(w.t0_token),
                 "t0_ego_to_world": history[-1].tolist(),
+                "history_ego_to_world": history.tolist(),
                 "future_ego_to_world": future.tolist(),
             }
             f.write(json.dumps(row, separators=(",", ":")) + "\n")

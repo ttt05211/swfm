@@ -13,8 +13,8 @@ if str(ROOT) not in sys.path:
 
 import yaml
 
-SCAN_PROTOCOL = "p0_f9_v20_query_extent_scan_v1"
-AUDIT_PROTOCOL = "p0_f9_v20_query_extent_audit_v1"
+SCAN_PROTOCOL = "p0_f9_v20_query_extent_scan_v2"
+AUDIT_PROTOCOL = "p0_f9_v20_query_extent_audit_v2"
 
 
 def _load_json(path, protocol):
@@ -53,10 +53,11 @@ def main():
     dev = _load_json(a.dev_audit, AUDIT_PROTOCOL)
     if not _same_lattice(scan, train) or not _same_lattice(scan, dev):
         raise RuntimeError("train/dev audits were not run on the scan-recommended lattice")
-    if int(train["out_of_bounds_voxels"]) != 0:
-        raise RuntimeError("train future-query OOB is non-zero")
-    if int(dev["out_of_bounds_voxels"]) != 0:
-        raise RuntimeError("dev future-query OOB is non-zero")
+    for split_name, report in (("train", train), ("dev", dev)):
+        if int(report["future_query"]["out_of_bounds_voxels"]) != 0:
+            raise RuntimeError(f"{split_name} future-query OOB is non-zero")
+        if int(report["history_view"]["out_of_bounds_voxels"]) != 0:
+            raise RuntimeError(f"{split_name} history-view OOB is non-zero")
 
     lc = cfg["canonical_lattice"]
     lc["origin_xyz_m"] = [float(x) for x in scan["recommended_origin_xyz_m"]]
@@ -65,8 +66,13 @@ def main():
     lc["extent_scan_complete"] = True
     lc["extent_scan_windows"] = int(scan["windows"])
     lc["extent_scan_scenes"] = int(scan["scenes"])
-    lc["extent_train_oob_voxels"] = 0
-    lc["extent_dev_oob_voxels"] = 0
+    lc["extent_train_future_oob_voxels"] = 0
+    lc["extent_dev_future_oob_voxels"] = 0
+    lc["extent_train_history_oob_voxels"] = 0
+    lc["extent_dev_history_oob_voxels"] = 0
+    lc["extent_contract"] = (
+        "union_of_6_history_evidence_views_and_6_future_query_views"
+    )
     lc["extent_scan_report"] = str(Path(a.train_scan).resolve())
     lc["extent_train_audit_report"] = str(Path(a.train_audit).resolve())
     lc["extent_dev_audit_report"] = str(Path(a.dev_audit).resolve())
