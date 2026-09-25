@@ -26,6 +26,7 @@ from real_motion.v19_static_novelty_factorized import (
     FactorizedStaticNewFOVHead,
     decode_factorized_static_new_fov,
 )
+from real_motion.v20_evaluation import population_fingerprint
 from real_motion.v20_stage0_voxel_semantic import (
     FrozenFactorizedFeatureAdapter,
     PerZSemanticHead,
@@ -307,6 +308,7 @@ def main():
     result = {
         "protocol": PROTOCOL,
         "num_windows": len(records),
+        "population_fingerprint_sha256": population_fingerprint(records),
         "base_checkpoint": str(Path(a.base_checkpoint).resolve()),
         "base_checkpoint_epoch": int(base_ck.get("epoch", -1)),
         "factorized_checkpoint": str(Path(a.factorized_checkpoint).resolve()),

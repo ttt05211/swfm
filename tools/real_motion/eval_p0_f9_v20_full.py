@@ -35,6 +35,7 @@ from real_motion.v20_evaluation import (
     SemanticMetricAccumulator,
     StaticSubsetAccumulator,
     metric_delta,
+    population_fingerprint,
 )
 from real_motion.v20_history_world import (
     CanonicalLattice,
@@ -526,6 +527,7 @@ def main():
     result = {
         "protocol": PROTOCOL,
         "num_windows": int(len(records)),
+        "population_fingerprint_sha256": population_fingerprint(records),
         "num_scenes": int(len(per_scene)),
         "base_checkpoint": str(Path(a.base_checkpoint).resolve()),
         "base_checkpoint_epoch": int(base_ck.get("epoch", -1)),

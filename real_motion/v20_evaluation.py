@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -309,3 +311,16 @@ class DormantExistenceAccumulator:
                 self.horizon_tp / max(self.horizon_tp + self.horizon_fn, 1)
             ),
         }
+
+
+def population_fingerprint(records: Sequence[Mapping[str, object]]) -> str:
+    """SHA-256 over the exact ordered (scene_name, t0_token) evaluation population."""
+    h = hashlib.sha256()
+    for row in records:
+        scene = str(row["scene_name"])
+        token = str(row["t0_token"])
+        h.update(scene.encode("utf-8"))
+        h.update(b"\t")
+        h.update(token.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()

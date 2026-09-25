@@ -20,6 +20,7 @@ from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig
+from real_motion.v20_evaluation import population_fingerprint
 from real_motion.v20_history_world import (
     CanonicalLattice,
     align_history_once_to_canonical,
@@ -258,6 +259,7 @@ def main():
     result = {
         "protocol": PROTOCOL,
         "num_windows": len(records),
+        "population_fingerprint_sha256": population_fingerprint(records),
         "base_checkpoint": str(Path(a.base_checkpoint).resolve()),
         "base_checkpoint_epoch": int(base_ck.get("epoch", -1)),
         "v20_checkpoint": str(Path(a.v20_checkpoint).resolve()),
