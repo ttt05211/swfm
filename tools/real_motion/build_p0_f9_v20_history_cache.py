@@ -169,7 +169,7 @@ def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
         counts[responsibility.name] += 1
 
         existence = np.zeros(6, dtype=np.uint8)
-        traj = np.zeros((6, 3), dtype=np.float32)
+        traj = np.zeros((6, 4), dtype=np.float32)
         size_lwh = None
         for fi in appearances:
             _, ann = future_maps[fi][token]
@@ -178,7 +178,7 @@ def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
             ct0 = (inv_t0 @ np.r_[cw, 1.0])[:3]
             yaw = quaternion_yaw(ann["rotation"]) - t0_yaw
             yaw = (float(yaw) + math.pi) % (2.0 * math.pi) - math.pi
-            traj[fi] = np.asarray([ct0[0], ct0[1], yaw], dtype=np.float32)
+            traj[fi] = np.asarray([ct0[0], ct0[1], ct0[2], yaw], dtype=np.float32)
             w_m, l_m, h_m = ann["size"]
             size_lwh = [float(l_m), float(w_m), float(h_m)]
         records.append({
@@ -188,7 +188,7 @@ def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
             "responsibility_name": responsibility.name,
             "first_horizon": int(first),
             "existence": existence.tolist(),
-            "trajectory_xy_yaw_t0": traj.tolist(),
+            "trajectory_xyz_yaw_t0": traj.tolist(),
             "size_lwh_m": size_lwh,
         })
     return records, counts
