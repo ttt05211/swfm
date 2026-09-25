@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Scan future-union geometric extent before freezing V20 Ωmax.
 
-Input JSONL rows must contain:
-  {"scene": "...", "future_ego_to_world": [[[...4x4...]], ... six ...]}
+Input JSONL rows must contain the t0 pose and six future ego poses:
+  {"scene": "...", "t0_ego_to_world": [[...4x4...]],
+   "future_ego_to_world": [[[...4x4...]], ... six ...]}
 
-Only future ego poses are consumed. No future semantic/mask/identity is read.
+The scanner first converts every future pose to the per-window t0-ego
+canonical frame. No future semantic/mask/identity is read.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 
 from real_motion.motion_transport import FUTURE_FRAMES
-from real_motion.v20_history_world import transform_points
+from real_motion.v20_history_world import poses_to_t0_canonical, transform_points
 
 
 def _parse3(text, typ=float):
@@ -62,14 +64,16 @@ def main():
             if not line.strip():
                 continue
             row = json.loads(line)
-            poses = np.asarray(row["future_ego_to_world"], dtype=np.float64)
-            if poses.shape != (FUTURE_FRAMES, 4, 4):
-                raise ValueError("future_ego_to_world must be [6,4,4]")
+            poses_world = np.asarray(row["future_ego_to_world"], dtype=np.float64)
+            t0_pose = np.asarray(row["t0_ego_to_world"], dtype=np.float64)
+            if poses_world.shape != (FUTURE_FRAMES, 4, 4) or t0_pose.shape != (4, 4):
+                raise ValueError("expected t0 [4,4] and future poses [6,4,4]")
+            poses = poses_to_t0_canonical(poses_world, t0_pose)
             for T in poses:
                 w = transform_points(T, corners)
                 mins = np.minimum(mins, w.min(axis=0))
                 maxs = np.maximum(maxs, w.max(axis=0))
-                # Diagnostic only: planar rotation angle magnitude.
+                # Diagnostic only: relative planar rotation in t0 canonical.
                 max_abs_yaw_proxy = max(max_abs_yaw_proxy, abs(float(np.arctan2(T[1,0], T[0,0]))))
             windows += 1
             if row.get("scene") is not None:
