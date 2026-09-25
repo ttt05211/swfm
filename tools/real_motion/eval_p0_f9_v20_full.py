@@ -16,6 +16,12 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
+from real_motion.v19_innovation import (
+    base_explained_bev,
+    build_future_aligned_history_and_static_memory,
+    decode_innovation,
+)
+from real_motion.v19_scene_memory import protected_add_only as v19_protected_add_only
 from real_motion.v20_birth import birth_query_match_counts
 from real_motion.v20_evaluation import (
     AdditionAccumulator,
@@ -51,11 +57,15 @@ from tools.real_motion.eval_p0_f9_v19_factorized_static_new_fov import (
     _moving_support_sequence,
     _prepare_record_from_raw,
 )
+from tools.real_motion.eval_p0_f9_v19_innovation import (
+    PROTOCOL as V19_REFERENCE_EVAL_PROTOCOL,
+    _load_innovation as _load_v19_innovation,
+)
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 from tools.real_motion.build_p0_f9_v20_history_cache import PROTOCOL as STAGE1_PROTOCOL
 
 PROTOCOL = "p0_f9_v20_stage5_full_eval_v1"
-VARIANTS = (
+BASE_VARIANTS = (
     "v18",
     "v20_static",
     "v20_dormant",
@@ -119,6 +129,16 @@ def main():
     p.add_argument("--stage1-cache", required=True)
     p.add_argument("--base-checkpoint", required=True)
     p.add_argument("--v20-checkpoint", required=True)
+    p.add_argument(
+        "--v19-innovation-checkpoint",
+        default="",
+        help=(
+            "Optional exact formal V19 Static+Innovation reference. "
+            "It is reported under its real protocol name, not relabeled context-only."
+        ),
+    )
+    p.add_argument("--v19-add-threshold", type=float, default=0.5)
+    p.add_argument("--v19-vertical-threshold", type=float, default=0.5)
     p.add_argument("--dataroot", required=True)
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output", required=True)
@@ -170,11 +190,18 @@ def main():
     coarse = _lattice(extra["coarse_lattice"])
     tile_size = tuple(int(x) for x in extra.get("tile_size_xyz", [32, 32, 16]))
     model.to(device).eval()
+    v19_ck = v19_model = None
+    variants = list(BASE_VARIANTS)
+    if str(a.v19_innovation_checkpoint):
+        v19_ck, v19_model = _load_v19_innovation(
+            a.v19_innovation_checkpoint, device
+        )
+        variants.append("v19_static_innovation_reference")
 
     source = CachedSource(a.dataroot, info_pkl=a.info_pkl, verbose=False)
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     component_cache = _ComponentLRU(maxsize=1024)
-    metrics = {name: SemanticMetricAccumulator() for name in VARIANTS}
+    metrics = {name: SemanticMetricAccumulator() for name in variants}
     per_scene = {}
     additions = {
         "static_standalone": AdditionAccumulator(),
@@ -285,23 +312,77 @@ def main():
         scene_name = str(w.scene_name)
         if scene_name not in per_scene:
             per_scene[scene_name] = {
-                name: SemanticMetricAccumulator() for name in VARIANTS
+                name: SemanticMetricAccumulator() for name in variants
             }
         moving_rows = _moving_support_sequence(
             source, w, grid=pcfg.grid, workers=int(a.alignment_workers)
         )
-        variants = {
+        pred_by_variant = {
             "v18": pred_stack,
             "v20_static": p_static,
             "v20_dormant": p_dormant,
             "v20_birth": p_birth,
             "v20_full": p_full,
         }
+        if v19_model is not None:
+            sem19, geo19, _, static19 = (
+                build_future_aligned_history_and_static_memory(
+                    raw["history_occ"],
+                    raw["history_observed"],
+                    raw["history_poses"],
+                    raw["future_poses"],
+                    grid=pcfg.grid,
+                    free_label=int(pcfg.free_label),
+                    dynamic_class_ids=tuple(
+                        int(x) for x in __import__(
+                            "real_motion.metrics.moving_miou_v2",
+                            fromlist=["DYNAMIC_CLASS_IDS"],
+                        ).DYNAMIC_CLASS_IDS
+                    ),
+                    workers=int(a.alignment_workers),
+                )
+            )
+            explained19 = np.stack([
+                v19_protected_add_only(
+                    pred_stack[fi],
+                    static19[fi],
+                    free_label=int(pcfg.free_label),
+                )
+                for fi in range(6)
+            ]).astype(np.uint8)
+            sem19_t = torch.from_numpy(sem19[None]).to(device)
+            geo19_t = torch.from_numpy(geo19[None]).to(device)
+            base19_t = torch.from_numpy(
+                base_explained_bev(
+                    explained19,
+                    free_label=int(pcfg.free_label),
+                )[None]
+            ).to(device)
+            with torch.inference_mode(), (
+                torch.autocast("cuda", dtype=torch.bfloat16)
+                if amp and device.type == "cuda" else nullcontext()
+            ):
+                v19_out = v19_model(sem19_t, geo19_t, base19_t)
+            v19_prop = decode_innovation(
+                v19_out,
+                free_label=int(pcfg.free_label),
+                add_threshold=float(a.v19_add_threshold),
+                vertical_threshold=float(a.v19_vertical_threshold),
+            )[0].cpu().numpy().astype(np.uint8)
+            pred_by_variant["v19_static_innovation_reference"] = np.stack([
+                v19_protected_add_only(
+                    explained19[fi],
+                    v19_prop[fi],
+                    free_label=int(pcfg.free_label),
+                )
+                for fi in range(6)
+            ]).astype(np.uint8)
+
         gt_all = np.asarray(raw["future_gt_occ"], dtype=np.uint8)
         for hi in range(6):
             gt = gt_all[hi]
             moving = moving_rows[hi]
-            for name, pred in variants.items():
+            for name, pred in pred_by_variant.items():
                 metrics[name].update(
                     hi, pred[hi], gt, moving, free_label=pcfg.free_label
                 )
@@ -426,6 +507,18 @@ def main():
         "base_checkpoint_epoch": int(base_ck.get("epoch", -1)),
         "v20_checkpoint": str(Path(a.v20_checkpoint).resolve()),
         "v20_stage": str(vck.get("stage")),
+        "v19_reference": (
+            {
+                "label": "v19_static_innovation_reference",
+                "eval_protocol": V19_REFERENCE_EVAL_PROTOCOL,
+                "checkpoint": str(Path(a.v19_innovation_checkpoint).resolve()),
+                "checkpoint_epoch": int(v19_ck.get("epoch", -1)),
+                "add_threshold": float(a.v19_add_threshold),
+                "vertical_threshold": float(a.v19_vertical_threshold),
+                "explicitly_not_renamed_context_only": True,
+            }
+            if v19_ck is not None else None
+        ),
         "stage1_cache": str(Path(a.stage1_cache).resolve()),
         "future_gt_used_for_prediction": False,
         "composition_priority": ["v18", "dormant", "birth", "static"],
@@ -439,7 +532,7 @@ def main():
         "metrics": final,
         "delta_vs_v18": {
             name: metric_delta(final[name], final["v18"])
-            for name in VARIANTS if name != "v18"
+            for name in variants if name != "v18"
         },
         "per_scene_metrics": {
             scene: {name: acc.finalize() for name, acc in rows.items()}
@@ -465,6 +558,12 @@ def main():
             "checkpoint_selection": (
                 "Use scene-disjoint development composed semantic metrics; "
                 "do not select by training loss."
+            ),
+            "v19_reference": (
+                "The optional reference is the repository's exact formal "
+                "V18 + deterministic Static Memory + trained V19 Innovation "
+                "path. No separate formally named context-only protocol was "
+                "found, so this result is not relabeled."
             ),
             "full_4369": (
                 "Run only after structure and thresholds are locked on dev."
