@@ -18,6 +18,46 @@ from .v20_history_world import (
 from .v20_training import decode_static_logits
 
 
+def sample_scene_features_at_t0_points(
+    scene_features: torch.Tensor,
+    points_xyz_t0_m: torch.Tensor,
+    coarse_lattice: CanonicalLattice,
+) -> torch.Tensor:
+    """Trilinearly sample [N,C] local scene evidence at t0-canonical points."""
+    import torch.nn.functional as F
+
+    if scene_features.ndim != 5 or scene_features.shape[0] != 1:
+        raise ValueError("scene_features must be [1,C,X,Y,Z]")
+    pts = points_xyz_t0_m.to(device=scene_features.device, dtype=scene_features.dtype)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("points_xyz_t0_m must be [N,3]")
+    if pts.shape[0] == 0:
+        return scene_features.new_empty((0, scene_features.shape[1]))
+    origin = torch.as_tensor(
+        coarse_lattice.origin_xyz_m, device=pts.device, dtype=pts.dtype
+    )
+    step = torch.as_tensor(
+        coarse_lattice.voxel_size_xyz_m, device=pts.device, dtype=pts.dtype
+    )
+    shape = torch.as_tensor(
+        coarse_lattice.shape_xyz, device=pts.device, dtype=pts.dtype
+    )
+    fidx = (pts - origin) / step - 0.5
+    denom = torch.clamp(shape - 1.0, min=1.0)
+    norm = 2.0 * fidx / denom - 1.0
+    # Input is [D,H,W]=[X,Y,Z]; grid tuple is (W,H,D)=(Z,Y,X).
+    grid = torch.stack((norm[:, 2], norm[:, 1], norm[:, 0]), dim=-1)
+    grid = grid.view(1, pts.shape[0], 1, 1, 3)
+    out = F.grid_sample(
+        scene_features,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return out[0, :, :, 0, 0].transpose(0, 1)
+
+
 @dataclass(frozen=True)
 class StaticRuntimeReport:
     canonical_semantic: np.ndarray
