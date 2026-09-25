@@ -301,7 +301,11 @@ def main():
         raise RuntimeError("train/val Ωmax mismatch")
 
     _, weights_cpu = _class_weights(tr_root, tr_idx)
-    cfg = V20SceneConfig()
+    v18_obj = torch.load(a.v18_checkpoint, map_location="cpu", weights_only=False)
+    v18_model_cfg = dict(v18_obj.get("model_config") or {})
+    if "d_model" not in v18_model_cfg:
+        raise RuntimeError("Clean-E14 checkpoint lacks model_config.d_model")
+    cfg = V20SceneConfig(source_dim=int(v18_model_cfg["d_model"]))
     model = V20HistoryWorldModel(cfg)
     # Stage 2 optimizes only encoder + Static.
     for p0 in model.dormant.parameters(): p0.requires_grad = False
