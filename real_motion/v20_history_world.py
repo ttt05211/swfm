@@ -232,6 +232,99 @@ def align_history_once_to_canonical(
     )
 
 
+
+@dataclass(frozen=True)
+class FutureRenderIndex:
+    indices_xyz: np.ndarray
+    valid: np.ndarray
+    out_of_bounds_voxels: int
+
+
+def future_native_to_canonical_indices(
+    lattice: CanonicalLattice,
+    *,
+    future_ego_to_world: np.ndarray,
+    native_shape_xyz: Sequence[int],
+    native_origin_xyz_m: Sequence[float],
+    native_voxel_size_xyz_m: Sequence[float],
+) -> FutureRenderIndex:
+    """Build the one authoritative canonical->future render lookup.
+
+    indices_xyz/valid are [F,X,Y,Z,(3)].  The same lookup can be cached and
+    reused by supervision and inference; no future semantic content is needed.
+    """
+    poses = np.asarray(future_ego_to_world, dtype=np.float64)
+    if poses.shape != (FUTURE_FRAMES, 4, 4):
+        raise ValueError("future_ego_to_world must be [6,4,4]")
+    shape = tuple(int(x) for x in native_shape_xyz)
+    local = grid_centers_xyz(
+        shape, native_origin_xyz_m, native_voxel_size_xyz_m
+    ).reshape(-1, 3)
+    all_idx, all_valid = [], []
+    oob = 0
+    for T in poses:
+        world = transform_points(T, local)
+        idx, valid = lattice.world_to_index(world)
+        all_idx.append(idx.reshape(shape + (3,)))
+        all_valid.append(valid.reshape(shape))
+        oob += int((~valid).sum())
+    return FutureRenderIndex(
+        indices_xyz=np.stack(all_idx, axis=0),
+        valid=np.stack(all_valid, axis=0),
+        out_of_bounds_voxels=int(oob),
+    )
+
+
+def render_canonical_semantic_to_future(
+    canonical_semantic: np.ndarray,
+    render_index: FutureRenderIndex,
+    *,
+    free_label: int = FREE_LABEL,
+) -> np.ndarray:
+    """Nearest-cell deterministic render of one canonical semantic world."""
+    world = np.asarray(canonical_semantic)
+    idx = np.asarray(render_index.indices_xyz, dtype=np.int64)
+    valid = np.asarray(render_index.valid, dtype=bool)
+    if world.ndim != 3 or idx.shape[:-1] != valid.shape or idx.shape[-1] != 3:
+        raise ValueError("canonical/render-index shape mismatch")
+    out = np.full(valid.shape, int(free_label), dtype=world.dtype)
+    q = idx[valid]
+    out[valid] = world[q[:, 0], q[:, 1], q[:, 2]]
+    return out
+
+
+def gather_canonical_logits_to_future(
+    canonical_logits: torch.Tensor,
+    indices_xyz: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiably gather canonical logits into six future native grids.
+
+    canonical_logits: [B,C,Xc,Yc,Zc]
+    indices_xyz: [B,F,X,Y,Z,3]
+    valid: [B,F,X,Y,Z]
+    Returns [B,F,C,X,Y,Z], with invalid locations set to zero logits.
+    """
+    if canonical_logits.ndim != 5 or indices_xyz.ndim != 6:
+        raise ValueError("unexpected canonical/render tensor rank")
+    if indices_xyz.shape[-1] != 3 or valid.shape != indices_xyz.shape[:-1]:
+        raise ValueError("render indices/valid mismatch")
+    B, C, Xc, Yc, Zc = canonical_logits.shape
+    if indices_xyz.shape[0] != B:
+        raise ValueError("render batch mismatch")
+    idx = indices_xyz.long()
+    safe = idx.clone()
+    safe[..., 0].clamp_(0, Xc - 1)
+    safe[..., 1].clamp_(0, Yc - 1)
+    safe[..., 2].clamp_(0, Zc - 1)
+    linear = (safe[..., 0] * (Yc * Zc) + safe[..., 1] * Zc + safe[..., 2])
+    flat = canonical_logits.reshape(B, C, Xc * Yc * Zc)
+    gather_idx = linear.reshape(B, 1, -1).expand(-1, C, -1)
+    out = torch.gather(flat, 2, gather_idx)
+    out = out.reshape(B, C, *valid.shape[1:]).permute(0, 2, 1, 3, 4, 5)
+    return out * valid[:, :, None].to(out.dtype)
+
+
 class DynamicResponsibility(IntEnum):
     IGNORE = 0
     CURRENT_ANCESTRAL = 1
