@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import lru_cache
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -110,20 +111,36 @@ def poses_to_t0_canonical(
     return np.stack([world_to_t0 @ p for p in poses], axis=0)
 
 
-def grid_centers_xyz(
-    shape_xyz: Sequence[int],
-    origin_xyz_m: Sequence[float],
-    voxel_size_xyz_m: Sequence[float],
+@lru_cache(maxsize=16)
+def _grid_centers_xyz_cached(
+    shape: tuple[int, int, int],
+    origin_t: tuple[float, float, float],
+    step_t: tuple[float, float, float],
 ) -> np.ndarray:
-    shape = tuple(int(x) for x in shape_xyz)
-    origin = np.asarray(origin_xyz_m, dtype=np.float64)
-    step = np.asarray(voxel_size_xyz_m, dtype=np.float64)
+    origin = np.asarray(origin_t, dtype=np.float64)
+    step = np.asarray(step_t, dtype=np.float64)
     axes = [
         origin[d] + (np.arange(shape[d], dtype=np.float64) + 0.5) * step[d]
         for d in range(3)
     ]
     x, y, z = np.meshgrid(*axes, indexing="ij")
-    return np.stack((x, y, z), axis=-1)
+    out = np.stack((x, y, z), axis=-1)
+    out.setflags(write=False)
+    return out
+
+
+def grid_centers_xyz(
+    shape_xyz: Sequence[int],
+    origin_xyz_m: Sequence[float],
+    voxel_size_xyz_m: Sequence[float],
+) -> np.ndarray:
+    """Return immutable cached native-grid centers for repeated V20 geometry."""
+    shape = tuple(int(x) for x in shape_xyz)
+    origin = tuple(float(x) for x in origin_xyz_m)
+    step = tuple(float(x) for x in voxel_size_xyz_m)
+    if len(shape) != 3 or len(origin) != 3 or len(step) != 3:
+        raise ValueError("grid center arguments must be xyz triples")
+    return _grid_centers_xyz_cached(shape, origin, step)
 
 
 def future_union_query_mask(
@@ -177,6 +194,65 @@ class AlignedHistoryEvidence:
     out_of_bounds_samples: int
 
 
+def _rasterize_observed_frame_vectorized(
+    idx_xyz: np.ndarray,
+    in_bounds: np.ndarray,
+    src_semantic_flat: np.ndarray,
+    src_observed_flat: np.ndarray,
+    *,
+    canonical_shape_xyz: Sequence[int],
+    free_label: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rasterize one observed frame with exact legacy collision semantics.
+
+    Source C-order is preserved. For each canonical cell:
+      * any observation marks the cell observed;
+      * occupied overrides observed-free;
+      * the first occupied source label wins deterministically;
+      * multiple distinct occupied labels set conflict=True.
+    """
+    idx = np.asarray(idx_xyz, dtype=np.int64)
+    bounds = np.asarray(in_bounds, dtype=bool)
+    sem = np.asarray(src_semantic_flat).reshape(-1)
+    obs = np.asarray(src_observed_flat, dtype=bool).reshape(-1)
+    shape = tuple(int(x) for x in canonical_shape_xyz)
+    if idx.shape != (sem.size, 3) or bounds.shape != (sem.size,) or obs.shape != (sem.size,):
+        raise ValueError("frame raster input shape mismatch")
+    out_sem = np.full(shape, int(free_label), dtype=np.uint8)
+    out_obs = np.zeros(shape, dtype=bool)
+    conflict = np.zeros(shape, dtype=bool)
+    valid = bounds & obs
+    if not bool(valid.any()):
+        return out_sem, out_obs, conflict
+
+    src_id = np.flatnonzero(valid)
+    cells = idx[valid]
+    labels = sem[valid].astype(np.uint8, copy=False)
+    lin = np.ravel_multi_index(cells.T, shape)
+    order = np.lexsort((src_id, lin))
+    lin = lin[order]
+    labels = labels[order]
+
+    unique_cells = np.unique(lin)
+    out_obs.reshape(-1)[unique_cells] = True
+
+    occupied = labels != int(free_label)
+    if bool(occupied.any()):
+        occ_lin = lin[occupied]
+        occ_lab = labels[occupied]
+        first_lin, first_pos = np.unique(occ_lin, return_index=True)
+        out_sem.reshape(-1)[first_lin] = occ_lab[first_pos]
+        if len(occ_lin) > 1:
+            transition = (
+                (occ_lin[1:] == occ_lin[:-1])
+                & (occ_lab[1:] != occ_lab[:-1])
+            )
+            if bool(transition.any()):
+                conflict_cells = np.unique(occ_lin[1:][transition])
+                conflict.reshape(-1)[conflict_cells] = True
+    return out_sem, out_obs, conflict
+
+
 def align_history_once_to_canonical(
     lattice: CanonicalLattice,
     *,
@@ -224,19 +300,19 @@ def align_history_once_to_canonical(
         world = transform_points(poses[t], local)
         idx, in_bounds = lattice.world_to_index(world)
         oob += int((src_obs & ~in_bounds).sum())
-        valid = in_bounds & src_obs
-        for cell, label in zip(idx[valid], src_sem[valid]):
-            key = (t, int(cell[0]), int(cell[1]), int(cell[2]))
-            was = out_obs[key]
-            old = int(out_sem[key])
-            lab = int(label)
-            if not was:
-                out_sem[key] = lab
-                out_obs[key] = True
-            elif old == int(free_label) and lab != int(free_label):
-                out_sem[key] = lab
-            elif old != int(free_label) and lab != int(free_label) and old != lab:
-                conflict[key] = True
+        frame_sem, frame_obs, frame_conflict = (
+            _rasterize_observed_frame_vectorized(
+                idx,
+                in_bounds,
+                src_sem,
+                src_obs,
+                canonical_shape_xyz=lattice.shape_xyz,
+                free_label=int(free_label),
+            )
+        )
+        out_sem[t] = frame_sem
+        out_obs[t] = frame_obs
+        conflict[t] = frame_conflict
 
     observed_free = out_obs & (out_sem == int(free_label))
     unknown = ~out_obs

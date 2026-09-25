@@ -15,7 +15,9 @@ import argparse
 import json
 import math
 from pathlib import Path
+import resource
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -243,10 +245,15 @@ def main():
 
     shards = []
     rows = []
+    shard_write_seconds = []
+    shard_bytes = 0
+    window_compute_seconds = []
+    started = time.perf_counter()
     oob_query = oob_history = 0
     dyn_totals = {x.name: 0 for x in DynamicResponsibility}
     scene_names = set()
     for wi, rec in enumerate(records, start=1):
+        window_started = time.perf_counter()
         w = window_from_record(rec)
         scene_names.add(str(w.scene_name))
         raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=False)
@@ -302,10 +309,21 @@ def main():
             "dynamic_supervision": dyn,
         })
 
+        window_compute_seconds.append(time.perf_counter() - window_started)
         if len(rows) >= int(a.shard_size) or wi == len(records):
             name = f"shard_{len(shards):05d}.pt"
+            save_started = time.perf_counter()
             torch.save({"protocol": PROTOCOL, "rows": rows}, out / name)
-            shards.append({"file": name, "count": len(rows)})
+            write_s = time.perf_counter() - save_started
+            nbytes = int((out / name).stat().st_size)
+            shard_write_seconds.append(write_s)
+            shard_bytes += nbytes
+            shards.append({
+                "file": name,
+                "count": len(rows),
+                "bytes": nbytes,
+                "write_seconds": float(write_s),
+            })
             rows = []
         if wi == 1 or wi % 25 == 0 or wi == len(records):
             print(f"v20_stage1_cache {wi}/{len(records)}", flush=True)
@@ -333,6 +351,28 @@ def main():
         "query_out_of_bounds_voxels": int(oob_query),
         "history_out_of_bounds_observed_samples": int(oob_history),
         "dynamic_partition_counts": dyn_totals,
+        "build_profile": {
+            "elapsed_seconds": float(time.perf_counter() - started),
+            "window_compute_mean_seconds": float(
+                np.mean(window_compute_seconds)
+            ),
+            "window_compute_p50_seconds": float(
+                np.quantile(window_compute_seconds, 0.50)
+            ),
+            "window_compute_p95_seconds": float(
+                np.quantile(window_compute_seconds, 0.95)
+            ),
+            "shard_write_seconds": float(sum(shard_write_seconds)),
+            "cache_bytes": int(shard_bytes),
+            "bytes_per_window": float(shard_bytes / max(len(records), 1)),
+            "process_max_rss_mib": float(
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+            ),
+            "note": (
+                "Linux ru_maxrss is process peak resident memory. "
+                "Run --max-windows smoke before full cache construction."
+            ),
+        },
         "shards": shards,
     }
     (out / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")

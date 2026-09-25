@@ -16,6 +16,7 @@ from real_motion.v20_history_world import (
     future_union_query_mask,
     partition_future_dynamic_instances,
     protected_add_only,
+    _rasterize_observed_frame_vectorized,
 )
 from real_motion.v20_scene_model import (
     BirthQueryHead,
@@ -457,3 +458,53 @@ def test_birth_matching_uses_strict_birth_records_and_center_distance():
     assert m["gt_birth_instances"] == 1
     assert m["predicted_birth_queries"] == 1
     assert m["distance_matched"] == 1
+
+
+def test_vectorized_history_raster_matches_legacy_collision_semantics():
+    shape = (2, 2, 1)
+    # Six native samples; several intentionally quantize to the same cells.
+    idx = np.asarray(
+        [
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+        ],
+        dtype=np.int64,
+    )
+    in_bounds = np.ones(6, dtype=bool)
+    sem = np.asarray([17, 4, 5, 17, 6, 7], dtype=np.uint8)
+    obs = np.asarray([1, 1, 1, 1, 1, 0], dtype=bool)
+
+    ref_sem = np.full(shape, 17, dtype=np.uint8)
+    ref_obs = np.zeros(shape, dtype=bool)
+    ref_conflict = np.zeros(shape, dtype=bool)
+    for cell, label in zip(idx[in_bounds & obs], sem[in_bounds & obs]):
+        key = tuple(int(x) for x in cell)
+        was = ref_obs[key]
+        old = int(ref_sem[key])
+        lab = int(label)
+        if not was:
+            ref_sem[key] = lab
+            ref_obs[key] = True
+        elif old == 17 and lab != 17:
+            ref_sem[key] = lab
+        elif old != 17 and lab != 17 and old != lab:
+            ref_conflict[key] = True
+
+    got_sem, got_obs, got_conflict = _rasterize_observed_frame_vectorized(
+        idx,
+        in_bounds,
+        sem,
+        obs,
+        canonical_shape_xyz=shape,
+        free_label=17,
+    )
+    assert np.array_equal(got_sem, ref_sem)
+    assert np.array_equal(got_obs, ref_obs)
+    assert np.array_equal(got_conflict, ref_conflict)
+    assert int(got_sem[0, 0, 0]) == 4
+    assert bool(got_conflict[0, 0, 0])
+    assert int(got_sem[1, 0, 0]) == 6
