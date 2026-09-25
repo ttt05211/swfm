@@ -19,8 +19,12 @@ import numpy as np
 import torch
 
 from real_motion.v20_birth import birth_targets_from_cache_row
+from real_motion.v20_runtime import v18_birth_condition_from_record
 from real_motion.v20_scene_model import BirthQueryHead
 from real_motion.v20_training import birth_set_loss, checkpoint_payload, load_v20_checkpoint
+from tools.real_motion import eval_p0_f9_v18_se2 as base
+from tools.real_motion import eval_p0_f9_v18_full_validation as full
+from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 from tools.real_motion.build_p0_f9_v20_history_cache import PROTOCOL as CACHE_PROTOCOL
 from tools.real_motion.v20_birth_stats_from_cache import PROTOCOL as STATS_PROTOCOL
 
@@ -50,6 +54,17 @@ def _unpack(bits, shape):
     return np.unpackbits(arr, bitorder="little", count=int(np.prod(shape))).reshape(shape).astype(bool)
 
 
+def _record_map(cache_path):
+    _, records = base.load_cache(cache_path)
+    out = {}
+    for rec in records:
+        key = (str(rec["scene_name"]), str(rec["t0_token"]))
+        if key in out:
+            raise RuntimeError(f"duplicate source-cache scene/t0 pair: {key}")
+        out[key] = rec
+    return out
+
+
 def _scene(model, row, device):
     shape = (6,) + tuple(int(x) for x in row["coarse_shape_xyz"])
     obs = _unpack(row["history_observed_bits"], shape)
@@ -77,7 +92,7 @@ def _shape_size_from_stats(stats, voxel_size, margin_voxels):
     return tuple(max(a, b) for a, b in zip(dims, mins))
 
 
-def _run(model, root, idx, device, *, optimizer, rng, amp):
+def _run(model, v18, source_records, root, idx, device, *, optimizer, rng, amp):
     train = optimizer is not None
     model.birth.train(train)
     losses = []
@@ -86,6 +101,15 @@ def _run(model, root, idx, device, *, optimizer, rng, amp):
     empty_windows = 0
     for row in _iter_rows(root, idx, train, rng):
         scene = _scene(model, row, device)
+        key = (str(row["scene_name"]), str(row["t0_token"]))
+        if key not in source_records:
+            raise RuntimeError(f"Birth source cache misses {key}")
+        cond = v18_birth_condition_from_record(
+            v18,
+            source_records[key],
+            device=device,
+            amp=amp,
+        )
         target = birth_targets_from_cache_row(
             row,
             shape_size_xyz=model.cfg.birth_shape_size_xyz,
@@ -98,7 +122,13 @@ def _run(model, root, idx, device, *, optimizer, rng, amp):
             torch.autocast("cuda", dtype=torch.bfloat16)
             if amp and device.type == "cuda" else nullcontext()
         ):
-            outputs = model.birth(scene)
+            outputs = model.birth(
+                scene,
+                current_source_tokens=cond.current_source_tokens,
+                current_source_xyz_norm=cond.current_source_xyz_norm,
+                future_source_tokens=cond.future_source_tokens,
+                future_source_xyz_norm=cond.future_source_xyz_norm,
+            )
             loss, stats = birth_set_loss(
                 outputs,
                 [target],
@@ -129,6 +159,11 @@ def main():
     p.add_argument("--val-cache", required=True)
     p.add_argument("--birth-stats", required=True)
     p.add_argument("--dormant-checkpoint", required=True)
+    p.add_argument(
+        "--base-checkpoint",
+        default="",
+        help="Frozen Clean-E14 checkpoint; defaults to the V20 parent checkpoint reference.",
+    )
     p.add_argument("--output-dir", required=True)
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -177,6 +212,17 @@ def main():
     for p0 in model.birth.parameters(): p0.requires_grad = True
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
+    base_checkpoint = str(a.base_checkpoint or parent["v18_checkpoint"])
+    _, v18, _ = full._load_model(base_checkpoint, CLEAN_PROTOCOL, device)
+    v18.eval()
+    for p0 in v18.parameters():
+        p0.requires_grad = False
+    if int(model.cfg.source_dim) != int(v18.config.d_model):
+        raise RuntimeError(
+            f"Birth source_dim={model.cfg.source_dim} != Clean-E14 d_model={v18.config.d_model}"
+        )
+    train_records = _record_map(tr_idx["source_cache"])
+    val_records = _record_map(va_idx["source_cache"])
     model.to(device).eval()
     model.birth.train()
     amp = device.type == "cuda" and not bool(a.no_amp)
@@ -190,11 +236,14 @@ def main():
     history = []
     parent_extra = dict(parent.get("extra") or {})
     for epoch in range(1, int(a.epochs) + 1):
-        tr = _run(model, tr_root, tr_idx, device, optimizer=optimizer, rng=rng, amp=amp)
+        tr = _run(
+            model, v18, train_records, tr_root, tr_idx, device,
+            optimizer=optimizer, rng=rng, amp=amp,
+        )
         model.birth.eval()
         with torch.no_grad():
             va = _run(
-                model, va_root, va_idx, device,
+                model, v18, val_records, va_root, va_idx, device,
                 optimizer=None, rng=random.Random(int(a.seed)), amp=amp,
             )
         model.birth.train()
@@ -203,7 +252,7 @@ def main():
         payload = checkpoint_payload(
             model,
             stage="birth",
-            v18_checkpoint=str(parent["v18_checkpoint"]),
+            v18_checkpoint=str(Path(base_checkpoint).resolve()),
             thresholds={},
             extra={
                 **parent_extra,
@@ -215,6 +264,10 @@ def main():
                 "birth_Q_truncated_gt_fraction": float(stats["truncated_gt_fraction"]),
                 "birth_shape_size_xyz": list(shape_size),
                 "birth_shape_voxel_size_m": shape_voxel,
+                "birth_conditioning": (
+                    "spatial_3d_scene_tokens + frozen V18 current-source context "
+                    "+ six-horizon V18 future transport queries with positions"
+                ),
                 "history": history,
                 "checkpoint_selection": (
                     "formal real-BIRTH matching/precision + composed semantic metrics on dev split"

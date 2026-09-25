@@ -241,3 +241,75 @@ def static_subset_masks(
             static_domain & ~seen_f & (gt != int(free_label))
         ),
     }
+
+
+@dataclass(frozen=True)
+class V18BirthCondition:
+    current_source_tokens: torch.Tensor
+    current_source_xyz_norm: torch.Tensor
+    future_source_tokens: torch.Tensor
+    future_source_xyz_norm: torch.Tensor
+    future_source_xy_t0_m: torch.Tensor
+    future_source_existence_prob: torch.Tensor
+    current_source_class_id: torch.Tensor
+
+
+def v18_birth_condition_from_record(
+    v18,
+    record,
+    *,
+    device: torch.device,
+    amp: bool,
+    position_scale_m: float = 40.0,
+) -> V18BirthCondition:
+    """Expose frozen V18 current/future source state for Birth conditioning."""
+    scale = float(position_scale_m)
+    if scale <= 0:
+        raise ValueError("position_scale_m must be positive")
+    def mv(name, dtype=None):
+        x = record[name].to(device)
+        return x.to(dtype) if dtype is not None else x
+    with torch.no_grad(), (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if amp and device.type == "cuda" else torch.autocast("cpu", enabled=False)
+    ):
+        out = v18(
+            mv("features", torch.float32),
+            mv("local_semantic_tube"),
+            mv("kta_displacement_xy_m", torch.float32),
+            mv("frame_motion_features", torch.float32),
+            mv("target_source_mask_tube"),
+            return_latents=True,
+        )
+    current_tok = out["history_source_context"].float()
+    future_tok = out["future_transport_queries"].float()
+    N = int(current_tok.shape[0])
+    if "source_centroid_xy_t0_m" in record:
+        current_xy = record["source_centroid_xy_t0_m"].float().to(device)
+    else:
+        # Frozen feature contract: first two channels are current x/y / 40 m.
+        current_xy = record["features"][:, :2].float().to(device) * 40.0
+    if current_xy.shape != (N, 2):
+        raise RuntimeError("V18 source centroid count mismatch")
+    future_xy = (
+        record["anchors_xy_t0_m"].float().to(device)
+        + out["residual_xy_m"].float()
+    )
+    if future_xy.shape != (N, 6, 2):
+        raise RuntimeError("V18 future source position shape mismatch")
+    cur_xyz = torch.zeros((N, 3), dtype=torch.float32, device=device)
+    cur_xyz[:, :2] = current_xy
+    fut_xyz = torch.zeros((N, 6, 3), dtype=torch.float32, device=device)
+    fut_xyz[..., :2] = future_xy
+    cls = record["source_class_id"].long().to(device)
+    return V18BirthCondition(
+        current_source_tokens=current_tok.unsqueeze(0),
+        current_source_xyz_norm=(cur_xyz / scale).unsqueeze(0),
+        future_source_tokens=future_tok.unsqueeze(0),
+        future_source_xyz_norm=(fut_xyz / scale).unsqueeze(0),
+        future_source_xy_t0_m=future_xy,
+        future_source_existence_prob=torch.sigmoid(
+            out["existence_logits"].float()
+        ),
+        current_source_class_id=cls,
+    )

@@ -17,7 +17,11 @@ from real_motion.v20_history_world import (
     partition_future_dynamic_instances,
     protected_add_only,
 )
-from real_motion.v20_scene_model import HistoricalEvidence3DEncoder, V20SceneConfig
+from real_motion.v20_scene_model import (
+    BirthQueryHead,
+    HistoricalEvidence3DEncoder,
+    V20SceneConfig,
+)
 from real_motion.v20_dormant import render_dormant_sources
 from real_motion.v19_scene_memory import SourceTrack
 from real_motion.v20_stage0_voxel_semantic import (
@@ -30,6 +34,7 @@ from real_motion.v20_stage0_voxel_semantic import (
     validate_stage0_sidecar_pair,
 )
 from real_motion.v20_training import choose_birth_query_count
+from real_motion.v20_birth import render_birth_queries
 
 
 def test_v18_optional_latents_do_not_change_default_predictions():
@@ -340,3 +345,70 @@ def test_dormant_renderer_uses_kta_plus_residual_and_existence():
     assert report.rendered_voxels == 1
     assert np.count_nonzero(report.future_semantic != 17) == 1
     assert np.count_nonzero(report.future_semantic[1:] != 17) == 0
+
+
+def test_birth_head_accepts_spatial_scene_and_v18_source_context():
+    torch.manual_seed(19)
+    cfg = V20SceneConfig(
+        semantic_dim=4,
+        base_dim=8,
+        source_dim=16,
+        birth_queries=3,
+        birth_shape_size_xyz=(4, 3, 2),
+    )
+    head = BirthQueryHead(scene_dim=16, cfg=cfg).eval()
+    scene = torch.randn(1, 16, 8, 8, 4)
+    cur = torch.randn(1, 2, 16)
+    cur_pos = torch.randn(1, 2, 3)
+    fut = torch.randn(1, 2, FUTURE_FRAMES, 16)
+    fut_pos = torch.randn(1, 2, FUTURE_FRAMES, 3)
+    with torch.no_grad():
+        out = head(
+            scene,
+            current_source_tokens=cur,
+            current_source_xyz_norm=cur_pos,
+            future_source_tokens=fut,
+            future_source_xyz_norm=fut_pos,
+        )
+    assert out["class_logits"].shape == (1, 3, len(DYNAMIC_CLASS_IDS) + 1)
+    assert out["existence_logits"].shape == (1, 3, FUTURE_FRAMES)
+    assert out["trajectory_xyz_yaw"].shape == (1, 3, FUTURE_FRAMES, 4)
+    assert out["shape_logits"].shape == (1, 3, 4, 3, 2)
+    # Zero-contribution init must still select no-object.
+    assert torch.all(out["class_logits"].argmax(-1) == len(DYNAMIC_CLASS_IDS))
+
+
+def test_birth_renderer_suppresses_duplicate_current_source_horizon():
+    cid = int(DYNAMIC_CLASS_IDS[0])
+    cfg = V20SceneConfig(
+        birth_queries=1,
+        birth_shape_size_xyz=(1, 1, 1),
+    )
+    outputs = {
+        "class_logits": torch.full((1, 1, len(DYNAMIC_CLASS_IDS) + 1), -8.0),
+        "existence_logits": torch.full((1, 1, FUTURE_FRAMES), -8.0),
+        "trajectory_xyz_yaw": torch.zeros((1, 1, FUTURE_FRAMES, 4)),
+        "shape_logits": torch.full((1, 1, 1, 1, 1), 8.0),
+    }
+    local = list(DYNAMIC_CLASS_IDS).index(cid)
+    outputs["class_logits"][0, 0, local] = 8.0
+    outputs["existence_logits"][0, 0, 0] = 8.0
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    src_xy = np.zeros((1, FUTURE_FRAMES, 2), dtype=np.float32)
+    src_ex = np.zeros((1, FUTURE_FRAMES), dtype=np.float32)
+    src_ex[0, 0] = 1.0
+    report = render_birth_queries(
+        outputs,
+        future_ego_to_canonical=poses,
+        native_shape_xyz=(4, 4, 2),
+        native_origin_xyz_m=(-2.0, -2.0, -1.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        shape_voxel_size_m=1.0,
+        current_source_future_xy_t0_m=src_xy,
+        current_source_existence_prob=src_ex,
+        current_source_class_id=np.asarray([cid], dtype=np.int64),
+        duplicate_distance_m=1.0,
+    )
+    assert report.duplicate_suppressed_query_horizons == 1
+    assert report.rendered_voxels == 0
+    assert np.all(report.future_semantic == 17)

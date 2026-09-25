@@ -233,11 +233,15 @@ class DormantSourceHead(nn.Module):
 
 
 class BirthQueryHead(nn.Module):
-    """Set prediction for ancestor-free dynamic objects.
+    """Persistent Birth queries over spatial scene evidence and V18 source state.
 
-    One learned query predicts one identity-consistent object over all six
-    horizons.  First-appearance is derived from existence logits rather than a
-    separate head.
+    Each query attends to:
+      1) a small spatial token grid pooled from the shared 3D history volume;
+      2) frozen V18 current-source context tokens;
+      3) frozen V18 six-horizon transport-query tokens at predicted positions.
+
+    This keeps Q small while making Birth explicitly aware of where historical
+    evidence exists and which dynamic sources are already owned by V18.
     """
 
     def __init__(
@@ -264,9 +268,32 @@ class BirthQueryHead(nn.Module):
             raise ValueError("invalid Birth shape lattice")
         if float(cfg.birth_shape_voxel_size_m) <= 0:
             raise ValueError("birth_shape_voxel_size_m must be positive")
+
         h = 2 * int(cfg.base_dim)
+        self.hidden_dim = h
+        self.scene_token_grid = (4, 4, 2)
         self.query = nn.Parameter(torch.zeros(1, self.Q, h))
         self.global_proj = nn.Linear(int(scene_dim), h)
+        self.scene_token_proj = nn.Linear(int(scene_dim), h)
+        self.scene_pos_proj = nn.Sequential(
+            nn.Linear(3, h),
+            nn.GELU(),
+            nn.Linear(h, h),
+        )
+        self.source_token_proj = nn.Linear(int(cfg.source_dim), h)
+        self.source_pos_proj = nn.Sequential(
+            nn.Linear(3, h),
+            nn.GELU(),
+            nn.Linear(h, h),
+        )
+        self.current_source_type = nn.Parameter(torch.zeros(1, 1, h))
+        self.future_source_type = nn.Parameter(torch.zeros(1, 1, h))
+        self.future_time = nn.Parameter(torch.zeros(1, FUTURE_FRAMES, h))
+        self.scene_attn = nn.MultiheadAttention(h, 4, batch_first=True)
+        self.source_attn = nn.MultiheadAttention(h, 4, batch_first=True)
+        self.scene_norm = nn.LayerNorm(h)
+        self.source_norm = nn.LayerNorm(h)
+
         enc = nn.TransformerEncoderLayer(
             d_model=h,
             nhead=4,
@@ -274,14 +301,18 @@ class BirthQueryHead(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        # This transformer only mixes Q object queries; it never sees all scene voxels.
         self.query_mixer = nn.TransformerEncoder(enc, num_layers=1)
-        self.class_head = nn.Linear(h, int(cfg.dynamic_classes) + 1)  # + no-object
+        self.class_head = nn.Linear(h, int(cfg.dynamic_classes) + 1)
         self.exist_head = nn.Linear(h, FUTURE_FRAMES)
-        self.traj_head = nn.Linear(h, FUTURE_FRAMES * 4)  # x,y,z,yaw
+        self.traj_head = nn.Linear(h, FUTURE_FRAMES * 4)
         sx, sy, sz = self.shape_size_xyz
         self.shape_head = nn.Linear(h, sx * sy * sz)
-        # No-object/no-existence initialization makes Birth render nothing.
+
+        nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.trunc_normal_(self.future_time, std=0.02)
+        nn.init.zeros_(self.current_source_type)
+        nn.init.zeros_(self.future_source_type)
+        # Zero-contribution initialization: no object/no existence/no shape.
         nn.init.zeros_(self.class_head.weight)
         nn.init.zeros_(self.class_head.bias)
         nn.init.zeros_(self.exist_head.weight)
@@ -291,18 +322,92 @@ class BirthQueryHead(nn.Module):
         with torch.no_grad():
             self.class_head.bias[int(cfg.dynamic_classes)] = 8.0
 
-    def forward(self, scene: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _scene_tokens(self, scene: torch.Tensor) -> torch.Tensor:
+        pooled = F.adaptive_avg_pool3d(scene, self.scene_token_grid)
+        B, C, X, Y, Z = pooled.shape
+        tok = pooled.flatten(2).transpose(1, 2)
+        xs = torch.linspace(-1.0, 1.0, X, device=scene.device, dtype=scene.dtype)
+        ys = torch.linspace(-1.0, 1.0, Y, device=scene.device, dtype=scene.dtype)
+        zs = torch.linspace(-1.0, 1.0, Z, device=scene.device, dtype=scene.dtype)
+        xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
+        pos = torch.stack((xx, yy, zz), dim=-1).reshape(1, X * Y * Z, 3)
+        return self.scene_token_proj(tok) + self.scene_pos_proj(pos).expand(B, -1, -1)
+
+    def _source_tokens(
+        self,
+        *,
+        current_source_tokens: torch.Tensor | None,
+        current_source_xyz_norm: torch.Tensor | None,
+        future_source_tokens: torch.Tensor | None,
+        future_source_xyz_norm: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        rows = []
+        if current_source_tokens is not None:
+            if current_source_xyz_norm is None:
+                raise ValueError("current source positions are required with source tokens")
+            if current_source_tokens.ndim != 3 or current_source_xyz_norm.shape != (
+                current_source_tokens.shape[0], current_source_tokens.shape[1], 3
+            ):
+                raise ValueError("current source token/position shape mismatch")
+            rows.append(
+                self.source_token_proj(current_source_tokens)
+                + self.source_pos_proj(current_source_xyz_norm.to(current_source_tokens.dtype))
+                + self.current_source_type
+            )
+        if future_source_tokens is not None:
+            if future_source_xyz_norm is None:
+                raise ValueError("future source positions are required with future tokens")
+            if future_source_tokens.ndim != 4 or future_source_tokens.shape[2] != FUTURE_FRAMES:
+                raise ValueError("future_source_tokens must be [B,N,6,C]")
+            if future_source_xyz_norm.shape != future_source_tokens.shape[:3] + (3,):
+                raise ValueError("future source token/position shape mismatch")
+            B, N, Fh, C = future_source_tokens.shape
+            ft = self.source_token_proj(
+                future_source_tokens.reshape(B, N * Fh, C)
+            )
+            fp = self.source_pos_proj(
+                future_source_xyz_norm.to(future_source_tokens.dtype).reshape(B, N * Fh, 3)
+            )
+            tm = self.future_time[:, None].expand(B, N, Fh, -1).reshape(B, N * Fh, -1)
+            rows.append(ft + fp + tm + self.future_source_type)
+        if not rows:
+            return None
+        return torch.cat(rows, dim=1)
+
+    def forward(
+        self,
+        scene: torch.Tensor,
+        *,
+        current_source_tokens: torch.Tensor | None = None,
+        current_source_xyz_norm: torch.Tensor | None = None,
+        future_source_tokens: torch.Tensor | None = None,
+        future_source_xyz_norm: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         if scene.ndim != 5:
             raise ValueError("scene must be [B,C,X,Y,Z]")
+        B = scene.shape[0]
         pooled = scene.mean(dim=(2, 3, 4))
-        q = self.query.expand(scene.shape[0], -1, -1)
+        q = self.query.expand(B, -1, -1)
         q = q + self.global_proj(pooled).unsqueeze(1)
-        q = self.query_mixer(q)
-        traj = self.traj_head(q).reshape(
-            scene.shape[0], self.Q, FUTURE_FRAMES, 4
+
+        scene_kv = self._scene_tokens(scene)
+        scene_delta, _ = self.scene_attn(q, scene_kv, scene_kv, need_weights=False)
+        q = self.scene_norm(q + scene_delta)
+
+        source_kv = self._source_tokens(
+            current_source_tokens=current_source_tokens,
+            current_source_xyz_norm=current_source_xyz_norm,
+            future_source_tokens=future_source_tokens,
+            future_source_xyz_norm=future_source_xyz_norm,
         )
+        if source_kv is not None and source_kv.shape[1] > 0:
+            source_delta, _ = self.source_attn(q, source_kv, source_kv, need_weights=False)
+            q = self.source_norm(q + source_delta)
+
+        q = self.query_mixer(q)
+        traj = self.traj_head(q).reshape(B, self.Q, FUTURE_FRAMES, 4)
         sx, sy, sz = self.shape_size_xyz
-        shape = self.shape_head(q).reshape(scene.shape[0], self.Q, sx, sy, sz)
+        shape = self.shape_head(q).reshape(B, self.Q, sx, sy, sz)
         return {
             "class_logits": self.class_head(q),
             "existence_logits": self.exist_head(q),
@@ -311,10 +416,15 @@ class BirthQueryHead(nn.Module):
         }
 
     @staticmethod
-    def first_appearance(existence_logits: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    def first_appearance(
+        existence_logits: torch.Tensor,
+        threshold: float = 0.5,
+    ) -> torch.Tensor:
         active = torch.sigmoid(existence_logits) >= float(threshold)
         B, Q, Fh = active.shape
-        ids = torch.arange(Fh, device=active.device).view(1, 1, Fh).expand(B, Q, Fh)
+        ids = torch.arange(
+            Fh, device=active.device
+        ).view(1, 1, Fh).expand(B, Q, Fh)
         sentinel = torch.full_like(ids, Fh)
         return torch.where(active, ids, sentinel).amin(dim=-1)
 

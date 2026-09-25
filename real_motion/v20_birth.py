@@ -89,6 +89,7 @@ class BirthRenderReport:
     active_query_horizons: int
     rendered_voxels: int
     out_of_bounds_voxels: int
+    duplicate_suppressed_query_horizons: int
 
 
 def _local_shape_points(
@@ -115,6 +116,10 @@ def render_birth_queries(
     existence_threshold: float = 0.5,
     shape_threshold: float = 0.5,
     free_label: int = FREE_LABEL,
+    current_source_future_xy_t0_m: torch.Tensor | np.ndarray | None = None,
+    current_source_existence_prob: torch.Tensor | np.ndarray | None = None,
+    current_source_class_id: torch.Tensor | np.ndarray | None = None,
+    duplicate_distance_m: float = 2.0,
 ) -> BirthRenderReport:
     """Render B=1 Birth queries directly into each future ego Occ3D grid.
 
@@ -150,7 +155,41 @@ def render_birth_queries(
     step = np.asarray(native_voxel_size_xyz_m, dtype=np.float64)
     nshape = np.asarray(tuple(int(x) for x in native_shape_xyz), dtype=np.int64)
     out = np.full((6,) + tuple(nshape.tolist()), int(free_label), dtype=np.uint8)
-    active_h = rendered = oob = 0
+    active_h = rendered = oob = duplicate_suppressed = 0
+    src_xy = None
+    src_exist = None
+    src_cls = None
+    supplied = [
+        current_source_future_xy_t0_m is not None,
+        current_source_existence_prob is not None,
+        current_source_class_id is not None,
+    ]
+    if any(supplied) and not all(supplied):
+        raise ValueError("Birth duplicate suppression requires xy/existence/class together")
+    if all(supplied):
+        def _np(x):
+            return (
+                x.detach().float().cpu().numpy()
+                if isinstance(x, torch.Tensor) else np.asarray(x)
+            )
+        src_xy = np.asarray(_np(current_source_future_xy_t0_m), dtype=np.float64)
+        src_exist = np.asarray(_np(current_source_existence_prob), dtype=np.float64)
+        src_cls = np.asarray(
+            current_source_class_id.detach().cpu().numpy()
+            if isinstance(current_source_class_id, torch.Tensor)
+            else current_source_class_id,
+            dtype=np.int64,
+        )
+        if src_xy.ndim == 4 and src_xy.shape[0] == 1:
+            src_xy = src_xy[0]
+        if src_exist.ndim == 3 and src_exist.shape[0] == 1:
+            src_exist = src_exist[0]
+        if src_cls.ndim == 2 and src_cls.shape[0] == 1:
+            src_cls = src_cls[0]
+        if src_xy.shape[:2] != src_exist.shape or src_xy.shape[-1] != 2:
+            raise ValueError("current source future xy/existence shape mismatch")
+        if src_xy.shape[0] != src_cls.shape[0] or src_xy.shape[1] != 6:
+            raise ValueError("current source class/future shape mismatch")
 
     for order_i, q in enumerate(selected):
         cid = int(global_cls[order_i])
@@ -163,8 +202,20 @@ def render_birth_queries(
         for h in range(6):
             if float(exist[0, q, h]) < float(existence_threshold):
                 continue
-            active_h += 1
             x, y, z, yaw = [float(v) for v in traj[0, q, h].tolist()]
+            if src_xy is not None:
+                same = (src_cls == int(cid)) & (
+                    src_exist[:, h] >= float(existence_threshold)
+                )
+                if bool(same.any()):
+                    dist = np.linalg.norm(
+                        src_xy[same, h] - np.asarray([x, y], dtype=np.float64)[None],
+                        axis=1,
+                    )
+                    if bool((dist < float(duplicate_distance_m)).any()):
+                        duplicate_suppressed += 1
+                        continue
+            active_h += 1
             cy, sy = math.cos(yaw), math.sin(yaw)
             rot = np.asarray(
                 [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]],
@@ -189,4 +240,5 @@ def render_birth_queries(
         active_query_horizons=int(active_h),
         rendered_voxels=int(rendered),
         out_of_bounds_voxels=int(oob),
+        duplicate_suppressed_query_horizons=int(duplicate_suppressed),
     )
