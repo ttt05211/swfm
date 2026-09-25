@@ -1,0 +1,99 @@
+protocol: p0_f9_v20_3d_history_world_model_v1
+
+base:
+  frozen_branch: freeze/v18-main-final-20260918
+  clean_e14_checkpoint: outputs/p0_f9_v18_se2_clean_tail15/epoch_0014.pt
+  freeze_v18_initially: true
+  current_source_path_must_match_v18: true
+
+history:
+  frames: 6
+  semantic_classes: 18
+  free_label: 17
+  require_mask_lidar: true
+  canonical_alignment: t0_world_canonical
+  distinguish_observed_free_from_unknown: true
+  align_history_once: true
+
+canonical_lattice:
+  # These values are placeholders until tools/real_motion/v20_scan_query_extent.py
+  # has been run on the full training split.  Training must refuse
+  # auto-finalization while extent_scan_complete=false.
+  extent_scan_complete: false
+  origin_xyz_m: [-80.0, -80.0, -6.4]
+  voxel_size_xyz_m: [0.4, 0.4, 0.4]
+  shape_xyz: [400, 400, 32]
+  report_out_of_bounds: true
+  high_resolution_only_inside_query_mask: true
+
+scene_encoder:
+  semantic_dim: 8
+  base_dim: 32
+  tile_dim: 48
+  downsample_xy: 4
+  downsample_z: 4
+  preserve_z_as_spatial_dimension: true
+  full_scene_transformer: false
+
+static:
+  enabled: true
+  one_canonical_world: true
+  supervise_future_observed_only: true
+  ignore_dynamic_gt: true
+  select_checkpoint_by_semantic_miou: true
+  report_subsets:
+    - history_seen_t0_missing
+    - never_seen_static
+  memory_is_input_only: true
+
+dormant:
+  enabled: true
+  current_sources_use_frozen_v18: true
+  only_history_seen_t0_missing: true
+  recompute_full_inputs_for_synthetic_occlusion: true
+
+birth:
+  enabled: true
+  q: null
+  q_must_be_selected_from_training_distribution: true
+  max_gt_truncation_fraction: 0.01
+  persistent_query_across_six_frames: true
+  separate_first_appearance_head: false
+  local_shape_size_xyz: [12, 12, 8]
+
+composition:
+  protected_add_only: true
+  priority:
+    - v18_current_source
+    - dormant_source
+    - birth_object
+    - static_world
+  zero_contribution_must_equal_v18_elementwise: true
+
+training:
+  amp: bf16
+  geometry_index_dtype: float64
+  stage_order:
+    - stage0_per_z_semantic_control
+    - stage1_data_zero_contribution
+    - stage2_static
+    - stage3_dormant
+    - stage4_birth
+    - stage5_full
+  dev_split_by_scene: true
+  full_eval_windows: 4369
+
+evaluation:
+  horizons_s: [1.0, 2.0, 3.0]
+  report_all_six: true
+  report_iou: true
+  report_miou: true
+  report_moving_macro: true
+  report_moving_micro: true
+  report_per_scene: true
+  report_full_latency: true
+  latency_components:
+    - input_preparation
+    - v18
+    - v20_network
+    - six_frame_render
