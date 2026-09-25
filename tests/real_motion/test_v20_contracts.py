@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.local_st_world_model_v17 import LocalSTWMV17Config
 from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
 from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRAMES
@@ -21,6 +22,7 @@ from real_motion.v20_stage0_voxel_semantic import (
     LABEL_SIDECAR_PROTOCOL,
     PerZSemanticHead,
     decode_per_z_semantic,
+    dense_targets_from_sparse,
     frozen_factorized_support,
     per_z_semantic_loss,
     validate_stage0_sidecar_pair,
@@ -222,7 +224,8 @@ def test_stage0_sidecar_pair_is_label_only_and_identity_checked():
         "protocol": LABEL_SIDECAR_PROTOCOL,
         "parent_v19_shard": "shard_00000.pt",
         "count": 2,
-        "voxel_semantic_target": torch.zeros((2, 6, 2, 2, 2), dtype=torch.uint8),
+        "semantic_values": torch.tensor([1, 2, 3], dtype=torch.uint8),
+        "semantic_offsets": torch.tensor([0, 1, 3], dtype=torch.int64),
         "scene_name": ["scene-a", "scene-b"],
         "t0_token": ["t0-a", "t0-b"],
     }
@@ -244,3 +247,23 @@ def test_stage0_sidecar_pair_is_label_only_and_identity_checked():
         pass
     else:
         raise AssertionError("Stage-0 sidecar accepted a copied V19/GT tensor")
+
+
+def test_stage0_sparse_labels_expand_in_parent_mask_order():
+    mask = torch.zeros((2, 1, 2, 2, 2), dtype=torch.bool)
+    mask[0, 0, 0, 0, 1] = True
+    mask[1, 0, 0, 1, 0] = True
+    mask[1, 0, 1, 1, 1] = True
+    values = torch.tensor([4, 6, 9], dtype=torch.uint8)
+    counts = torch.tensor([1, 2], dtype=torch.int64)
+    dense = dense_targets_from_sparse(
+        mask,
+        values,
+        counts,
+        ignore_label=255,
+    )
+    assert dense.shape == mask.shape
+    assert dense[0, 0, 0, 0, 1].item() == 4
+    assert dense[1, 0, 0, 1, 0].item() == 6
+    assert dense[1, 0, 1, 1, 1].item() == 9
+    assert torch.all(dense[~mask] == 255)

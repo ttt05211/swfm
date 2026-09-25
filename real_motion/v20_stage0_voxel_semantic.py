@@ -21,13 +21,14 @@ from .v20_history_world import DYNAMIC_IDS
 from .v19_static_novelty_factorized import FactorizedStaticNewFOVHead
 
 PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_v1"
-LABEL_SIDECAR_PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_labels_v2"
+LABEL_SIDECAR_PROTOCOL = "p0_f9_v20_stage0_per_z_semantic_labels_v3"
 LABEL_SIDECAR_KEYS = frozenset(
     {
         "protocol",
         "parent_v19_shard",
         "count",
-        "voxel_semantic_target",
+        "semantic_values",
+        "semantic_offsets",
         "scene_name",
         "t0_token",
     }
@@ -103,10 +104,59 @@ def validate_stage0_sidecar_pair(
         raise RuntimeError("malformed V19 shard identity arrays")
     if int(label_shard.get("count", -1)) != n:
         raise RuntimeError("Stage-0 sidecar count mismatch")
-    target = label_shard.get("voxel_semantic_target")
-    if not isinstance(target, torch.Tensor) or int(target.shape[0]) != n:
-        raise RuntimeError("Stage-0 sidecar target batch mismatch")
+    values = label_shard.get("semantic_values")
+    offsets = label_shard.get("semantic_offsets")
+    if not isinstance(values, torch.Tensor) or values.ndim != 1:
+        raise RuntimeError("Stage-0 sidecar semantic_values must be 1D")
+    if values.dtype != torch.uint8:
+        raise RuntimeError("Stage-0 sidecar semantic_values must be uint8")
+    if not isinstance(offsets, torch.Tensor) or offsets.ndim != 1:
+        raise RuntimeError("Stage-0 sidecar semantic_offsets must be 1D")
+    if offsets.dtype != torch.int64 or int(offsets.numel()) != n + 1:
+        raise RuntimeError("Stage-0 sidecar semantic_offsets shape/dtype mismatch")
+    off = offsets.cpu()
+    if int(off[0]) != 0 or int(off[-1]) != int(values.numel()):
+        raise RuntimeError("Stage-0 sidecar offsets do not span semantic_values")
+    if bool((off[1:] < off[:-1]).any()):
+        raise RuntimeError("Stage-0 sidecar offsets must be monotonic")
+    if values.numel() and (int(values.min()) < 0 or int(values.max()) >= 17):
+        raise RuntimeError("Stage-0 sidecar semantic class outside [0,16]")
     return n
+
+
+def dense_targets_from_sparse(
+    vertical_target: torch.Tensor,
+    semantic_values: torch.Tensor,
+    semantic_counts: torch.Tensor,
+    *,
+    ignore_label: int = 255,
+) -> torch.Tensor:
+    """Expand sparse labels on the GT-only supervision mask.
+
+    vertical_target is supervision only and must never be passed to the model.
+    Values are stored in the same flattened [F,Z,H,W] order as this mask.
+    """
+    mask = vertical_target.bool()
+    if mask.ndim != 5:
+        raise ValueError("vertical_target must be [B,F,Z,H,W]")
+    counts = mask.reshape(mask.shape[0], -1).sum(dim=1).to(torch.int64)
+    expected = semantic_counts.to(device=counts.device, dtype=torch.int64)
+    if expected.ndim != 1 or expected.numel() != mask.shape[0]:
+        raise ValueError("semantic_counts must be [B]")
+    if not torch.equal(counts, expected):
+        raise RuntimeError("sparse semantic count disagrees with vertical_target_bits")
+    values = semantic_values.to(device=mask.device, dtype=torch.long)
+    if int(counts.sum().item()) != int(values.numel()):
+        raise RuntimeError("sparse semantic value count mismatch")
+    out = torch.full(
+        mask.shape,
+        int(ignore_label),
+        dtype=torch.long,
+        device=mask.device,
+    )
+    if values.numel():
+        out[mask] = values
+    return out
 
 
 

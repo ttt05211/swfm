@@ -30,6 +30,7 @@ from real_motion.v20_stage0_voxel_semantic import (
     FrozenFactorizedFeatureAdapter,
     PerZSemanticHead,
     frozen_factorized_support,
+    dense_targets_from_sparse,
     per_z_semantic_loss,
     validate_stage0_sidecar_pair,
 )
@@ -135,11 +136,28 @@ def _iter_batches(
                 k: vobj[k].index_select(0, ids)
                 for k in V19_INPUT_KEYS
             }
-            # Supervision enters through a separate key after the frozen model
-            # inputs have already been selected from the V19 shard.
-            batch["voxel_semantic_target"] = lobj[
-                "voxel_semantic_target"
+            # GT-derived V19 vertical_target_bits and sparse semantic labels are
+            # supervision only.  They are attached after the model-input dict is
+            # selected and are never passed into the frozen V19 forward call.
+            batch["vertical_target_bits"] = vobj[
+                "vertical_target_bits"
             ].index_select(0, ids)
+            offsets = lobj["semantic_offsets"]
+            chunks = []
+            counts = []
+            for rid in ids.tolist():
+                lo = int(offsets[rid])
+                hi = int(offsets[rid + 1])
+                chunks.append(lobj["semantic_values"][lo:hi])
+                counts.append(hi - lo)
+            batch["semantic_values"] = (
+                torch.cat(chunks, dim=0)
+                if chunks
+                else torch.empty(0, dtype=torch.uint8)
+            )
+            batch["semantic_counts"] = torch.as_tensor(
+                counts, dtype=torch.int64
+            )
             yield batch
 
 
@@ -162,7 +180,11 @@ def _move(raw, device, z, anchor_distance_max_m):
         "anchor_distance_m": dequantize_anchor_distance_torch(
             mv(raw["anchor_distance_q"]), anchor_distance_max_m
         ),
-        "voxel_semantic_target": mv(raw["voxel_semantic_target"]).long(),
+        "vertical_target": unpack_vertical_occupancy_torch(
+            mv(raw["vertical_target_bits"]), z
+        ).bool(),
+        "semantic_values": mv(raw["semantic_values"]),
+        "semantic_counts": mv(raw["semantic_counts"]).to(torch.int64),
     }
 
 
@@ -179,10 +201,10 @@ def _flatten_stage0(feature, frozen_support, semantic_target):
     z = int(frozen_support.shape[2])
     feat = feature.reshape(B * Fh, C, H, W)
     support = frozen_support.reshape(B * Fh, z, H, W)
-    # label sidecar [B,F,H,W,Z] -> [BF,Z,H,W]
-    target = semantic_target.permute(0, 1, 4, 2, 3).reshape(
-        B * Fh, z, H, W
-    )
+    # sparse labels are expanded on supervision-only [B,F,Z,H,W].
+    if semantic_target.shape != (B, Fh, z, H, W):
+        raise ValueError("expanded Stage-0 target shape mismatch")
+    target = semantic_target.reshape(B * Fh, z, H, W)
     supervised = target.ne(int(IGNORE_LABEL)) & support
     return feat, support, target, supervised
 
@@ -278,10 +300,16 @@ def _run_epoch(
                 presence_threshold=presence_threshold,
                 vertical_threshold=vertical_threshold,
             )
+        semantic_target = dense_targets_from_sparse(
+            b["vertical_target"],
+            b["semantic_values"],
+            b["semantic_counts"],
+            ignore_label=int(IGNORE_LABEL),
+        )
         feat, support_bf, target, supervised = _flatten_stage0(
             feature,
             support,
-            b["voxel_semantic_target"],
+            semantic_target,
         )
         with _autocast(device, amp):
             logits = head(feat, support_bf)
@@ -395,7 +423,6 @@ def main():
     anchor_max = float(
         train_idx.get("anchor_distance_max_m", ANCHOR_DISTANCE_MAX_M)
     )
-    best = float("inf")
     history = []
     for epoch in range(1, int(a.epochs) + 1):
         tr = _run_epoch(
@@ -459,14 +486,15 @@ def main():
             "train_label_cache": str(Path(a.train_label_cache).resolve()),
             "val_v19_cache": str(Path(a.val_v19_cache).resolve()),
             "val_label_cache": str(Path(a.val_label_cache).resolve()),
-            "selection_metric": "validation_per_z_semantic_cross_entropy",
+            "selection_metric": (
+                "none_in_training; select only by formal composed semantic "
+                "mIoU on the scene-disjoint development set"
+            ),
+            "validation_ce_is_diagnostic_only": True,
             "val": va,
             "history": history,
         }
         torch.save(payload, out / f"epoch_{epoch:04d}.pt")
-        if float(va["loss"]) < best:
-            best = float(va["loss"])
-            torch.save(payload, out / "best.pt")
     (out / "history.json").write_text(
         json.dumps(history, indent=2),
         encoding="utf-8",

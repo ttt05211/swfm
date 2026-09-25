@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build a label-only Stage-0 sidecar for frozen V19 Factorized caches.
+"""Build a sparse label-only Stage-0 sidecar for frozen V19 Factorized caches.
 
-The parent V19 cache remains the sole source of inference tensors.  This tool
-writes only per-Z future semantic supervision and identity metadata, so future
-GT cannot travel through the model-input dictionary by construction.
+The parent V19 cache remains the sole source of inference tensors and already
+stores the GT-derived vertical_target_bits used for supervision.  This sidecar
+therefore stores only semantic class bytes at those valid voxels plus per-window
+offsets and identity metadata.  No dense [F,H,W,Z] label volume is duplicated.
 """
 from __future__ import annotations
 
@@ -96,7 +97,8 @@ def main():
         if len(obj["scene_name"]) != n or len(obj["t0_token"]) != n:
             raise RuntimeError(f"malformed V19 shard identities: {parent_name}")
 
-        voxel_targets = []
+        values_per_window = []
+        offsets = [0]
         for bi in range(n):
             scene = str(obj["scene_name"][bi])
             token = str(obj["t0_token"][bi])
@@ -112,31 +114,40 @@ def main():
             if gt.shape != (6,) + tuple(pcfg.grid.shape_hwd):
                 raise RuntimeError(f"future GT shape mismatch for {key}: {gt.shape}")
 
-            # vertical_target_bits is GT-derived supervision from the frozen V19
-            # cache.  It is used only to choose which semantic labels are valid;
-            # it is never copied to the sidecar and never becomes a model input.
-            target_bits = obj["vertical_target_bits"][bi : bi + 1]
-            target = unpack_vertical_occupancy_torch(target_bits, z)[0]
-            target = target.permute(0, 2, 3, 1).bool().numpy()
-            sem = np.full(gt.shape, IGNORE_LABEL, dtype=np.uint8)
-            sem[target] = gt[target]
-            bad_free = target & (gt == free_label)
-            bad_dyn = target & np.isin(gt, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
-            if bool(bad_free.any()) or bool(bad_dyn.any()):
-                raise RuntimeError(
-                    f"Stage-0 target contract violated for {key}: "
-                    f"free={int(bad_free.sum())} dynamic={int(bad_dyn.sum())}"
-                )
+            # V19 stores vertical_target_bits in [F,Z,H,W] packed form.  Keep
+            # exactly that flattened ordering so training can recover targets
+            # without storing coordinates or another dense mask.
+            target = unpack_vertical_occupancy_torch(
+                obj["vertical_target_bits"][bi : bi + 1],
+                z,
+            )[0].bool().numpy()
+            gt_zxy = np.transpose(gt, (0, 3, 1, 2))
+            values = gt_zxy[target].astype(np.uint8, copy=False)
+            if values.size:
+                bad_free = values == free_label
+                bad_dyn = np.isin(values, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
+                if bool(bad_free.any()) or bool(bad_dyn.any()):
+                    raise RuntimeError(
+                        f"Stage-0 target contract violated for {key}: "
+                        f"free={int(bad_free.sum())} dynamic={int(bad_dyn.sum())}"
+                    )
             for cid in range(17):
-                class_hist[str(cid)] += int((target & (gt == cid)).sum())
-            supervised_voxels += int(target.sum())
-            voxel_targets.append(torch.from_numpy(sem))
+                class_hist[str(cid)] += int((values == cid).sum())
+            supervised_voxels += int(values.size)
+            values_per_window.append(torch.from_numpy(values.copy()))
+            offsets.append(offsets[-1] + int(values.size))
 
+        semantic_values = (
+            torch.cat(values_per_window, dim=0)
+            if values_per_window
+            else torch.empty(0, dtype=torch.uint8)
+        )
         payload = {
             "protocol": PROTOCOL,
             "parent_v19_shard": parent_name,
             "count": n,
-            "voxel_semantic_target": torch.stack(voxel_targets),
+            "semantic_values": semantic_values,
+            "semantic_offsets": torch.as_tensor(offsets, dtype=torch.int64),
             "scene_name": list(obj["scene_name"]),
             "t0_token": list(obj["t0_token"]),
         }
@@ -149,10 +160,16 @@ def main():
                 "file": name,
                 "count": n,
                 "parent_v19_shard": parent_name,
+                "semantic_values": int(semantic_values.numel()),
                 "bytes": nbytes,
             }
         )
 
+    dense_raw_bytes = (
+        int(idx["num_windows"])
+        * 6
+        * int(np.prod(np.asarray(idx["grid_shape_hwd"], dtype=np.int64)))
+    )
     out_idx = {
         "protocol": PROTOCOL,
         "parent_v19_cache": str(src_root.resolve()),
@@ -166,8 +183,10 @@ def main():
         "anchor_distance_max_m": float(idx.get("anchor_distance_max_m", 40.0)),
         "future_gt_semantic_is_supervision_only": True,
         "label_only_sidecar": True,
+        "sparse_semantic_labels": True,
         "model_input_tensors_copied_from_v19": False,
         "pairing_contract": "shard + scene_name + t0_token exact order",
+        "semantic_order_contract": "parent V19 vertical_target_bits flattened [F,Z,H,W]",
         "stage0_frozen_geometry_contract": (
             "presence/vertical support is recomputed from the frozen V19 "
             "checkpoint during train/eval; GT vertical_target is label-only"
@@ -176,6 +195,10 @@ def main():
         "voxel_semantic_supervised_voxels": int(supervised_voxels),
         "voxel_semantic_class_histogram": class_hist,
         "sidecar_bytes": int(sidecar_bytes),
+        "dense_uint8_equivalent_bytes": int(dense_raw_bytes),
+        "compression_ratio_vs_dense_uint8": float(
+            sidecar_bytes / max(dense_raw_bytes, 1)
+        ),
         "shards": out_shards,
     }
     (out_dir / "index.json").write_text(
@@ -189,6 +212,10 @@ def main():
                 "num_windows": int(idx["num_windows"]),
                 "supervised_voxels": int(supervised_voxels),
                 "sidecar_bytes": int(sidecar_bytes),
+                "dense_uint8_equivalent_bytes": int(dense_raw_bytes),
+                "compression_ratio_vs_dense_uint8": out_idx[
+                    "compression_ratio_vs_dense_uint8"
+                ],
                 "class_histogram": class_hist,
             },
             indent=2,
