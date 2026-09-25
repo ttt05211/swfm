@@ -28,7 +28,7 @@ V20_MODEL_PROTOCOL = "p0_f9_v20_3d_history_model_v1"
 class V20SceneConfig:
     semantic_dim: int = 8
     base_dim: int = 32
-    source_dim: int = 96
+    source_dim: int = 128
     tile_dim: int = 48
     birth_queries: int = 8
     vertical_bins: int = 16
