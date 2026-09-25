@@ -222,9 +222,9 @@ def align_history_once_to_canonical(
         src_sem = sem[t].reshape(-1)
         src_obs = obs[t].reshape(-1)
         world = transform_points(poses[t], local)
-        idx, valid = lattice.world_to_index(world)
-        valid &= src_obs
-        oob += int((src_obs & ~lattice.world_to_index(world)[1]).sum())
+        idx, in_bounds = lattice.world_to_index(world)
+        oob += int((src_obs & ~in_bounds).sum())
+        valid = in_bounds & src_obs
         for cell, label in zip(idx[valid], src_sem[valid]):
             key = (t, int(cell[0]), int(cell[1]), int(cell[2]))
             was = out_obs[key]
