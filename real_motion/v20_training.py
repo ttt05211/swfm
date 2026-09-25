@@ -61,6 +61,16 @@ def static_semantic_loss(
     return F.cross_entropy(rows, target.long()[mask], weight=class_weights)
 
 
+def decode_static_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Argmax static/free semantics while structurally excluding dynamic IDs."""
+    if logits.ndim < 2 or logits.shape[1] != SEMANTIC_CLASSES:
+        raise ValueError("static logits must have semantic class dimension at dim=1")
+    masked = logits.clone()
+    dyn = torch.as_tensor(DYNAMIC_IDS, dtype=torch.long, device=masked.device)
+    masked[:, dyn] = torch.finfo(masked.dtype).min
+    return masked.argmax(dim=1)
+
+
 def dormant_source_loss(
     outputs: Mapping[str, torch.Tensor],
     *,
