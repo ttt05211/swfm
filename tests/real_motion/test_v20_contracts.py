@@ -21,6 +21,7 @@ from real_motion.v20_history_world import (
 from real_motion.v20_scene_model import (
     BirthQueryHead,
     HistoricalEvidence3DEncoder,
+    V20HistoryWorldModel,
     V20SceneConfig,
 )
 from real_motion.v20_dormant import render_dormant_sources
@@ -508,3 +509,57 @@ def test_vectorized_history_raster_matches_legacy_collision_semantics():
     assert int(got_sem[0, 0, 0]) == 4
     assert bool(got_conflict[0, 0, 0])
     assert int(got_sem[1, 0, 0]) == 6
+
+
+def test_fresh_v20_heads_are_zero_contribution_before_training():
+    torch.manual_seed(23)
+    cfg = V20SceneConfig(
+        semantic_dim=4,
+        base_dim=8,
+        source_dim=16,
+        tile_dim=8,
+        birth_queries=2,
+        birth_shape_size_xyz=(2, 2, 2),
+    )
+    model = V20HistoryWorldModel(cfg).eval()
+    scene = torch.randn(1, model.encoder.output_dim, 2, 2, 2)
+
+    coarse = model.static.forward_coarse(scene)
+    assert torch.all(coarse.argmax(1) == 17)
+
+    sample_grid = torch.zeros((1, 2, 2, 2, 3))
+    qmask = torch.ones((1, 2, 2, 2), dtype=torch.bool)
+    zmask = torch.zeros_like(qmask)
+    fine = model.static.refine_tiles(
+        scene,
+        sample_grid=sample_grid,
+        query_mask=qmask,
+        seen_mask=zmask,
+        t0_missing_mask=zmask,
+    )
+    assert torch.all(fine.argmax(1) == 17)
+
+    source = torch.randn(1, cfg.source_dim)
+    local = torch.randn(1, model.encoder.output_dim)
+    dout = model.dormant(source, local)
+    assert torch.all(torch.sigmoid(dout["existence_logits"]) < 0.5)
+    assert torch.count_nonzero(dout["residual_xy_m"]) == 0
+    assert torch.count_nonzero(dout["yaw_delta_rad"]) == 0
+
+    bout = model.birth(scene)
+    assert torch.all(
+        bout["class_logits"].argmax(-1) == len(DYNAMIC_CLASS_IDS)
+    )
+    assert torch.all(torch.sigmoid(bout["existence_logits"]) < 0.5)
+    assert torch.all(torch.sigmoid(bout["shape_logits"]) < 0.5)
+
+    base = torch.randint(0, 18, (6, 3, 3, 2), dtype=torch.uint8)
+    free = torch.full_like(base, 17)
+    combined = protected_add_only(
+        base,
+        dormant=free,
+        birth=free,
+        static_world=free,
+        free_label=17,
+    )
+    assert_zero_contribution_identity(base, combined)
