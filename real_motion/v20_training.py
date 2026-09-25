@@ -208,7 +208,7 @@ def birth_set_loss(
     cls_tgt = torch.full(
         (B, Q), int(no_object_class), dtype=torch.long, device=outputs["class_logits"].device
     )
-    exist_loss = outputs["existence_logits"].sum() * 0.0
+    exist_tgt = torch.zeros_like(outputs["existence_logits"])
     traj_loss = outputs["trajectory_xyz_yaw"].sum() * 0.0
     shape_loss = outputs["shape_logits"].sum() * 0.0
     matched = 0
@@ -218,9 +218,7 @@ def birth_set_loss(
         tgt = targets[b]
         cls_tgt[b, qi] = dynamic_global_to_local(tgt["class_id"].long()[ti])
         ex = tgt["existence"].to(outputs["existence_logits"].dtype)[ti]
-        exist_loss = exist_loss + F.binary_cross_entropy_with_logits(
-            outputs["existence_logits"][b, qi], ex
-        )
+        exist_tgt[b, qi] = ex
         mask = ex.bool().unsqueeze(-1)
         ptr = outputs["trajectory_xyz_yaw"][b, qi]
         ttr = tgt["trajectory_xyz_yaw"].to(ptr.dtype)[ti]
@@ -242,7 +240,10 @@ def birth_set_loss(
         matched += int(qi.numel())
     denom = max(B, 1)
     cls_loss = F.cross_entropy(outputs["class_logits"].reshape(B * Q, -1), cls_tgt.reshape(-1))
-    total = cls_loss + exist_loss / denom + traj_loss / denom + float(shape_weight) * shape_loss / denom
+    exist_loss = F.binary_cross_entropy_with_logits(
+        outputs["existence_logits"], exist_tgt
+    )
+    total = cls_loss + exist_loss + traj_loss / denom + float(shape_weight) * shape_loss / denom
     return total, {
         "loss": float(total.detach().cpu()),
         "class_ce": float(cls_loss.detach().cpu()),
