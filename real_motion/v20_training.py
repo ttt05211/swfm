@@ -225,7 +225,15 @@ def birth_set_loss(
         ptr = outputs["trajectory_xy_yaw"][b, qi]
         ttr = tgt["trajectory_xy_yaw"].to(ptr.dtype)[ti]
         if bool(mask.any()):
-            traj_loss = traj_loss + F.smooth_l1_loss(ptr[mask.expand_as(ptr)], ttr[mask.expand_as(ttr)])
+            active = ex.bool()
+            traj_loss = traj_loss + F.smooth_l1_loss(
+                ptr[..., :2][active], ttr[..., :2][active]
+            )
+            yaw_delta = torch.atan2(
+                torch.sin(ptr[..., 2] - ttr[..., 2]),
+                torch.cos(ptr[..., 2] - ttr[..., 2]),
+            )
+            traj_loss = traj_loss + 0.25 * (1.0 - torch.cos(yaw_delta[active])).mean()
         if "shape" in tgt:
             shape_loss = shape_loss + F.binary_cross_entropy_with_logits(
                 outputs["shape_logits"][b, qi],
