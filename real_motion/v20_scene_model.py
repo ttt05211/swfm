@@ -40,6 +40,9 @@ class HistoricalEvidence3DEncoder(nn.Module):
 
     Unknown, observed-free and observed-occupied are distinct channels.
     Time is fused by a tiny 3D conv over concatenated per-frame embeddings.
+    The caller already supplies the configured low-resolution Ωmax lattice, so
+    this encoder preserves its spatial resolution rather than downsampling it
+    a second time.
     """
 
     def __init__(self, cfg: V20SceneConfig = V20SceneConfig()):
@@ -51,10 +54,10 @@ class HistoricalEvidence3DEncoder(nn.Module):
         # Per frame: semantic embedding + observed + observed_free.
         in_ch = HISTORY_FRAMES * (d + 2)
         self.stem = nn.Sequential(
-            nn.Conv3d(in_ch, b, 3, stride=2, padding=1),
+            nn.Conv3d(in_ch, b, 3, stride=1, padding=1),
             nn.GroupNorm(1, b),
             nn.GELU(),
-            nn.Conv3d(b, 2 * b, 3, stride=2, padding=1),
+            nn.Conv3d(b, 2 * b, 3, stride=1, padding=1),
             nn.GroupNorm(1, 2 * b),
             nn.GELU(),
         )
