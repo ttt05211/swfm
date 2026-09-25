@@ -107,7 +107,9 @@ def _history_source_evidence(source, w, raw, pcfg, strong_cfg, match_max_distanc
     ambiguous_sets = []
     components_by_frame = []
     for ti, token in enumerate(w.history_tokens):
-        sem = np.asarray(raw["history_occ"][ti], dtype=np.uint8)
+        sem_raw = np.asarray(raw["history_occ"][ti], dtype=np.uint8)
+        obs = np.asarray(raw["history_observed"][ti], dtype=bool)
+        sem = np.where(obs, sem_raw, int(pcfg.free_label)).astype(np.uint8)
         pose = np.asarray(raw["history_poses"][ti], dtype=np.float64)
         comps = extract_instances_cropped_exact(
             sem, pose, grid=pcfg.grid, cfg=strong_cfg
