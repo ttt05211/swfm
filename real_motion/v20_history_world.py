@@ -345,6 +345,68 @@ def gather_canonical_logits_to_future(
     return out * valid[:, :, None].to(out.dtype)
 
 
+
+def canonical_tile_grid_sample_coordinates(
+    high_lattice: CanonicalLattice,
+    coarse_lattice: CanonicalLattice,
+    tile_start_xyz: Sequence[int],
+    tile_shape_xyz: Sequence[int],
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Normalized grid_sample coordinates for one canonical high-res tile.
+
+    V20 semantic tensors use Occ3D [X,Y,Z]. PyTorch Conv3d interprets these as
+    [D,H,W]=[X,Y,Z], while grid_sample's coordinate tuple is ordered
+    (W,H,D)=(Z,Y,X). This helper is the single place where that permutation is
+    performed.
+    """
+    start = np.asarray(tuple(int(x) for x in tile_start_xyz), dtype=np.int64)
+    shape = np.asarray(tuple(int(x) for x in tile_shape_xyz), dtype=np.int64)
+    if start.shape != (3,) or shape.shape != (3,) or bool((shape <= 0).any()):
+        raise ValueError("tile start/shape must be xyz triples")
+    hi_shape = np.asarray(high_lattice.shape_xyz, dtype=np.int64)
+    if bool((start < 0).any()) or bool((start + shape > hi_shape).any()):
+        raise ValueError("tile lies outside high-resolution Ωmax")
+
+    xs = np.arange(start[0], start[0] + shape[0], dtype=np.float64)
+    ys = np.arange(start[1], start[1] + shape[1], dtype=np.float64)
+    zs = np.arange(start[2], start[2] + shape[2], dtype=np.float64)
+    ix, iy, iz = np.meshgrid(xs, ys, zs, indexing="ij")
+    high_idx = np.stack((ix, iy, iz), axis=-1)
+    xyz = high_lattice.index_to_world_center(high_idx)
+
+    origin = np.asarray(coarse_lattice.origin_xyz_m, dtype=np.float64)
+    step = np.asarray(coarse_lattice.voxel_size_xyz_m, dtype=np.float64)
+    coarse_f = (xyz - origin) / step - 0.5
+    cs = np.asarray(coarse_lattice.shape_xyz, dtype=np.float64)
+    denom = np.maximum(cs - 1.0, 1.0)
+    norm = 2.0 * coarse_f / denom - 1.0
+    # grid_sample tuple order: z, y, x for an input laid out [X,Y,Z].
+    grid = np.stack((norm[..., 2], norm[..., 1], norm[..., 0]), axis=-1)
+    return torch.as_tensor(grid[None], dtype=dtype, device=device)
+
+
+def native_sparse_to_canonical_indices(
+    lattice: CanonicalLattice,
+    *,
+    native_indices_xyz: np.ndarray,
+    ego_to_canonical: np.ndarray,
+    native_origin_xyz_m: Sequence[float],
+    native_voxel_size_xyz_m: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map sparse native Occ3D indices into the canonical lattice."""
+    idx = np.asarray(native_indices_xyz, dtype=np.int64)
+    if idx.ndim != 2 or idx.shape[1] != 3:
+        raise ValueError("native indices must be [N,3]")
+    origin = np.asarray(native_origin_xyz_m, dtype=np.float64)
+    step = np.asarray(native_voxel_size_xyz_m, dtype=np.float64)
+    xyz = origin[None] + (idx.astype(np.float64) + 0.5) * step[None]
+    canon = transform_points(np.asarray(ego_to_canonical, dtype=np.float64), xyz)
+    return lattice.world_to_index(canon)
+
+
 class DynamicResponsibility(IntEnum):
     IGNORE = 0
     CURRENT_ANCESTRAL = 1
