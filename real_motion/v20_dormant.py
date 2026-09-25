@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 
+from .nuscenes_adapter import category_to_dynamic_class
 from .v19_scene_memory import (
     SourceTrack,
     build_dynamic_source_memory,
@@ -290,3 +291,77 @@ def render_dormant_sources(
         out_of_bounds_voxels=int(oob),
         collision_voxels=int(collisions),
     )
+
+
+def _dynamic_annotation_map_for_eval(nusc, sample_token: str) -> dict[str, tuple[int, dict]]:
+    sample = nusc.get("sample", str(sample_token))
+    out = {}
+    for atok in sample["anns"]:
+        ann = nusc.get("sample_annotation", atok)
+        cid = category_to_dynamic_class(ann["category_name"])
+        if cid is not None:
+            out[str(ann["instance_token"])] = (int(cid), ann)
+    return out
+
+
+def match_dormant_tracks_to_history_gt(
+    tracks: Sequence[SourceTrack],
+    nusc,
+    history_tokens: Sequence[str],
+    *,
+    max_distance_m: float = 4.0,
+) -> list[str | None]:
+    """Offline-only identity assignment at each track's last real observation."""
+    if len(history_tokens) != 6:
+        raise ValueError("expected six history tokens")
+    by_frame: dict[int, list[tuple[int, SourceTrack]]] = {}
+    for i, tr in enumerate(tracks):
+        by_frame.setdefault(int(tr.last_observed_frame), []).append((i, tr))
+    tokens: list[str | None] = [None] * len(tracks)
+    for ti, rows in by_frame.items():
+        amap = _dynamic_annotation_map_for_eval(nusc, history_tokens[ti])
+        candidates = []
+        for global_i, tr in rows:
+            c = np.asarray(tr.centers_world[ti], dtype=np.float64)
+            for tok, (cid, ann) in amap.items():
+                if int(cid) != int(tr.class_id):
+                    continue
+                p = np.asarray(ann["translation"], dtype=np.float64)
+                dist = float(np.linalg.norm(c[:2] - p[:2]))
+                if dist <= float(max_distance_m):
+                    candidates.append((dist, int(global_i), str(tok)))
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+        used_i, used_tok = set(), set()
+        for _, i, tok in candidates:
+            if i in used_i or tok in used_tok:
+                continue
+            used_i.add(i)
+            used_tok.add(tok)
+            tokens[i] = tok
+    return tokens
+
+
+def dormant_future_existence_targets(
+    tracks: Sequence[SourceTrack],
+    history_identity_tokens: Sequence[str | None],
+    nusc,
+    future_tokens: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Offline-only supervised mask and six-frame existence targets."""
+    if len(tracks) != len(history_identity_tokens) or len(future_tokens) != 6:
+        raise ValueError("Dormant existence target length mismatch")
+    supervised = np.asarray(
+        [tok is not None for tok in history_identity_tokens], dtype=bool
+    )
+    target = np.zeros((len(tracks), 6), dtype=bool)
+    future_maps = [
+        _dynamic_annotation_map_for_eval(nusc, tok) for tok in future_tokens
+    ]
+    for i, (tr, token) in enumerate(zip(tracks, history_identity_tokens)):
+        if token is None:
+            continue
+        for h, amap in enumerate(future_maps):
+            row = amap.get(str(token))
+            if row is not None and int(row[0]) == int(tr.class_id):
+                target[i, h] = True
+    return supervised, target

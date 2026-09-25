@@ -29,6 +29,8 @@ class V20WindowPrediction:
     birth_future: np.ndarray
     static_report: StaticRuntimeReport | None
     dormant_report: DormantRenderReport | None
+    dormant_outputs: dict[str, torch.Tensor] | None
+    dormant_track_objects: tuple
     birth_report: BirthRenderReport | None
     birth_outputs: dict[str, torch.Tensor] | None
     dormant_tracks: int
@@ -134,6 +136,8 @@ def run_v20_modules(
         static_future = static_report.future_semantic
 
     dormant_report = None
+    dormant_outputs = None
+    dormant_track_objects = ()
     dormant_future = _free_future(pcfg)
     dormant_n = 0
     if enable_dormant:
@@ -151,6 +155,7 @@ def run_v20_modules(
         )
         _, dormant = split_current_and_dormant_tracks(tracks)
         dormant = list(dormant)
+        dormant_track_objects = tuple(dormant)
         dormant_n = len(dormant)
         timing["dormant_prepare"] = (time.perf_counter() - t) * 1000.0
         if dormant:
@@ -184,6 +189,9 @@ def run_v20_modules(
             _sync(device)
             timing["dormant_network"] = (time.perf_counter() - t) * 1000.0
             t = time.perf_counter()
+            dormant_outputs = {
+                k: v.detach().cpu() for k, v in dout.items()
+            }
             dormant_report = render_dormant_sources(
                 dout,
                 dormant,
@@ -251,6 +259,8 @@ def run_v20_modules(
         birth_future=birth_future,
         static_report=static_report,
         dormant_report=dormant_report,
+        dormant_outputs=dormant_outputs,
+        dormant_track_objects=dormant_track_objects,
         birth_report=birth_report,
         birth_outputs=birth_outputs,
         dormant_tracks=int(dormant_n),

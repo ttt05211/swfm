@@ -22,10 +22,16 @@ from real_motion.v19_innovation import (
     decode_innovation,
 )
 from real_motion.v19_scene_memory import protected_add_only as v19_protected_add_only
+from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.v20_birth import birth_query_match_counts
+from real_motion.v20_dormant import (
+    dormant_future_existence_targets,
+    match_dormant_tracks_to_history_gt,
+)
 from real_motion.v20_evaluation import (
     AdditionAccumulator,
     BirthMatchAccumulator,
+    DormantExistenceAccumulator,
     SemanticMetricAccumulator,
     StaticSubsetAccumulator,
     metric_delta,
@@ -216,6 +222,7 @@ def main():
         "never_seen_static_domain": StaticSubsetAccumulator(),
     }
     birth_match = BirthMatchAccumulator()
+    dormant_existence = DormantExistenceAccumulator()
     strict_dynamic_counts = {"DORMANT_ANCESTRAL": 0, "BIRTH": 0}
     audit = {
         "windows": 0,
@@ -333,12 +340,7 @@ def main():
                     raw["future_poses"],
                     grid=pcfg.grid,
                     free_label=int(pcfg.free_label),
-                    dynamic_class_ids=tuple(
-                        int(x) for x in __import__(
-                            "real_motion.metrics.moving_miou_v2",
-                            fromlist=["DYNAMIC_CLASS_IDS"],
-                        ).DYNAMIC_CLASS_IDS
-                    ),
+                    dynamic_class_ids=tuple(int(x) for x in DYNAMIC_CLASS_IDS),
                     workers=int(a.alignment_workers),
                 )
             )
@@ -457,6 +459,28 @@ def main():
                 free_label=pcfg.free_label,
             )
 
+        if vp.dormant_outputs is not None and vp.dormant_track_objects:
+            identity = match_dormant_tracks_to_history_gt(
+                vp.dormant_track_objects,
+                source.nusc,
+                w.history_tokens,
+            )
+            supervised, target_exists = dormant_future_existence_targets(
+                vp.dormant_track_objects,
+                identity,
+                source.nusc,
+                w.future_tokens,
+            )
+            pred_active = (
+                torch.sigmoid(
+                    vp.dormant_outputs["existence_logits"].float()
+                ).numpy()
+                >= float(a.dormant_existence_threshold)
+            )
+            dormant_existence.update(
+                pred_active, target_exists, supervised
+            )
+
         if vp.birth_outputs is not None:
             birth_match.update(
                 birth_query_match_counts(
@@ -545,6 +569,7 @@ def main():
             k: v.finalize() for k, v in static_subsets.items()
         },
         "strict_dynamic_gt_counts": strict_dynamic_counts,
+        "dormant_existence": dormant_existence.finalize(),
         "birth_matching": birth_match.finalize(),
         "audit": audit,
         "v20_component_timing_diagnostic": _mean_timing(timing_rows),
@@ -576,6 +601,7 @@ def main():
     print(json.dumps({
         "metrics": final,
         "branch_addition_quality": result["branch_addition_quality"],
+        "dormant_existence": result["dormant_existence"],
         "birth_matching": result["birth_matching"],
         "audit": audit,
     }, indent=2))

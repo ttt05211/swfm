@@ -259,3 +259,53 @@ class BirthMatchAccumulator:
                 self.matched_center_error_sum_m / max(self.distance_matched, 1)
             ),
         }
+
+
+@dataclass
+class DormantExistenceAccumulator:
+    supervised_tracks: int = 0
+    future_negative_tracks: int = 0
+    false_active_negative_tracks: int = 0
+    horizon_tp: int = 0
+    horizon_fp: int = 0
+    horizon_fn: int = 0
+    horizon_tn: int = 0
+
+    def update(self, pred_active, target_exists, supervised):
+        p = np.asarray(pred_active, dtype=bool)
+        t = np.asarray(target_exists, dtype=bool)
+        s = np.asarray(supervised, dtype=bool)
+        if p.shape != t.shape or p.ndim != 2 or s.shape != (p.shape[0],):
+            raise ValueError("Dormant existence metric shape mismatch")
+        valid = np.broadcast_to(s[:, None], p.shape)
+        self.supervised_tracks += int(s.sum())
+        neg_track = s & ~t.any(axis=1)
+        self.future_negative_tracks += int(neg_track.sum())
+        self.false_active_negative_tracks += int(
+            (neg_track & p.any(axis=1)).sum()
+        )
+        self.horizon_tp += int((valid & p & t).sum())
+        self.horizon_fp += int((valid & p & ~t).sum())
+        self.horizon_fn += int((valid & ~p & t).sum())
+        self.horizon_tn += int((valid & ~p & ~t).sum())
+
+    def finalize(self):
+        return {
+            "supervised_tracks": int(self.supervised_tracks),
+            "future_negative_tracks": int(self.future_negative_tracks),
+            "false_active_negative_tracks": int(self.false_active_negative_tracks),
+            "negative_track_false_activation_rate": float(
+                self.false_active_negative_tracks
+                / max(self.future_negative_tracks, 1)
+            ),
+            "track_horizon_tp": int(self.horizon_tp),
+            "track_horizon_fp": int(self.horizon_fp),
+            "track_horizon_fn": int(self.horizon_fn),
+            "track_horizon_tn": int(self.horizon_tn),
+            "track_horizon_precision": float(
+                self.horizon_tp / max(self.horizon_tp + self.horizon_fp, 1)
+            ),
+            "track_horizon_recall": float(
+                self.horizon_tp / max(self.horizon_tp + self.horizon_fn, 1)
+            ),
+        }
