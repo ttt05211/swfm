@@ -31,6 +31,8 @@ class V20SceneConfig:
     source_dim: int = 128
     tile_dim: int = 48
     birth_queries: int = 8
+    birth_shape_size_xyz: tuple[int, int, int] = (36, 18, 12)
+    birth_shape_voxel_size_m: float = 0.4
     vertical_bins: int = 16
     dynamic_classes: int = len(DYNAMIC_IDS)
 
@@ -243,7 +245,7 @@ class BirthQueryHead(nn.Module):
         scene_dim: int,
         cfg: V20SceneConfig = V20SceneConfig(),
         *,
-        shape_size_xyz: tuple[int, int, int] = (36, 18, 12),
+        shape_size_xyz: tuple[int, int, int] | None = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -253,7 +255,15 @@ class BirthQueryHead(nn.Module):
                 "birth dynamic_classes must match frozen DYNAMIC_IDS "
                 f"({len(DYNAMIC_IDS)})"
             )
-        self.shape_size_xyz = tuple(int(x) for x in shape_size_xyz)
+        self.shape_size_xyz = tuple(
+            int(x) for x in (
+                cfg.birth_shape_size_xyz if shape_size_xyz is None else shape_size_xyz
+            )
+        )
+        if len(self.shape_size_xyz) != 3 or min(self.shape_size_xyz) <= 0:
+            raise ValueError("invalid Birth shape lattice")
+        if float(cfg.birth_shape_voxel_size_m) <= 0:
+            raise ValueError("birth_shape_voxel_size_m must be positive")
         h = 2 * int(cfg.base_dim)
         self.query = nn.Parameter(torch.zeros(1, self.Q, h))
         self.global_proj = nn.Linear(int(scene_dim), h)
