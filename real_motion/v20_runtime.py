@@ -1,8 +1,9 @@
 """V20 runtime helpers shared by formal evaluation and latency measurement."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -254,46 +255,37 @@ class V18BirthCondition:
     current_source_class_id: torch.Tensor
 
 
-def v18_birth_condition_from_record(
-    v18,
-    record,
+def v18_birth_condition_from_output(
+    record: Mapping[str, object],
+    output: Mapping[str, torch.Tensor],
     *,
     device: torch.device,
-    amp: bool,
     position_scale_m: float = 40.0,
 ) -> V18BirthCondition:
-    """Expose frozen V18 current/future source state for Birth conditioning."""
+    """Convert one already-computed frozen V18 output into Birth context."""
     scale = float(position_scale_m)
     if scale <= 0:
         raise ValueError("position_scale_m must be positive")
-    def mv(name, dtype=None):
-        x = record[name].to(device)
-        return x.to(dtype) if dtype is not None else x
-    with torch.no_grad(), (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if amp and device.type == "cuda" else torch.autocast("cpu", enabled=False)
+    for key in (
+        "history_source_context",
+        "future_transport_queries",
+        "residual_xy_m",
+        "existence_logits",
     ):
-        out = v18(
-            mv("features", torch.float32),
-            mv("local_semantic_tube"),
-            mv("kta_displacement_xy_m", torch.float32),
-            mv("frame_motion_features", torch.float32),
-            mv("target_source_mask_tube"),
-            return_latents=True,
-        )
-    current_tok = out["history_source_context"].float()
-    future_tok = out["future_transport_queries"].float()
+        if key not in output:
+            raise KeyError(f"V18 latent output missing {key}")
+    current_tok = output["history_source_context"].float()
+    future_tok = output["future_transport_queries"].float()
     N = int(current_tok.shape[0])
     if "source_centroid_xy_t0_m" in record:
         current_xy = record["source_centroid_xy_t0_m"].float().to(device)
     else:
-        # Frozen feature contract: first two channels are current x/y / 40 m.
         current_xy = record["features"][:, :2].float().to(device) * 40.0
     if current_xy.shape != (N, 2):
         raise RuntimeError("V18 source centroid count mismatch")
     future_xy = (
         record["anchors_xy_t0_m"].float().to(device)
-        + out["residual_xy_m"].float()
+        + output["residual_xy_m"].float()
     )
     if future_xy.shape != (N, 6, 2):
         raise RuntimeError("V18 future source position shape mismatch")
@@ -309,7 +301,67 @@ def v18_birth_condition_from_record(
         future_source_xyz_norm=(fut_xyz / scale).unsqueeze(0),
         future_source_xy_t0_m=future_xy,
         future_source_existence_prob=torch.sigmoid(
-            out["existence_logits"].float()
+            output["existence_logits"].float()
         ),
         current_source_class_id=cls,
     )
+
+
+def v18_birth_condition_from_record(
+    v18,
+    record,
+    *,
+    device: torch.device,
+    amp: bool,
+    position_scale_m: float = 40.0,
+) -> V18BirthCondition:
+    """Run frozen V18 once and expose current/future source state for Birth."""
+    def mv(name, dtype=None):
+        x = record[name].to(device)
+        return x.to(dtype) if dtype is not None else x
+    ctx = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if amp and device.type == "cuda" else nullcontext()
+    )
+    with torch.no_grad(), ctx:
+        out = v18(
+            mv("features", torch.float32),
+            mv("local_semantic_tube"),
+            mv("kta_displacement_xy_m", torch.float32),
+            mv("frame_motion_features", torch.float32),
+            mv("target_source_mask_tube"),
+            return_latents=True,
+        )
+    return v18_birth_condition_from_output(
+        record,
+        out,
+        device=device,
+        position_scale_m=position_scale_m,
+    )
+
+
+def v18_source_tokens_from_arrays(
+    v18,
+    arrays: Mapping[str, torch.Tensor],
+    *,
+    device: torch.device,
+    amp: bool,
+) -> torch.Tensor:
+    """Frozen V18 history-source context for arbitrary causal source arrays."""
+    def mv(name, dtype=None):
+        x = arrays[name].to(device)
+        return x.to(dtype) if dtype is not None else x
+    ctx = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if amp and device.type == "cuda" else nullcontext()
+    )
+    with torch.no_grad(), ctx:
+        out = v18(
+            mv("features", torch.float32),
+            mv("local_semantic_tube"),
+            mv("kta_displacement_xy_m", torch.float32),
+            mv("frame_motion_features", torch.float32),
+            mv("target_source_mask_tube"),
+            return_latents=True,
+        )
+    return out["history_source_context"].float()

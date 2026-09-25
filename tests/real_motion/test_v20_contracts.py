@@ -412,3 +412,48 @@ def test_birth_renderer_suppresses_duplicate_current_source_horizon():
     assert report.duplicate_suppressed_query_horizons == 1
     assert report.rendered_voxels == 0
     assert np.all(report.future_semantic == 17)
+
+
+def test_birth_matching_uses_strict_birth_records_and_center_distance():
+    cid = int(DYNAMIC_CLASS_IDS[0])
+    local = list(DYNAMIC_CLASS_IDS).index(cid)
+    outputs = {
+        "class_logits": torch.full((1, 1, len(DYNAMIC_CLASS_IDS) + 1), -8.0),
+        "existence_logits": torch.full((1, 1, FUTURE_FRAMES), -8.0),
+        "trajectory_xyz_yaw": torch.zeros((1, 1, FUTURE_FRAMES, 4)),
+    }
+    outputs["class_logits"][0, 0, local] = 8.0
+    outputs["existence_logits"][0, 0, 0] = 8.0
+    row = {
+        "dynamic_supervision": [
+            {
+                "responsibility_name": "BIRTH",
+                "class_id": cid,
+                "existence": [1, 0, 0, 0, 0, 0],
+                "trajectory_xyz_yaw_t0": [
+                    [0.5, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                ],
+            },
+            {
+                "responsibility_name": "CURRENT_ANCESTRAL",
+                "class_id": cid,
+                "existence": [1, 1, 1, 1, 1, 1],
+                "trajectory_xyz_yaw_t0": [[0.0, 0.0, 0.0, 0.0]] * 6,
+            },
+        ]
+    }
+    from real_motion.v20_birth import birth_query_match_counts
+    m = birth_query_match_counts(
+        outputs,
+        row,
+        existence_threshold=0.5,
+        distance_threshold_m=1.0,
+    )
+    assert m["gt_birth_instances"] == 1
+    assert m["predicted_birth_queries"] == 1
+    assert m["distance_matched"] == 1

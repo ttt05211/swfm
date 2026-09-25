@@ -242,3 +242,90 @@ def render_birth_queries(
         out_of_bounds_voxels=int(oob),
         duplicate_suppressed_query_horizons=int(duplicate_suppressed),
     )
+
+
+def birth_query_match_counts(
+    outputs: Mapping[str, torch.Tensor],
+    cache_row: Mapping,
+    *,
+    existence_threshold: float = 0.5,
+    distance_threshold_m: float = 4.0,
+) -> dict[str, float | int]:
+    """Strict BIRTH-object center matching diagnostic.
+
+    Voxel-level OCC semantics remain the generation metric.  This object metric
+    only checks whether active persistent queries correspond to strict BIRTH GT
+    identities under the Stage-1 ancestry partition.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    gt = [
+        r for r in cache_row["dynamic_supervision"]
+        if str(r["responsibility_name"]) == "BIRTH"
+    ]
+    cls_logits = outputs["class_logits"].detach().float().cpu()
+    ex = torch.sigmoid(outputs["existence_logits"].detach().float()).cpu()
+    traj = outputs["trajectory_xyz_yaw"].detach().float().cpu()
+    if cls_logits.shape[0] != 1:
+        raise ValueError("Birth matching currently expects B=1")
+    probs = cls_logits[0].softmax(-1)
+    local = probs.argmax(-1)
+    noobj = len(DYNAMIC_IDS)
+    pred_ids = [
+        q for q in range(cls_logits.shape[1])
+        if int(local[q]) != noobj
+        and bool((ex[0, q] >= float(existence_threshold)).any())
+    ]
+    pred_cls = (
+        dynamic_local_to_global(local[pred_ids]).numpy()
+        if pred_ids else np.zeros(0, dtype=np.int64)
+    )
+    n_pred, n_gt = len(pred_ids), len(gt)
+    if n_pred == 0 or n_gt == 0:
+        return {
+            "predicted_birth_queries": int(n_pred),
+            "gt_birth_instances": int(n_gt),
+            "hungarian_pairs": 0,
+            "distance_matched": 0,
+            "class_correct_pairs": 0,
+            "matched_center_error_sum_m": 0.0,
+        }
+
+    cost = np.full((n_pred, n_gt), 1e6, dtype=np.float64)
+    ade = np.full_like(cost, np.inf)
+    class_ok = np.zeros_like(cost, dtype=bool)
+    for pi, q in enumerate(pred_ids):
+        pactive = ex[0, q].numpy() >= float(existence_threshold)
+        for gi, row in enumerate(gt):
+            gcid = int(row["class_id"])
+            if int(pred_cls[pi]) != gcid:
+                continue
+            gactive = np.asarray(row["existence"], dtype=bool)
+            overlap = pactive & gactive
+            if not bool(overlap.any()):
+                continue
+            gtraj = np.asarray(row["trajectory_xyz_yaw_t0"], dtype=np.float64)
+            ptraj = traj[0, q].numpy().astype(np.float64)
+            d = np.linalg.norm(ptraj[overlap, :3] - gtraj[overlap, :3], axis=1)
+            ade[pi, gi] = float(d.mean())
+            class_ok[pi, gi] = True
+            cost[pi, gi] = float(d.mean())
+    ri, ci = linear_sum_assignment(cost)
+    good_pairs = [
+        (int(i), int(j)) for i, j in zip(ri, ci)
+        if np.isfinite(ade[int(i), int(j)])
+    ]
+    matched = [
+        (i, j) for i, j in good_pairs
+        if float(ade[i, j]) <= float(distance_threshold_m)
+    ]
+    return {
+        "predicted_birth_queries": int(n_pred),
+        "gt_birth_instances": int(n_gt),
+        "hungarian_pairs": int(len(good_pairs)),
+        "distance_matched": int(len(matched)),
+        "class_correct_pairs": int(sum(bool(class_ok[i, j]) for i, j in good_pairs)),
+        "matched_center_error_sum_m": float(
+            sum(float(ade[i, j]) for i, j in matched)
+        ),
+    }
