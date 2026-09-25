@@ -33,7 +33,7 @@ class PerZSemanticHead(nn.Module):
         bev_feature_channels: int,
         vertical_bins: int = 16,
         hidden_dim: int = 32,
-        num_classes: int = SEMANTIC_CLASSES,
+        num_classes: int = SEMANTIC_CLASSES - 1,
     ):
         super().__init__()
         self.vertical_bins = int(vertical_bins)
