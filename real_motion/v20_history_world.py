@@ -96,6 +96,20 @@ def transform_points(T: np.ndarray, points: np.ndarray) -> np.ndarray:
     return p @ T[:3, :3].T + T[:3, 3]
 
 
+
+def poses_to_t0_canonical(
+    ego_to_world: np.ndarray,
+    t0_ego_to_world: np.ndarray,
+) -> np.ndarray:
+    """Convert ego poses to per-window t0-ego canonical transforms."""
+    poses = np.asarray(ego_to_world, dtype=np.float64)
+    t0 = np.asarray(t0_ego_to_world, dtype=np.float64)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4) or t0.shape != (4, 4):
+        raise ValueError("poses must be [N,4,4] and t0 pose [4,4]")
+    world_to_t0 = np.linalg.inv(t0)
+    return np.stack([world_to_t0 @ p for p in poses], axis=0)
+
+
 def grid_centers_xyz(
     shape_xyz: Sequence[int],
     origin_xyz_m: Sequence[float],
@@ -115,7 +129,7 @@ def grid_centers_xyz(
 def future_union_query_mask(
     lattice: CanonicalLattice,
     *,
-    future_ego_to_world: np.ndarray,
+    future_ego_to_canonical: np.ndarray,
     native_shape_xyz: Sequence[int],
     native_origin_xyz_m: Sequence[float],
     native_voxel_size_xyz_m: Sequence[float],
@@ -125,9 +139,9 @@ def future_union_query_mask(
     This uses future ego *pose only*.  It never inspects future semantics or
     future lidar masks.  Duplicate mapped cells are naturally unioned.
     """
-    poses = np.asarray(future_ego_to_world, dtype=np.float64)
+    poses = np.asarray(future_ego_to_canonical, dtype=np.float64)
     if poses.shape != (FUTURE_FRAMES, 4, 4):
-        raise ValueError("future_ego_to_world must be [6,4,4]")
+        raise ValueError("future_ego_to_canonical must be [6,4,4]")
     local = grid_centers_xyz(
         native_shape_xyz, native_origin_xyz_m, native_voxel_size_xyz_m
     ).reshape(-1, 3)
@@ -169,6 +183,7 @@ def align_history_once_to_canonical(
     history_semantic: np.ndarray,
     history_observed: np.ndarray,
     history_ego_to_world: np.ndarray,
+    t0_ego_to_world: np.ndarray,
     native_origin_xyz_m: Sequence[float],
     native_voxel_size_xyz_m: Sequence[float],
     free_label: int = FREE_LABEL,
@@ -182,11 +197,16 @@ def align_history_once_to_canonical(
     """
     sem = np.asarray(history_semantic)
     obs = np.asarray(history_observed, dtype=bool)
-    poses = np.asarray(history_ego_to_world, dtype=np.float64)
+    poses_world = np.asarray(history_ego_to_world, dtype=np.float64)
+    t0 = np.asarray(t0_ego_to_world, dtype=np.float64)
     if sem.shape != obs.shape or sem.ndim != 4:
         raise ValueError("history semantic/observed must be [T,X,Y,Z]")
-    if sem.shape[0] != HISTORY_FRAMES or poses.shape != (HISTORY_FRAMES, 4, 4):
+    if sem.shape[0] != HISTORY_FRAMES or poses_world.shape != (HISTORY_FRAMES, 4, 4):
         raise ValueError("V20 requires exactly six historical frames")
+    if t0.shape != (4, 4):
+        raise ValueError("t0_ego_to_world must be [4,4]")
+    world_to_t0 = np.linalg.inv(t0)
+    poses = np.stack([world_to_t0 @ p for p in poses_world], axis=0)
 
     native_shape = sem.shape[1:]
     local = grid_centers_xyz(
@@ -243,7 +263,7 @@ class FutureRenderIndex:
 def future_native_to_canonical_indices(
     lattice: CanonicalLattice,
     *,
-    future_ego_to_world: np.ndarray,
+    future_ego_to_canonical: np.ndarray,
     native_shape_xyz: Sequence[int],
     native_origin_xyz_m: Sequence[float],
     native_voxel_size_xyz_m: Sequence[float],
@@ -253,9 +273,9 @@ def future_native_to_canonical_indices(
     indices_xyz/valid are [F,X,Y,Z,(3)].  The same lookup can be cached and
     reused by supervision and inference; no future semantic content is needed.
     """
-    poses = np.asarray(future_ego_to_world, dtype=np.float64)
+    poses = np.asarray(future_ego_to_canonical, dtype=np.float64)
     if poses.shape != (FUTURE_FRAMES, 4, 4):
-        raise ValueError("future_ego_to_world must be [6,4,4]")
+        raise ValueError("future_ego_to_canonical must be [6,4,4]")
     shape = tuple(int(x) for x in native_shape_xyz)
     local = grid_centers_xyz(
         shape, native_origin_xyz_m, native_voxel_size_xyz_m
