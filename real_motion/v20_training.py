@@ -155,8 +155,8 @@ def _pair_cost(
     pe = torch.sigmoid(pred_exist_logits)[:, None, :]
     te = target_exist.to(pe.dtype)[None, :, :]
     exist = (pe - te).abs().mean(dim=-1)
-    ptr = pred_traj[:, None, :, :2]
-    ttr = target_traj.to(ptr.dtype)[None, :, :, :2]
+    ptr = pred_traj[:, None, :, :3]
+    ttr = target_traj.to(ptr.dtype)[None, :, :, :3]
     mask = te.unsqueeze(-1)
     denom = mask.sum(dim=(-2, -1)).clamp_min(1.0)
     traj = ((ptr - ttr).abs() * mask).sum(dim=(-2, -1)) / denom
@@ -180,10 +180,10 @@ def hungarian_birth_match(
         cost = _pair_cost(
             outputs["class_logits"][b],
             outputs["existence_logits"][b],
-            outputs["trajectory_xy_yaw"][b],
+            outputs["trajectory_xyz_yaw"][b],
             tgt["class_id"],
             tgt["existence"],
-            tgt["trajectory_xy_yaw"],
+            tgt["trajectory_xyz_yaw"],
         )
         qidx, tidx = linear_sum_assignment(cost.detach().float().cpu().numpy())
         matches.append((
@@ -209,7 +209,7 @@ def birth_set_loss(
         (B, Q), int(no_object_class), dtype=torch.long, device=outputs["class_logits"].device
     )
     exist_loss = outputs["existence_logits"].sum() * 0.0
-    traj_loss = outputs["trajectory_xy_yaw"].sum() * 0.0
+    traj_loss = outputs["trajectory_xyz_yaw"].sum() * 0.0
     shape_loss = outputs["shape_logits"].sum() * 0.0
     matched = 0
     for b, (qi, ti) in enumerate(matches):
@@ -222,16 +222,16 @@ def birth_set_loss(
             outputs["existence_logits"][b, qi], ex
         )
         mask = ex.bool().unsqueeze(-1)
-        ptr = outputs["trajectory_xy_yaw"][b, qi]
-        ttr = tgt["trajectory_xy_yaw"].to(ptr.dtype)[ti]
+        ptr = outputs["trajectory_xyz_yaw"][b, qi]
+        ttr = tgt["trajectory_xyz_yaw"].to(ptr.dtype)[ti]
         if bool(mask.any()):
             active = ex.bool()
             traj_loss = traj_loss + F.smooth_l1_loss(
-                ptr[..., :2][active], ttr[..., :2][active]
+                ptr[..., :3][active], ttr[..., :3][active]
             )
             yaw_delta = torch.atan2(
-                torch.sin(ptr[..., 2] - ttr[..., 2]),
-                torch.cos(ptr[..., 2] - ttr[..., 2]),
+                torch.sin(ptr[..., 3] - ttr[..., 3]),
+                torch.cos(ptr[..., 3] - ttr[..., 3]),
             )
             traj_loss = traj_loss + 0.25 * (1.0 - torch.cos(yaw_delta[active])).mean()
         if "shape" in tgt:
