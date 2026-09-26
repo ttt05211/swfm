@@ -247,7 +247,7 @@ def _epoch(
     # Dormant/Birth are not part of Stage 2.
     model.dormant.eval(); model.birth.eval()
     sums = {"loss": 0.0, "coarse": 0.0, "tile": 0.0}
-    conf = np.zeros((17, 17), dtype=np.int64)
+    conf = np.zeros((18, 18), dtype=np.int64)
     n = 0
     for row in _iter_rows(root, idx, train, seed):
         sem, obs, free, obs_np = _row_history(row, device)

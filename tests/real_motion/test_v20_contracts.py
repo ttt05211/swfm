@@ -713,3 +713,15 @@ def test_cached_sparse_history_alignment_is_elementwise_identical():
     assert np.array_equal(sparse.unknown, dense.unknown)
     assert np.array_equal(sparse.conflict, dense.conflict)
     assert sparse.out_of_bounds_samples == dense.out_of_bounds_samples
+
+
+def test_static_training_confusion_supports_free_prediction_column():
+    from tools.real_motion.train_p0_f9_v20_static import _miou
+
+    conf = np.zeros((18, 18), dtype=np.int64)
+    # One correct class-4 prediction and one class-4 -> free miss.
+    conf[4, 4] = 1
+    conf[4, 17] = 1
+    miou, per = _miou(conf)
+    assert abs(per["4"] - 0.5) < 1e-12
+    assert np.isfinite(miou)
