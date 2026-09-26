@@ -1522,6 +1522,79 @@ def test_static_repair_sparse_loss_matches_dense_reference():
     assert torch.equal(fs, fd)
 
 
+def test_static_output_subset_matches_full_logits_and_gradients():
+    import copy
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+    from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
+
+    torch.manual_seed(109)
+    cfg = V20SceneConfig(
+        semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+    )
+    m0 = V20HistoryWorldModel(cfg)
+    m1 = copy.deepcopy(m0)
+    scene0 = torch.randn(
+        1, m0.encoder.output_dim, 4, 4, 2, requires_grad=True
+    )
+    scene1 = scene0.detach().clone().requires_grad_(True)
+    grid = torch.rand(5, 4, 4, 2, 3) * 2.0 - 1.0
+    q = torch.rand(5, 4, 4, 2) > 0.5
+    seen = torch.rand(5, 4, 4, 2) > 0.5
+    missing = seen & (torch.rand(5, 4, 4, 2) > 0.5)
+    ids = torch.as_tensor(STATIC_ALLOWED_IDS, dtype=torch.long)
+
+    full = m0.static.refine_tiles(
+        scene0,
+        sample_grid=grid,
+        query_mask=q,
+        seen_mask=seen,
+        t0_missing_mask=missing,
+    ).index_select(1, ids)
+    subset = m1.static.refine_tiles(
+        scene1,
+        sample_grid=grid,
+        query_mask=q,
+        seen_mask=seen,
+        t0_missing_mask=missing,
+        output_ids=ids,
+    )
+    assert torch.allclose(full, subset, atol=1e-6, rtol=1e-6)
+
+    weight = torch.randn_like(full)
+    (full * weight).sum().backward()
+    (subset * weight).sum().backward()
+    assert torch.allclose(scene0.grad, scene1.grad, atol=1e-5, rtol=1e-5)
+    for p0, p1 in zip(
+        m0.static.tile_refine.parameters(),
+        m1.static.tile_refine.parameters(),
+    ):
+        if p0.grad is None or p1.grad is None:
+            assert p0.grad is None and p1.grad is None
+        else:
+            assert torch.allclose(p0.grad, p1.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_history_encoder_channels_last_3d_preserves_values():
+    import copy
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+
+    torch.manual_seed(113)
+    cfg = V20SceneConfig(
+        semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+    )
+    m0 = V20HistoryWorldModel(cfg).eval()
+    m1 = copy.deepcopy(m0).eval()
+    m1.encoder.set_channels_last_3d(True)
+
+    sem = torch.randint(0, 18, (1, 6, 4, 4, 2))
+    obs = torch.rand(1, 6, 4, 4, 2) > 0.2
+    obsfree = obs & (sem == 17)
+    with torch.no_grad():
+        y0 = m0.encode_history(sem, obs, obsfree)
+        y1 = m1.encode_history(sem, obs, obsfree)
+    assert torch.allclose(y0, y1, atol=1e-5, rtol=1e-5)
+
+
 def test_static_repair_tile_batch_padding_preserves_logits_and_gradients():
     import copy
     from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
