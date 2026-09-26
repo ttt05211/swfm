@@ -1416,11 +1416,15 @@ def test_static_repair_sparse_query_decode_matches_dense_reference():
             model, scene, q, seen_h, missing_h, geom,
             tile_batch_size=8,
         )
+        active_dense = geom.active_tiles(q)
+        active_direct = geom.active_tiles_from_linear(linear)
         sparse, row_map, ns = _decode_query_logits_sparse(
             model, scene, q, obs[0].numpy(), geom,
             tile_batch_size=8,
+            active_tiles=active_direct,
         )
 
+    assert np.array_equal(active_direct, active_dense)
     qlin = torch.nonzero(q.reshape(-1), as_tuple=False).reshape(-1)
     ref = dense.reshape(dense.shape[0], -1)[:, qlin].transpose(0, 1)
     assert nd == ns
