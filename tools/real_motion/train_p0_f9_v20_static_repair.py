@@ -721,6 +721,13 @@ def _decode_query_logits_sparse(
             # [B,C,X,Y,Z] -> [B,X,Y,Z,C], then retain only M_query cells.
             selected_logits = logits.permute(0, 2, 3, 4, 1)[qstack]
             selected_rows = torch.stack(rrows, dim=0)[qstack].long()
+            # Under BF16 autocast tile_refine may return BF16 while scene (and
+            # therefore the sparse destination buffer) remains FP32. The
+            # legacy dense slice assignment performed this cast implicitly;
+            # index_copy_ requires exact dtype equality, so make the same
+            # conversion explicit here.
+            if selected_logits.dtype != query_logits.dtype:
+                selected_logits = selected_logits.to(query_logits.dtype)
             query_logits.index_copy_(0, selected_rows, selected_logits)
             filled[selected_rows] = True
             ntiles += len(chunk)
