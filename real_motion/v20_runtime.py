@@ -11,6 +11,7 @@ import torch
 from .v20_history_world import (
     CanonicalLattice,
     DYNAMIC_IDS,
+    QueryMaskReport,
     canonical_tile_grid_sample_coordinates,
     future_native_to_canonical_indices,
     future_union_query_mask,
@@ -68,6 +69,28 @@ class StaticRuntimeReport:
     out_of_bounds_voxels: int
 
 
+def _query_mask_from_render_index(
+    high_lattice: CanonicalLattice,
+    render_index,
+) -> QueryMaskReport:
+    valid = np.asarray(render_index.valid, dtype=bool)
+    idx = np.asarray(render_index.indices_xyz, dtype=np.int64)
+    out = np.zeros(high_lattice.shape_xyz, dtype=bool)
+    good = idx[valid]
+    if len(good):
+        out[good[:, 0], good[:, 1], good[:, 2]] = True
+    requested = int(valid.size)
+    in_bounds = int(valid.sum())
+    oob = int(requested - in_bounds)
+    return QueryMaskReport(
+        mask=out,
+        requested_voxels=requested,
+        in_bounds_voxels=in_bounds,
+        out_of_bounds_voxels=oob,
+        out_of_bounds_fraction=float(oob / max(requested, 1)),
+    )
+
+
 def _tile_history_context(
     history_observed_coarse: np.ndarray,
     *,
@@ -108,69 +131,17 @@ def decode_static_world_tiled(
     native_origin_xyz_m: Sequence[float],
     native_voxel_size_xyz_m: Sequence[float],
     tile_size_xyz: Sequence[int] = (32, 32, 16),
+    tile_batch_size: int = 32,
     free_label: int = 17,
 ) -> StaticRuntimeReport:
-    """Decode one canonical Static world, then render it to all six futures."""
+    """Decode one canonical Static world and render all six futures.
+
+    The future native->canonical mapping is computed once and reused for both
+    the query union and final render. Equal-shaped active tiles are refined in
+    batches to avoid one Conv3D launch and GPU->CPU sync per tile.
+    """
     if scene_features.shape[0] != 1:
         raise ValueError("runtime helper currently expects one window")
-    q = future_union_query_mask(
-        high_lattice,
-        future_ego_to_canonical=np.asarray(future_ego_to_canonical),
-        native_shape_xyz=native_shape_xyz,
-        native_origin_xyz_m=native_origin_xyz_m,
-        native_voxel_size_xyz_m=native_voxel_size_xyz_m,
-    )
-    world = np.full(high_lattice.shape_xyz, int(free_label), dtype=np.uint8)
-    tile = np.asarray(tuple(int(x) for x in tile_size_xyz), dtype=np.int64)
-    shape = np.asarray(high_lattice.shape_xyz, dtype=np.int64)
-    starts = []
-    for x in range(0, shape[0], tile[0]):
-        for y in range(0, shape[1], tile[1]):
-            for z in range(0, shape[2], tile[2]):
-                stop = np.minimum(np.asarray([x, y, z]) + tile, shape)
-                if q.mask[x:stop[0], y:stop[1], z:stop[2]].any():
-                    starts.append((x, y, z))
-
-    with torch.inference_mode():
-        for start_t in starts:
-            start = np.asarray(start_t, dtype=np.int64)
-            stop = np.minimum(start + tile, shape)
-            tshape = tuple((stop - start).tolist())
-            grid = canonical_tile_grid_sample_coordinates(
-                high_lattice,
-                coarse_lattice,
-                start,
-                tshape,
-                device=scene_features.device,
-                dtype=scene_features.dtype,
-            )
-            qtile = q.mask[
-                start[0]:stop[0],
-                start[1]:stop[1],
-                start[2]:stop[2],
-            ]
-            seen, missing = _tile_history_context(
-                history_observed_coarse,
-                high_lattice=high_lattice,
-                coarse_lattice=coarse_lattice,
-                start_xyz=start,
-                shape_xyz=tshape,
-            )
-            logits = model.static.refine_tiles(
-                scene_features,
-                sample_grid=grid,
-                query_mask=torch.from_numpy(qtile).to(scene_features.device).unsqueeze(0),
-                seen_mask=torch.from_numpy(seen).to(scene_features.device).unsqueeze(0),
-                t0_missing_mask=torch.from_numpy(missing).to(scene_features.device).unsqueeze(0),
-            )
-            pred = decode_static_logits(logits)[0].cpu().numpy().astype(np.uint8)
-            # No prediction is allowed outside the future-union query domain.
-            pred[~qtile] = int(free_label)
-            world[
-                start[0]:stop[0],
-                start[1]:stop[1],
-                start[2]:stop[2],
-            ] = pred
 
     ri = future_native_to_canonical_indices(
         high_lattice,
@@ -179,6 +150,97 @@ def decode_static_world_tiled(
         native_origin_xyz_m=native_origin_xyz_m,
         native_voxel_size_xyz_m=native_voxel_size_xyz_m,
     )
+    q = _query_mask_from_render_index(high_lattice, ri)
+
+    world = np.full(high_lattice.shape_xyz, int(free_label), dtype=np.uint8)
+    tile = np.asarray(tuple(int(x) for x in tile_size_xyz), dtype=np.int64)
+    shape = np.asarray(high_lattice.shape_xyz, dtype=np.int64)
+    starts = []
+    buckets = {}
+    for x in range(0, shape[0], tile[0]):
+        for y in range(0, shape[1], tile[1]):
+            for z in range(0, shape[2], tile[2]):
+                start = np.asarray([x, y, z], dtype=np.int64)
+                stop = np.minimum(start + tile, shape)
+                if not q.mask[x:stop[0], y:stop[1], z:stop[2]].any():
+                    continue
+                start_t = (int(x), int(y), int(z))
+                tshape = tuple((stop - start).tolist())
+                starts.append(start_t)
+                buckets.setdefault(tshape, []).append(start_t)
+
+    bsz = max(int(tile_batch_size), 1)
+    with torch.inference_mode():
+        for tshape, bucket in buckets.items():
+            for bi in range(0, len(bucket), bsz):
+                chunk = bucket[bi:bi + bsz]
+                grids = []
+                qtiles = []
+                seen_rows = []
+                missing_rows = []
+                stops = []
+                for start_t in chunk:
+                    start = np.asarray(start_t, dtype=np.int64)
+                    stop = np.minimum(start + tile, shape)
+                    stops.append(stop)
+                    grids.append(
+                        canonical_tile_grid_sample_coordinates(
+                            high_lattice,
+                            coarse_lattice,
+                            start,
+                            tshape,
+                            device=scene_features.device,
+                            dtype=scene_features.dtype,
+                        )
+                    )
+                    qtile = q.mask[
+                        start[0]:stop[0],
+                        start[1]:stop[1],
+                        start[2]:stop[2],
+                    ]
+                    seen, missing = _tile_history_context(
+                        history_observed_coarse,
+                        high_lattice=high_lattice,
+                        coarse_lattice=coarse_lattice,
+                        start_xyz=start,
+                        shape_xyz=tshape,
+                    )
+                    qtiles.append(qtile)
+                    seen_rows.append(seen)
+                    missing_rows.append(missing)
+
+                B = len(chunk)
+                logits = model.static.refine_tiles(
+                    scene_features.expand(B, -1, -1, -1, -1),
+                    sample_grid=torch.cat(grids, dim=0),
+                    query_mask=torch.from_numpy(
+                        np.stack(qtiles, axis=0)
+                    ).to(scene_features.device, non_blocking=True),
+                    seen_mask=torch.from_numpy(
+                        np.stack(seen_rows, axis=0)
+                    ).to(scene_features.device, non_blocking=True),
+                    t0_missing_mask=torch.from_numpy(
+                        np.stack(missing_rows, axis=0)
+                    ).to(scene_features.device, non_blocking=True),
+                )
+                pred_batch = (
+                    decode_static_logits(logits)
+                    .cpu()
+                    .numpy()
+                    .astype(np.uint8, copy=False)
+                )
+                for local_b, (start_t, stop, qtile) in enumerate(
+                    zip(chunk, stops, qtiles)
+                ):
+                    pred = pred_batch[local_b].copy()
+                    pred[~qtile] = int(free_label)
+                    start = np.asarray(start_t, dtype=np.int64)
+                    world[
+                        start[0]:stop[0],
+                        start[1]:stop[1],
+                        start[2]:stop[2],
+                    ] = pred
+
     future = render_canonical_semantic_to_future(
         world, ri, free_label=int(free_label)
     )
