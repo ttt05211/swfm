@@ -1522,6 +1522,82 @@ def test_static_repair_sparse_loss_matches_dense_reference():
     assert torch.equal(fs, fd)
 
 
+def test_static_repair_aggregated_loss_matches_repeated_ce_gradient():
+    from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _repair_sparse_loss_only,
+    )
+
+    rng = np.random.default_rng(101)
+    high = CanonicalLattice(
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (4, 3, 2)
+    )
+    coarse = CanonicalLattice(
+        (0.0, 0.0, 0.0), (2.0, 2.0, 2.0), (2, 2, 1)
+    )
+    geom = _Geometry(
+        high, coarse, (2, 2, 1),
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+        (2, 2, 1), torch.device("cpu"),
+    )
+    linear = torch.tensor([
+        [0, 1, 6, 7],
+        [1, 2, 7, 8],
+        [2, 3, 8, 9],
+        [3, 4, 9, 10],
+        [4, 5, 10, 11],
+        [5, 0, 11, 6],
+    ], dtype=torch.long)
+    q = torch.zeros(int(np.prod(high.shape_xyz)), dtype=torch.bool)
+    q[linear.reshape(-1)] = True
+    qlin = torch.nonzero(q, as_tuple=False).reshape(-1)
+    row_map = torch.full(
+        (int(np.prod(high.shape_xyz)),), -1, dtype=torch.int32
+    )
+    row_map[qlin] = torch.arange(len(qlin), dtype=torch.int32)
+
+    support = rng.random((6, 2, 2, 1)) > 0.15
+    allowed = np.asarray(STATIC_ALLOWED_IDS, dtype=np.uint8)
+    target = rng.choice(allowed, size=(6, 2, 2, 1)).astype(np.uint8)
+
+    base_logits = torch.randn(
+        len(qlin), len(STATIC_ALLOWED_IDS), dtype=torch.float32
+    )
+    q_new = base_logits.clone().requires_grad_(True)
+    new_loss = _repair_sparse_loss_only(
+        q_new,
+        row_map,
+        linear,
+        support,
+        target,
+        geom=geom,
+        device=torch.device("cpu"),
+    )
+    new_loss.backward()
+    new_grad = q_new.grad.detach().clone()
+
+    q_ref = base_logits.clone().requires_grad_(True)
+    support_t = torch.from_numpy(np.asarray(support, dtype=bool))
+    target_t = torch.from_numpy(np.asarray(target, dtype=np.uint8))
+    ref_sum = q_ref.sum() * 0.0
+    denom = 0
+    for hi in range(6):
+        s = support_t[hi].reshape(-1)
+        qrow = row_map[linear[hi][s]].long()
+        y = target_t[hi].reshape(-1)[s].long()
+        yl = geom.global_to_local[y]
+        ref_sum = ref_sum + F.cross_entropy(
+            q_ref[qrow], yl, reduction="sum"
+        )
+        denom += int(qrow.numel())
+    ref_loss = ref_sum / float(denom)
+    ref_loss.backward()
+
+    assert torch.allclose(new_loss, ref_loss, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(new_grad, q_ref.grad, atol=1e-6, rtol=1e-6)
+
+
 def test_static_repair_sparse_decode_matches_dense_under_bfloat16_autocast():
     from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
     from tools.real_motion.train_p0_f9_v20_static_repair import (
