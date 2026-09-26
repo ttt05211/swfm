@@ -1522,6 +1522,105 @@ def test_static_repair_sparse_loss_matches_dense_reference():
     assert torch.equal(fs, fd)
 
 
+def test_static_repair_tile_batch_padding_preserves_logits_and_gradients():
+    import copy
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _decode_query_logits_sparse,
+    )
+
+    torch.manual_seed(103)
+    coarse = CanonicalLattice(
+        (0.0, 0.0, 0.0), (2.0, 2.0, 2.0), (4, 4, 2)
+    )
+    high = CanonicalLattice(
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (8, 8, 4)
+    )
+    geom = _Geometry(
+        high, coarse, (4, 4, 2),
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+        (4, 4, 2), torch.device("cpu"),
+    )
+    cfg = V20SceneConfig(
+        semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+    )
+    m0 = V20HistoryWorldModel(cfg)
+    m1 = copy.deepcopy(m0)
+    scene0 = torch.randn(
+        (1, m0.encoder.output_dim) + coarse.shape_xyz,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    scene1 = scene0.detach().clone().requires_grad_(True)
+    q = torch.ones(high.shape_xyz, dtype=torch.bool)
+    obs = np.ones((6,) + coarse.shape_xyz, dtype=bool)
+
+    y0, rows0, n0 = _decode_query_logits_sparse(
+        m0, scene0, q, obs, geom,
+        tile_batch_size=16,
+        tile_batch_pad_multiple=1,
+    )
+    y1, rows1, n1 = _decode_query_logits_sparse(
+        m1, scene1, q, obs, geom,
+        tile_batch_size=16,
+        tile_batch_pad_multiple=6,
+    )
+    assert n0 == n1 == 8
+    assert torch.equal(rows0, rows1)
+    assert torch.allclose(y0, y1, atol=1e-6, rtol=1e-6)
+
+    weight = torch.randn_like(y0)
+    (y0 * weight).sum().backward()
+    (y1 * weight).sum().backward()
+    assert torch.allclose(scene0.grad, scene1.grad, atol=1e-5, rtol=1e-5)
+    for p0, p1 in zip(
+        m0.static.tile_refine.parameters(),
+        m1.static.tile_refine.parameters(),
+    ):
+        if p0.grad is None or p1.grad is None:
+            assert p0.grad is None and p1.grad is None
+        else:
+            assert torch.allclose(p0.grad, p1.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_static_tile_channels_last_3d_preserves_values():
+    import copy
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+
+    torch.manual_seed(107)
+    cfg = V20SceneConfig(
+        semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+    )
+    m0 = V20HistoryWorldModel(cfg).eval()
+    m1 = copy.deepcopy(m0).eval()
+    m1.static.set_tile_channels_last_3d(True)
+
+    scene0 = torch.randn(1, m0.encoder.output_dim, 4, 4, 2)
+    scene1 = scene0.clone()
+    grid = torch.rand(5, 4, 4, 2, 3) * 2.0 - 1.0
+    q = torch.rand(5, 4, 4, 2) > 0.5
+    seen = torch.rand(5, 4, 4, 2) > 0.5
+    missing = seen & (torch.rand(5, 4, 4, 2) > 0.5)
+
+    with torch.no_grad():
+        y0 = m0.static.refine_tiles(
+            scene0,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=missing,
+        )
+        y1 = m1.static.refine_tiles(
+            scene1,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=missing,
+        )
+    assert torch.allclose(y0, y1, atol=1e-5, rtol=1e-5)
+
+
 def test_static_repair_aggregated_loss_matches_repeated_ce_gradient():
     import torch.nn.functional as F
     from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
@@ -1725,4 +1824,7 @@ def test_static_repair_training_defers_metrics_and_has_stage_profiler():
     assert "_CudaStageProfiler(" in epoch_src
     assert "recent_rate=" in epoch_src
     assert "gpu_recent_ms=" in epoch_src
+    assert "tile_batch_pad_multiple" in epoch_src
+    assert "--tile-batch-pad-multiple" in main_src
+    assert "--no-channels-last-3d" in main_src
     assert "--profile-gpu-stages" in main_src
