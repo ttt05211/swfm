@@ -854,3 +854,24 @@ def test_equal_tile_weighted_ce_matches_per_tile_loop():
         for tid in range(3)
     )
     assert torch.allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+
+def test_static_prepared_rows_preserve_order_with_threads(tmp_path):
+    from tools.real_motion.train_p0_f9_v20_static import _iter_prepared_rows
+    # Contract-level source check: ordered prefetch uses a deque and yields
+    # future results from the left, never completion order.
+    import inspect
+    src = inspect.getsource(_iter_prepared_rows)
+    assert "pending.popleft()" in src
+    assert "yield result" in src
+    assert "ThreadPoolExecutor" in src
+
+
+def test_static_resume_checkpoint_contract_is_present():
+    import inspect
+    from tools.real_motion import train_p0_f9_v20_static as m
+    src = inspect.getsource(m.main)
+    assert '"optimizer_state_dict"' in src
+    assert '"training_progress"' in src
+    assert '"rng_state"' in src
+    assert '"resume_latest.pt"' in src

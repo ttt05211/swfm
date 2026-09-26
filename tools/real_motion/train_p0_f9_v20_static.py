@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import json
 import math
@@ -71,17 +73,28 @@ def _iter_rows(root, idx, shuffle, seed):
         yield from rows
 
 
-def _row_history(row, device):
+def _row_history_cpu(row):
     shape = (6,) + tuple(int(x) for x in row["coarse_shape_xyz"])
     obs = unpack_bool(row["history_observed_bits"], shape)
     free = unpack_bool(row["history_observed_free_bits"], shape)
-    sem_np = unpack_history_semantic(row, obs, free)
-    sem = torch.from_numpy(sem_np).to(device).unsqueeze(0)
+    sem = unpack_history_semantic(row, obs, free)
+    return sem, obs, free
+
+
+def _prepared_to_device(prepared, device):
+    sem_np = prepared["sem"]
+    obs_np = prepared["obs"]
+    free_np = prepared["free"]
+    non_blocking = device.type == "cuda"
     return (
-        sem,
-        torch.from_numpy(obs).to(device).unsqueeze(0),
-        torch.from_numpy(free).to(device).unsqueeze(0),
-        obs,
+        torch.from_numpy(sem_np).to(device, non_blocking=non_blocking).unsqueeze(0),
+        torch.from_numpy(obs_np).to(device, non_blocking=non_blocking).unsqueeze(0),
+        torch.from_numpy(free_np).to(device, non_blocking=non_blocking).unsqueeze(0),
+        obs_np,
+        prepared["coarse_idx"],
+        prepared["coarse_y"],
+        prepared["high_idx"],
+        prepared["high_y"],
     )
 
 
@@ -224,6 +237,124 @@ def _aggregate_sparse_targets_pair(
         *_merge_linear_targets(coarse_lin, coarse_y, cshape),
         *_merge_linear_targets(high_lin, high_y, hshape),
     )
+
+
+def _prepare_row_cpu(
+    row, coarse, high, native_shape, native_origin, native_step
+):
+    started = time.perf_counter()
+    sem, obs, free = _row_history_cpu(row)
+    coarse_idx, coarse_y, high_idx, high_y = _aggregate_sparse_targets_pair(
+        row, coarse, high, native_shape, native_origin, native_step
+    )
+    return {
+        "sem": sem,
+        "obs": obs,
+        "free": free,
+        "coarse_idx": coarse_idx,
+        "coarse_y": coarse_y,
+        "high_idx": high_idx,
+        "high_y": high_y,
+        "cpu_seconds": float(time.perf_counter() - started),
+    }
+
+
+def _iter_prepared_rows(
+    root,
+    idx,
+    *,
+    shuffle,
+    seed,
+    coarse,
+    high,
+    native_shape,
+    native_origin,
+    native_step,
+    workers,
+    prefetch,
+    skip_windows=0,
+):
+    """Bounded ordered CPU prefetch without changing the training sample order."""
+    raw = iter(_iter_rows(root, idx, shuffle, seed))
+    skip = max(int(skip_windows), 0)
+    for _ in range(skip):
+        try:
+            next(raw)
+        except StopIteration:
+            return
+
+    def prepare(row):
+        return _prepare_row_cpu(
+            row,
+            coarse,
+            high,
+            native_shape,
+            native_origin,
+            native_step,
+        )
+
+    nw = max(int(workers), 0)
+    if nw == 0:
+        for row in raw:
+            yield prepare(row)
+        return
+
+    max_pending = max(int(prefetch), nw)
+    with ThreadPoolExecutor(
+        max_workers=nw, thread_name_prefix="v20-static-prep"
+    ) as pool:
+        pending = deque()
+        exhausted = False
+        for _ in range(max_pending):
+            try:
+                pending.append(pool.submit(prepare, next(raw)))
+            except StopIteration:
+                exhausted = True
+                break
+
+        while pending:
+            fut = pending.popleft()
+            result = fut.result()
+            if not exhausted:
+                try:
+                    pending.append(pool.submit(prepare, next(raw)))
+                except StopIteration:
+                    exhausted = True
+            yield result
+
+
+def _capture_rng_state():
+    out = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        out["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return out
+
+
+def _restore_rng_state(state):
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and state.get("torch_cuda") is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _atomic_torch_save(obj, path):
+    path = Path(path)
+    tmp = path.with_name("." + path.name + ".tmp")
+    try:
+        if tmp.exists():
+            tmp.unlink()
+        torch.save(obj, tmp)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _point_ce(logits, idx, labels, class_weights):
@@ -499,44 +630,78 @@ def _assert_finite_async(x):
 def _epoch(
     model, root, idx, high, coarse, native_shape, native_origin, native_step,
     device, weights, *, optimizer, tile_size, tile_batch_size,
-    progress_every, seed, amp
+    progress_every, prep_workers, prefetch, seed, amp,
+    start_window=0, resume_accum=None, checkpoint_every=0,
+    checkpoint_callback=None, geometry_caches=None
 ):
     train = optimizer is not None
     model.train(train)
     # Dormant/Birth are not part of Stage 2.
     model.dormant.eval(); model.birth.eval()
+    resume_accum = dict(resume_accum or {})
     sums_gpu = {
-        "loss": torch.zeros((), dtype=torch.float32, device=device),
-        "coarse": torch.zeros((), dtype=torch.float32, device=device),
-        "tile": torch.zeros((), dtype=torch.float32, device=device),
-    }
-    conf_gpu = torch.zeros((18, 18), dtype=torch.int64, device=device)
-    n = 0
-    total = int(idx["num_windows"])
-    started = time.perf_counter()
-    prep_seconds = 0.0
-    tiles_total = 0
-    # Persist these caches for the epoch; all entries depend only on frozen
-    # lattice/tile geometry, never on labels or model state.
-    grid_cache = {}
-    context_index_cache = {}
-
-    for row in _iter_rows(root, idx, train, seed):
-        t0 = time.perf_counter()
-        sem, obs, free, obs_np = _row_history(row, device)
-        coarse_idx, coarse_y, high_idx, high_y = (
-            _aggregate_sparse_targets_pair(
-                row,
-                coarse,
-                high,
-                native_shape,
-                native_origin,
-                native_step,
-            )
+        k: torch.tensor(
+            float(resume_accum.get("sums", {}).get(k, 0.0)),
+            dtype=torch.float32,
+            device=device,
         )
-        prep_seconds += time.perf_counter() - t0
+        for k in ("loss", "coarse", "tile")
+    }
+    conf0 = np.asarray(
+        resume_accum.get("confusion", np.zeros((18, 18), dtype=np.int64)),
+        dtype=np.int64,
+    )
+    conf_gpu = torch.as_tensor(conf0, dtype=torch.int64, device=device).clone()
+    n = int(start_window)
+    total = int(idx["num_windows"])
+    if n < 0 or n > total:
+        raise ValueError(f"invalid start_window={n} for total={total}")
+    started = time.perf_counter()
+    cpu_wait_seconds = 0.0
+    cpu_work_seconds = float(resume_accum.get("cpu_work_seconds", 0.0))
+    prior_elapsed = float(resume_accum.get("elapsed_seconds", 0.0))
+    tiles_total = int(resume_accum.get("tiles_total", 0))
 
-        t1 = time.perf_counter()
+    geometry_caches = geometry_caches if geometry_caches is not None else {}
+    grid_cache = geometry_caches.setdefault("grid", {})
+    context_index_cache = geometry_caches.setdefault("context_index", {})
+
+    prepared_iter = iter(_iter_prepared_rows(
+        root,
+        idx,
+        shuffle=train,
+        seed=seed,
+        coarse=coarse,
+        high=high,
+        native_shape=native_shape,
+        native_origin=native_origin,
+        native_step=native_step,
+        workers=prep_workers,
+        prefetch=prefetch,
+        skip_windows=n,
+    ))
+
+    while n < total:
+        wait_started = time.perf_counter()
+        try:
+            prepared = next(prepared_iter)
+        except StopIteration:
+            break
+        cpu_wait_seconds += time.perf_counter() - wait_started
+        cpu_work_seconds += float(prepared["cpu_seconds"])
+        (
+            sem,
+            obs,
+            free,
+            obs_np,
+            coarse_idx,
+            coarse_y,
+            high_idx,
+            high_y,
+        ) = _prepared_to_device(prepared, device)
+
+        if train:
+            optimizer.zero_grad(set_to_none=True)
         with _autocast(device, amp):
             scene = model.encode_history(sem, obs, free)
             clogits = model.static.forward_coarse(scene)
@@ -558,12 +723,12 @@ def _epoch(
             loss = lc + lt
         _assert_finite_async(loss)
         if train:
-            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(model.encoder.parameters()) + list(model.static.parameters()),
                 5.0,
                 error_if_nonfinite=True,
+                foreach=True,
             )
             optimizer.step()
         sums_gpu["loss"].add_(loss.detach().float())
@@ -572,26 +737,55 @@ def _epoch(
         conf_gpu.add_(c)
         tiles_total += int(nt)
         n += 1
-        # Synchronize only at reporting points so normal training stays async.
-        if n == 1 or n % max(int(progress_every), 1) == 0 or n == total:
+        should_report = (
+            n == int(start_window) + 1
+            or n % max(int(progress_every), 1) == 0
+            or n == total
+        )
+        should_checkpoint = (
+            train
+            and checkpoint_callback is not None
+            and int(checkpoint_every) > 0
+            and n < total
+            and n % int(checkpoint_every) == 0
+        )
+        if should_report or should_checkpoint:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             now = time.perf_counter()
+            segment_n = max(n - int(start_window), 1)
             phase = "train" if train else "val"
             loss_mean = float(sums_gpu["loss"].item() / max(n, 1))
             alloc_gib = (
                 torch.cuda.memory_allocated(device) / 1024**3
                 if device.type == "cuda" else 0.0
             )
-            print(
-                f"v20_static_{phase} {n}/{total} "
-                f"rate={n/max(now-started,1e-9):.3f} win/s "
-                f"prep={prep_seconds/max(n,1):.3f}s/win "
-                f"tiles={tiles_total/max(n,1):.1f}/win "
-                f"gpu_mem={alloc_gib:.2f}GiB "
-                f"loss={loss_mean:.4f}",
-                flush=True,
-            )
+            if should_report:
+                print(
+                    f"v20_static_{phase} {n}/{total} "
+                    f"rate={segment_n/max(now-started,1e-9):.3f} win/s "
+                    f"cpu_wait={cpu_wait_seconds/segment_n:.3f}s/win "
+                    f"cpu_work={cpu_work_seconds/max(n,1):.3f}s/win "
+                    f"tiles={tiles_total/max(n,1):.1f}/win "
+                    f"gpu_mem={alloc_gib:.2f}GiB "
+                    f"loss={loss_mean:.4f}",
+                    flush=True,
+                )
+            if should_checkpoint:
+                checkpoint_callback(
+                    n,
+                    {
+                        "sums": {
+                            k: float(v.item()) for k, v in sums_gpu.items()
+                        },
+                        "confusion": conf_gpu.detach().cpu().numpy().tolist(),
+                        "tiles_total": int(tiles_total),
+                        "cpu_work_seconds": float(cpu_work_seconds),
+                        "elapsed_seconds": float(
+                            prior_elapsed + (now - started)
+                        ),
+                    },
+                )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     conf = conf_gpu.cpu().numpy()
@@ -602,11 +796,16 @@ def _epoch(
         "static_supervised_semantic_miou": miou,
         "per_class_iou": per,
         "windows": n,
-        "mean_preprocess_seconds_per_window": float(
-            prep_seconds / max(n, 1)
+        "mean_cpu_work_seconds_per_window": float(
+            cpu_work_seconds / max(n, 1)
+        ),
+        "mean_cpu_wait_seconds_per_resumed_window": float(
+            cpu_wait_seconds / max(n - int(start_window), 1)
         ),
         "mean_tiles_per_window": float(tiles_total / max(n, 1)),
-        "epoch_elapsed_seconds": float(time.perf_counter() - started),
+        "epoch_elapsed_seconds": float(
+            prior_elapsed + time.perf_counter() - started
+        ),
         "checkpoint_selection_metric": "NONE; run formal composed V20 Static evaluation",
     }
 
@@ -632,6 +831,29 @@ def main():
         type=int,
         default=50,
         help="Print Stage-2 progress every N windows.",
+    )
+    p.add_argument(
+        "--prep-workers",
+        type=int,
+        default=4,
+        help="CPU workers for ordered history/target preparation.",
+    )
+    p.add_argument(
+        "--prefetch",
+        type=int,
+        default=32,
+        help="Maximum prepared/pending windows kept ahead of the GPU.",
+    )
+    p.add_argument(
+        "--checkpoint-every-windows",
+        type=int,
+        default=500,
+        help="Atomically refresh resume_latest.pt every N train windows; 0 disables.",
+    )
+    p.add_argument(
+        "--resume",
+        default="",
+        help="Resume exactly from a V20 Static resume/epoch checkpoint.",
     )
     p.add_argument("--seed", type=int, default=20260925)
     p.add_argument("--device", default="cuda")
@@ -671,7 +893,9 @@ def main():
     weights = weights_cpu.to(device)
     optimizer = torch.optim.AdamW(
         [p0 for p0 in model.parameters() if p0.requires_grad],
-        lr=float(a.lr), weight_decay=float(a.weight_decay)
+        lr=float(a.lr),
+        weight_decay=float(a.weight_decay),
+        foreach=(device.type == "cuda"),
     )
     amp = device.type == "cuda" and not bool(a.no_amp)
     tile_size = tuple(int(x) for x in a.tile_size.split(","))
@@ -683,11 +907,132 @@ def main():
     native_step = tuple(float(x) for x in native["voxel_size_xyz_m"])
 
     out = Path(a.output_dir)
-    if out.exists() and any(out.iterdir()):
-        raise FileExistsError(f"refusing non-empty output dir: {out}")
-    out.mkdir(parents=True, exist_ok=True)
-    history = []
-    for epoch in range(1, int(a.epochs) + 1):
+    resume_path = Path(a.resume).resolve() if str(a.resume).strip() else None
+    if resume_path is None:
+        if out.exists() and any(out.iterdir()):
+            raise FileExistsError(f"refusing non-empty output dir: {out}")
+        out.mkdir(parents=True, exist_ok=True)
+        history = []
+        start_epoch = 1
+        resume_window = 0
+        resume_accum = None
+    else:
+        if not resume_path.is_file():
+            raise FileNotFoundError(resume_path)
+        out.mkdir(parents=True, exist_ok=True)
+        ck = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if ck.get("protocol") != "p0_f9_v20_checkpoint_v1":
+            raise RuntimeError("resume checkpoint protocol mismatch")
+        if ck.get("stage") != "static":
+            raise RuntimeError("resume checkpoint is not V20 Static")
+        if str(Path(ck.get("v18_checkpoint", "")).resolve()) != str(
+            Path(a.v18_checkpoint).resolve()
+        ):
+            raise RuntimeError("resume V18 checkpoint mismatch")
+        extra = dict(ck.get("extra") or {})
+        contract = dict(extra.get("training_contract") or {})
+        expected = {
+            "train_cache": str(Path(a.train_cache).resolve()),
+            "val_cache": str(Path(a.val_cache).resolve()),
+            "seed": int(a.seed),
+            "tile_size_xyz": list(tile_size),
+        }
+        for key, value in expected.items():
+            if contract.get(key) != value:
+                raise RuntimeError(
+                    f"resume contract mismatch for {key}: "
+                    f"{contract.get(key)!r} != {value!r}"
+                )
+        model.load_state_dict(ck["model"], strict=True)
+        if ck.get("optimizer_state_dict") is None:
+            raise RuntimeError(
+                "resume checkpoint lacks optimizer_state_dict; "
+                "use a checkpoint produced by the new Static trainer"
+            )
+        optimizer.load_state_dict(ck["optimizer_state_dict"])
+        _restore_rng_state(ck.get("rng_state"))
+        progress = dict(ck.get("training_progress") or {})
+        history = list(progress.get("history") or [])
+        completed_epoch = bool(progress.get("epoch_complete", False))
+        saved_epoch = int(progress.get("epoch", 0))
+        if completed_epoch:
+            start_epoch = saved_epoch + 1
+            resume_window = 0
+            resume_accum = None
+        else:
+            start_epoch = saved_epoch
+            resume_window = int(progress.get("completed_windows", 0))
+            resume_accum = dict(progress.get("partial_epoch_state") or {})
+        print(
+            f"resumed V20 Static from {resume_path}: "
+            f"epoch={start_epoch} window={resume_window}",
+            flush=True,
+        )
+
+    if start_epoch > int(a.epochs):
+        raise RuntimeError(
+            f"resume already completed epoch {start_epoch-1}; "
+            f"target --epochs={a.epochs}"
+        )
+
+    geometry_caches = {}
+    total_train_windows = int(tr_idx["num_windows"])
+
+    def make_payload(epoch, *, epoch_complete, completed_windows, partial_state, hist):
+        payload = checkpoint_payload(
+            model,
+            stage="static",
+            v18_checkpoint=str(Path(a.v18_checkpoint).resolve()),
+            thresholds={},
+            extra={
+                "train_protocol": PROTOCOL,
+                "epoch": int(epoch),
+                "highres_lattice": tr_idx["highres_lattice"],
+                "coarse_lattice": tr_idx["coarse_lattice"],
+                "tile_size_xyz": list(tile_size),
+                "tile_batch_size": int(a.tile_batch_size),
+                "class_weights": weights_cpu.tolist(),
+                "training_contract": {
+                    "train_cache": str(Path(a.train_cache).resolve()),
+                    "val_cache": str(Path(a.val_cache).resolve()),
+                    "seed": int(a.seed),
+                    "tile_size_xyz": list(tile_size),
+                    "lr": float(a.lr),
+                    "weight_decay": float(a.weight_decay),
+                },
+                "selection": (
+                    "No automatic best.pt. Select epoch only from formal composed "
+                    "semantic mIoU on the scene-disjoint development set."
+                ),
+                "history": list(hist),
+            },
+        )
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+        payload["rng_state"] = _capture_rng_state()
+        payload["training_progress"] = {
+            "epoch": int(epoch),
+            "epoch_complete": bool(epoch_complete),
+            "completed_windows": int(completed_windows),
+            "total_windows": int(total_train_windows),
+            "partial_epoch_state": partial_state,
+            "history": list(hist),
+        }
+        return payload
+
+    for epoch in range(int(start_epoch), int(a.epochs) + 1):
+        this_start = int(resume_window) if epoch == int(start_epoch) else 0
+        this_accum = resume_accum if epoch == int(start_epoch) else None
+
+        def save_partial(completed_windows, partial_state):
+            payload = make_payload(
+                epoch,
+                epoch_complete=False,
+                completed_windows=completed_windows,
+                partial_state=partial_state,
+                hist=history,
+            )
+            _atomic_torch_save(payload, out / "resume_latest.pt")
+
         tr = _epoch(
             model, tr_root, tr_idx, high, coarse, native_shape, native_origin, native_step,
             device,
@@ -696,10 +1041,17 @@ def main():
             tile_size=tile_size,
             tile_batch_size=int(a.tile_batch_size),
             progress_every=int(a.progress_every),
+            prep_workers=int(a.prep_workers),
+            prefetch=int(a.prefetch),
             seed=int(a.seed) + epoch,
             amp=amp,
+            start_window=this_start,
+            resume_accum=this_accum,
+            checkpoint_every=int(a.checkpoint_every_windows),
+            checkpoint_callback=save_partial,
+            geometry_caches=geometry_caches,
         )
-        with torch.no_grad():
+        with torch.inference_mode():
             va = _epoch(
                 model, va_root, va_idx, high, coarse, native_shape, native_origin, native_step,
                 device,
@@ -708,34 +1060,27 @@ def main():
                 tile_size=tile_size,
                 tile_batch_size=int(a.tile_batch_size),
                 progress_every=int(a.progress_every),
+                prep_workers=int(a.prep_workers),
+                prefetch=int(a.prefetch),
                 seed=int(a.seed),
                 amp=amp,
+                geometry_caches=geometry_caches,
             )
         row = {"epoch": epoch, "train": tr, "val": va}
         history.append(row)
         print(json.dumps(row))
-        payload = checkpoint_payload(
-            model,
-            stage="static",
-            v18_checkpoint=str(Path(a.v18_checkpoint).resolve()),
-            thresholds={},
-            extra={
-                "train_protocol": PROTOCOL,
-                "epoch": epoch,
-                "highres_lattice": tr_idx["highres_lattice"],
-                "coarse_lattice": tr_idx["coarse_lattice"],
-                "tile_size_xyz": list(tile_size),
-                "tile_batch_size": int(a.tile_batch_size),
-                "class_weights": weights_cpu.tolist(),
-                "selection": (
-                    "No automatic best.pt. Select epoch only from formal composed "
-                    "semantic mIoU on the scene-disjoint development set."
-                ),
-                "history": history,
-            },
+        payload = make_payload(
+            epoch,
+            epoch_complete=True,
+            completed_windows=total_train_windows,
+            partial_state=None,
+            hist=history,
         )
-        torch.save(payload, out / f"epoch_{epoch:04d}.pt")
-        torch.save(payload, out / "latest.pt")
+        _atomic_torch_save(payload, out / f"epoch_{epoch:04d}.pt")
+        _atomic_torch_save(payload, out / "latest.pt")
+        _atomic_torch_save(payload, out / "resume_latest.pt")
+        resume_window = 0
+        resume_accum = None
     (out / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
 
