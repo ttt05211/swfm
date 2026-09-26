@@ -759,7 +759,8 @@ def _decode_query_logits_sparse(
                 query_mask=q_model,
                 seen_mask=seen_model,
                 t0_missing_mask=missing_model,
-            ).index_select(1, geom.allowed_ids)[:real_b]
+                output_ids=geom.allowed_ids,
+            )[:real_b]
 
             # [B,C,X,Y,Z] -> [B,X,Y,Z,C], then retain only M_query cells.
             selected_logits = logits.permute(0, 2, 3, 4, 1)[qstack]
@@ -1796,6 +1797,7 @@ def main():
     channels_last_3d = (
         device.type == "cuda" and not bool(a.no_channels_last_3d)
     )
+    model.encoder.set_channels_last_3d(channels_last_3d)
     model.static.set_tile_channels_last_3d(channels_last_3d)
 
     optimizer = torch.optim.AdamW(
