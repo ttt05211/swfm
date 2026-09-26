@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import random
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -88,15 +89,20 @@ def _aggregate_sparse_targets(
 ):
     """Merge six future observed static/free labels in canonical coordinates.
 
-    Disagreeing labels at one canonical cell are ignored instead of forcing a
-    time-varying scene into one static world.
+    This is the exact vectorized equivalent of the former Python dict loop:
+    a canonical cell is supervised iff every future observation mapped to that
+    cell agrees on one label.  Output order follows first occurrence in the
+    six-horizon/native-C-order stream for deterministic parity.
     """
-    table = {}
     rel = np.asarray(row["future_ego_to_t0"], dtype=np.float64)
+    linear_parts = []
+    label_parts = []
+    first_offset = 0
+    first_parts = []
+    shape = tuple(int(x) for x in lattice.shape_xyz)
+
     for fi, sup in enumerate(row["static_supervision"]):
-        native, labels = unpack_static_indices_and_labels(
-            sup, native_shape
-        )
+        native, labels = unpack_static_indices_and_labels(sup, native_shape)
         if len(native) == 0:
             continue
         idx, valid = native_sparse_to_canonical_indices(
@@ -106,21 +112,47 @@ def _aggregate_sparse_targets(
             native_origin_xyz_m=native_origin,
             native_voxel_size_xyz_m=native_step,
         )
-        for cell, lab in zip(idx[valid], labels[valid]):
-            key = (int(cell[0]), int(cell[1]), int(cell[2]))
-            lab = int(lab)
-            old = table.get(key)
-            if old is None:
-                table[key] = lab
-            elif old != lab:
-                table[key] = -1
-    keys = [k for k, v in table.items() if v >= 0]
-    if not keys:
+        if not bool(valid.any()):
+            continue
+        cells = idx[valid]
+        y = labels[valid].astype(np.int64, copy=False)
+        lin = np.ravel_multi_index(cells.T, shape)
+        linear_parts.append(lin)
+        label_parts.append(y)
+        first_parts.append(
+            np.arange(first_offset, first_offset + len(lin), dtype=np.int64)
+        )
+        first_offset += len(lin)
+
+    if not linear_parts:
         return np.zeros((0, 3), np.int64), np.zeros((0,), np.int64)
-    return (
-        np.asarray(keys, dtype=np.int64),
-        np.asarray([table[k] for k in keys], dtype=np.int64),
+
+    lin = np.concatenate(linear_parts)
+    y = np.concatenate(label_parts)
+    source_order = np.concatenate(first_parts)
+
+    order = np.argsort(lin, kind="stable")
+    lin_s = lin[order]
+    y_s = y[order]
+    src_s = source_order[order]
+    starts = np.r_[0, 1 + np.flatnonzero(lin_s[1:] != lin_s[:-1])]
+
+    group_lin = lin_s[starts]
+    group_first = src_s[starts]
+    group_min = np.minimum.reduceat(y_s, starts)
+    group_max = np.maximum.reduceat(y_s, starts)
+    keep = group_min == group_max
+    if not bool(keep.any()):
+        return np.zeros((0, 3), np.int64), np.zeros((0,), np.int64)
+
+    # Preserve the previous dict insertion order (first mapped occurrence).
+    kept_order = np.argsort(group_first[keep], kind="stable")
+    kept_lin = group_lin[keep][kept_order]
+    kept_y = group_min[keep][kept_order]
+    cells = np.column_stack(np.unravel_index(kept_lin, shape)).astype(
+        np.int64, copy=False
     )
+    return cells, kept_y.astype(np.int64, copy=False)
 
 
 def _point_ce(logits, idx, labels, class_weights):
@@ -167,54 +199,139 @@ def _tile_masks(obs_np, start, shape, high, coarse):
     return seen, missing
 
 
-def _tile_loss(model, scene, high_idx, labels, obs_np, high, coarse, tile_size, weights):
+def _tile_loss(
+    model,
+    scene,
+    high_idx,
+    labels,
+    obs_np,
+    high,
+    coarse,
+    tile_size,
+    weights,
+    *,
+    tile_batch_size,
+    grid_cache,
+):
     if len(high_idx) == 0:
-        return scene.sum() * 0.0, np.zeros((18, 18), dtype=np.int64)
+        return scene.sum() * 0.0, np.zeros((18, 18), dtype=np.int64), 0
+
     tile_size = np.asarray(tile_size, dtype=np.int64)
-    groups = {}
-    for i, cell in enumerate(high_idx):
-        key = tuple((cell // tile_size).tolist())
-        groups.setdefault(key, []).append(i)
+    high_shape = np.asarray(high.shape_xyz, dtype=np.int64)
+    tile_grid_shape = tuple(
+        np.ceil(high_shape / tile_size).astype(np.int64).tolist()
+    )
+
+    # Vectorized grouping of supervised high-res cells into tiles.
+    tile_xyz = high_idx // tile_size[None]
+    tile_lin = np.ravel_multi_index(tile_xyz.T, tile_grid_shape)
+    order = np.argsort(tile_lin, kind="stable")
+    lin_s = tile_lin[order]
+    starts = np.r_[0, 1 + np.flatnonzero(lin_s[1:] != lin_s[:-1])]
+    stops = np.r_[starts[1:], len(order)]
+
+    entries = []
+    for s, e in zip(starts, stops):
+        ids = order[s:e]
+        key = tile_xyz[ids[0]]
+        start_xyz = key * tile_size
+        stop_xyz = np.minimum(start_xyz + tile_size, high_shape)
+        tshape = tuple((stop_xyz - start_xyz).tolist())
+        entries.append((tuple(start_xyz.tolist()), tshape, ids))
+
+    # Boundary tiles have smaller shapes; only equal-shape tiles can share one
+    # grid_sample/Conv3d batch.
+    buckets = {}
+    for entry in entries:
+        buckets.setdefault(entry[1], []).append(entry)
+
     loss = scene.sum() * 0.0
     conf = np.zeros((18, 18), dtype=np.int64)
     ng = 0
-    for key, ids in groups.items():
-        start = np.asarray(key, dtype=np.int64) * tile_size
-        stop = np.minimum(start + tile_size, np.asarray(high.shape_xyz))
-        tshape = tuple((stop - start).tolist())
-        grid = canonical_tile_grid_sample_coordinates(
-            high, coarse, start, tshape, device=scene.device, dtype=scene.dtype
-        )
-        seen, missing = _tile_masks(obs_np, start, tshape, high, coarse)
-        query = np.ones(tshape, dtype=bool)
-        logits = model.static.refine_tiles(
-            scene,
-            sample_grid=grid,
-            query_mask=torch.from_numpy(query).to(scene.device).unsqueeze(0),
-            seen_mask=torch.from_numpy(seen).to(scene.device).unsqueeze(0),
-            t0_missing_mask=torch.from_numpy(missing).to(scene.device).unsqueeze(0),
-        )
-        local = high_idx[ids] - start[None]
-        y = labels[ids]
-        li = torch.as_tensor(local, dtype=torch.long, device=scene.device)
-        yt = torch.as_tensor(y, dtype=torch.long, device=scene.device)
-        rows = logits[0, :, li[:, 0], li[:, 1], li[:, 2]].transpose(0, 1).clone()
-        dyn = torch.as_tensor(tuple(DYNAMIC_IDS), dtype=torch.long, device=scene.device)
-        rows[:, dyn] = torch.finfo(rows.dtype).min
-        loss = loss + F.cross_entropy(rows, yt, weight=weights)
-        pred = rows.detach().float().argmax(-1).cpu().numpy()
-        # GT free cells are excluded from this occupied-semantic diagnostic,
-        # but prediction may legitimately be free=17.  Keep an 18-column
-        # confusion matrix so semantic->free errors count as false negatives
-        # instead of overflowing a 17x17 matrix.
-        valid_sem = y < 17
-        if np.any(valid_sem):
-            code = y[valid_sem] * 18 + pred[valid_sem]
-            conf += np.bincount(
-                code, minlength=18 * 18
-            ).reshape(18, 18)
-        ng += 1
-    return loss / max(ng, 1), conf
+    bsz = max(int(tile_batch_size), 1)
+    dyn = torch.as_tensor(
+        tuple(DYNAMIC_IDS), dtype=torch.long, device=scene.device
+    )
+
+    for tshape, bucket in buckets.items():
+        for bi in range(0, len(bucket), bsz):
+            chunk = bucket[bi:bi + bsz]
+            grids = []
+            seen_rows = []
+            missing_rows = []
+            for start_t, _, _ in chunk:
+                cache_key = (start_t, tshape, str(scene.dtype))
+                grid = grid_cache.get(cache_key)
+                if grid is None:
+                    grid = canonical_tile_grid_sample_coordinates(
+                        high,
+                        coarse,
+                        start_t,
+                        tshape,
+                        device=scene.device,
+                        dtype=scene.dtype,
+                    )
+                    grid_cache[cache_key] = grid
+                grids.append(grid)
+                seen, missing = _tile_masks(
+                    obs_np,
+                    np.asarray(start_t, dtype=np.int64),
+                    tshape,
+                    high,
+                    coarse,
+                )
+                seen_rows.append(seen)
+                missing_rows.append(missing)
+
+            B = len(chunk)
+            grid = torch.cat(grids, dim=0)
+            seen_t = torch.from_numpy(
+                np.stack(seen_rows, axis=0)
+            ).to(scene.device)
+            missing_t = torch.from_numpy(
+                np.stack(missing_rows, axis=0)
+            ).to(scene.device)
+            query_t = torch.ones(
+                (B,) + tuple(tshape),
+                dtype=torch.bool,
+                device=scene.device,
+            )
+
+            logits = model.static.refine_tiles(
+                scene.expand(B, -1, -1, -1, -1),
+                sample_grid=grid,
+                query_mask=query_t,
+                seen_mask=seen_t,
+                t0_missing_mask=missing_t,
+            )
+
+            # Preserve the former equal-per-tile loss weighting exactly.
+            for local_b, (start_t, _, ids) in enumerate(chunk):
+                start_xyz = np.asarray(start_t, dtype=np.int64)
+                local = high_idx[ids] - start_xyz[None]
+                y = labels[ids]
+                li = torch.as_tensor(
+                    local, dtype=torch.long, device=scene.device
+                )
+                yt = torch.as_tensor(
+                    y, dtype=torch.long, device=scene.device
+                )
+                rows = logits[
+                    local_b, :, li[:, 0], li[:, 1], li[:, 2]
+                ].transpose(0, 1).clone()
+                rows[:, dyn] = torch.finfo(rows.dtype).min
+                loss = loss + F.cross_entropy(rows, yt, weight=weights)
+
+                pred = rows.detach().float().argmax(-1).cpu().numpy()
+                valid_sem = y < 17
+                if np.any(valid_sem):
+                    code = y[valid_sem] * 18 + pred[valid_sem]
+                    conf += np.bincount(
+                        code, minlength=18 * 18
+                    ).reshape(18, 18)
+                ng += 1
+
+    return loss / max(ng, 1), conf, ng
 
 
 def _miou(conf):
@@ -240,7 +357,8 @@ def _autocast(device, enabled):
 
 def _epoch(
     model, root, idx, high, coarse, native_shape, native_origin, native_step,
-    device, weights, *, optimizer, tile_size, seed, amp
+    device, weights, *, optimizer, tile_size, tile_batch_size,
+    progress_every, seed, amp
 ):
     train = optimizer is not None
     model.train(train)
@@ -249,7 +367,15 @@ def _epoch(
     sums = {"loss": 0.0, "coarse": 0.0, "tile": 0.0}
     conf = np.zeros((18, 18), dtype=np.int64)
     n = 0
+    total = int(idx["num_windows"])
+    started = time.perf_counter()
+    prep_seconds = 0.0
+    step_seconds = 0.0
+    tiles_total = 0
+    grid_cache = {}
+
     for row in _iter_rows(root, idx, train, seed):
+        t0 = time.perf_counter()
         sem, obs, free, obs_np = _row_history(row, device)
         coarse_idx, coarse_y = _aggregate_sparse_targets(
             row, coarse, native_shape, native_origin, native_step
@@ -257,13 +383,25 @@ def _epoch(
         high_idx, high_y = _aggregate_sparse_targets(
             row, high, native_shape, native_origin, native_step
         )
+        prep_seconds += time.perf_counter() - t0
+
+        t1 = time.perf_counter()
         with _autocast(device, amp):
             scene = model.encode_history(sem, obs, free)
             clogits = model.static.forward_coarse(scene)
             lc = _point_ce(clogits, coarse_idx, coarse_y, weights)
-            lt, c = _tile_loss(
-                model, scene, high_idx, high_y, obs_np, high, coarse,
-                tile_size, weights,
+            lt, c, nt = _tile_loss(
+                model,
+                scene,
+                high_idx,
+                high_y,
+                obs_np,
+                high,
+                coarse,
+                tile_size,
+                weights,
+                tile_batch_size=tile_batch_size,
+                grid_cache=grid_cache,
             )
             loss = lc + lt
         if not bool(torch.isfinite(loss)):
@@ -279,13 +417,34 @@ def _epoch(
         sums["coarse"] += float(lc.detach().cpu())
         sums["tile"] += float(lt.detach().cpu())
         conf += c
+        tiles_total += int(nt)
         n += 1
+        # Synchronize only at reporting points so normal training stays async.
+        if n == 1 or n % max(int(progress_every), 1) == 0 or n == total:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            now = time.perf_counter()
+            step_seconds = now - started - prep_seconds
+            phase = "train" if train else "val"
+            print(
+                f"v20_static_{phase} {n}/{total} "
+                f"rate={n/max(now-started,1e-9):.3f} win/s "
+                f"prep={prep_seconds/max(n,1):.3f}s/win "
+                f"tiles={tiles_total/max(n,1):.1f}/win "
+                f"loss={sums['loss']/max(n,1):.4f}",
+                flush=True,
+            )
     miou, per = _miou(conf)
     return {
         **{k: float(v / max(n, 1)) for k, v in sums.items()},
         "static_supervised_semantic_miou": miou,
         "per_class_iou": per,
         "windows": n,
+        "mean_preprocess_seconds_per_window": float(
+            prep_seconds / max(n, 1)
+        ),
+        "mean_tiles_per_window": float(tiles_total / max(n, 1)),
+        "epoch_elapsed_seconds": float(time.perf_counter() - started),
         "checkpoint_selection_metric": "NONE; run formal composed V20 Static evaluation",
     }
 
@@ -300,6 +459,18 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--tile-size", default="32,32,16")
+    p.add_argument(
+        "--tile-batch-size",
+        type=int,
+        default=8,
+        help="Number of equal-shape fine tiles refined in one GPU batch.",
+    )
+    p.add_argument(
+        "--progress-every",
+        type=int,
+        default=50,
+        help="Print Stage-2 progress every N windows.",
+    )
     p.add_argument("--seed", type=int, default=20260925)
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
@@ -350,14 +521,26 @@ def main():
     for epoch in range(1, int(a.epochs) + 1):
         tr = _epoch(
             model, tr_root, tr_idx, high, coarse, native_shape, native_origin, native_step,
-            device, weights, optimizer=optimizer, tile_size=tile_size,
-            seed=int(a.seed) + epoch, amp=amp,
+            device,
+            weights,
+            optimizer=optimizer,
+            tile_size=tile_size,
+            tile_batch_size=int(a.tile_batch_size),
+            progress_every=int(a.progress_every),
+            seed=int(a.seed) + epoch,
+            amp=amp,
         )
         with torch.no_grad():
             va = _epoch(
                 model, va_root, va_idx, high, coarse, native_shape, native_origin, native_step,
-                device, weights, optimizer=None, tile_size=tile_size,
-                seed=int(a.seed), amp=amp,
+                device,
+                weights,
+                optimizer=None,
+                tile_size=tile_size,
+                tile_batch_size=int(a.tile_batch_size),
+                progress_every=int(a.progress_every),
+                seed=int(a.seed),
+                amp=amp,
             )
         row = {"epoch": epoch, "train": tr, "val": va}
         history.append(row)
@@ -373,6 +556,7 @@ def main():
                 "highres_lattice": tr_idx["highres_lattice"],
                 "coarse_lattice": tr_idx["coarse_lattice"],
                 "tile_size_xyz": list(tile_size),
+                "tile_batch_size": int(a.tile_batch_size),
                 "class_weights": weights_cpu.tolist(),
                 "selection": (
                     "No automatic best.pt. Select epoch only from formal composed "

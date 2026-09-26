@@ -719,9 +719,79 @@ def test_static_training_confusion_supports_free_prediction_column():
     from tools.real_motion.train_p0_f9_v20_static import _miou
 
     conf = np.zeros((18, 18), dtype=np.int64)
-    # One correct class-4 prediction and one class-4 -> free miss.
-    conf[4, 4] = 1
-    conf[4, 17] = 1
+    cid = next(
+        i for i in range(17) if i not in set(DYNAMIC_CLASS_IDS)
+    )
+    # One correct static prediction and one static -> free miss.
+    conf[cid, cid] = 1
+    conf[cid, 17] = 1
     miou, per = _miou(conf)
-    assert abs(per["4"] - 0.5) < 1e-12
+    assert abs(per[str(cid)] - 0.5) < 1e-12
     assert np.isfinite(miou)
+
+
+def test_static_vectorized_aggregate_matches_dict_reference():
+    from real_motion.v20_stage1_codec import pack_static_supervision
+    from tools.real_motion.train_p0_f9_v20_static import (
+        _aggregate_sparse_targets,
+    )
+    from real_motion.v20_history_world import (
+        native_sparse_to_canonical_indices,
+    )
+
+    rng = np.random.default_rng(47)
+    native_shape = (6, 5, 3)
+    lattice = CanonicalLattice((-2, -2, -1), (1, 1, 1), (8, 8, 4))
+    rel = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    rel[:, 0, 3] = np.linspace(0.0, 0.7, FUTURE_FRAMES)
+    rel[:, 1, 3] = np.linspace(0.2, -0.4, FUTURE_FRAMES)
+
+    sups = []
+    dense_pairs = []
+    for fi in range(FUTURE_FRAMES):
+        gt = rng.integers(0, 18, size=native_shape, dtype=np.uint8)
+        obs = rng.random(native_shape) > 0.25
+        sup = pack_static_supervision(gt, obs)
+        sups.append(sup)
+
+    row = {
+        "future_ego_to_t0": torch.from_numpy(rel.astype(np.float32)),
+        "static_supervision": sups,
+    }
+    got_i, got_y = _aggregate_sparse_targets(
+        row,
+        lattice,
+        native_shape,
+        (-1.5, -1.5, -0.5),
+        (1.0, 1.0, 1.0),
+    )
+
+    from real_motion.v20_stage1_codec import (
+        unpack_static_indices_and_labels,
+    )
+    table = {}
+    for fi, sup in enumerate(sups):
+        native, labels = unpack_static_indices_and_labels(sup, native_shape)
+        idx, valid = native_sparse_to_canonical_indices(
+            lattice,
+            native_indices_xyz=native,
+            ego_to_canonical=rel[fi],
+            native_origin_xyz_m=(-1.5, -1.5, -0.5),
+            native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        )
+        for cell, lab in zip(idx[valid], labels[valid]):
+            key = tuple(int(x) for x in cell)
+            lab = int(lab)
+            old = table.get(key)
+            if old is None:
+                table[key] = lab
+            elif old != lab:
+                table[key] = -1
+    ref_i = np.asarray(
+        [k for k, v in table.items() if v >= 0], dtype=np.int64
+    )
+    ref_y = np.asarray(
+        [v for v in table.values() if v >= 0], dtype=np.int64
+    )
+    assert np.array_equal(got_i, ref_i)
+    assert np.array_equal(got_y, ref_y)
