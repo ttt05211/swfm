@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Train V20 Stage-2 Static Repair v2.
+"""Train V20 Stage-2 Static Repair v2 with deployment-aligned supervision.
 
-Unlike the legacy Static-v1 trainer, this objective is mathematically aligned
-with protected add-only deployment.  It uses full formal future-grid
-supervision on V18-free locations, feeds the exact runtime future-union query
-mask to the tile head, treats free/dynamic GT as no-add, retains every horizon
-contribution after canonical mapping, uses ordinary CE, and aggregates loss by
-supervised future voxels rather than equal-weighting tiles.
+Key contract:
+* historical evidence comes from the frozen Stage1 aligned-history cache;
+* frozen V18 defines where Static can act (V18 predicts free);
+* supervision covers the same full future occupancy grid as formal evaluation;
+* dynamic GT is a no-add/free target for Static;
+* the exact runtime M_query is supplied as the query input channel;
+* six future horizons contribute independently, including conflicting labels
+  that map to the same canonical cell;
+* loss is ordinary per-future-voxel CE with no class/tile reweighting.
 """
 from __future__ import annotations
 
@@ -14,9 +17,7 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-import hashlib
 import json
-import math
 from pathlib import Path
 import random
 import sys
@@ -32,54 +33,36 @@ import torch.nn.functional as F
 
 from real_motion.v20_history_world import (
     CanonicalLattice,
+    FREE_LABEL,
     canonical_tile_grid_sample_coordinates,
-    future_native_to_canonical_indices,
+    grid_centers_xyz,
+    poses_to_t0_canonical,
 )
 from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
-from real_motion.v20_stage1_codec import (
-    unpack_bool,
-    unpack_history_semantic,
-)
+from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
 from real_motion.v20_static_repair import (
-    FREE_LABEL,
-    REPAIR_CACHE_PROTOCOL,
-    REPAIR_STAGE,
-    REPAIR_TRAIN_PROTOCOL,
-    STATIC_POSITIVE_IDS,
-    repair_confusion_summary,
-    unpack_static_repair_supervision,
+    STATIC_ALLOWED_IDS,
+    SUPPORT_CACHE_PROTOCOL,
+    TRAIN_PROTOCOL,
+    full_grid_metrics_from_confusion,
+    repair_diagnostics_from_confusion,
+    repair_target_from_gt,
+    unpack_v18_free_support,
+    unpack_v18_prediction,
 )
 from real_motion.v20_training import checkpoint_payload
 from tools.real_motion.build_p0_f9_v20_history_cache import (
     PROTOCOL as STAGE1_PROTOCOL,
 )
-
-PROTOCOL = REPAIR_TRAIN_PROTOCOL
-_ALLOWED_IDS = tuple(STATIC_POSITIVE_IDS) + (FREE_LABEL,)
-_GLOBAL_TO_LOCAL = np.full(18, -1, dtype=np.int64)
-for _local, _global in enumerate(_ALLOWED_IDS):
-    _GLOBAL_TO_LOCAL[int(_global)] = int(_local)
-_FREE_LOCAL = int(_GLOBAL_TO_LOCAL[FREE_LABEL])
+from tools.real_motion.eval_p0_f9_v19_factorized_static_new_fov import CachedSource
 
 
-def _sha256_file(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        while True:
-            x = f.read(1 << 20)
-            if not x:
-                break
-            h.update(x)
-    return h.hexdigest()
-
-
-def _load_index(root, protocol):
+def _load_index(root, expected):
     root = Path(root)
-    path = root / "index.json"
-    idx = json.loads(path.read_text(encoding="utf-8"))
-    if idx.get("protocol") != protocol:
+    idx = json.loads((root / "index.json").read_text(encoding="utf-8"))
+    if idx.get("protocol") != expected:
         raise RuntimeError(
-            f"unexpected cache protocol at {root}: {idx.get('protocol')}"
+            f"{root}: protocol={idx.get('protocol')!r}, expected {expected!r}"
         )
     return root, idx
 
@@ -92,81 +75,77 @@ def _lattice(d):
     )
 
 
-def _validate_pair(history_root, hidx, repair_root, ridx, v18_checkpoint):
-    if str(Path(ridx["source_history_cache"]).resolve()) != str(
-        Path(history_root).resolve()
-    ):
-        raise RuntimeError("Repair cache references a different Stage-1 history cache")
-    got_hash = _sha256_file(Path(history_root) / "index.json")
-    if str(ridx.get("source_history_index_sha256")) != got_hash:
-        raise RuntimeError("Repair cache Stage-1 index hash mismatch")
-    if str(Path(ridx["v18_checkpoint"]).resolve()) != str(
-        Path(v18_checkpoint).resolve()
-    ):
-        raise RuntimeError("Repair cache references a different frozen V18 checkpoint")
-    if ridx["highres_lattice"] != hidx["highres_lattice"]:
-        raise RuntimeError("Repair/history high-resolution lattice mismatch")
-    if ridx["coarse_lattice"] != hidx["coarse_lattice"]:
-        raise RuntimeError("Repair/history coarse lattice mismatch")
-    if ridx["native_grid"] != hidx["native_grid"]:
-        raise RuntimeError("Repair/history native grid mismatch")
-
-    hshards = {str(x["file"]): x for x in hidx["shards"]}
-    total = 0
-    for rsh in ridx["shards"]:
-        hname = str(rsh["source_history_shard"])
-        hs = hshards.get(hname)
-        if hs is None:
-            raise RuntimeError(f"Repair shard references missing history shard: {hname}")
-        if int(rsh["count"]) > int(hs["count"]):
-            raise RuntimeError(f"Repair shard has more rows than history shard: {hname}")
-        total += int(rsh["count"])
-    if total != int(ridx["num_windows"]):
-        raise RuntimeError("Repair index shard counts do not sum to num_windows")
+def _stage1_rows(root, shard_name):
+    obj = torch.load(
+        Path(root) / str(shard_name),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if obj.get("protocol") != STAGE1_PROTOCOL:
+        raise RuntimeError(f"bad Stage1 shard: {shard_name}")
+    return list(obj["rows"])
 
 
-def _iter_paired_rows(history_root, hidx, repair_root, ridx, shuffle, seed, skip=0):
-    order = list(range(len(ridx["shards"])))
+def _repair_rows(root, shard_name):
+    obj = torch.load(
+        Path(root) / str(shard_name),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if obj.get("protocol") != SUPPORT_CACHE_PROTOCOL:
+        raise RuntimeError(f"bad repair-support shard: {shard_name}")
+    return list(obj["rows"])
+
+
+def _iter_paired_rows(
+    stage_root,
+    repair_root,
+    repair_idx,
+    *,
+    shuffle,
+    seed,
+    max_windows=0,
+    skip_windows=0,
+):
+    order = list(range(len(repair_idx["shards"])))
     rng = random.Random(int(seed))
     if shuffle:
         rng.shuffle(order)
-    remaining_skip = max(int(skip), 0)
 
-    for si in order:
-        rmeta = ridx["shards"][si]
-        rname = str(rmeta["file"])
-        hname = str(rmeta["source_history_shard"])
-        robj = torch.load(
-            repair_root / rname, map_location="cpu", weights_only=False
-        )
-        hobj = torch.load(
-            history_root / hname, map_location="cpu", weights_only=False
-        )
-        if robj.get("protocol") != REPAIR_CACHE_PROTOCOL:
-            raise RuntimeError(f"bad Repair-v2 shard: {rname}")
-        if hobj.get("protocol") != STAGE1_PROTOCOL:
-            raise RuntimeError(f"bad Stage-1 shard: {hname}")
-        rrows = list(robj["rows"])
-        hrows = list(hobj["rows"])[: len(rrows)]
-        if len(rrows) != int(rmeta["count"]) or len(hrows) != len(rrows):
-            raise RuntimeError("paired Repair/history shard row-count mismatch")
+    yielded = 0
+    skipped = 0
+    max_windows = int(max_windows)
+    skip_windows = int(skip_windows)
 
-        indices = list(range(len(rrows)))
+    for rsi in order:
+        rmeta = repair_idx["shards"][rsi]
+        rrows = _repair_rows(repair_root, rmeta["file"])
+        srows = _stage1_rows(stage_root, rmeta["source_stage1_shard"])
+        if len(rrows) > len(srows):
+            raise RuntimeError(
+                f"repair shard longer than Stage1 source shard: {rmeta['file']}"
+            )
+        srows = srows[:len(rrows)]
+
+        row_order = list(range(len(rrows)))
         if shuffle:
-            rng.shuffle(indices)
-        for i in indices:
-            hr = hrows[i]
-            rr = rrows[i]
-            hk = (str(hr["scene_name"]), str(hr["t0_token"]))
-            rk = (str(rr["scene_name"]), str(rr["t0_token"]))
-            if hk != rk:
+            rng.shuffle(row_order)
+        for j in row_order:
+            rr = rrows[j]
+            sr = srows[j]
+            rkey = (str(rr["scene_name"]), str(rr["t0_token"]))
+            skey = (str(sr["scene_name"]), str(sr["t0_token"]))
+            if rkey != skey:
                 raise RuntimeError(
-                    f"paired Repair/history identity mismatch: {hk} != {rk}"
+                    f"Stage1/repair identity mismatch: {skey} != {rkey}"
                 )
-            if remaining_skip:
-                remaining_skip -= 1
+            if skipped < skip_windows:
+                skipped += 1
                 continue
-            yield hr, rr
+            if max_windows > 0 and yielded >= max_windows:
+                return
+            yield sr, rr
+            yielded += 1
 
 
 def _decode_history(row):
@@ -177,267 +156,403 @@ def _decode_history(row):
     return sem, obs, free
 
 
-def _tile_entries_from_exact_targets(
-    *,
-    high,
-    tile_size,
-    render_index,
-    v18_occupied,
-    static_positive,
-    positive_labels,
-):
-    """Prepare exact deployed-support loss terms for one window.
-
-    Every V18-free future voxel contributes one target.  It is FREE by default;
-    static-positive future voxels replace that one FREE target by their semantic
-    label.  Contributions are accumulated after future->canonical mapping
-    without merging or discarding horizon conflicts.
-    """
-    if int(render_index.out_of_bounds_voxels) != 0:
-        raise RuntimeError(
-            "Repair-v2 requires frozen Ωmax OOB=0; got "
-            f"{render_index.out_of_bounds_voxels}"
-        )
-    shape = tuple(int(x) for x in high.shape_xyz)
-    high_n = int(np.prod(shape))
-    linear = np.asarray(render_index.linear_index, dtype=np.int32).reshape(-1)
-    occ = np.asarray(v18_occupied, dtype=bool).reshape(-1)
-    pos = np.asarray(static_positive, dtype=bool).reshape(-1)
-    if linear.size != occ.size or pos.size != occ.size:
-        raise RuntimeError("Repair-v2 native geometry/supervision size mismatch")
-    if bool((pos & occ).any()):
-        raise RuntimeError("Repair-v2 positive overlaps V18 occupied support")
-
-    query = np.zeros(high_n, dtype=bool)
-    query[linear] = True
-
-    # Rigid equal-resolution mapping plus six horizons keeps multiplicity tiny;
-    # uint16 is intentionally conservative and cannot overflow here in practice.
-    support_count = np.zeros(high_n, dtype=np.uint16)
-    support_linear = linear[~occ]
-    np.add.at(support_count, support_linear, 1)
-    expected_support = int((~occ).sum())
-    if int(support_count.sum(dtype=np.int64)) != expected_support:
-        raise RuntimeError("Repair-v2 support multiplicity accounting mismatch")
-
-    pos_linear = linear[pos]
-    if len(pos_linear) != len(positive_labels):
-        raise RuntimeError("Repair-v2 positive label/mapping count mismatch")
-    pos_xyz = (
-        np.column_stack(np.unravel_index(pos_linear, shape)).astype(np.int64)
-        if len(pos_linear)
-        else np.empty((0, 3), dtype=np.int64)
-    )
-
-    tile = np.asarray(tile_size, dtype=np.int64)
-    hshape = np.asarray(shape, dtype=np.int64)
-    tgrid = tuple(np.ceil(hshape / tile).astype(np.int64).tolist())
-    pos_by_tile = {}
-    if len(pos_xyz):
-        pxyz = pos_xyz // tile[None]
-        plin = np.ravel_multi_index(pxyz.T, tgrid)
-        order = np.argsort(plin, kind="stable")
-        plin_s = plin[order]
-        starts = np.r_[0, 1 + np.flatnonzero(plin_s[1:] != plin_s[:-1])]
-        stops = np.r_[starts[1:], len(order)]
-        for s, e in zip(starts, stops):
-            ids = order[s:e]
-            key = int(plin_s[s])
-            pos_by_tile[key] = (
-                pos_xyz[ids],
-                np.asarray(positive_labels, dtype=np.uint8)[ids],
-            )
-
-    q3 = query.reshape(shape)
-    c3 = support_count.reshape(shape)
-    entries = []
-    total_support = 0
-    total_positive = 0
-    for x in range(0, shape[0], int(tile[0])):
-        for y in range(0, shape[1], int(tile[1])):
-            for z in range(0, shape[2], int(tile[2])):
-                start = np.asarray([x, y, z], dtype=np.int64)
-                stop = np.minimum(start + tile, hshape)
-                qtile = q3[
-                    x:stop[0], y:stop[1], z:stop[2]
-                ]
-                if not bool(qtile.any()):
-                    continue
-                counts = c3[
-                    x:stop[0], y:stop[1], z:stop[2]
-                ]
-                support_n = int(counts.sum(dtype=np.int64))
-                if support_n == 0:
-                    # Static cannot affect any future voxel represented by this
-                    # tile because V18 already owns all of them.
-                    continue
-                key_xyz = start // tile
-                key = int(np.ravel_multi_index(tuple(key_xyz), tgrid))
-                pxyz, plabel = pos_by_tile.get(
-                    key,
-                    (
-                        np.empty((0, 3), dtype=np.int64),
-                        np.empty((0,), dtype=np.uint8),
-                    ),
-                )
-                local = pxyz - start[None] if len(pxyz) else pxyz
-                tshape = tuple((stop - start).tolist())
-                entries.append({
-                    "start": tuple(int(v) for v in start),
-                    "shape": tshape,
-                    "query": qtile.copy(),
-                    "support_count": counts.copy(),
-                    "positive_local": local.astype(np.int16, copy=False),
-                    "positive_label": plabel.astype(np.uint8, copy=False),
-                })
-                total_support += support_n
-                total_positive += int(len(plabel))
-
-    if total_support != expected_support:
-        raise RuntimeError(
-            f"Repair-v2 tiled support mismatch: {total_support} != {expected_support}"
-        )
-    if total_positive != int(pos.sum()):
-        raise RuntimeError("Repair-v2 tiled positive count mismatch")
-    return entries, total_support, total_positive
-
-
-def _prepare_pair(hr, rr, high, native, tile_size):
+def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
     started = time.perf_counter()
-    sem, obs, free = _decode_history(hr)
-    v18_occ, static_pos, positive_labels = unpack_static_repair_supervision(rr)
-    expected_shape = tuple(int(x) for x in rr["shape_fxyz"])
-    native_shape = tuple(int(x) for x in native["shape_xyz"])
-    if expected_shape != (6,) + native_shape:
-        raise RuntimeError("Repair-v2 cached native shape mismatch")
-    render_index = future_native_to_canonical_indices(
-        high,
-        future_ego_to_canonical=np.asarray(
-            hr["future_ego_to_t0"], dtype=np.float64
-        ),
-        native_shape_xyz=native_shape,
-        native_origin_xyz_m=tuple(float(x) for x in native["origin_xyz_m"]),
-        native_voxel_size_xyz_m=tuple(
-            float(x) for x in native["voxel_size_xyz_m"]
-        ),
+    sem, obs, obsfree = _decode_history(srow)
+    support = unpack_v18_free_support(
+        rrow["v18_free_bits"], native_shape
     )
-    entries, support_n, positive_n = _tile_entries_from_exact_targets(
-        high=high,
-        tile_size=tile_size,
-        render_index=render_index,
-        v18_occupied=v18_occ,
-        static_positive=static_pos,
-        positive_labels=positive_labels,
+    gt = np.stack([
+        source.load_semantics(str(rrow["scene_name"]), str(tok))
+        for tok in rrow["future_tokens"]
+    ]).astype(np.uint8, copy=False)
+    if gt.shape != (6,) + tuple(native_shape):
+        raise RuntimeError(
+            f"future GT shape mismatch: {gt.shape}"
+        )
+    target = repair_target_from_gt(gt, free_label=int(free_label))
+    base_pred = unpack_v18_prediction(
+        rrow, native_shape, free_label=int(free_label)
     )
-    if support_n != int(rr["support_count"]):
-        raise RuntimeError("Repair-v2 prepared support count differs from cache")
-    if positive_n != int(rr["static_positive_count"]):
-        raise RuntimeError("Repair-v2 prepared positive count differs from cache")
+    if not np.array_equal(
+        base_pred == int(free_label), support
+    ):
+        raise RuntimeError("reconstructed V18 prediction/support mismatch")
+    t0_pose = np.asarray(
+        source.pose(str(rrow["t0_token"])), dtype=np.float64
+    )
+    future_poses = np.stack([
+        np.asarray(source.pose(str(tok)), dtype=np.float64)
+        for tok in rrow["future_tokens"]
+    ])
+    future_rel = poses_to_t0_canonical(future_poses, t0_pose)
+    cached_counts = np.asarray(
+        rrow["v18_free_count_by_horizon"], dtype=np.int64
+    )
+    got_counts = support.reshape(6, -1).sum(axis=1).astype(np.int64)
+    if not np.array_equal(cached_counts, got_counts):
+        raise RuntimeError("V18-free packed support count mismatch")
     return {
         "sem": sem,
         "obs": obs,
-        "free": free,
-        "entries": entries,
-        "support_count": support_n,
-        "positive_count": positive_n,
+        "obsfree": obsfree,
+        "support": support,
+        "target": target,
+        "gt": gt,
+        "base_pred": base_pred,
+        "future_rel": future_rel,
         "cpu_seconds": float(time.perf_counter() - started),
     }
 
 
 def _iter_prepared(
-    history_root,
-    hidx,
+    stage_root,
     repair_root,
-    ridx,
+    repair_idx,
+    source,
     *,
+    native_shape,
+    free_label,
     shuffle,
     seed,
-    high,
-    native,
-    tile_size,
+    max_windows,
+    skip_windows,
     workers,
     prefetch,
-    skip=0,
 ):
-    raw = iter(
-        _iter_paired_rows(
-            history_root,
-            hidx,
-            repair_root,
-            ridx,
-            shuffle,
-            seed,
-            skip=skip,
-        )
-    )
+    raw = iter(_iter_paired_rows(
+        stage_root,
+        repair_root,
+        repair_idx,
+        shuffle=shuffle,
+        seed=seed,
+        max_windows=max_windows,
+        skip_windows=skip_windows,
+    ))
 
-    def prep(pair):
-        return _prepare_pair(
-            pair[0], pair[1], high, native, tile_size
+    def prepare(pair):
+        return _prepare_pair_cpu(
+            pair[0], pair[1], source, native_shape, free_label
         )
 
     nw = max(int(workers), 0)
     if nw == 0:
         for pair in raw:
-            yield prep(pair)
+            yield prepare(pair)
         return
 
-    cap = max(int(prefetch), nw)
+    pending = deque()
+    capacity = max(int(prefetch), nw)
     with ThreadPoolExecutor(
-        max_workers=nw, thread_name_prefix="v20-repair-prep"
+        max_workers=nw, thread_name_prefix="v20-static-repair"
     ) as pool:
-        pending = deque()
         exhausted = False
-        for _ in range(cap):
+        for _ in range(capacity):
             try:
-                pending.append(pool.submit(prep, next(raw)))
+                pending.append(pool.submit(prepare, next(raw)))
             except StopIteration:
                 exhausted = True
                 break
         while pending:
-            result = pending.popleft().result()
+            fut = pending.popleft()
+            item = fut.result()
             if not exhausted:
                 try:
-                    pending.append(pool.submit(prep, next(raw)))
+                    pending.append(pool.submit(prepare, next(raw)))
                 except StopIteration:
                     exhausted = True
-            yield result
+            yield item
 
 
-def _tile_coarse_linear_map(start, shape, high, coarse, cache):
-    key = (tuple(int(x) for x in start), tuple(int(x) for x in shape))
-    got = cache.get(key)
-    if got is not None:
-        return got
-    start = np.asarray(key[0], dtype=np.int64)
-    tshape = np.asarray(key[1], dtype=np.int64)
-    factor = np.maximum(
-        np.rint(
-            np.asarray(coarse.voxel_size_xyz_m)
-            / np.asarray(high.voxel_size_xyz_m)
-        ).astype(np.int64),
-        1,
+class _Geometry:
+    def __init__(self, high, coarse, native_shape, native_origin, native_step, tile_size, device):
+        self.high = high
+        self.coarse = coarse
+        self.high_shape = tuple(int(x) for x in high.shape_xyz)
+        self.coarse_shape = tuple(int(x) for x in coarse.shape_xyz)
+        self.native_shape = tuple(int(x) for x in native_shape)
+        self.tile = tuple(int(x) for x in tile_size)
+        self.device = device
+
+        xyz = grid_centers_xyz(
+            self.native_shape, native_origin, native_step
+        ).reshape(-1, 3)
+        self.native_xyz = torch.from_numpy(
+            np.asarray(xyz, dtype=np.float64)
+        ).to(device)
+        self.high_origin = torch.as_tensor(
+            high.origin_xyz_m, dtype=torch.float64, device=device
+        )
+        self.high_step = torch.as_tensor(
+            high.voxel_size_xyz_m, dtype=torch.float64, device=device
+        )
+        self.high_shape_t = torch.as_tensor(
+            self.high_shape, dtype=torch.long, device=device
+        )
+        hi = np.asarray(high.voxel_size_xyz_m, dtype=np.float64)
+        co = np.asarray(coarse.voxel_size_xyz_m, dtype=np.float64)
+        factor = np.rint(co / hi).astype(np.int64)
+        if not np.allclose(factor * hi, co):
+            raise RuntimeError("coarse/high lattice ratio is not integral")
+        self.factor = tuple(int(x) for x in factor)
+        self.grid_cache = {}
+
+    def future_linear_and_query(self, future_rel):
+        T = torch.as_tensor(
+            future_rel, dtype=torch.float64, device=self.device
+        )
+        if T.shape != (6, 4, 4):
+            raise ValueError("future_rel must be [6,4,4]")
+        canon = torch.einsum(
+            "fij,nj->fni", T[:, :3, :3], self.native_xyz
+        ) + T[:, None, :3, 3]
+        idx = torch.floor(
+            (canon - self.high_origin[None, None])
+            / self.high_step[None, None]
+        ).to(torch.long)
+        valid = ((idx >= 0) & (idx < self.high_shape_t)).all(dim=-1)
+        ok = valid.all()
+        if self.device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                ok, "V20 repair geometry violated frozen Omega-max"
+            )
+        elif not bool(ok.item()):
+            raise RuntimeError("repair geometry escaped frozen Omega-max")
+
+        Y, Z = self.high_shape[1], self.high_shape[2]
+        linear = (
+            idx[..., 0] * (Y * Z)
+            + idx[..., 1] * Z
+            + idx[..., 2]
+        )
+        q = torch.zeros(
+            int(np.prod(self.high_shape)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        q[linear.reshape(-1)] = True
+        q = q.reshape(self.high_shape)
+        return linear, q
+
+    def active_tiles(self, q):
+        tx, ty, tz = self.tile
+        pooled = F.max_pool3d(
+            q[None, None].to(torch.float32),
+            kernel_size=(tx, ty, tz),
+            stride=(tx, ty, tz),
+            ceil_mode=True,
+        )
+        return torch.nonzero(
+            pooled[0, 0] > 0, as_tuple=False
+        ).cpu().numpy()
+
+    def tile_grid(self, start, shape, dtype):
+        key = (
+            tuple(int(x) for x in start),
+            tuple(int(x) for x in shape),
+            str(dtype),
+        )
+        got = self.grid_cache.get(key)
+        if got is not None:
+            return got
+        grid = canonical_tile_grid_sample_coordinates(
+            self.high,
+            self.coarse,
+            start,
+            shape,
+            device=self.device,
+            dtype=dtype,
+        )
+        self.grid_cache[key] = grid
+        return grid
+
+
+def _high_context(obs, geom, device):
+    obs_t = torch.from_numpy(np.asarray(obs, dtype=bool)).to(
+        device, non_blocking=True
     )
-    x = np.clip(
-        np.arange(start[0], start[0] + tshape[0]) // factor[0],
-        0, coarse.shape_xyz[0] - 1,
+    seen = obs_t.any(dim=0)
+    t0 = obs_t[-1]
+    fx, fy, fz = geom.factor
+    seen_h = seen.repeat_interleave(fx, 0).repeat_interleave(
+        fy, 1
+    ).repeat_interleave(fz, 2)
+    t0_h = t0.repeat_interleave(fx, 0).repeat_interleave(
+        fy, 1
+    ).repeat_interleave(fz, 2)
+    X, Y, Z = geom.high_shape
+    seen_h = seen_h[:X, :Y, :Z]
+    t0_h = t0_h[:X, :Y, :Z]
+    return seen_h, seen_h & ~t0_h
+
+
+def _decode_query_logits(
+    model,
+    scene,
+    q,
+    seen_h,
+    missing_h,
+    geom,
+    *,
+    tile_batch_size,
+):
+    allowed = torch.as_tensor(
+        STATIC_ALLOWED_IDS, dtype=torch.long, device=scene.device
     )
-    y = np.clip(
-        np.arange(start[1], start[1] + tshape[1]) // factor[1],
-        0, coarse.shape_xyz[1] - 1,
+    world = torch.empty(
+        (len(STATIC_ALLOWED_IDS),) + geom.high_shape,
+        dtype=scene.dtype,
+        device=scene.device,
     )
-    z = np.clip(
-        np.arange(start[2], start[2] + tshape[2]) // factor[2],
-        0, coarse.shape_xyz[2] - 1,
+
+    active = geom.active_tiles(q)
+    buckets = {}
+    high_shape = np.asarray(geom.high_shape, dtype=np.int64)
+    tile = np.asarray(geom.tile, dtype=np.int64)
+    for tc in active:
+        start = tc.astype(np.int64) * tile
+        stop = np.minimum(start + tile, high_shape)
+        shape = tuple((stop - start).tolist())
+        buckets.setdefault(shape, []).append(tuple(start.tolist()))
+
+    bsz = max(int(tile_batch_size), 1)
+    ntiles = 0
+    for tshape, starts in buckets.items():
+        for bi in range(0, len(starts), bsz):
+            chunk = starts[bi:bi + bsz]
+            grids = []
+            qrows = []
+            srows = []
+            mrows = []
+            stops = []
+            for start_t in chunk:
+                start = np.asarray(start_t, dtype=np.int64)
+                stop = np.minimum(start + tile, high_shape)
+                stops.append(stop)
+                grids.append(
+                    geom.tile_grid(start_t, tshape, scene.dtype)
+                )
+                sl = (
+                    slice(start[0], stop[0]),
+                    slice(start[1], stop[1]),
+                    slice(start[2], stop[2]),
+                )
+                qrows.append(q[sl])
+                srows.append(seen_h[sl])
+                mrows.append(missing_h[sl])
+
+            logits = model.static.refine_tiles(
+                scene,
+                sample_grid=torch.cat(grids, dim=0),
+                query_mask=torch.stack(qrows, dim=0),
+                seen_mask=torch.stack(srows, dim=0),
+                t0_missing_mask=torch.stack(mrows, dim=0),
+            ).index_select(1, allowed)
+
+            for b, (start_t, stop) in enumerate(zip(chunk, stops)):
+                start = np.asarray(start_t, dtype=np.int64)
+                world[
+                    :,
+                    start[0]:stop[0],
+                    start[1]:stop[1],
+                    start[2]:stop[2],
+                ] = logits[b]
+            ntiles += len(chunk)
+    return world, int(ntiles)
+
+
+def _repair_loss_and_confusion(
+    world_allowed,
+    linear,
+    support,
+    target,
+    *,
+    gt=None,
+    base_pred=None,
+    device,
+):
+    support_t = torch.from_numpy(
+        np.asarray(support, dtype=bool)
+    ).to(device, non_blocking=True)
+    target_t = torch.from_numpy(
+        np.asarray(target, dtype=np.uint8)
+    ).to(device, non_blocking=True).long()
+
+    allowed = torch.as_tensor(
+        STATIC_ALLOWED_IDS, dtype=torch.long, device=device
     )
-    Y, Z = int(coarse.shape_xyz[1]), int(coarse.shape_xyz[2])
-    lin = (
-        x[:, None, None] * (Y * Z)
-        + y[None, :, None] * Z
-        + z[None, None, :]
-    ).reshape(-1)
-    cache[key] = lin
-    return lin
+    global_to_local = torch.full(
+        (18,), -1, dtype=torch.long, device=device
+    )
+    global_to_local[allowed] = torch.arange(
+        len(STATIC_ALLOWED_IDS), device=device
+    )
+
+    flat_world = world_allowed.reshape(
+        len(STATIC_ALLOWED_IDS), -1
+    )
+    loss_sum = world_allowed.sum() * 0.0
+    conf = torch.zeros((18, 18), dtype=torch.int64, device=device)
+    base_conf = torch.zeros((6, 18, 18), dtype=torch.int64, device=device)
+    final_conf = torch.zeros((6, 18, 18), dtype=torch.int64, device=device)
+    gt_t = (
+        torch.from_numpy(np.asarray(gt, dtype=np.uint8)).to(
+            device, non_blocking=True
+        ).long()
+        if gt is not None else None
+    )
+    base_t = (
+        torch.from_numpy(np.asarray(base_pred, dtype=np.uint8)).to(
+            device, non_blocking=True
+        ).long()
+        if base_pred is not None else None
+    )
+    if (gt_t is None) != (base_t is None):
+        raise ValueError("gt/base_pred must be supplied together")
+
+    for hi in range(6):
+        s = support_t[hi].reshape(-1)
+        y = target_t[hi].reshape(-1)[s]
+        lin = linear[hi][s]
+        rows = flat_world[:, lin].transpose(0, 1)
+        yl = global_to_local[y]
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                (yl >= 0).all(),
+                "dynamic label entered Static Repair target",
+            )
+        elif not bool((yl >= 0).all().item()):
+            raise RuntimeError("dynamic label entered Static Repair target")
+        loss_sum = loss_sum + F.cross_entropy(
+            rows, yl, reduction="sum"
+        )
+        with torch.no_grad():
+            pred = allowed[rows.detach().float().argmax(dim=1)]
+            conf += torch.bincount(
+                y * 18 + pred,
+                minlength=18 * 18,
+            ).reshape(18, 18)
+            if gt_t is not None:
+                gt_h = gt_t[hi].reshape(-1)
+                base_h = base_t[hi].reshape(-1)
+                final_h = base_h.clone()
+                final_h[s] = pred
+                base_conf[hi] = torch.bincount(
+                    gt_h * 18 + base_h,
+                    minlength=18 * 18,
+                ).reshape(18, 18)
+                final_conf[hi] = torch.bincount(
+                    gt_h * 18 + final_h,
+                    minlength=18 * 18,
+                ).reshape(18, 18)
+
+    denom = support_t.sum().clamp_min(1)
+    return (
+        loss_sum / denom.to(loss_sum.dtype),
+        conf,
+        base_conf,
+        final_conf,
+    )
 
 
 def _autocast(device, enabled):
@@ -446,185 +561,7 @@ def _autocast(device, enabled):
     return nullcontext()
 
 
-def _assert_finite_async(x):
-    finite = torch.isfinite(x.detach()).all()
-    if x.device.type == "cuda" and hasattr(torch, "_assert_async"):
-        torch._assert_async(finite, "non-finite V20 Static Repair loss")
-    elif not bool(finite.item()):
-        raise RuntimeError("non-finite V20 Static Repair loss")
-
-
-def _repair_loss_and_confusion(
-    model,
-    scene,
-    obs_np,
-    entries,
-    *,
-    high,
-    coarse,
-    tile_batch_size,
-    grid_cache,
-    context_index_cache,
-    allowed_ids,
-    global_to_local,
-):
-    if not entries:
-        z = torch.zeros((18, 18), dtype=torch.int64, device=scene.device)
-        return scene.sum() * 0.0, z, 0, 0
-
-    buckets = {}
-    for e in entries:
-        buckets.setdefault(tuple(e["shape"]), []).append(e)
-
-    seen_coarse = np.asarray(obs_np, dtype=bool).any(axis=0).reshape(-1)
-    t0_coarse = np.asarray(obs_np, dtype=bool)[-1].reshape(-1)
-    bsz = max(int(tile_batch_size), 1)
-    loss_num = scene.sum() * 0.0
-    conf = torch.zeros((18, 18), dtype=torch.int64, device=scene.device)
-    support_total = 0
-    positive_total = 0
-    free_local = int(_FREE_LOCAL)
-
-    for tshape, bucket in buckets.items():
-        for bi in range(0, len(bucket), bsz):
-            chunk = bucket[bi:bi + bsz]
-            grids = []
-            qrows = []
-            count_rows = []
-            seen_rows = []
-            missing_rows = []
-            p_batch = []
-            p_x = []
-            p_y = []
-            p_z = []
-            p_label = []
-
-            for local_b, entry in enumerate(chunk):
-                start = tuple(int(x) for x in entry["start"])
-                cache_key = (
-                    start, tuple(tshape), str(scene.device), str(scene.dtype)
-                )
-                grid = grid_cache.get(cache_key)
-                if grid is None:
-                    grid = canonical_tile_grid_sample_coordinates(
-                        high,
-                        coarse,
-                        start,
-                        tshape,
-                        device=scene.device,
-                        dtype=scene.dtype,
-                    )
-                    grid_cache[cache_key] = grid
-                grids.append(grid)
-                qrows.append(entry["query"])
-                count_rows.append(entry["support_count"])
-
-                cmap = _tile_coarse_linear_map(
-                    start, tshape, high, coarse, context_index_cache
-                )
-                seen = seen_coarse[cmap].reshape(tshape)
-                t0_seen = t0_coarse[cmap].reshape(tshape)
-                seen_rows.append(seen)
-                missing_rows.append(seen & ~t0_seen)
-
-                local = np.asarray(entry["positive_local"], dtype=np.int64)
-                labels = np.asarray(entry["positive_label"], dtype=np.int64)
-                if len(local):
-                    n = len(local)
-                    p_batch.append(np.full(n, local_b, dtype=np.int64))
-                    p_x.append(local[:, 0])
-                    p_y.append(local[:, 1])
-                    p_z.append(local[:, 2])
-                    p_label.append(labels)
-
-            B = len(chunk)
-            q = torch.from_numpy(np.stack(qrows, axis=0)).to(
-                scene.device, non_blocking=True
-            )
-            counts = torch.from_numpy(
-                np.stack(count_rows, axis=0)
-            ).to(scene.device, non_blocking=True)
-            seen_t = torch.from_numpy(np.stack(seen_rows, axis=0)).to(
-                scene.device, non_blocking=True
-            )
-            missing_t = torch.from_numpy(
-                np.stack(missing_rows, axis=0)
-            ).to(scene.device, non_blocking=True)
-
-            logits = model.static.refine_tiles(
-                scene,
-                sample_grid=torch.cat(grids, dim=0),
-                query_mask=q,
-                seen_mask=seen_t,
-                t0_missing_mask=missing_t,
-            )
-            allowed_logits = logits.index_select(1, allowed_ids)
-            logp = F.log_softmax(allowed_logits.float(), dim=1)
-            free_lp = logp[:, free_local]
-            count_f = counts.to(logp.dtype)
-            loss_num = loss_num - (free_lp * count_f).sum()
-            support_total += int(
-                sum(int(e["support_count"].sum(dtype=np.int64)) for e in chunk)
-            )
-
-            pred_local = allowed_logits.detach().float().argmax(dim=1)
-            pred_global = allowed_ids[pred_local]
-            flat_count = counts.reshape(-1).to(torch.int64)
-            flat_pred = pred_global.reshape(-1).to(torch.int64)
-            active = flat_count > 0
-            if bool(active.any()):
-                codes = int(FREE_LABEL) * 18 + flat_pred[active]
-                base_conf = torch.zeros(
-                    18 * 18, dtype=torch.int64, device=scene.device
-                )
-                base_conf.scatter_add_(0, codes, flat_count[active])
-                conf += base_conf.reshape(18, 18)
-
-            if p_batch:
-                bt = torch.from_numpy(np.concatenate(p_batch)).to(
-                    scene.device, non_blocking=True
-                )
-                ix = torch.from_numpy(np.concatenate(p_x)).to(
-                    scene.device, non_blocking=True
-                )
-                iy = torch.from_numpy(np.concatenate(p_y)).to(
-                    scene.device, non_blocking=True
-                )
-                iz = torch.from_numpy(np.concatenate(p_z)).to(
-                    scene.device, non_blocking=True
-                )
-                yg = torch.from_numpy(np.concatenate(p_label)).to(
-                    scene.device, non_blocking=True
-                ).long()
-                yl = global_to_local[yg]
-                if bool((yl < 0).any()):
-                    raise RuntimeError(
-                        "Repair-v2 positive target mapped outside static taxonomy"
-                    )
-                pos_cls_lp = logp[bt, yl, ix, iy, iz]
-                pos_free_lp = free_lp[bt, ix, iy, iz]
-                # Replace one implicit FREE contribution by its static semantic
-                # target for every future-horizon positive voxel.
-                loss_num = loss_num + (-pos_cls_lp + pos_free_lp).sum()
-                positive_total += int(yg.numel())
-
-                pp = pred_global[bt, ix, iy, iz].to(torch.int64)
-                neg_codes = int(FREE_LABEL) * 18 + pp
-                pos_codes = yg.to(torch.int64) * 18 + pp
-                corr = torch.zeros(
-                    18 * 18, dtype=torch.int64, device=scene.device
-                )
-                ones = torch.ones_like(pos_codes, dtype=torch.int64)
-                corr.scatter_add_(0, neg_codes, -ones)
-                corr.scatter_add_(0, pos_codes, ones)
-                conf += corr.reshape(18, 18)
-
-    if support_total <= 0:
-        raise RuntimeError("Repair-v2 window has zero V18-free supervision")
-    return loss_num / float(support_total), conf, support_total, positive_total
-
-
-def _capture_rng_state():
+def _capture_rng():
     out = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
@@ -635,7 +572,7 @@ def _capture_rng_state():
     return out
 
 
-def _restore_rng_state(state):
+def _restore_rng(state):
     if not state:
         return
     random.setstate(state["python"])
@@ -645,7 +582,7 @@ def _restore_rng_state(state):
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
-def _atomic_torch_save(obj, path):
+def _atomic_save(obj, path):
     path = Path(path)
     tmp = path.with_name("." + path.name + ".tmp")
     try:
@@ -660,28 +597,25 @@ def _atomic_torch_save(obj, path):
 
 def _epoch(
     model,
-    history_root,
-    hidx,
+    stage_root,
     repair_root,
-    ridx,
-    high,
-    coarse,
-    native,
-    device,
+    repair_idx,
+    source,
+    geom,
     *,
+    device,
     optimizer,
-    tile_size,
     tile_batch_size,
     prep_workers,
     prefetch,
     progress_every,
     seed,
     amp,
+    max_windows=0,
     start_window=0,
-    resume_accum=None,
+    resume_state=None,
     checkpoint_every=0,
     checkpoint_callback=None,
-    geometry_caches=None,
 ):
     train = optimizer is not None
     model.train(train)
@@ -689,107 +623,145 @@ def _epoch(
     model.birth.eval()
     model.static.coarse_head.eval()
 
-    resume_accum = dict(resume_accum or {})
-    n = int(start_window)
-    total = int(ridx["num_windows"])
-    if n < 0 or n > total:
-        raise ValueError("invalid Repair-v2 resume window")
-
-    sums_gpu = torch.tensor(
-        float(resume_accum.get("loss_sum_windows", 0.0)),
-        dtype=torch.float32,
-        device=device,
+    total = (
+        min(int(repair_idx["num_windows"]), int(max_windows))
+        if int(max_windows) > 0
+        else int(repair_idx["num_windows"])
     )
+    if start_window < 0 or start_window > total:
+        raise ValueError("invalid resume window")
+
+    saved = dict(resume_state or {})
     conf0 = np.asarray(
-        resume_accum.get("confusion", np.zeros((18, 18), dtype=np.int64)),
+        saved.get("confusion", np.zeros((18, 18), dtype=np.int64)),
         dtype=np.int64,
     )
-    conf_gpu = torch.as_tensor(conf0, dtype=torch.int64, device=device).clone()
-    support_seen = int(resume_accum.get("support_contributions", 0))
-    positive_seen = int(resume_accum.get("positive_contributions", 0))
-    cpu_work = float(resume_accum.get("cpu_work_seconds", 0.0))
-    prior_elapsed = float(resume_accum.get("elapsed_seconds", 0.0))
-    started = time.perf_counter()
-    cpu_wait = 0.0
-
-    geometry_caches = geometry_caches if geometry_caches is not None else {}
-    grid_cache = geometry_caches.setdefault("grid", {})
-    context_cache = geometry_caches.setdefault("context", {})
-
-    allowed_ids = torch.as_tensor(
-        _ALLOWED_IDS, dtype=torch.long, device=device
+    conf_gpu = torch.as_tensor(
+        conf0, dtype=torch.int64, device=device
+    ).clone()
+    base_full_gpu = torch.as_tensor(
+        np.asarray(
+            saved.get(
+                "base_full_confusion",
+                np.zeros((6, 18, 18), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ),
+        dtype=torch.int64,
+        device=device,
+    ).clone()
+    final_full_gpu = torch.as_tensor(
+        np.asarray(
+            saved.get(
+                "final_full_confusion",
+                np.zeros((6, 18, 18), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ),
+        dtype=torch.int64,
+        device=device,
+    ).clone()
+    loss_sum_scalar = torch.tensor(
+        float(saved.get("loss_sum", 0.0)),
+        dtype=torch.float64,
+        device=device,
     )
-    global_to_local = torch.as_tensor(
-        _GLOBAL_TO_LOCAL, dtype=torch.long, device=device
-    )
+    cpu_work = float(saved.get("cpu_work_seconds", 0.0))
+    prior_elapsed = float(saved.get("elapsed_seconds", 0.0))
+    tiles_total = int(saved.get("tiles_total", 0))
 
     prepared = iter(_iter_prepared(
-        history_root,
-        hidx,
+        stage_root,
         repair_root,
-        ridx,
+        repair_idx,
+        source,
+        native_shape=geom.native_shape,
+        free_label=FREE_LABEL,
         shuffle=train,
         seed=seed,
-        high=high,
-        native=native,
-        tile_size=tile_size,
+        max_windows=total,
+        skip_windows=start_window,
         workers=prep_workers,
         prefetch=prefetch,
-        skip=n,
     ))
+
+    n = int(start_window)
+    started = time.perf_counter()
+    cpu_wait = 0.0
 
     while n < total:
         tw = time.perf_counter()
         try:
-            row = next(prepared)
+            item = next(prepared)
         except StopIteration:
             break
         cpu_wait += time.perf_counter() - tw
-        cpu_work += float(row["cpu_seconds"])
+        cpu_work += float(item["cpu_seconds"])
 
-        sem = torch.from_numpy(row["sem"]).to(
-            device, non_blocking=device.type == "cuda"
+        sem = torch.from_numpy(item["sem"]).to(
+            device, non_blocking=True
         ).unsqueeze(0)
-        obs = torch.from_numpy(row["obs"]).to(
-            device, non_blocking=device.type == "cuda"
+        obs = torch.from_numpy(item["obs"]).to(
+            device, non_blocking=True
         ).unsqueeze(0)
-        free = torch.from_numpy(row["free"]).to(
-            device, non_blocking=device.type == "cuda"
+        obsfree = torch.from_numpy(item["obsfree"]).to(
+            device, non_blocking=True
         ).unsqueeze(0)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
+
         with _autocast(device, amp):
-            scene = model.encode_history(sem, obs, free)
-            loss, c, nsupport, npositive = _repair_loss_and_confusion(
+            scene = model.encode_history(sem, obs, obsfree)
+            linear, q = geom.future_linear_and_query(item["future_rel"])
+            seen_h, missing_h = _high_context(
+                item["obs"], geom, device
+            )
+            world, ntiles = _decode_query_logits(
                 model,
                 scene,
-                row["obs"],
-                row["entries"],
-                high=high,
-                coarse=coarse,
+                q,
+                seen_h,
+                missing_h,
+                geom,
                 tile_batch_size=tile_batch_size,
-                grid_cache=grid_cache,
-                context_index_cache=context_cache,
-                allowed_ids=allowed_ids,
-                global_to_local=global_to_local,
             )
-        _assert_finite_async(loss)
+            loss, conf, base_full, final_full = (
+                _repair_loss_and_confusion(
+                    world,
+                    linear,
+                    item["support"],
+                    item["target"],
+                    gt=item["gt"],
+                    base_pred=item["base_pred"],
+                    device=device,
+                )
+            )
+
+        finite = torch.isfinite(loss.detach()).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(finite, "non-finite Static Repair loss")
+        elif not bool(finite.item()):
+            raise RuntimeError("non-finite Static Repair loss")
+
         if train:
             loss.backward()
-            params = [
-                p for p in model.parameters()
-                if p.requires_grad and p.grad is not None
-            ]
             torch.nn.utils.clip_grad_norm_(
-                params, 5.0, error_if_nonfinite=True, foreach=True
+                [
+                    p for p in model.parameters()
+                    if p.requires_grad
+                ],
+                5.0,
+                error_if_nonfinite=True,
+                foreach=(device.type == "cuda"),
             )
             optimizer.step()
 
-        sums_gpu.add_(loss.detach().float())
-        conf_gpu.add_(c)
-        support_seen += int(nsupport)
-        positive_seen += int(npositive)
+        loss_sum_scalar.add_(loss.detach().double())
+        conf_gpu.add_(conf)
+        base_full_gpu.add_(base_full)
+        final_full_gpu.add_(final_full)
+        tiles_total += int(ntiles)
         n += 1
 
         report = (
@@ -797,84 +769,119 @@ def _epoch(
             or n % max(int(progress_every), 1) == 0
             or n == total
         )
-        checkpoint = (
+        save_now = (
             train
             and checkpoint_callback is not None
             and int(checkpoint_every) > 0
             and n < total
             and n % int(checkpoint_every) == 0
         )
-        if report or checkpoint:
+        if report or save_now:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             now = time.perf_counter()
-            segment_n = max(n - int(start_window), 1)
+            seg = max(n - int(start_window), 1)
+            diag = repair_diagnostics_from_confusion(
+                conf_gpu.detach().cpu().numpy()
+            )
+            base_metrics = full_grid_metrics_from_confusion(
+                base_full_gpu.detach().cpu().numpy()
+            )
+            final_metrics = full_grid_metrics_from_confusion(
+                final_full_gpu.detach().cpu().numpy()
+            )
             if report:
-                summary = repair_confusion_summary(
-                    conf_gpu.detach().cpu().numpy()
-                )
+                phase = "train" if train else "val"
                 print(
-                    f"v20_static_repair_{'train' if train else 'val'} "
-                    f"{n}/{total} "
-                    f"rate={segment_n/max(now-started,1e-9):.3f} win/s "
-                    f"cpu_wait={cpu_wait/segment_n:.3f}s/win "
+                    f"v20_static_repair_{phase} {n}/{total} "
+                    f"rate={seg/max(now-started,1e-9):.3f} win/s "
+                    f"cpu_wait={cpu_wait/seg:.3f}s/win "
                     f"cpu_work={cpu_work/max(n,1):.3f}s/win "
-                    f"loss={float(sums_gpu.item()/max(n,1)):.4f} "
-                    f"addP={summary['added_precision']:.4f} "
-                    f"addR={summary['added_recall']:.4f} "
-                    f"repair_mIoU={summary['repair_static_mIoU']:.4f}",
+                    f"tiles={tiles_total/max(n,1):.1f}/win "
+                    f"loss={float(loss_sum_scalar.item()/max(n,1)):.5f} "
+                    f"addP={diag['addition_precision']:.4f} "
+                    f"addR={diag['static_positive_recall']:.4f} "
+                    f"base_mIoU={base_metrics['mIoU']:.2f} "
+                    f"repair_mIoU={final_metrics['mIoU']:.2f} "
+                    f"delta={final_metrics['mIoU']-base_metrics['mIoU']:+.2f}",
                     flush=True,
                 )
-            if checkpoint:
+            if save_now:
                 checkpoint_callback(
                     n,
                     {
-                        "loss_sum_windows": float(sums_gpu.item()),
+                        "loss_sum": float(loss_sum_scalar.item()),
                         "confusion": conf_gpu.detach().cpu().numpy().tolist(),
-                        "support_contributions": int(support_seen),
-                        "positive_contributions": int(positive_seen),
+                        "base_full_confusion": (
+                            base_full_gpu.detach().cpu().numpy().tolist()
+                        ),
+                        "final_full_confusion": (
+                            final_full_gpu.detach().cpu().numpy().tolist()
+                        ),
                         "cpu_work_seconds": float(cpu_work),
+                        "tiles_total": int(tiles_total),
                         "elapsed_seconds": float(
                             prior_elapsed + now - started
                         ),
                     },
                 )
 
+        del world, linear, q, scene
+
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    conf = conf_gpu.detach().cpu().numpy()
-    summary = repair_confusion_summary(conf)
-    elapsed = prior_elapsed + time.perf_counter() - started
+    conf_np = conf_gpu.cpu().numpy()
+    base_full_np = base_full_gpu.cpu().numpy()
+    final_full_np = final_full_gpu.cpu().numpy()
+    diag = repair_diagnostics_from_confusion(conf_np)
+    base_metrics = full_grid_metrics_from_confusion(base_full_np)
+    final_metrics = full_grid_metrics_from_confusion(final_full_np)
     return {
-        "loss": float(sums_gpu.item() / max(n, 1)),
+        "loss": float(loss_sum_scalar.item() / max(n, 1)),
         "windows": int(n),
-        "support_contributions": int(support_seen),
-        "positive_contributions": int(positive_seen),
-        "positive_fraction": float(
-            positive_seen / max(support_seen, 1)
+        "mean_tiles_per_window": float(
+            tiles_total / max(n, 1)
         ),
         "mean_cpu_work_seconds_per_window": float(
             cpu_work / max(n, 1)
         ),
-        "mean_cpu_wait_seconds_per_resumed_window": float(
-            cpu_wait / max(n - int(start_window), 1)
+        "epoch_elapsed_seconds": float(
+            prior_elapsed + time.perf_counter() - started
         ),
-        "elapsed_seconds": float(elapsed),
-        "repair_metrics": summary,
-        "confusion": conf.tolist(),
-        "formal_checkpoint_selection_metric": (
-            "NONE; use composed V18+Static full-grid dev mIoU"
+        "repair_diagnostics": diag,
+        "full_grid_v18_metrics": base_metrics,
+        "full_grid_v18_plus_static_metrics": final_metrics,
+        "full_grid_delta": {
+            "IoU": float(final_metrics["IoU"] - base_metrics["IoU"]),
+            "mIoU": float(final_metrics["mIoU"] - base_metrics["mIoU"]),
+            "main_1_2_3s": {
+                "IoU": float(
+                    final_metrics["main_1_2_3s"]["IoU"]
+                    - base_metrics["main_1_2_3s"]["IoU"]
+                ),
+                "mIoU": float(
+                    final_metrics["main_1_2_3s"]["mIoU"]
+                    - base_metrics["main_1_2_3s"]["mIoU"]
+                ),
+            },
+        },
+        "confusion_18x18": conf_np.tolist(),
+        "checkpoint_selection_metric": (
+            "NONE; use formal composed dev mIoU"
         ),
     }
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--train-history-cache", required=True)
-    p.add_argument("--train-repair-cache", required=True)
-    p.add_argument("--val-history-cache", required=True)
-    p.add_argument("--val-repair-cache", required=True)
+    p.add_argument("--stage1-train-cache", required=True)
+    p.add_argument("--stage1-val-cache", required=True)
+    p.add_argument("--repair-train-cache", required=True)
+    p.add_argument("--repair-val-cache", required=True)
     p.add_argument("--v18-checkpoint", required=True)
+    p.add_argument("--dataroot", required=True)
+    p.add_argument("--train-info-pkl", required=True)
+    p.add_argument("--val-info-pkl", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -885,16 +892,22 @@ def main():
     p.add_argument("--prefetch", type=int, default=16)
     p.add_argument("--progress-every", type=int, default=50)
     p.add_argument("--checkpoint-every-windows", type=int, default=2000)
+    p.add_argument("--max-train-windows", type=int, default=0)
+    p.add_argument("--max-val-windows", type=int, default=0)
+    p.add_argument(
+        "--overfit-windows",
+        type=int,
+        default=0,
+        help=(
+            "Diagnostic only: train and validate on the same first N train "
+            "windows. Checkpoints are explicitly marked non-formal."
+        ),
+    )
     p.add_argument("--resume", default="")
     p.add_argument("--seed", type=int, default=20260926)
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
     a = p.parse_args()
-
-    if int(a.epochs) <= 0:
-        raise ValueError("--epochs must be positive")
-    if float(a.lr) <= 0 or float(a.weight_decay) < 0:
-        raise ValueError("invalid optimizer hyperparameters")
 
     random.seed(a.seed)
     np.random.seed(a.seed)
@@ -902,44 +915,68 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(a.seed)
 
-    trh_root, trh = _load_index(a.train_history_cache, STAGE1_PROTOCOL)
-    trr_root, trr = _load_index(a.train_repair_cache, REPAIR_CACHE_PROTOCOL)
-    vah_root, vah = _load_index(a.val_history_cache, STAGE1_PROTOCOL)
-    var_root, var = _load_index(a.val_repair_cache, REPAIR_CACHE_PROTOCOL)
-    _validate_pair(trh_root, trh, trr_root, trr, a.v18_checkpoint)
-    _validate_pair(vah_root, vah, var_root, var, a.v18_checkpoint)
-
-    overlap = set(trr["scene_names"]) & set(var["scene_names"])
-    if overlap:
-        raise RuntimeError(f"Repair-v2 train/val scene overlap: {sorted(overlap)[:5]}")
-    for key in ("highres_lattice", "coarse_lattice", "native_grid"):
-        if trr[key] != var[key]:
-            raise RuntimeError(f"Repair-v2 train/val {key} mismatch")
-
-    high = _lattice(trr["highres_lattice"])
-    coarse = _lattice(trr["coarse_lattice"])
-    native = dict(trr["native_grid"])
-    tile_size = tuple(int(x) for x in str(a.tile_size).split(","))
-    if len(tile_size) != 3 or min(tile_size) <= 0:
-        raise ValueError("invalid --tile-size")
-
-    base = torch.load(
-        a.v18_checkpoint, map_location="cpu", weights_only=False
+    st_root, st_idx = _load_index(
+        a.stage1_train_cache, STAGE1_PROTOCOL
     )
-    model_cfg = dict(base.get("model_config") or {})
-    if "d_model" not in model_cfg:
-        raise RuntimeError("frozen V18 checkpoint lacks model_config.d_model")
-    cfg = V20SceneConfig(source_dim=int(model_cfg["d_model"]))
-    model = V20HistoryWorldModel(cfg)
+    sv_root, sv_idx = _load_index(
+        a.stage1_val_cache, STAGE1_PROTOCOL
+    )
+    rt_root, rt_idx = _load_index(
+        a.repair_train_cache, SUPPORT_CACHE_PROTOCOL
+    )
+    rv_root, rv_idx = _load_index(
+        a.repair_val_cache, SUPPORT_CACHE_PROTOCOL
+    )
 
-    # Repair-v2 optimizes exactly the deployed path: encoder + tile_refine.
-    # The unused coarse auxiliary head and later Stage3/4 heads are frozen.
-    for p0 in model.static.coarse_head.parameters():
-        p0.requires_grad = False
-    for p0 in model.dormant.parameters():
-        p0.requires_grad = False
-    for p0 in model.birth.parameters():
-        p0.requires_grad = False
+    for name, sroot, ridx in (
+        ("train", st_root, rt_idx),
+        ("val", sv_root, rv_idx),
+    ):
+        if str(Path(ridx["stage1_cache"]).resolve()) != str(
+            Path(sroot).resolve()
+        ):
+            raise RuntimeError(
+                f"{name} repair cache references different Stage1 cache"
+            )
+        if str(Path(ridx["base_checkpoint"]).resolve()) != str(
+            Path(a.v18_checkpoint).resolve()
+        ):
+            raise RuntimeError(
+                f"{name} repair cache references different V18 checkpoint"
+            )
+        if bool(ridx.get("future_gt_used", True)):
+            raise RuntimeError("repair support cache must not use future GT")
+        if bool(ridx.get("future_lidar_mask_used", True)):
+            raise RuntimeError(
+                "repair support cache must not use future lidar mask"
+            )
+        if not bool(
+            ridx.get("contains_lossless_v18_semantic_prediction", False)
+        ):
+            raise RuntimeError(
+                "repair cache lacks lossless frozen-V18 semantic prediction"
+            )
+
+    overlap = set(st_idx["scene_names"]) & set(sv_idx["scene_names"])
+    if overlap:
+        raise RuntimeError(f"train/val scene overlap: {sorted(overlap)[:5]}")
+
+    overfit = int(a.overfit_windows)
+    if overfit > 0:
+        sv_root, sv_idx = st_root, st_idx
+        rv_root, rv_idx = rt_root, rt_idx
+        a.max_train_windows = overfit
+        a.max_val_windows = overfit
+        val_info = a.train_info_pkl
+    else:
+        val_info = a.val_info_pkl
+
+    if st_idx["highres_lattice"] != sv_idx["highres_lattice"]:
+        raise RuntimeError("train/val high-resolution lattice mismatch")
+    if st_idx["coarse_lattice"] != sv_idx["coarse_lattice"]:
+        raise RuntimeError("train/val coarse lattice mismatch")
+    if dict(st_idx["native_grid"]) != dict(sv_idx["native_grid"]):
+        raise RuntimeError("train/val native grid mismatch")
 
     device = torch.device(
         a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu"
@@ -949,214 +986,296 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
-    model.to(device)
     amp = device.type == "cuda" and not bool(a.no_amp)
 
-    params = [p0 for p0 in model.parameters() if p0.requires_grad]
+    v18_obj = torch.load(
+        a.v18_checkpoint, map_location="cpu", weights_only=False
+    )
+    v18_cfg = dict(v18_obj.get("model_config") or {})
+    if "d_model" not in v18_cfg:
+        raise RuntimeError("V18 checkpoint lacks model_config.d_model")
+
+    cfg = V20SceneConfig(source_dim=int(v18_cfg["d_model"]))
+    model = V20HistoryWorldModel(cfg)
+    for p0 in model.dormant.parameters():
+        p0.requires_grad = False
+    for p0 in model.birth.parameters():
+        p0.requires_grad = False
+    for p0 in model.static.coarse_head.parameters():
+        p0.requires_grad = False
+    model.to(device)
+
     optimizer = torch.optim.AdamW(
-        params,
+        [p0 for p0 in model.parameters() if p0.requires_grad],
         lr=float(a.lr),
         weight_decay=float(a.weight_decay),
         foreach=(device.type == "cuda"),
     )
 
+    high = _lattice(st_idx["highres_lattice"])
+    coarse = _lattice(st_idx["coarse_lattice"])
+    native = dict(st_idx["native_grid"])
+    native_shape = tuple(int(x) for x in native["shape_xyz"])
+    native_origin = tuple(float(x) for x in native["origin_xyz_m"])
+    native_step = tuple(float(x) for x in native["voxel_size_xyz_m"])
+    if tuple(int(x) for x in rt_idx["native_shape_xyz"]) != native_shape:
+        raise RuntimeError("repair/native shape mismatch")
+    tile_size = tuple(int(x) for x in a.tile_size.split(","))
+    if len(tile_size) != 3 or min(tile_size) <= 0:
+        raise ValueError("tile-size must be positive xyz triple")
+
+    geom = _Geometry(
+        high,
+        coarse,
+        native_shape,
+        native_origin,
+        native_step,
+        tile_size,
+        device,
+    )
+    train_source = CachedSource(
+        a.dataroot, info_pkl=a.train_info_pkl, verbose=False
+    )
+    val_source = (
+        train_source
+        if overfit > 0
+        else CachedSource(
+            a.dataroot, info_pkl=val_info, verbose=False
+        )
+    )
+
     out = Path(a.output_dir)
-    resume_path = Path(a.resume).resolve() if str(a.resume).strip() else None
-    resume_ck = None
+    resume_path = (
+        Path(a.resume).resolve() if str(a.resume).strip() else None
+    )
+    history = []
+    start_epoch = 1
+    resume_window = 0
+    resume_partial = None
+
     if resume_path is None:
         if out.exists() and any(out.iterdir()):
-            raise FileExistsError(f"refusing non-empty output dir: {out}")
+            raise FileExistsError(
+                f"refusing non-empty output dir: {out}"
+            )
         out.mkdir(parents=True, exist_ok=True)
-        history = []
-        start_epoch = 1
-        resume_window = 0
-        resume_accum = None
     else:
         if not resume_path.is_file():
             raise FileNotFoundError(resume_path)
-        resume_ck = torch.load(
+        out.mkdir(parents=True, exist_ok=True)
+        ck = torch.load(
             resume_path, map_location="cpu", weights_only=False
         )
-        if resume_ck.get("stage") != REPAIR_STAGE:
-            raise RuntimeError("resume checkpoint is not Static Repair v2")
-        if str(Path(resume_ck.get("v18_checkpoint", "")).resolve()) != str(
-            Path(a.v18_checkpoint).resolve()
-        ):
-            raise RuntimeError("resume V18 checkpoint mismatch")
-        extra = dict(resume_ck.get("extra") or {})
+        extra = dict(ck.get("extra") or {})
+        if extra.get("train_protocol") != TRAIN_PROTOCOL:
+            raise RuntimeError(
+                "resume checkpoint is not Static Repair v2"
+            )
         contract = dict(extra.get("training_contract") or {})
         expected = {
-            "train_history_cache": str(Path(a.train_history_cache).resolve()),
-            "train_repair_cache": str(Path(a.train_repair_cache).resolve()),
-            "val_history_cache": str(Path(a.val_history_cache).resolve()),
-            "val_repair_cache": str(Path(a.val_repair_cache).resolve()),
+            "stage1_train_cache": str(Path(a.stage1_train_cache).resolve()),
+            "repair_train_cache": str(Path(a.repair_train_cache).resolve()),
             "seed": int(a.seed),
             "tile_size_xyz": list(tile_size),
-            "lr": float(a.lr),
-            "weight_decay": float(a.weight_decay),
+            "overfit_windows": int(overfit),
         }
-        for k, v in expected.items():
-            if contract.get(k) != v:
+        for key, value in expected.items():
+            if contract.get(key) != value:
                 raise RuntimeError(
-                    f"resume training contract mismatch for {k}: "
-                    f"{contract.get(k)!r} != {v!r}"
+                    f"resume contract mismatch {key}: "
+                    f"{contract.get(key)!r} != {value!r}"
                 )
-        model.load_state_dict(resume_ck["model"], strict=True)
-        optimizer.load_state_dict(resume_ck["optimizer_state_dict"])
-        _restore_rng_state(resume_ck.get("rng_state"))
-        progress = dict(resume_ck.get("training_progress") or {})
+        model.load_state_dict(ck["model"], strict=True)
+        optimizer.load_state_dict(ck["optimizer_state_dict"])
+        _restore_rng(ck.get("rng_state"))
+        progress = dict(ck.get("training_progress") or {})
         history = list(progress.get("history") or [])
         saved_epoch = int(progress.get("epoch", 0))
         if bool(progress.get("epoch_complete", False)):
             start_epoch = saved_epoch + 1
-            resume_window = 0
-            resume_accum = None
         else:
             start_epoch = saved_epoch
             resume_window = int(progress.get("completed_windows", 0))
-            resume_accum = dict(progress.get("partial_epoch_state") or {})
-        out.mkdir(parents=True, exist_ok=True)
+            resume_partial = dict(
+                progress.get("partial_epoch_state") or {}
+            )
         print(
-            f"resumed V20 Static Repair v2: epoch={start_epoch} "
+            f"resumed Static Repair v2: epoch={start_epoch} "
             f"window={resume_window}",
             flush=True,
         )
 
     if start_epoch > int(a.epochs):
-        raise RuntimeError("resume checkpoint already exceeds requested epochs")
+        raise RuntimeError("requested epochs already completed")
 
-    geometry_caches = {}
-    total_train = int(trr["num_windows"])
+    train_total = (
+        min(int(rt_idx["num_windows"]), int(a.max_train_windows))
+        if int(a.max_train_windows) > 0
+        else int(rt_idx["num_windows"])
+    )
 
-    def payload(epoch, *, complete, completed_windows, partial, hist):
-        obj = checkpoint_payload(
+    def make_payload(
+        epoch,
+        *,
+        epoch_complete,
+        completed_windows,
+        partial,
+        hist,
+    ):
+        payload = checkpoint_payload(
             model,
-            stage=REPAIR_STAGE,
+            stage="static",
             v18_checkpoint=str(Path(a.v18_checkpoint).resolve()),
             thresholds={},
             extra={
-                "train_protocol": PROTOCOL,
-                "epoch": int(epoch),
-                "highres_lattice": trr["highres_lattice"],
-                "coarse_lattice": trr["coarse_lattice"],
-                "tile_size_xyz": list(tile_size),
-                "class_weights": None,
-                "loss_contract": (
-                    "full_formal_future_grid AND frozen_v18_free; "
-                    "static_gt=semantic; free_or_dynamic_gt=FREE; "
-                    "ordinary_CE; exact_per_future_voxel_contributions; "
-                    "no_tile_equal_weighting; runtime_query_mask"
+                "train_protocol": TRAIN_PROTOCOL,
+                "static_role": "protected_add_only_repair",
+                "supervision_domain": (
+                    "formal_full_future_grid_intersection_v18_free"
                 ),
+                "future_lidar_mask_used_for_supervision": False,
+                "dynamic_gt_target": "free_no_add",
+                "query_mask_contract": "exact_runtime_M_query",
+                "loss": "ordinary_per_future_voxel_cross_entropy",
+                "class_weighting": "none",
+                "tile_weighting": "none",
+                "horizon_conflicts": (
+                    "preserved_as_independent_future_voxel_contributions"
+                ),
+                "overfit_diagnostic_only": bool(overfit > 0),
+                "highres_lattice": st_idx["highres_lattice"],
+                "coarse_lattice": st_idx["coarse_lattice"],
+                "tile_size_xyz": list(tile_size),
+                "tile_batch_size": int(a.tile_batch_size),
                 "training_contract": {
-                    "train_history_cache": str(Path(a.train_history_cache).resolve()),
-                    "train_repair_cache": str(Path(a.train_repair_cache).resolve()),
-                    "val_history_cache": str(Path(a.val_history_cache).resolve()),
-                    "val_repair_cache": str(Path(a.val_repair_cache).resolve()),
+                    "stage1_train_cache": str(
+                        Path(a.stage1_train_cache).resolve()
+                    ),
+                    "repair_train_cache": str(
+                        Path(a.repair_train_cache).resolve()
+                    ),
+                    "stage1_val_cache": str(
+                        Path(a.stage1_val_cache).resolve()
+                    ),
+                    "repair_val_cache": str(
+                        Path(a.repair_val_cache).resolve()
+                    ),
                     "seed": int(a.seed),
                     "tile_size_xyz": list(tile_size),
                     "lr": float(a.lr),
                     "weight_decay": float(a.weight_decay),
+                    "overfit_windows": int(overfit),
                 },
-                "selection": (
-                    "Select only by formal composed V18+Static full-grid "
-                    "semantic mIoU on scene-disjoint dev."
-                ),
                 "history": list(hist),
+                "selection": (
+                    "Select only by formal composed scene-disjoint dev mIoU; "
+                    "repair diagnostics are safety/capacity diagnostics."
+                ),
             },
         )
-        obj["optimizer_state_dict"] = optimizer.state_dict()
-        obj["rng_state"] = _capture_rng_state()
-        obj["training_progress"] = {
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+        payload["rng_state"] = _capture_rng()
+        payload["training_progress"] = {
             "epoch": int(epoch),
-            "epoch_complete": bool(complete),
+            "epoch_complete": bool(epoch_complete),
             "completed_windows": int(completed_windows),
-            "total_windows": total_train,
+            "total_windows": int(train_total),
             "partial_epoch_state": partial,
             "history": list(hist),
         }
-        return obj
+        return payload
 
-    for epoch in range(int(start_epoch), int(a.epochs) + 1):
-        sw = int(resume_window) if epoch == int(start_epoch) else 0
-        sa = resume_accum if epoch == int(start_epoch) else None
+    print(json.dumps({
+        "protocol": TRAIN_PROTOCOL,
+        "device": str(device),
+        "amp_bfloat16": bool(amp),
+        "train_windows": int(train_total),
+        "val_windows": (
+            min(int(rv_idx["num_windows"]), int(a.max_val_windows))
+            if int(a.max_val_windows) > 0
+            else int(rv_idx["num_windows"])
+        ),
+        "overfit_diagnostic_only": bool(overfit > 0),
+        "support": "formal full grid AND frozen V18 free",
+        "target": "static semantic; free/dynamic -> no-add",
+        "class_weighting": "none",
+        "tile_weighting": "none",
+    }, indent=2), flush=True)
 
-        def save_partial(completed_windows, partial_state):
-            _atomic_torch_save(
-                payload(
+    for epoch in range(start_epoch, int(a.epochs) + 1):
+        this_start = resume_window if epoch == start_epoch else 0
+        this_partial = (
+            resume_partial if epoch == start_epoch else None
+        )
+
+        def save_partial(done, state):
+            _atomic_save(
+                make_payload(
                     epoch,
-                    complete=False,
-                    completed_windows=completed_windows,
-                    partial=partial_state,
+                    epoch_complete=False,
+                    completed_windows=done,
+                    partial=state,
                     hist=history,
                 ),
                 out / "resume_latest.pt",
             )
 
-        train_report = _epoch(
+        tr = _epoch(
             model,
-            trh_root,
-            trh,
-            trr_root,
-            trr,
-            high,
-            coarse,
-            native,
-            device,
+            st_root,
+            rt_root,
+            rt_idx,
+            train_source,
+            geom,
+            device=device,
             optimizer=optimizer,
-            tile_size=tile_size,
             tile_batch_size=int(a.tile_batch_size),
             prep_workers=int(a.prep_workers),
             prefetch=int(a.prefetch),
             progress_every=int(a.progress_every),
             seed=int(a.seed) + epoch,
             amp=amp,
-            start_window=sw,
-            resume_accum=sa,
+            max_windows=int(a.max_train_windows),
+            start_window=int(this_start),
+            resume_state=this_partial,
             checkpoint_every=int(a.checkpoint_every_windows),
             checkpoint_callback=save_partial,
-            geometry_caches=geometry_caches,
         )
         with torch.inference_mode():
-            val_report = _epoch(
+            va = _epoch(
                 model,
-                vah_root,
-                vah,
-                var_root,
-                var,
-                high,
-                coarse,
-                native,
-                device,
+                sv_root,
+                rv_root,
+                rv_idx,
+                val_source,
+                geom,
+                device=device,
                 optimizer=None,
-                tile_size=tile_size,
                 tile_batch_size=int(a.tile_batch_size),
                 prep_workers=int(a.prep_workers),
                 prefetch=int(a.prefetch),
                 progress_every=int(a.progress_every),
                 seed=int(a.seed),
                 amp=amp,
-                geometry_caches=geometry_caches,
+                max_windows=int(a.max_val_windows),
             )
 
-        row = {
-            "epoch": int(epoch),
-            "train": train_report,
-            "val": val_report,
-        }
+        row = {"epoch": int(epoch), "train": tr, "val": va}
         history.append(row)
-        print("REPAIR_EPOCH " + json.dumps(row), flush=True)
-        obj = payload(
+        print(json.dumps(row), flush=True)
+
+        payload = make_payload(
             epoch,
-            complete=True,
-            completed_windows=total_train,
+            epoch_complete=True,
+            completed_windows=train_total,
             partial=None,
             hist=history,
         )
-        _atomic_torch_save(obj, out / f"epoch_{epoch:04d}.pt")
-        _atomic_torch_save(obj, out / "latest.pt")
-        _atomic_torch_save(obj, out / "resume_latest.pt")
+        _atomic_save(payload, out / f"epoch_{epoch:04d}.pt")
+        _atomic_save(payload, out / "latest.pt")
+        _atomic_save(payload, out / "resume_latest.pt")
         resume_window = 0
-        resume_accum = None
+        resume_partial = None
 
     (out / "history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"
