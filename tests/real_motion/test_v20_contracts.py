@@ -1066,3 +1066,58 @@ def test_future_render_index_uses_compact_int32_xyz():
     )
     assert ri.indices_xyz.dtype == np.int32
     assert ri.linear_index.dtype == np.int32
+
+
+def test_static_repair_support_codec_and_target_contract():
+    from real_motion.v20_static_repair import (
+        pack_v18_free_support,
+        unpack_v18_free_support,
+        repair_target_from_gt,
+    )
+
+    rng = np.random.default_rng(71)
+    shape = (7, 6, 3)
+    support = rng.random((FUTURE_FRAMES,) + shape) > 0.3
+    packed = pack_v18_free_support(support)
+    got = unpack_v18_free_support(packed, shape)
+    assert np.array_equal(got, support)
+
+    gt = rng.integers(0, 18, size=(FUTURE_FRAMES,) + shape, dtype=np.uint8)
+    target = repair_target_from_gt(gt)
+    dyn = np.isin(gt, np.asarray(DYNAMIC_CLASS_IDS, dtype=np.uint8))
+    assert np.all(target[dyn] == 17)
+    assert np.array_equal(target[~dyn], gt[~dyn])
+
+
+def test_static_repair_confusion_keeps_free_to_static_false_positives():
+    from real_motion.v20_static_repair import (
+        repair_confusion,
+        repair_diagnostics_from_confusion,
+    )
+
+    # 100 static positives and 900 free negatives, predict the static class
+    # everywhere.  This is the failure mode the legacy training metric hid.
+    cid = next(i for i in range(17) if i not in set(DYNAMIC_CLASS_IDS))
+    target = np.full((1, 1000), 17, dtype=np.uint8)
+    target[0, :100] = cid
+    pred = np.full_like(target, cid)
+    support = np.ones_like(target, dtype=bool)
+    conf = repair_confusion(target, pred, support)
+    diag = repair_diagnostics_from_confusion(conf)
+    assert conf[17, cid] == 900
+    assert conf[cid, cid] == 100
+    assert abs(diag["addition_precision"] - 0.1) < 1e-12
+    assert abs(diag["repair_support_semantic_miou"] - 0.1) < 1e-12
+
+
+def test_static_repair_protocol_guards_are_wired():
+    import inspect
+    from tools.real_motion import train_p0_f9_v20_dormant as dormant
+    from tools.real_motion import v20_validate_run_inputs as validate
+
+    dsrc = inspect.getsource(dormant.main)
+    vsrc = inspect.getsource(validate.main)
+    assert "STATIC_REPAIR_PROTOCOL" in dsrc
+    assert "STATIC_REPAIR_PROTOCOL" in vsrc
+    assert "overfit_diagnostic_only" in dsrc
+    assert "overfit_diagnostic_only" in vsrc

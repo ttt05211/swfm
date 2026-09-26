@@ -38,6 +38,7 @@ from real_motion.v20_dormant import (
 from real_motion.v20_history_world import CanonicalLattice, align_history_once_to_canonical
 from real_motion.v20_runtime import sample_scene_features_at_t0_points
 from real_motion.v20_training import dormant_source_loss, load_v20_checkpoint, checkpoint_payload
+from real_motion.v20_static_repair import TRAIN_PROTOCOL as STATIC_REPAIR_PROTOCOL
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import CachedSource
@@ -296,6 +297,15 @@ def main():
     model, sck = load_v20_checkpoint(a.static_checkpoint, map_location="cpu")
     if str(sck.get("stage")) != "static":
         raise RuntimeError("Dormant training requires frozen Stage-2 Static checkpoint")
+    sx = dict(sck.get("extra") or {})
+    if sx.get("train_protocol") != STATIC_REPAIR_PROTOCOL:
+        raise RuntimeError(
+            "Dormant training requires corrected Static Repair v2 checkpoint"
+        )
+    if bool(sx.get("overfit_diagnostic_only", False)):
+        raise RuntimeError(
+            "Dormant training refuses non-formal Static overfit checkpoint"
+        )
     model.to(device)
     for p0 in model.parameters(): p0.requires_grad = False
     for p0 in model.dormant.parameters(): p0.requires_grad = True

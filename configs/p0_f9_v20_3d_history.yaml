@@ -38,9 +38,20 @@ scene_encoder:
 static:
   enabled: true
   one_canonical_world: true
-  supervise_future_observed_only: true
-  ignore_dynamic_gt: true
+  # Stage-2 Repair v2: training and deployment share the same support.
+  training_protocol: p0_f9_v20_static_repair_train_v2
+  supervision_domain: formal_full_future_grid
+  composition_support: frozen_v18_free
+  future_lidar_mask_is_input_only: true
+  future_lidar_mask_used_for_supervision: false
+  dynamic_gt_target: free_no_add
+  query_mask_train_matches_runtime: true
+  loss: ordinary_per_future_voxel_cross_entropy
+  class_weighting: none
+  tile_equal_weighting: false
+  horizon_conflicts: preserve_independent_contributions
   select_checkpoint_by_semantic_miou: true
+  report_global_addition_quality: true
   report_subsets:
     - history_seen_t0_missing
     - never_seen_static

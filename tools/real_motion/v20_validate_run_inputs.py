@@ -15,6 +15,7 @@ import torch
 import yaml
 
 from real_motion.v20_training import CHECKPOINT_PROTOCOL
+from real_motion.v20_static_repair import TRAIN_PROTOCOL as STATIC_REPAIR_PROTOCOL
 from tools.real_motion.build_p0_f9_v20_history_cache import PROTOCOL as STAGE1_PROTOCOL
 
 
@@ -97,6 +98,14 @@ def main():
         if _norm_path(static["v18_checkpoint"]) != base_path:
             raise RuntimeError("Static checkpoint uses a different V18 checkpoint")
         sx = dict(static.get("extra") or {})
+        if sx.get("train_protocol") != STATIC_REPAIR_PROTOCOL:
+            raise RuntimeError(
+                "Static checkpoint is not the corrected Stage-2 Repair v2 protocol"
+            )
+        if bool(sx.get("overfit_diagnostic_only", False)):
+            raise RuntimeError(
+                "overfit diagnostic Static checkpoint cannot enter Stage-3/4/5 chain"
+            )
         _same_lattice(sx["highres_lattice"], tr["highres_lattice"], "Static/cache highres")
         _same_lattice(sx["coarse_lattice"], tr["coarse_lattice"], "Static/cache coarse")
         chain["static"] = _norm_path(a.static_checkpoint)
