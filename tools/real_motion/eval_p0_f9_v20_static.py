@@ -156,6 +156,15 @@ def main():
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--alignment-workers", type=int, default=6)
     p.add_argument("--tile-batch-size", type=int, default=32)
+    p.add_argument(
+        "--selection-only",
+        action="store_true",
+        help=(
+            "Compute exact composed V18/V20 IoU, mIoU and Moving metrics "
+            "but skip expensive Static capability-subset masks. Use for "
+            "checkpoint selection; run full eval once for selected epochs."
+        ),
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
     a = p.parse_args()
@@ -218,10 +227,6 @@ def main():
         t_phase = time.perf_counter()
         w = window_from_record(rec)
         raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=True)
-        future_obs = np.stack([
-            source.load_lidar_observation(str(w.scene_name), str(tok))
-            for tok in w.future_tokens
-        ])
         state = _prepare_record_from_raw(
             rec, raw, source, pcfg, strong_cfg, device, component_cache
         )
@@ -298,32 +303,45 @@ def main():
         total_oob += int(static.out_of_bounds_voxels)
         total_history_oob += history_oob
 
-        t_phase = time.perf_counter()
-        masks = static_subset_masks(
-            high_lattice=high,
-            history_observed=np.asarray(raw["history_observed"], dtype=bool),
-            history_ego_to_canonical=hist_rel,
-            future_ego_to_canonical=future_rel,
-            future_observed=future_obs,
-            future_gt_semantic=np.asarray(raw["future_gt_occ"], dtype=np.uint8),
-            native_origin_xyz_m=(pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min),
-            native_voxel_size_xyz_m=pcfg.grid.voxel_size,
-            free_label=int(pcfg.free_label),
-            future_render_index=static.render_index,
-        )
-        phase_s["subset"] += time.perf_counter() - t_phase
-        for fi in range(6):
-            gt = np.asarray(raw["future_gt_occ"][fi], dtype=np.uint8)
-            _update_subset(
-                subset["history_seen_t0_missing"],
-                masks["history_seen_t0_missing"][fi],
-                pred_stack[fi], final[fi], gt, int(pcfg.free_label),
+        if not bool(a.selection_only):
+            t_phase = time.perf_counter()
+            future_obs = np.stack([
+                source.load_lidar_observation(
+                    str(w.scene_name), str(tok)
+                )
+                for tok in w.future_tokens
+            ])
+            masks = static_subset_masks(
+                high_lattice=high,
+                history_observed=np.asarray(
+                    raw["history_observed"], dtype=bool
+                ),
+                history_ego_to_canonical=hist_rel,
+                future_ego_to_canonical=future_rel,
+                future_observed=future_obs,
+                future_gt_semantic=np.asarray(
+                    raw["future_gt_occ"], dtype=np.uint8
+                ),
+                native_origin_xyz_m=(
+                    pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min
+                ),
+                native_voxel_size_xyz_m=pcfg.grid.voxel_size,
+                free_label=int(pcfg.free_label),
+                future_render_index=static.render_index,
             )
-            _update_subset(
-                subset["never_seen_static_domain"],
-                masks["never_seen_static_domain"][fi],
-                pred_stack[fi], final[fi], gt, int(pcfg.free_label),
-            )
+            phase_s["subset"] += time.perf_counter() - t_phase
+            for fi in range(6):
+                gt = np.asarray(raw["future_gt_occ"][fi], dtype=np.uint8)
+                _update_subset(
+                    subset["history_seen_t0_missing"],
+                    masks["history_seen_t0_missing"][fi],
+                    pred_stack[fi], final[fi], gt, int(pcfg.free_label),
+                )
+                _update_subset(
+                    subset["never_seen_static_domain"],
+                    masks["never_seen_static_domain"][fi],
+                    pred_stack[fi], final[fi], gt, int(pcfg.free_label),
+                )
 
         t_phase = time.perf_counter()
         moving_rows = _moving_support_sequence(
@@ -366,7 +384,11 @@ def main():
         "static_memory_unconditional_output": False,
         "metrics": metrics,
         "delta_v20_static_vs_v18": _delta(metrics["v20_static"], metrics["v18"]),
-        "static_capability_subsets": {k: _finish_subset(v) for k, v in subset.items()},
+        "static_capability_subsets": (
+            None
+            if bool(a.selection_only)
+            else {k: _finish_subset(v) for k, v in subset.items()}
+        ),
         "geometry_audit": {
             "query_voxels": int(total_query),
             "active_tiles": int(total_tiles),
@@ -386,6 +408,7 @@ def main():
             },
             "tile_batch_size": int(a.tile_batch_size),
             "stage1_history_reuse": bool(stage1_rows is not None),
+            "selection_only": bool(a.selection_only),
             "note": "end-to-end evaluation wall time; dedicated benchmark reports decomposed latency",
         },
     }
