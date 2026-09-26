@@ -1154,7 +1154,7 @@ def _epoch(
                 ),
                 dtype=np.int64,
             ),
-            dtype=np.int64,
+            dtype=torch.int64,
             device=device,
         ).clone()
         final_full_gpu = torch.as_tensor(
