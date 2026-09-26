@@ -432,7 +432,9 @@ class _Geometry:
             len(STATIC_ALLOWED_IDS), device=device
         )
 
-    def future_linear_and_query(self, future_rel):
+    def future_linear_and_query(
+        self, future_rel, *, return_active_tiles=False
+    ):
         T = torch.as_tensor(
             future_rel, dtype=torch.float64, device=self.device
         )
@@ -467,7 +469,40 @@ class _Geometry:
         )
         q[linear.reshape(-1)] = True
         q = q.reshape(self.high_shape)
+        if return_active_tiles:
+            return linear, q, self.active_tiles_from_indices(idx)
         return linear, q
+
+    def active_tiles_from_indices(self, idx):
+        """Exact active tiles from valid canonical xyz indices."""
+        xyz = idx.reshape(-1, 3).long()
+        tile = torch.as_tensor(
+            self.tile, dtype=torch.long, device=self.device
+        )
+        tc = torch.div(xyz, tile[None], rounding_mode="floor")
+        tx, ty, tz = self.tile
+        ntx = (self.high_shape[0] + tx - 1) // tx
+        nty = (self.high_shape[1] + ty - 1) // ty
+        ntz = (self.high_shape[2] + tz - 1) // tz
+        tile_linear = (
+            tc[:, 0] * (nty * ntz)
+            + tc[:, 1] * ntz
+            + tc[:, 2]
+        )
+        tile_mask = torch.zeros(
+            ntx * nty * ntz, dtype=torch.bool, device=self.device
+        )
+        tile_mask[tile_linear] = True
+        active_linear = torch.nonzero(
+            tile_mask, as_tuple=False
+        ).reshape(-1)
+        ax = torch.div(
+            active_linear, nty * ntz, rounding_mode="floor"
+        )
+        rem = active_linear - ax * (nty * ntz)
+        ay = torch.div(rem, ntz, rounding_mode="floor")
+        az = rem - ay * ntz
+        return torch.stack((ax, ay, az), dim=1).cpu().numpy()
 
     def active_tiles(self, q):
         """Dense reference path retained for equivalence tests."""
@@ -483,12 +518,7 @@ class _Geometry:
         ).cpu().numpy()
 
     def active_tiles_from_linear(self, linear):
-        """Exact active tiles directly from canonical query-cell indices.
-
-        This avoids a full-resolution float cast + max_pool3d over M_query.
-        Sorted tile-linear IDs preserve the row-major order returned by the
-        dense nonzero reference path.
-        """
+        """Reference helper for tests when xyz indices are unavailable."""
         lin = linear.reshape(-1).long()
         Y, Z = self.high_shape[1], self.high_shape[2]
         yz = int(Y * Z)
@@ -496,25 +526,8 @@ class _Geometry:
         rem = lin - x * yz
         y = torch.div(rem, int(Z), rounding_mode="floor")
         z = rem - y * int(Z)
-
-        tx, ty, tz = self.tile
-        ntx = (self.high_shape[0] + tx - 1) // tx
-        nty = (self.high_shape[1] + ty - 1) // ty
-        ntz = (self.high_shape[2] + tz - 1) // tz
-        tile_linear = (
-            torch.div(x, tx, rounding_mode="floor") * (nty * ntz)
-            + torch.div(y, ty, rounding_mode="floor") * ntz
-            + torch.div(z, tz, rounding_mode="floor")
-        )
-        uniq = torch.unique(tile_linear, sorted=True)
-        ux = torch.div(uniq, nty * ntz, rounding_mode="floor")
-        urem = uniq - ux * (nty * ntz)
-        uy = torch.div(urem, ntz, rounding_mode="floor")
-        uz = urem - uy * ntz
-        out = torch.stack((ux, uy, uz), dim=1)
-        if bool(((out[:, 0] < 0) | (out[:, 0] >= ntx)).any()):
-            raise RuntimeError("active tile x index escaped lattice")
-        return out.cpu().numpy()
+        idx = torch.stack((x, y, z), dim=1)
+        return self.active_tiles_from_indices(idx)
 
     def tile_grid(self, start, shape, dtype):
         key = (
@@ -1271,8 +1284,9 @@ def _epoch(
             profiler.stop(prof_events, "encoder")
 
             profiler.start(prof_events, "geometry")
-            linear, q = geom.future_linear_and_query(item["future_rel"])
-            active_tiles = geom.active_tiles_from_linear(linear)
+            linear, q, active_tiles = geom.future_linear_and_query(
+                item["future_rel"], return_active_tiles=True
+            )
             profiler.stop(prof_events, "geometry")
 
             profiler.start(prof_events, "tile_decode")
