@@ -34,7 +34,6 @@ from real_motion.motion_transport import (
     match_sources_to_annotations,
 )
 from real_motion.nuscenes_adapter import category_to_dynamic_class
-from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.runtime_fastpath import extract_instances_cropped_exact
 from real_motion.strong_w2det import StrongW2DetConfig
@@ -103,47 +102,62 @@ def _ann_by_instance(nusc, token):
     return out
 
 
-def _history_source_evidence(source, w, raw, pcfg, strong_cfg, match_max_distance_m):
+def _history_source_evidence(
+    source, w, raw, pcfg, strong_cfg, match_max_distance_m, *, token_cache=None
+):
     matched_sets = []
     ambiguous_sets = []
     components_by_frame = []
     for ti, token in enumerate(w.history_tokens):
-        sem_raw = np.asarray(raw["history_occ"][ti], dtype=np.uint8)
-        obs = np.asarray(raw["history_observed"][ti], dtype=bool)
-        sem = np.where(obs, sem_raw, int(pcfg.free_label)).astype(np.uint8)
-        pose = np.asarray(raw["history_poses"][ti], dtype=np.float64)
-        comps = extract_instances_cropped_exact(
-            sem, pose, grid=pcfg.grid, cfg=strong_cfg
-        )
-        components_by_frame.append(comps)
-        anns = dynamic_annotations(source.nusc, token)
-        matched = match_sources_to_annotations(
-            comps, anns, max_distance_m=float(match_max_distance_m)
-        )
-        matched_sets.append({str(x) for x in matched if x is not None})
+        key = str(token)
+        cached = None if token_cache is None else token_cache.get(key)
+        if cached is None:
+            sem_raw = np.asarray(raw["history_occ"][ti], dtype=np.uint8)
+            obs = np.asarray(raw["history_observed"][ti], dtype=bool)
+            sem = np.where(obs, sem_raw, int(pcfg.free_label)).astype(np.uint8)
+            pose = np.asarray(raw["history_poses"][ti], dtype=np.float64)
+            comps = extract_instances_cropped_exact(
+                sem, pose, grid=pcfg.grid, cfg=strong_cfg
+            )
+            anns = dynamic_annotations(source.nusc, token)
+            matched = match_sources_to_annotations(
+                comps, anns, max_distance_m=float(match_max_distance_m)
+            )
+            matched_now = {str(x) for x in matched if x is not None}
 
-        # Ambiguity is reserved for a GT ancestor with nearby same-class source
-        # evidence that failed deterministic one-to-one matching.
-        matched_now = matched_sets[-1]
-        amb = set()
-        for ann in anns:
-            tok = str(ann["instance_token"])
-            if tok in matched_now:
-                continue
-            ac = np.asarray(ann["center_world"], dtype=np.float64)
-            same = [
-                c for c in comps
-                if int(c["class_id"]) == int(ann["class_id"])
-                and float(np.linalg.norm(np.asarray(c["centroid_world"])[:2] - ac[:2]))
-                <= 1.5 * float(match_max_distance_m)
-            ]
-            if same:
-                amb.add(tok)
-        ambiguous_sets.append(amb)
+            # Ambiguity is reserved for a GT ancestor with nearby same-class
+            # source evidence that failed deterministic one-to-one matching.
+            amb = set()
+            for ann in anns:
+                tok = str(ann["instance_token"])
+                if tok in matched_now:
+                    continue
+                ac = np.asarray(ann["center_world"], dtype=np.float64)
+                same = [
+                    comp for comp in comps
+                    if int(comp["class_id"]) == int(ann["class_id"])
+                    and float(
+                        np.linalg.norm(
+                            np.asarray(comp["centroid_world"])[:2] - ac[:2]
+                        )
+                    )
+                    <= 1.5 * float(match_max_distance_m)
+                ]
+                if same:
+                    amb.add(tok)
+            cached = (comps, matched_now, amb)
+            if token_cache is not None:
+                token_cache[key] = cached
+        comps, matched_now, amb = cached
+        components_by_frame.append(comps)
+        matched_sets.append(set(matched_now))
+        ambiguous_sets.append(set(amb))
     return components_by_frame, matched_sets, ambiguous_sets
 
 
-def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
+def _future_dynamic_targets(
+    source, w, raw, matched_sets, ambiguous_sets, *, ann_cache=None
+):
     t0_pose = np.asarray(raw["history_poses"][-1], dtype=np.float64)
     inv_t0 = np.linalg.inv(t0_pose)
     t0_yaw = math.atan2(float(t0_pose[1, 0]), float(t0_pose[0, 0]))
@@ -151,7 +165,15 @@ def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
     earlier = set().union(*matched_sets[:-1])
     ambiguous_hist = set().union(*ambiguous_sets)
 
-    future_maps = [_ann_by_instance(source.nusc, tok) for tok in w.future_tokens]
+    future_maps = []
+    for tok in w.future_tokens:
+        key = str(tok)
+        amap = None if ann_cache is None else ann_cache.get(key)
+        if amap is None:
+            amap = _ann_by_instance(source.nusc, key)
+            if ann_cache is not None:
+                ann_cache[key] = amap
+        future_maps.append(amap)
     tokens = sorted(set().union(*(set(x) for x in future_maps)))
     records = []
     counts = {x.name: 0 for x in DynamicResponsibility}
@@ -195,21 +217,49 @@ def _future_dynamic_targets(source, w, raw, matched_sets, ambiguous_sets):
     return records, counts
 
 
-def _static_sparse_supervision(source, w, raw, free_label):
+def _static_sparse_supervision(
+    source, w, raw, free_label, *, token_cache=None
+):
     rows = []
     for token in w.future_tokens:
-        gt, obs = source.load_occ3d(
-            str(w.scene_name), str(token), require_lidar_mask=True
-        )
-        rows.append(
-            pack_static_supervision(
+        key = str(token)
+        sup = None if token_cache is None else token_cache.get(key)
+        if sup is None:
+            gt, obs = source.load_occ3d(
+                str(w.scene_name), key, require_lidar_mask=True
+            )
+            sup = pack_static_supervision(
                 np.asarray(gt, dtype=np.uint8),
                 np.asarray(obs, dtype=bool),
                 dynamic_class_ids=DYNAMIC_IDS,
                 free_label=int(free_label),
             )
-        )
+            if token_cache is not None:
+                token_cache[key] = sup
+        rows.append(sup)
     return rows
+
+
+def _load_stage1_raw(source, w):
+    """Load only the arrays Stage-1 actually consumes.
+
+    Unlike load_nuscenes_window_raw(), this deliberately skips the official
+    trajectory construction because Stage-1 never stores or reads it.
+    """
+    hist = []
+    hist_obs = []
+    for token in w.history_tokens:
+        sem, obs = source.load_occ3d(
+            str(w.scene_name), str(token), require_lidar_mask=True
+        )
+        hist.append(np.asarray(sem, dtype=np.uint8))
+        hist_obs.append(np.asarray(obs, dtype=bool))
+    return {
+        "history_occ": np.stack(hist),
+        "history_observed": np.stack(hist_obs),
+        "history_poses": [source.pose(t) for t in w.history_tokens],
+        "future_poses": [source.pose(t) for t in w.future_tokens],
+    }
 
 
 def main():
@@ -223,6 +273,15 @@ def main():
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--shard-size", type=int, default=16)
     p.add_argument("--match-max-distance-m", type=float, default=4.0)
+    p.add_argument(
+        "--record-order",
+        choices=("scene", "source"),
+        default="scene",
+        help=(
+            "scene groups overlapping windows so token-level caches are reused; "
+            "source preserves the source-cache order"
+        ),
+    )
     a = p.parse_args()
 
     v20 = _load_v20(a.v20_config)
@@ -240,6 +299,13 @@ def main():
     high, coarse = _coarse_lattice(v20)
     pcfg = make_prepare_config(load_runtime_config(a.config, a.override))
     _, records = base.load_cache(a.source_cache)
+    if str(a.record_order) == "scene":
+        # Stable grouping: preserve original temporal/order relationship within
+        # each scene while bringing overlapping windows together for cache reuse.
+        records = sorted(
+            records,
+            key=lambda r: str(r["scene_name"]),
+        )
     if int(a.max_windows) > 0:
         records = records[:min(len(records), int(a.max_windows))]
     if not records:
@@ -262,11 +328,41 @@ def main():
     static_semantic_values = 0
     dyn_totals = {x.name: 0 for x in DynamicResponsibility}
     scene_names = set()
+    current_scene = None
+    history_source_cache = {}
+    future_ann_cache = {}
+    static_supervision_cache = {}
+    cache_stats = {
+        "scene_resets": 0,
+        "history_source_hits": 0,
+        "history_source_misses": 0,
+        "future_ann_hits": 0,
+        "future_ann_misses": 0,
+        "static_supervision_hits": 0,
+        "static_supervision_misses": 0,
+    }
+    phase_seconds = {
+        "raw_load": 0.0,
+        "history_align": 0.0,
+        "dynamic_labels": 0.0,
+        "static_supervision": 0.0,
+        "packing": 0.0,
+    }
     for wi, rec in enumerate(records, start=1):
         window_started = time.perf_counter()
         w = window_from_record(rec)
-        scene_names.add(str(w.scene_name))
-        raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=False)
+        scene_name = str(w.scene_name)
+        scene_names.add(scene_name)
+        if scene_name != current_scene:
+            current_scene = scene_name
+            history_source_cache.clear()
+            future_ann_cache.clear()
+            static_supervision_cache.clear()
+            cache_stats["scene_resets"] += 1
+
+        t_phase = time.perf_counter()
+        raw = _load_stage1_raw(source, w)
+        phase_seconds["raw_load"] += time.perf_counter() - t_phase
         history_occ = np.asarray(raw["history_occ"], dtype=np.uint8)
         history_obs = np.asarray(raw["history_observed"], dtype=bool)
         history_poses = np.asarray(raw["history_poses"], dtype=np.float64)
@@ -274,6 +370,7 @@ def main():
         t0_pose = history_poses[-1]
         future_rel = poses_to_t0_canonical(future_poses_world, t0_pose)
 
+        t_phase = time.perf_counter()
         aligned = align_history_once_to_canonical(
             coarse,
             history_semantic=history_occ,
@@ -284,18 +381,53 @@ def main():
             native_voxel_size_xyz_m=pcfg.grid.voxel_size,
             free_label=int(pcfg.free_label),
         )
-        _, matched, ambiguous = _history_source_evidence(
-            source, w, raw, pcfg, strong_cfg, float(a.match_max_distance_m)
+        phase_seconds["history_align"] += time.perf_counter() - t_phase
+
+        hist_keys = [str(x) for x in w.history_tokens]
+        cache_stats["history_source_hits"] += sum(
+            key in history_source_cache for key in hist_keys
         )
-        dyn, counts = _future_dynamic_targets(source, w, raw, matched, ambiguous)
+        cache_stats["history_source_misses"] += sum(
+            key not in history_source_cache for key in hist_keys
+        )
+        fut_keys = [str(x) for x in w.future_tokens]
+        cache_stats["future_ann_hits"] += sum(
+            key in future_ann_cache for key in fut_keys
+        )
+        cache_stats["future_ann_misses"] += sum(
+            key not in future_ann_cache for key in fut_keys
+        )
+
+        t_phase = time.perf_counter()
+        _, matched, ambiguous = _history_source_evidence(
+            source, w, raw, pcfg, strong_cfg, float(a.match_max_distance_m),
+            token_cache=history_source_cache,
+        )
+        dyn, counts = _future_dynamic_targets(
+            source, w, raw, matched, ambiguous,
+            ann_cache=future_ann_cache,
+        )
+        phase_seconds["dynamic_labels"] += time.perf_counter() - t_phase
         for k, v in counts.items():
             dyn_totals[k] += int(v)
 
-        static_sup = _static_sparse_supervision(source, w, raw, int(pcfg.free_label))
+        cache_stats["static_supervision_hits"] += sum(
+            key in static_supervision_cache for key in fut_keys
+        )
+        cache_stats["static_supervision_misses"] += sum(
+            key not in static_supervision_cache for key in fut_keys
+        )
+        t_phase = time.perf_counter()
+        static_sup = _static_sparse_supervision(
+            source, w, raw, int(pcfg.free_label),
+            token_cache=static_supervision_cache,
+        )
+        phase_seconds["static_supervision"] += time.perf_counter() - t_phase
         # Future query OOB was already proven zero by the frozen full-population
         # Omega audit. Stage-1 v2 deliberately does not re-rasterize 3.84M
         # future native points per window just to reproduce that proof.
         oob_history += int(aligned.out_of_bounds_samples)
+        t_phase = time.perf_counter()
         packed_history = pack_history_semantic(
             aligned.semantic,
             aligned.observed,
@@ -308,6 +440,7 @@ def main():
         static_semantic_values += int(
             sum(int(x["semantic_count"]) for x in static_sup)
         )
+        phase_seconds["packing"] += time.perf_counter() - t_phase
         rows.append({
             "scene_name": str(w.scene_name),
             "t0_token": str(w.t0_token),
@@ -349,6 +482,9 @@ def main():
         "num_scenes": len(scene_names),
         "scene_names": sorted(scene_names),
         "canonical_frame": "per_window_t0_ego",
+        "record_order": str(a.record_order),
+        "token_cache_stats": cache_stats,
+        "phase_seconds": phase_seconds,
         "highres_lattice": {
             "origin_xyz_m": list(high.origin_xyz_m),
             "voxel_size_xyz_m": list(high.voxel_size_xyz_m),
