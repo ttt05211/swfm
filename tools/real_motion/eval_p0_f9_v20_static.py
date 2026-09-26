@@ -33,6 +33,9 @@ from real_motion.v20_runtime import (
     static_subset_masks,
 )
 from real_motion.v20_training import load_v20_checkpoint
+from real_motion.v20_static_repair import (
+    TRAIN_PROTOCOL as STATIC_REPAIR_PROTOCOL,
+)
 from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
 from tools.real_motion.build_p0_f9_v20_history_cache import (
     PROTOCOL as STAGE1_PROTOCOL,
@@ -265,6 +268,11 @@ def main():
             "checkpoint selection; run full eval once for selected epochs."
         ),
     )
+    p.add_argument(
+        "--allow-legacy-v1",
+        action="store_true",
+        help="Explicitly allow evaluation of the failed legacy Static-v1 checkpoint.",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
     a = p.parse_args()
@@ -305,6 +313,14 @@ def main():
     if str(vck.get("stage")) != "static":
         raise RuntimeError(f"expected V20 static checkpoint, got {vck.get('stage')}")
     extra = dict(vck.get("extra") or {})
+    train_protocol = str(extra.get("train_protocol", ""))
+    is_repair_v2 = train_protocol == STATIC_REPAIR_PROTOCOL
+    if not is_repair_v2 and not bool(a.allow_legacy_v1):
+        raise RuntimeError(
+            "formal Static evaluation refuses non-Repair-v2 checkpoints. "
+            "Use a p0_f9_v20_static_repair_train_v2 checkpoint, or pass "
+            "--allow-legacy-v1 only for explicit failed-protocol reproduction."
+        )
     high = _lattice(extra["highres_lattice"])
     coarse = _lattice(extra["coarse_lattice"])
     tile_size = tuple(int(x) for x in extra.get("tile_size_xyz", [32, 32, 16]))
@@ -501,6 +517,14 @@ def main():
         "base_checkpoint": str(Path(a.base_checkpoint).resolve()),
         "base_checkpoint_epoch": int(base_ck.get("epoch", -1)),
         "v20_checkpoint": str(Path(a.v20_checkpoint).resolve()),
+        "v20_train_protocol": train_protocol,
+        "overfit_diagnostic_only": bool(
+            extra.get("overfit_diagnostic_only", False)
+        ),
+        "checkpoint_eligible_for_formal_selection": bool(
+            is_repair_v2
+            and not bool(extra.get("overfit_diagnostic_only", False))
+        ),
         "future_gt_used_for_prediction": False,
         "static_memory_unconditional_output": False,
         "metrics": metrics,

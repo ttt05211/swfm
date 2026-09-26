@@ -1214,3 +1214,77 @@ def test_static_repair_builder_never_reads_future_gt_or_lidar_masks():
     assert "future_gt_occ" not in src
     assert "load_lidar_observation" not in src
     assert "load_semantics" in src  # only t-1/t0 causal V18 input semantics
+
+
+def test_static_repair_query_decode_backpropagates_to_encoder_and_head():
+    from real_motion.v20_scene_model import (
+        V20HistoryWorldModel,
+        V20SceneConfig,
+    )
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _decode_query_logits,
+        _high_context,
+    )
+
+    torch.manual_seed(73)
+    coarse = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (1.0, 1.0, 1.0), (4, 4, 2)
+    )
+    high = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (0.5, 0.5, 0.5), (8, 8, 4)
+    )
+    native_shape = (4, 4, 2)
+    geom = _Geometry(
+        high,
+        coarse,
+        native_shape,
+        (-1.0, -1.0, -0.5),
+        (0.5, 0.5, 0.5),
+        (4, 4, 2),
+        torch.device("cpu"),
+    )
+    cfg = V20SceneConfig(
+        semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+    )
+    model = V20HistoryWorldModel(cfg)
+    sem = torch.randint(0, 18, (1, 6, 4, 4, 2))
+    obs = torch.ones_like(sem, dtype=torch.bool)
+    obsfree = obs & (sem == 17)
+    scene = model.encode_history(sem, obs, obsfree)
+
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    linear, q = geom.future_linear_and_query(poses)
+    seen_h, missing_h = _high_context(
+        obs[0].numpy(), geom, torch.device("cpu")
+    )
+    world, _ = _decode_query_logits(
+        model,
+        scene,
+        q,
+        seen_h,
+        missing_h,
+        geom,
+        tile_batch_size=16,
+    )
+    # Gather only deployed future-query positions, exactly as Repair loss does.
+    picked = world.reshape(world.shape[0], -1)[:, linear.reshape(-1)]
+    loss = picked.square().mean()
+    loss.backward()
+
+    assert model.encoder.stem[0].weight.grad is not None
+    assert torch.isfinite(model.encoder.stem[0].weight.grad).all()
+    assert model.static.tile_refine[0].weight.grad is not None
+    assert torch.isfinite(model.static.tile_refine[0].weight.grad).all()
+    assert model.static.tile_refine[-1].weight.grad is not None
+    assert torch.isfinite(model.static.tile_refine[-1].weight.grad).all()
+
+
+def test_static_eval_defaults_to_repair_v2_only():
+    import inspect
+    from tools.real_motion import eval_p0_f9_v20_static as m
+
+    src = inspect.getsource(m.main)
+    assert "STATIC_REPAIR_PROTOCOL" in src
+    assert "--allow-legacy-v1" in src
+    assert "checkpoint_eligible_for_formal_selection" in src

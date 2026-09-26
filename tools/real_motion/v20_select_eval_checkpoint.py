@@ -41,6 +41,10 @@ def main():
             base_checkpoint = base
         elif base != base_checkpoint:
             raise RuntimeError("refusing selection across different V18 checkpoints")
+        if obj.get("checkpoint_eligible_for_formal_selection") is False:
+            raise RuntimeError(
+                f"{path}: checkpoint is explicitly ineligible for formal selection"
+            )
         checkpoint = (
             obj.get("v20_checkpoint")
             or obj.get("stage0_checkpoint")
