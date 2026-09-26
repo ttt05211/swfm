@@ -1,251 +1,183 @@
-"""V20 Stage-2 Static Repair supervision contract.
+"""V20 Stage-2 Static Repair v2 supervision contracts.
 
-The deployed Static branch is protected-add-only on top of frozen V18.
-Training therefore supervises only positions where frozen V18 predicts free,
-over the same full future occupancy grid used by formal evaluation.
+The v1 Static objective was future-LiDAR sparse while formal evaluation was
+full-grid.  Repair-v2 makes training match deployment:
 
-Target semantics on that support:
-* static occupied GT -> its static semantic label;
-* free GT -> free/no-add;
-* dynamic GT -> free/no-add (owned by Dormant/Birth, never Static).
+* supervision domain is the full formal future occupancy grid;
+* Static has decision authority only where frozen V18 predicts FREE;
+* static GT occupied -> its semantic class;
+* GT free or dynamic -> FREE/no-add;
+* six horizon contributions are retained independently after canonical mapping;
+* no class reweighting is part of this protocol.
 
-Future lidar observation masks are deliberately absent from this contract.
+The cache stores only two compact native-grid masks plus packed positive static
+labels. Full-grid FREE/no-add targets are implicit, which keeps the cache
+lossless without materializing dense semantic targets.
 """
 from __future__ import annotations
 
-import hashlib
-from typing import Iterable, Mapping, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch
 
 from .metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
-from .v20_history_world import FREE_LABEL
-from .v20_stage1_codec import pack_bool, unpack_bool
+from .motion_transport import FUTURE_FRAMES
+from .v20_stage1_codec import (
+    _pack_nibbles,
+    _unpack_nibbles,
+    pack_bool,
+    unpack_bool,
+)
 
-SUPPORT_CACHE_PROTOCOL = "p0_f9_v20_static_repair_support_v2"
-TRAIN_PROTOCOL = "p0_f9_v20_static_repair_train_v2"
+FREE_LABEL = 17
+REPAIR_CACHE_PROTOCOL = "p0_f9_v20_static_repair_cache_v2"
+REPAIR_TRAIN_PROTOCOL = "p0_f9_v20_static_repair_train_v2"
+REPAIR_STAGE = "static_repair_v2"
 
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 DYNAMIC_SET = frozenset(DYNAMIC_IDS)
-STATIC_ALLOWED_IDS = tuple(i for i in range(18) if i not in DYNAMIC_SET)
-STATIC_SEMANTIC_IDS = tuple(i for i in range(17) if i not in DYNAMIC_SET)
+STATIC_POSITIVE_IDS = tuple(
+    i for i in range(FREE_LABEL) if i not in DYNAMIC_SET
+)
+if len(STATIC_POSITIVE_IDS) > 16:
+    raise RuntimeError("Static positive taxonomy no longer fits 4 bits")
+
+_STATIC_POS_TO_CODE = np.full(18, 255, dtype=np.uint8)
+for _code, _label in enumerate(STATIC_POSITIVE_IDS):
+    _STATIC_POS_TO_CODE[_label] = _code
+_CODE_TO_STATIC_POS = np.asarray(STATIC_POSITIVE_IDS, dtype=np.uint8)
 
 
-def population_fingerprint(rows: Iterable[Mapping[str, object]]) -> str:
-    h = hashlib.sha256()
-    for row in rows:
-        h.update(str(row["scene_name"]).encode("utf-8"))
-        h.update(b"\0")
-        h.update(str(row["t0_token"]).encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()
-
-
-def pack_v18_free_support(mask: np.ndarray) -> torch.Tensor:
-    arr = np.asarray(mask, dtype=bool)
-    if arr.ndim != 4 or arr.shape[0] != 6:
-        raise ValueError("V18-free support must be [6,X,Y,Z]")
-    return pack_bool(arr)
-
-
-def unpack_v18_free_support(
-    bits: torch.Tensor | np.ndarray,
-    native_shape_xyz: Sequence[int],
-) -> np.ndarray:
-    shape = (6,) + tuple(int(x) for x in native_shape_xyz)
-    return unpack_bool(bits, shape)
-
-
-def _pack_5bit(values: np.ndarray) -> torch.Tensor:
-    vals = np.asarray(values, dtype=np.uint8).reshape(-1)
-    if vals.size and int(vals.max()) > 31:
-        raise ValueError("5-bit pack received value >31")
-    if vals.size == 0:
-        return torch.empty(0, dtype=torch.uint8)
-    shifts = np.arange(5, dtype=np.uint8)
-    bits = ((vals[:, None] >> shifts[None]) & 1).astype(np.uint8)
-    return torch.from_numpy(
-        np.packbits(bits.reshape(-1), bitorder="little").copy()
-    )
-
-
-def _unpack_5bit(packed: torch.Tensor | np.ndarray, count: int) -> np.ndarray:
-    count = int(count)
-    if count == 0:
-        return np.empty(0, dtype=np.uint8)
-    arr = np.asarray(
-        packed.cpu() if isinstance(packed, torch.Tensor) else packed,
-        dtype=np.uint8,
-    )
-    bits = np.unpackbits(
-        arr.reshape(-1), bitorder="little", count=count * 5
-    ).reshape(count, 5)
-    weights = (1 << np.arange(5, dtype=np.uint8))[None]
-    return (bits * weights).sum(
-        axis=1, dtype=np.uint16
-    ).astype(np.uint8)
-
-
-def pack_v18_prediction(
-    pred: np.ndarray,
+def pack_static_repair_supervision(
+    v18_prediction: np.ndarray,
+    future_gt: np.ndarray,
     *,
     free_label: int = FREE_LABEL,
 ) -> dict[str, object]:
-    y = np.asarray(pred, dtype=np.uint8)
-    if y.ndim != 4 or y.shape[0] != 6:
-        raise ValueError("V18 prediction must be [6,X,Y,Z]")
-    if y.size and int(y.max()) >= 18:
-        raise ValueError("V18 prediction outside frozen taxonomy")
-    free = y == int(free_label)
-    occupied_labels = y[~free]
-    return {
-        "v18_free_bits": pack_v18_free_support(free),
-        "v18_occupied_semantic_5bit": _pack_5bit(occupied_labels),
-        "v18_occupied_semantic_count": int(occupied_labels.size),
-        "v18_free_count_by_horizon": torch.from_numpy(
-            free.reshape(6, -1).sum(axis=1).astype(np.int64)
-        ),
-    }
+    """Pack exact full-grid composition-aware Static supervision.
 
-
-def unpack_v18_prediction(
-    row: Mapping[str, object],
-    native_shape_xyz: Sequence[int],
-    *,
-    free_label: int = FREE_LABEL,
-) -> np.ndarray:
-    free = unpack_v18_free_support(
-        row["v18_free_bits"], native_shape_xyz
-    )
-    labels = _unpack_5bit(
-        row["v18_occupied_semantic_5bit"],
-        int(row["v18_occupied_semantic_count"]),
-    )
-    occupied = ~free
-    if int(occupied.sum()) != int(labels.size):
-        raise RuntimeError("V18 occupied semantic count mismatch")
-    out = np.full(free.shape, int(free_label), dtype=np.uint8)
-    out[occupied] = labels
-    return out
-
-
-def repair_target_from_gt(
-    gt: np.ndarray,
-    *,
-    free_label: int = FREE_LABEL,
-) -> np.ndarray:
-    """Convert formal future GT into Static add/no-add semantic targets."""
-    y = np.asarray(gt, dtype=np.uint8)
-    if y.ndim != 4 or y.shape[0] != 6:
-        raise ValueError("future GT must be [6,X,Y,Z]")
-    if y.size and int(y.max()) >= 18:
-        raise ValueError("future GT contains label outside frozen 18-class taxonomy")
-    out = y.copy()
-    dyn = np.isin(out, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
-    out[dyn] = int(free_label)
-    return out
-
-
-def repair_confusion(
-    target: np.ndarray,
-    pred: np.ndarray,
-    support: np.ndarray,
-    *,
-    free_label: int = FREE_LABEL,
-) -> np.ndarray:
-    """18x18 confusion on the actual Static decision support.
-
-    The GT-free row is retained.  Static semantic mIoU later excludes free
-    from the class average but free->semantic errors remain in semantic unions.
+    V18-occupied voxels are outside Static's deployed decision support.
+    Everywhere else the target defaults to FREE/no-add; only static occupied GT
+    needs an explicit semantic label. Dynamic GT is intentionally FREE/no-add
+    for this branch and remains the responsibility of V18/Dormant/Birth.
     """
-    y = np.asarray(target)
-    p = np.asarray(pred)
-    s = np.asarray(support, dtype=bool)
-    if y.shape != p.shape or y.shape != s.shape:
-        raise ValueError("repair target/pred/support shape mismatch")
-    yy = y[s].astype(np.int64, copy=False)
-    pp = p[s].astype(np.int64, copy=False)
-    code = yy * 18 + pp
-    return np.bincount(code, minlength=18 * 18).reshape(18, 18)
+    pred = np.asarray(v18_prediction, dtype=np.uint8)
+    gt = np.asarray(future_gt, dtype=np.uint8)
+    if pred.shape != gt.shape or pred.ndim != 4:
+        raise ValueError("V18 prediction/GT must match [F,X,Y,Z]")
+    if pred.shape[0] != FUTURE_FRAMES:
+        raise ValueError("Static Repair v2 requires six future frames")
+    if pred.size and (int(pred.min()) < 0 or int(pred.max()) > int(free_label)):
+        raise ValueError("V18 prediction label outside semantic taxonomy")
+    if gt.size and (int(gt.min()) < 0 or int(gt.max()) > int(free_label)):
+        raise ValueError("future GT label outside semantic taxonomy")
 
+    v18_occupied = pred != int(free_label)
+    dynamic_gt = np.isin(gt, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
+    static_positive = (
+        (~v18_occupied)
+        & (gt != int(free_label))
+        & (~dynamic_gt)
+    )
+    labels = gt[static_positive]
+    codes = (
+        _STATIC_POS_TO_CODE[labels]
+        if labels.size
+        else np.empty(0, dtype=np.uint8)
+    )
+    if codes.size and bool((codes == 255).any()):
+        bad = np.unique(labels[codes == 255]).tolist()
+        raise RuntimeError(
+            f"non-static label entered Static Repair positive targets: {bad}"
+        )
 
-def repair_diagnostics_from_confusion(
-    conf: np.ndarray,
-    *,
-    free_label: int = FREE_LABEL,
-) -> dict[str, object]:
-    c = np.asarray(conf, dtype=np.int64)
-    if c.shape != (18, 18):
-        raise ValueError("repair confusion must be 18x18")
-    free = int(free_label)
-    static_ids = tuple(int(x) for x in STATIC_SEMANTIC_IDS)
-
-    pred_occ = int(c[:, :free].sum())
-    gt_static = int(c[list(static_ids), :].sum())
-    add_tp = int(c[list(static_ids), :free].sum())
-    add_fp = int(c[free, :free].sum())
-    semantic_correct = int(sum(c[i, i] for i in static_ids))
-
-    per = {}
-    vals = []
-    for cid in static_ids:
-        tp = int(c[cid, cid])
-        union = int(c[cid, :].sum() + c[:, cid].sum() - tp)
-        iou = float(tp / union) if union else float("nan")
-        per[str(cid)] = iou
-        if union:
-            vals.append(iou)
+    support = ~v18_occupied
+    static_positive_count = int(static_positive.sum())
+    support_count = int(support.sum())
+    dynamic_noadd_count = int((support & dynamic_gt).sum())
+    free_noadd_count = int((support & (gt == int(free_label))).sum())
+    if static_positive_count + dynamic_noadd_count + free_noadd_count != support_count:
+        raise RuntimeError("Static Repair support partition is not exhaustive")
 
     return {
-        "support_voxels": int(c.sum()),
-        "predicted_add_voxels": pred_occ,
-        "target_static_positive_voxels": gt_static,
-        "added_tp": add_tp,
-        "added_fp": add_fp,
-        "addition_precision": float(add_tp / max(add_tp + add_fp, 1)),
-        "static_positive_recall": float(add_tp / max(gt_static, 1)),
-        "semantic_accuracy_on_static_positive": float(
-            semantic_correct / max(add_tp, 1)
-        ),
-        "repair_support_semantic_miou": (
-            float(np.mean(vals)) if vals else float("nan")
-        ),
-        "per_static_class_iou": per,
+        "shape_fxyz": tuple(int(x) for x in pred.shape),
+        "v18_occupied_bits": pack_bool(v18_occupied),
+        "static_positive_bits": pack_bool(static_positive),
+        "static_positive_semantic_4bit": _pack_nibbles(codes),
+        "static_positive_count": static_positive_count,
+        "v18_occupied_count": int(v18_occupied.sum()),
+        "support_count": support_count,
+        "free_noadd_count": free_noadd_count,
+        "dynamic_noadd_count": dynamic_noadd_count,
     }
 
 
-def full_grid_metrics_from_confusion(conf_by_horizon: np.ndarray) -> dict[str, object]:
-    """Formal full-grid IoU/mIoU summary from six 18x18 confusions."""
-    c = np.asarray(conf_by_horizon, dtype=np.int64)
-    if c.shape != (6, 18, 18):
-        raise ValueError("full-grid confusion must be [6,18,18]")
-    occ, miou = [], []
+def unpack_static_repair_supervision(
+    row: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return V18 occupied mask, static-positive mask and positive labels."""
+    shape = tuple(int(x) for x in row["shape_fxyz"])
+    if len(shape) != 4 or shape[0] != FUTURE_FRAMES:
+        raise RuntimeError("invalid Static Repair cached shape")
+    v18_occupied = unpack_bool(row["v18_occupied_bits"], shape)
+    static_positive = unpack_bool(row["static_positive_bits"], shape)
+    if bool((static_positive & v18_occupied).any()):
+        raise RuntimeError("Static Repair positive overlaps V18-occupied support")
+    count = int(row["static_positive_count"])
+    if count != int(static_positive.sum()):
+        raise RuntimeError("Static Repair positive count/mask mismatch")
+    codes = _unpack_nibbles(
+        row["static_positive_semantic_4bit"], count
+    )
+    if codes.size and int(codes.max()) >= len(_CODE_TO_STATIC_POS):
+        raise RuntimeError("invalid Static Repair semantic code")
+    labels = (
+        _CODE_TO_STATIC_POS[codes]
+        if codes.size
+        else np.empty(0, dtype=np.uint8)
+    )
+    if int((~v18_occupied).sum()) != int(row["support_count"]):
+        raise RuntimeError("Static Repair support count mismatch")
+    return v18_occupied, static_positive, labels
+
+
+def repair_confusion_summary(confusion: np.ndarray) -> dict[str, float | int]:
+    """Composition-aware diagnostics from exact repair-target confusion.
+
+    Rows are repair GT (static semantic or FREE/no-add), columns are Static
+    predictions. Dynamic semantic output columns are structurally impossible.
+    FREE-row false positives are retained in every static-class IoU union.
+    """
+    conf = np.asarray(confusion, dtype=np.int64)
+    if conf.shape != (18, 18):
+        raise ValueError("repair confusion must be 18x18")
+    static_ids = np.asarray(STATIC_POSITIVE_IDS, dtype=np.int64)
+    tp_sem = int(sum(int(conf[c, c]) for c in STATIC_POSITIVE_IDS))
+    gt_pos = int(conf[static_ids, :].sum())
+    added_on_pos = int(conf[np.ix_(static_ids, static_ids)].sum())
+    added_on_noadd = int(conf[int(FREE_LABEL), static_ids].sum())
+    added = added_on_pos + added_on_noadd
+    vals = []
     per = {}
-    for hi in range(6):
-        ch = c[hi]
-        oi = int(ch[:17, :17].sum())
-        ou = int(ch.sum() - ch[17, 17])
-        ov = float(100.0 * oi / ou) if ou else float("nan")
-        vals = []
-        for cid in range(17):
-            tp = int(ch[cid, cid])
-            union = int(
-                ch[cid, :].sum() + ch[:, cid].sum() - tp
-            )
-            if union:
-                vals.append(float(tp / union))
-        mv = float(100.0 * np.mean(vals)) if vals else float("nan")
-        occ.append(ov)
-        miou.append(mv)
-        per[str(0.5 * (hi + 1))] = {"IoU": ov, "mIoU": mv}
-    main = (1, 3, 5)
+    for cid in STATIC_POSITIVE_IDS:
+        tp = int(conf[cid, cid])
+        union = int(conf[cid, :].sum() + conf[:, cid].sum() - tp)
+        value = float(tp / union) if union else float("nan")
+        per[str(cid)] = value
+        if union:
+            vals.append(value)
     return {
-        "IoU": float(np.nanmean(occ)),
-        "mIoU": float(np.nanmean(miou)),
-        "main_1_2_3s": {
-            "IoU": float(np.nanmean([occ[i] for i in main])),
-            "mIoU": float(np.nanmean([miou[i] for i in main])),
-        },
-        "per_horizon": per,
+        "repair_static_mIoU": float(np.mean(vals)) if vals else float("nan"),
+        "added_precision": float(added_on_pos / max(added, 1)),
+        "added_recall": float(added_on_pos / max(gt_pos, 1)),
+        "semantic_accuracy_on_positive_adds": float(
+            tp_sem / max(added_on_pos, 1)
+        ),
+        "added_voxels": added,
+        "added_positive": added_on_pos,
+        "added_noadd_fp": added_on_noadd,
+        "target_static_positive": gt_pos,
+        "semantic_correct_positive": tp_sem,
+        "per_class_iou": per,
     }
