@@ -1374,3 +1374,181 @@ def test_static_eval_binds_checkpoint_to_requested_v18():
     assert "Path(checkpoint_v18).resolve()" in src
     assert "Path(a.base_checkpoint).resolve()" in src
     assert "evaluation_population_truncated" in src
+
+
+def test_static_repair_sparse_query_decode_matches_dense_reference():
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _decode_query_logits,
+        _decode_query_logits_sparse,
+        _high_context,
+    )
+
+    torch.manual_seed(79)
+    coarse = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (1.0, 1.0, 1.0), (4, 4, 2)
+    )
+    high = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (0.5, 0.5, 0.5), (8, 8, 4)
+    )
+    geom = _Geometry(
+        high, coarse, (4, 4, 2),
+        (-1.0, -1.0, -0.5), (0.5, 0.5, 0.5),
+        (4, 4, 2), torch.device("cpu"),
+    )
+    cfg = V20SceneConfig(
+        semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+    )
+    model = V20HistoryWorldModel(cfg).eval()
+    sem = torch.randint(0, 18, (1, 6, 4, 4, 2))
+    obs = (torch.rand(1, 6, 4, 4, 2) > 0.25)
+    obsfree = obs & (sem == 17)
+    with torch.inference_mode():
+        scene = model.encode_history(sem, obs, obsfree)
+        poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+        poses[:, 0, 3] = np.linspace(-0.1, 0.2, FUTURE_FRAMES)
+        linear, q = geom.future_linear_and_query(poses)
+        seen_h, missing_h = _high_context(
+            obs[0].numpy(), geom, torch.device("cpu")
+        )
+        dense, nd = _decode_query_logits(
+            model, scene, q, seen_h, missing_h, geom,
+            tile_batch_size=8,
+        )
+        sparse, row_map, ns = _decode_query_logits_sparse(
+            model, scene, q, obs[0].numpy(), geom,
+            tile_batch_size=8,
+        )
+
+    qlin = torch.nonzero(q.reshape(-1), as_tuple=False).reshape(-1)
+    ref = dense.reshape(dense.shape[0], -1)[:, qlin].transpose(0, 1)
+    assert nd == ns
+    assert torch.allclose(sparse, ref, atol=1e-6, rtol=1e-6)
+    assert torch.equal(
+        row_map[qlin].long(),
+        torch.arange(len(qlin), dtype=torch.long),
+    )
+    assert bool((row_map[linear.reshape(-1)] >= 0).all())
+
+
+def test_static_repair_sparse_loss_matches_dense_reference():
+    from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _repair_loss_and_confusion,
+        _repair_sparse_loss_and_confusion,
+    )
+
+    rng = np.random.default_rng(83)
+    high = CanonicalLattice(
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (4, 3, 2)
+    )
+    coarse = CanonicalLattice(
+        (0.0, 0.0, 0.0), (2.0, 2.0, 2.0), (2, 2, 1)
+    )
+    geom = _Geometry(
+        high, coarse, (2, 2, 1),
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+        (2, 2, 1), torch.device("cpu"),
+    )
+    A = len(STATIC_ALLOWED_IDS)
+    world = torch.randn((A,) + high.shape_xyz, dtype=torch.float32)
+    # Six horizons, four native voxels each, all inside the query union.
+    linear = torch.tensor([
+        [0, 1, 6, 7],
+        [1, 2, 7, 8],
+        [2, 3, 8, 9],
+        [3, 4, 9, 10],
+        [4, 5, 10, 11],
+        [5, 0, 11, 6],
+    ], dtype=torch.long)
+    q = torch.zeros(int(np.prod(high.shape_xyz)), dtype=torch.bool)
+    q[linear.reshape(-1)] = True
+    qlin = torch.nonzero(q, as_tuple=False).reshape(-1)
+    row_map = torch.full(
+        (int(np.prod(high.shape_xyz)),), -1, dtype=torch.int32
+    )
+    row_map[qlin] = torch.arange(len(qlin), dtype=torch.int32)
+    query_logits = world.reshape(A, -1)[:, qlin].transpose(0, 1)
+
+    support = rng.random((6, 2, 2, 1)) > 0.25
+    allowed = np.asarray(STATIC_ALLOWED_IDS, dtype=np.uint8)
+    target = rng.choice(allowed, size=(6, 2, 2, 1)).astype(np.uint8)
+    gt = rng.integers(0, 18, size=(6, 2, 2, 1), dtype=np.uint8)
+    base = rng.integers(0, 18, size=(6, 2, 2, 1), dtype=np.uint8)
+    base[support] = 17
+
+    base_full = np.zeros((6, 18, 18), dtype=np.int64)
+    base_support = np.zeros((6, 18, 18), dtype=np.int64)
+    for hi in range(6):
+        g = gt[hi].reshape(-1).astype(np.int64)
+        b = base[hi].reshape(-1).astype(np.int64)
+        s = support[hi].reshape(-1)
+        base_full[hi] = np.bincount(
+            g * 18 + b, minlength=18 * 18
+        ).reshape(18, 18)
+        gs = g[s]
+        base_support[hi] = np.bincount(
+            gs * 18 + 17, minlength=18 * 18
+        ).reshape(18, 18)
+
+    ld, cd, bd, fd = _repair_loss_and_confusion(
+        world, linear, support, target,
+        gt=gt, base_pred=base, device=torch.device("cpu"),
+    )
+    ls, cs, bs, fs = _repair_sparse_loss_and_confusion(
+        query_logits, row_map, linear, support, target,
+        gt=gt,
+        base_full_conf=base_full,
+        base_support_conf=base_support,
+        geom=geom,
+        device=torch.device("cpu"),
+    )
+    assert torch.allclose(ls, ld, atol=1e-6, rtol=1e-6)
+    assert torch.equal(cs, cd)
+    assert torch.equal(bs, bd)
+    assert torch.equal(fs, fd)
+
+
+def test_static_repair_sparse_decode_backpropagates():
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _decode_query_logits_sparse,
+    )
+
+    torch.manual_seed(89)
+    coarse = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (1.0, 1.0, 1.0), (4, 4, 2)
+    )
+    high = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (0.5, 0.5, 0.5), (8, 8, 4)
+    )
+    geom = _Geometry(
+        high, coarse, (4, 4, 2),
+        (-1.0, -1.0, -0.5), (0.5, 0.5, 0.5),
+        (4, 4, 2), torch.device("cpu"),
+    )
+    model = V20HistoryWorldModel(
+        V20SceneConfig(
+            semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+        )
+    )
+    sem = torch.randint(0, 18, (1, 6, 4, 4, 2))
+    obs = torch.ones_like(sem, dtype=torch.bool)
+    obsfree = obs & (sem == 17)
+    scene = model.encode_history(sem, obs, obsfree)
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    _, q = geom.future_linear_and_query(poses)
+    logits, _, _ = _decode_query_logits_sparse(
+        model, scene, q, obs[0].numpy(), geom,
+        tile_batch_size=16,
+    )
+    logits.square().mean().backward()
+    assert model.encoder.stem[0].weight.grad is not None
+    assert torch.isfinite(model.encoder.stem[0].weight.grad).all()
+    assert model.static.tile_refine[0].weight.grad is not None
+    assert torch.isfinite(model.static.tile_refine[0].weight.grad).all()
+    assert model.static.tile_refine[-1].weight.grad is not None
+    assert torch.isfinite(model.static.tile_refine[-1].weight.grad).all()
