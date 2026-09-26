@@ -432,9 +432,7 @@ class _Geometry:
             len(STATIC_ALLOWED_IDS), device=device
         )
 
-    def future_linear_and_query(
-        self, future_rel, *, return_active_tiles=False
-    ):
+    def future_linear_and_query(self, future_rel):
         T = torch.as_tensor(
             future_rel, dtype=torch.float64, device=self.device
         )
@@ -469,43 +467,9 @@ class _Geometry:
         )
         q[linear.reshape(-1)] = True
         q = q.reshape(self.high_shape)
-        if return_active_tiles:
-            return linear, q, self.active_tiles_from_indices(idx)
         return linear, q
 
-    def active_tiles_from_indices(self, idx):
-        """Exact active tiles from valid canonical xyz indices."""
-        xyz = idx.reshape(-1, 3).long()
-        tile = torch.as_tensor(
-            self.tile, dtype=torch.long, device=self.device
-        )
-        tc = torch.div(xyz, tile[None], rounding_mode="floor")
-        tx, ty, tz = self.tile
-        ntx = (self.high_shape[0] + tx - 1) // tx
-        nty = (self.high_shape[1] + ty - 1) // ty
-        ntz = (self.high_shape[2] + tz - 1) // tz
-        tile_linear = (
-            tc[:, 0] * (nty * ntz)
-            + tc[:, 1] * ntz
-            + tc[:, 2]
-        )
-        tile_mask = torch.zeros(
-            ntx * nty * ntz, dtype=torch.bool, device=self.device
-        )
-        tile_mask[tile_linear] = True
-        active_linear = torch.nonzero(
-            tile_mask, as_tuple=False
-        ).reshape(-1)
-        ax = torch.div(
-            active_linear, nty * ntz, rounding_mode="floor"
-        )
-        rem = active_linear - ax * (nty * ntz)
-        ay = torch.div(rem, ntz, rounding_mode="floor")
-        az = rem - ay * ntz
-        return torch.stack((ax, ay, az), dim=1).cpu().numpy()
-
     def active_tiles(self, q):
-        """Dense reference path retained for equivalence tests."""
         tx, ty, tz = self.tile
         pooled = F.max_pool3d(
             q[None, None].to(torch.float32),
@@ -516,18 +480,6 @@ class _Geometry:
         return torch.nonzero(
             pooled[0, 0] > 0, as_tuple=False
         ).cpu().numpy()
-
-    def active_tiles_from_linear(self, linear):
-        """Reference helper for tests when xyz indices are unavailable."""
-        lin = linear.reshape(-1).long()
-        Y, Z = self.high_shape[1], self.high_shape[2]
-        yz = int(Y * Z)
-        x = torch.div(lin, yz, rounding_mode="floor")
-        rem = lin - x * yz
-        y = torch.div(rem, int(Z), rounding_mode="floor")
-        z = rem - y * int(Z)
-        idx = torch.stack((x, y, z), dim=1)
-        return self.active_tiles_from_indices(idx)
 
     def tile_grid(self, start, shape, dtype):
         key = (
@@ -684,7 +636,6 @@ def _decode_query_logits_sparse(
     geom,
     *,
     tile_batch_size,
-    active_tiles=None,
 ):
     """Decode only canonical query cells, preserving exact tiled semantics.
 
@@ -720,11 +671,7 @@ def _decode_query_logits_sparse(
     seen_flat = obs_t.any(dim=0).reshape(-1)
     t0_flat = obs_t[-1].reshape(-1)
 
-    active = (
-        geom.active_tiles(q)
-        if active_tiles is None
-        else np.asarray(active_tiles, dtype=np.int64)
-    )
+    active = geom.active_tiles(q)
     buckets = {}
     high_shape = np.asarray(geom.high_shape, dtype=np.int64)
     tile = np.asarray(geom.tile, dtype=np.int64)
@@ -1284,9 +1231,7 @@ def _epoch(
             profiler.stop(prof_events, "encoder")
 
             profiler.start(prof_events, "geometry")
-            linear, q, active_tiles = geom.future_linear_and_query(
-                item["future_rel"], return_active_tiles=True
-            )
+            linear, q = geom.future_linear_and_query(item["future_rel"])
             profiler.stop(prof_events, "geometry")
 
             profiler.start(prof_events, "tile_decode")
@@ -1298,7 +1243,6 @@ def _epoch(
                     item["obs"],
                     geom,
                     tile_batch_size=tile_batch_size,
-                    active_tiles=active_tiles,
                 )
             )
             profiler.stop(prof_events, "tile_decode")
@@ -1447,7 +1391,7 @@ def _epoch(
                     },
                 )
 
-        del query_logits, query_row_map, linear, q, active_tiles, scene
+        del query_logits, query_row_map, linear, q, scene
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
