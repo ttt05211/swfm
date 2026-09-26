@@ -89,7 +89,13 @@ class HistoricalEvidence3DEncoder(nn.Module):
             raise ValueError("V20 requires six history frames")
         if observed.shape != semantic.shape or observed_free.shape != semantic.shape:
             raise ValueError("observed masks must match semantic")
-        if bool((observed_free.bool() & ~observed.bool()).any()):
+        invalid_free = (observed_free.bool() & ~observed.bool()).any()
+        if invalid_free.device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                ~invalid_free,
+                "observed_free cannot occur in unknown voxels",
+            )
+        elif bool(invalid_free.item()):
             raise ValueError("observed_free cannot occur in unknown voxels")
         emb = self.semantic_embedding(semantic.long())  # B,T,X,Y,Z,D
         obs = observed.to(emb.dtype).unsqueeze(-1)

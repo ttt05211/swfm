@@ -432,6 +432,7 @@ class FutureRenderIndex:
     indices_xyz: np.ndarray
     valid: np.ndarray
     out_of_bounds_voxels: int
+    linear_index: np.ndarray | None = None
 
 
 def future_native_to_canonical_indices(
@@ -462,10 +463,24 @@ def future_native_to_canonical_indices(
         all_idx.append(idx.reshape(shape + (3,)))
         all_valid.append(valid.reshape(shape))
         oob += int((~valid).sum())
+    indices = np.stack(all_idx, axis=0)
+    valid_all = np.stack(all_valid, axis=0)
+    # Keep a compact flattened canonical lookup.  Runtime query-union and
+    # rendering can then avoid repeatedly materializing Nx3 advanced-index
+    # arrays. Invalid entries are zeroed and ignored through valid_all.
+    safe = indices.copy()
+    safe[~valid_all] = 0
+    Y, Z = int(lattice.shape_xyz[1]), int(lattice.shape_xyz[2])
+    linear = (
+        safe[..., 0] * (Y * Z)
+        + safe[..., 1] * Z
+        + safe[..., 2]
+    ).astype(np.int32, copy=False)
     return FutureRenderIndex(
-        indices_xyz=np.stack(all_idx, axis=0),
-        valid=np.stack(all_valid, axis=0),
+        indices_xyz=indices,
+        valid=valid_all,
         out_of_bounds_voxels=int(oob),
+        linear_index=linear,
     )
 
 
@@ -482,8 +497,13 @@ def render_canonical_semantic_to_future(
     if world.ndim != 3 or idx.shape[:-1] != valid.shape or idx.shape[-1] != 3:
         raise ValueError("canonical/render-index shape mismatch")
     out = np.full(valid.shape, int(free_label), dtype=world.dtype)
-    q = idx[valid]
-    out[valid] = world[q[:, 0], q[:, 1], q[:, 2]]
+    linear = getattr(render_index, "linear_index", None)
+    if linear is not None:
+        lin = np.asarray(linear)
+        out[valid] = world.reshape(-1)[lin[valid]]
+    else:
+        q = idx[valid]
+        out[valid] = world[q[:, 0], q[:, 1], q[:, 2]]
     return out
 
 

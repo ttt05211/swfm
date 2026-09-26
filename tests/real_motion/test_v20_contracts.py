@@ -997,3 +997,52 @@ def test_static_refine_packed_single_scene_matches_expanded_scene():
             t0_missing_mask=miss,
         )
     assert torch.allclose(packed, expanded, atol=1e-5, rtol=1e-5)
+
+
+def test_decode_static_logits_allowed_channel_path_matches_mask_reference():
+    from real_motion.v20_training import decode_static_logits
+
+    torch.manual_seed(67)
+    logits = torch.randn(3, 18, 4, 3, 2)
+    # Include ties to verify ascending global-class tie breaking.
+    logits[:, 0, 0, 0, 0] = 5.0
+    logits[:, 17, 0, 0, 0] = 5.0
+    ref = logits.clone()
+    dyn = torch.as_tensor(DYNAMIC_CLASS_IDS, dtype=torch.long)
+    ref[:, dyn] = torch.finfo(ref.dtype).min
+    expected = ref.argmax(dim=1)
+    got = decode_static_logits(logits)
+    assert torch.equal(got, expected)
+
+
+def test_future_render_linear_index_matches_xyz_render():
+    from real_motion.v20_history_world import (
+        FutureRenderIndex,
+        future_native_to_canonical_indices,
+        render_canonical_semantic_to_future,
+    )
+
+    lattice = CanonicalLattice(
+        (-3.0, -3.0, -1.0), (0.5, 0.5, 0.5), (14, 14, 6)
+    )
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    poses[:, 0, 3] = np.linspace(-0.2, 0.4, FUTURE_FRAMES)
+    ri = future_native_to_canonical_indices(
+        lattice,
+        future_ego_to_canonical=poses,
+        native_shape_xyz=(5, 4, 2),
+        native_origin_xyz_m=(-1.0, -1.0, -0.5),
+        native_voxel_size_xyz_m=(0.5, 0.5, 0.5),
+    )
+    world = np.arange(np.prod(lattice.shape_xyz), dtype=np.int64).reshape(
+        lattice.shape_xyz
+    )
+    fast = render_canonical_semantic_to_future(world, ri, free_label=-1)
+    legacy = FutureRenderIndex(
+        indices_xyz=ri.indices_xyz,
+        valid=ri.valid,
+        out_of_bounds_voxels=ri.out_of_bounds_voxels,
+        linear_index=None,
+    )
+    slow = render_canonical_semantic_to_future(world, legacy, free_label=-1)
+    assert np.array_equal(fast, slow)

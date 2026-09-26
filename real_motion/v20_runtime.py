@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -70,16 +70,99 @@ class StaticRuntimeReport:
     render_index: object | None = None
 
 
+@dataclass
+class StaticRuntimeCache:
+    """Geometry tensors invariant across V20 Static evaluation windows."""
+    tile_grids: dict = field(default_factory=dict)
+    tile_coarse_linear: dict = field(default_factory=dict)
+
+
+def _runtime_tile_grid(
+    cache,
+    high_lattice,
+    coarse_lattice,
+    start_t,
+    tshape,
+    *,
+    device,
+    dtype,
+):
+    key = (
+        tuple(int(x) for x in start_t),
+        tuple(int(x) for x in tshape),
+        str(device),
+        str(dtype),
+    )
+    if cache is not None and key in cache.tile_grids:
+        return cache.tile_grids[key]
+    grid = canonical_tile_grid_sample_coordinates(
+        high_lattice,
+        coarse_lattice,
+        start_t,
+        tshape,
+        device=device,
+        dtype=dtype,
+    )
+    if cache is not None:
+        cache.tile_grids[key] = grid
+    return grid
+
+
+def _runtime_tile_coarse_linear(
+    cache,
+    high_lattice,
+    coarse_lattice,
+    start_t,
+    tshape,
+):
+    key = (
+        tuple(int(x) for x in start_t),
+        tuple(int(x) for x in tshape),
+    )
+    if cache is not None and key in cache.tile_coarse_linear:
+        return cache.tile_coarse_linear[key]
+    start = np.asarray(start_t, dtype=np.int64)
+    shape = np.asarray(tshape, dtype=np.int64)
+    hi_step = np.asarray(high_lattice.voxel_size_xyz_m, dtype=np.float64)
+    co_step = np.asarray(coarse_lattice.voxel_size_xyz_m, dtype=np.float64)
+    factor = np.maximum(np.rint(co_step / hi_step).astype(np.int64), 1)
+    x = np.clip(
+        np.arange(start[0], start[0] + shape[0]) // factor[0],
+        0, coarse_lattice.shape_xyz[0] - 1,
+    )
+    y = np.clip(
+        np.arange(start[1], start[1] + shape[1]) // factor[1],
+        0, coarse_lattice.shape_xyz[1] - 1,
+    )
+    z = np.clip(
+        np.arange(start[2], start[2] + shape[2]) // factor[2],
+        0, coarse_lattice.shape_xyz[2] - 1,
+    )
+    Y, Z = int(coarse_lattice.shape_xyz[1]), int(coarse_lattice.shape_xyz[2])
+    linear = (
+        x[:, None, None] * (Y * Z)
+        + y[None, :, None] * Z
+        + z[None, None, :]
+    ).reshape(-1)
+    if cache is not None:
+        cache.tile_coarse_linear[key] = linear
+    return linear
+
+
 def _query_mask_from_render_index(
     high_lattice: CanonicalLattice,
     render_index,
 ) -> QueryMaskReport:
     valid = np.asarray(render_index.valid, dtype=bool)
-    idx = np.asarray(render_index.indices_xyz, dtype=np.int64)
     out = np.zeros(high_lattice.shape_xyz, dtype=bool)
-    good = idx[valid]
-    if len(good):
-        out[good[:, 0], good[:, 1], good[:, 2]] = True
+    linear = getattr(render_index, "linear_index", None)
+    if linear is not None:
+        out.reshape(-1)[np.asarray(linear)[valid]] = True
+    else:
+        idx = np.asarray(render_index.indices_xyz, dtype=np.int64)
+        good = idx[valid]
+        if len(good):
+            out[good[:, 0], good[:, 1], good[:, 2]] = True
     requested = int(valid.size)
     in_bounds = int(valid.sum())
     oob = int(requested - in_bounds)
@@ -134,6 +217,7 @@ def decode_static_world_tiled(
     tile_size_xyz: Sequence[int] = (32, 32, 16),
     tile_batch_size: int = 32,
     free_label: int = 17,
+    runtime_cache: StaticRuntimeCache | None = None,
 ) -> StaticRuntimeReport:
     """Decode one canonical Static world and render all six futures.
 
@@ -171,6 +255,12 @@ def decode_static_world_tiled(
                 buckets.setdefault(tshape, []).append(start_t)
 
     bsz = max(int(tile_batch_size), 1)
+    obs_arr = np.asarray(history_observed_coarse, dtype=bool)
+    if obs_arr.shape != (6,) + tuple(coarse_lattice.shape_xyz):
+        raise ValueError("history_observed_coarse shape mismatch")
+    seen_coarse = obs_arr.any(axis=0).reshape(-1)
+    t0_coarse = obs_arr[-1].reshape(-1)
+
     with torch.inference_mode():
         for tshape, bucket in buckets.items():
             for bi in range(0, len(bucket), bsz):
@@ -185,10 +275,11 @@ def decode_static_world_tiled(
                     stop = np.minimum(start + tile, shape)
                     stops.append(stop)
                     grids.append(
-                        canonical_tile_grid_sample_coordinates(
+                        _runtime_tile_grid(
+                            runtime_cache,
                             high_lattice,
                             coarse_lattice,
-                            start,
+                            start_t,
                             tshape,
                             device=scene_features.device,
                             dtype=scene_features.dtype,
@@ -199,13 +290,16 @@ def decode_static_world_tiled(
                         start[1]:stop[1],
                         start[2]:stop[2],
                     ]
-                    seen, missing = _tile_history_context(
-                        history_observed_coarse,
-                        high_lattice=high_lattice,
-                        coarse_lattice=coarse_lattice,
-                        start_xyz=start,
-                        shape_xyz=tshape,
+                    cmap = _runtime_tile_coarse_linear(
+                        runtime_cache,
+                        high_lattice,
+                        coarse_lattice,
+                        start_t,
+                        tshape,
                     )
+                    seen = seen_coarse[cmap].reshape(tshape)
+                    t0_seen = t0_coarse[cmap].reshape(tshape)
+                    missing = seen & ~t0_seen
                     qtiles.append(qtile)
                     seen_rows.append(seen)
                     missing_rows.append(missing)

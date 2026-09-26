@@ -62,13 +62,19 @@ def static_semantic_loss(
 
 
 def decode_static_logits(logits: torch.Tensor) -> torch.Tensor:
-    """Argmax static/free semantics while structurally excluding dynamic IDs."""
+    """Argmax static/free semantics while structurally excluding dynamic IDs.
+
+    Selecting only allowed channels avoids cloning and rewriting the full
+    high-resolution 18-class tensor during tiled inference.
+    """
     if logits.ndim < 2 or logits.shape[1] != SEMANTIC_CLASSES:
         raise ValueError("static logits must have semantic class dimension at dim=1")
-    masked = logits.clone()
-    dyn = torch.as_tensor(DYNAMIC_IDS, dtype=torch.long, device=masked.device)
-    masked[:, dyn] = torch.finfo(masked.dtype).min
-    return masked.argmax(dim=1)
+    allowed_ids = tuple(i for i in range(SEMANTIC_CLASSES) if i not in set(DYNAMIC_IDS))
+    allowed = torch.as_tensor(
+        allowed_ids, dtype=torch.long, device=logits.device
+    )
+    local = logits.index_select(1, allowed).argmax(dim=1)
+    return allowed[local]
 
 
 def dormant_source_loss(

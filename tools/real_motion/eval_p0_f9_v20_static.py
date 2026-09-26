@@ -27,7 +27,11 @@ from real_motion.v20_history_world import (
     poses_to_t0_canonical,
     protected_add_only,
 )
-from real_motion.v20_runtime import decode_static_world_tiled, static_subset_masks
+from real_motion.v20_runtime import (
+    StaticRuntimeCache,
+    decode_static_world_tiled,
+    static_subset_masks,
+)
 from real_motion.v20_training import load_v20_checkpoint
 from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
 from tools.real_motion.build_p0_f9_v20_history_cache import (
@@ -155,7 +159,7 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--alignment-workers", type=int, default=6)
-    p.add_argument("--tile-batch-size", type=int, default=32)
+    p.add_argument("--tile-batch-size", type=int, default=256)
     p.add_argument(
         "--selection-only",
         action="store_true",
@@ -194,6 +198,11 @@ def main():
 
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
     amp = device.type == "cuda" and not bool(a.no_amp)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     base_ck, base_model, _ = full._load_model(a.base_checkpoint, CLEAN_PROTOCOL, device)
     model, vck = load_v20_checkpoint(a.v20_checkpoint, map_location="cpu")
@@ -214,6 +223,7 @@ def main():
         "never_seen_static_domain": _subset_empty(),
     }
     total_query = total_tiles = total_oob = total_history_oob = 0
+    static_runtime_cache = StaticRuntimeCache()
     started = time.perf_counter()
     phase_s = {
         "raw_v18": 0.0,
@@ -263,6 +273,7 @@ def main():
                 ),
                 native_voxel_size_xyz_m=pcfg.grid.voxel_size,
                 free_label=int(pcfg.free_label),
+                runtime_cache=static_runtime_cache,
             )
             hsem = aligned.semantic
             hobs = aligned.observed
@@ -409,6 +420,10 @@ def main():
             "tile_batch_size": int(a.tile_batch_size),
             "stage1_history_reuse": bool(stage1_rows is not None),
             "selection_only": bool(a.selection_only),
+            "cached_tile_grids": int(len(static_runtime_cache.tile_grids)),
+            "cached_tile_context_maps": int(
+                len(static_runtime_cache.tile_coarse_linear)
+            ),
             "note": "end-to-end evaluation wall time; dedicated benchmark reports decomposed latency",
         },
     }
