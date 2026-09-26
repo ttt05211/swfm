@@ -118,10 +118,11 @@ def _iter_paired_rows(
         rmeta = repair_idx["shards"][rsi]
         rrows = _repair_rows(repair_root, rmeta["file"])
         srows = _stage1_rows(stage_root, rmeta["source_stage1_shard"])
-        if len(rrows) != len(srows):
+        if len(rrows) > len(srows):
             raise RuntimeError(
-                f"paired shard count mismatch: {rmeta['file']}"
+                f"repair shard longer than Stage1 source shard: {rmeta['file']}"
             )
+        srows = srows[:len(rrows)]
 
         row_order = list(range(len(rrows)))
         if shuffle:
@@ -167,6 +168,12 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
             f"future GT shape mismatch: {gt.shape}"
         )
     target = repair_target_from_gt(gt, free_label=int(free_label))
+    cached_counts = np.asarray(
+        rrow["v18_free_count_by_horizon"], dtype=np.int64
+    )
+    got_counts = support.reshape(6, -1).sum(axis=1).astype(np.int64)
+    if not np.array_equal(cached_counts, got_counts):
+        raise RuntimeError("V18-free packed support count mismatch")
     return {
         "sem": sem,
         "obs": obs,
