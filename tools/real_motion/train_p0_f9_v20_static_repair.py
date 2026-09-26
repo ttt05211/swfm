@@ -278,7 +278,7 @@ class _Geometry:
             self.native_shape, native_origin, native_step
         ).reshape(-1, 3)
         self.native_xyz = torch.from_numpy(
-            np.asarray(xyz, dtype=np.float64)
+            np.array(xyz, dtype=np.float64, copy=True)
         ).to(device)
         self.high_origin = torch.as_tensor(
             high.origin_xyz_m, dtype=torch.float64, device=device
@@ -547,12 +547,11 @@ def _repair_loss_and_confusion(
                 ).reshape(18, 18)
 
     denom = support_t.sum().clamp_min(1)
-    return (
-        loss_sum / denom.to(loss_sum.dtype),
-        conf,
-        base_conf,
-        final_conf,
-    )
+    loss = loss_sum / denom.to(loss_sum.dtype)
+    if gt_t is None:
+        # Keep the focused contract-test/diagnostic API compact.
+        return loss, conf
+    return loss, conf, base_conf, final_conf
 
 
 def _autocast(device, enabled):
