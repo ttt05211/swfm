@@ -1622,6 +1622,16 @@ def test_static_repair_sparse_decode_backpropagates():
 
 
 
+def test_static_repair_validation_confusion_buffers_use_torch_dtype():
+    import inspect
+    from tools.real_motion import train_p0_f9_v20_static_repair as m
+
+    src = inspect.getsource(m._epoch)
+    assert "base_full_gpu = torch.as_tensor(" in src
+    assert "dtype=torch.int64" in src
+    assert "dtype=np.int64,\n            device=device" not in src
+
+
 def test_static_repair_training_defers_metrics_and_has_stage_profiler():
     import inspect
     from tools.real_motion import train_p0_f9_v20_static_repair as m
