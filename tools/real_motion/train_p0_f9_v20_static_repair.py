@@ -752,7 +752,15 @@ def _repair_sparse_loss_only(
     geom,
     device,
 ):
-    """Exact Repair-v2 CE without evaluation-only prediction metrics."""
+    """Exact Repair-v2 CE with repeated canonical rows aggregated first.
+
+    The formal objective is still one equally weighted CE term for every
+    future voxel/horizon in frozen-V18-free support. Multiple future voxels
+    can map to the same canonical query row, so evaluating CE independently
+    repeats the same logit vector millions of times. Count those repeated
+    (query-row, class) pairs first, then evaluate the algebraically identical
+    weighted negative log-likelihood once per canonical query row.
+    """
     support_t = torch.from_numpy(
         np.asarray(support, dtype=bool)
     ).to(device, non_blocking=True)
@@ -760,7 +768,11 @@ def _repair_sparse_loss_only(
         np.asarray(target, dtype=np.uint8)
     ).to(device, non_blocking=True)
 
-    loss_sum = query_logits.sum() * 0.0
+    nclass = int(query_logits.shape[1])
+    qcount = int(query_logits.shape[0])
+    pair_keys = []
+    total_support = 0
+
     for hi in range(6):
         s = support_t[hi].reshape(-1)
         lin = linear[hi][s]
@@ -776,7 +788,6 @@ def _repair_sparse_loss_only(
                 "Static Repair support escaped decoded query union"
             )
 
-        rows = query_logits[qrow]
         y = target_t[hi].reshape(-1)[s].long()
         yl = geom.global_to_local[y]
         valid_labels = (yl >= 0).all()
@@ -787,13 +798,46 @@ def _repair_sparse_loss_only(
             )
         elif not bool(valid_labels.item()):
             raise RuntimeError("dynamic label entered Static Repair target")
-        loss_sum = loss_sum + F.cross_entropy(
-            rows, yl, reduction="sum"
-        )
 
-    denom = support_t.sum().clamp_min(1)
-    return loss_sum / denom.to(loss_sum.dtype)
+        pair_keys.append(qrow * nclass + yl)
+        total_support += int(qrow.numel())
 
+    if total_support <= 0:
+        return query_logits.sum() * 0.0
+
+    keys = torch.cat(pair_keys, dim=0)
+    # float32 integer counts are exact at the collision multiplicities present
+    # here and avoid an 8-byte int64 count volume followed by another copy.
+    count_dtype = (
+        torch.float32
+        if query_logits.dtype in {torch.float16, torch.bfloat16}
+        else query_logits.dtype
+    )
+    counts_flat = torch.zeros(
+        qcount * nclass,
+        dtype=count_dtype,
+        device=device,
+    )
+    counts_flat.scatter_add_(
+        0,
+        keys,
+        torch.ones(keys.shape, dtype=count_dtype, device=device),
+    )
+    counts = counts_flat.view(qcount, nclass)
+
+    logits = query_logits
+    if logits.dtype != count_dtype:
+        logits = logits.to(count_dtype)
+
+    # Sum_{examples} CE(logits[row], y)
+    # = Sum_row [N_row * logsumexp(logits_row)
+    #            - Sum_class N_{row,class} * logits_{row,class}]
+    row_count = counts.sum(dim=1)
+    loss_sum = (
+        row_count * torch.logsumexp(logits, dim=1)
+        - (counts * logits).sum(dim=1)
+    ).sum()
+    return loss_sum / float(total_support)
 
 def _repair_sparse_loss_and_confusion(
     query_logits,
