@@ -1438,6 +1438,7 @@ def test_static_repair_sparse_loss_matches_dense_reference():
         _Geometry,
         _repair_loss_and_confusion,
         _repair_sparse_loss_and_confusion,
+        _repair_sparse_loss_only,
     )
 
     rng = np.random.default_rng(83)
@@ -1505,7 +1506,17 @@ def test_static_repair_sparse_loss_matches_dense_reference():
         geom=geom,
         device=torch.device("cpu"),
     )
+    lo = _repair_sparse_loss_only(
+        query_logits,
+        row_map,
+        linear,
+        support,
+        target,
+        geom=geom,
+        device=torch.device("cpu"),
+    )
     assert torch.allclose(ls, ld, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(lo, ld, atol=1e-6, rtol=1e-6)
     assert torch.equal(cs, cd)
     assert torch.equal(bs, bd)
     assert torch.equal(fs, fd)
@@ -1552,3 +1563,21 @@ def test_static_repair_sparse_decode_backpropagates():
     assert torch.isfinite(model.static.tile_refine[0].weight.grad).all()
     assert model.static.tile_refine[-1].weight.grad is not None
     assert torch.isfinite(model.static.tile_refine[-1].weight.grad).all()
+
+
+
+def test_static_repair_training_defers_metrics_and_has_stage_profiler():
+    import inspect
+    from tools.real_motion import train_p0_f9_v20_static_repair as m
+
+    prep_src = inspect.getsource(m._prepare_pair_cpu)
+    epoch_src = inspect.getsource(m._epoch)
+    main_src = inspect.getsource(m.main)
+
+    assert "if need_metrics:" in prep_src
+    assert 'out["gt"] = gt' in prep_src
+    assert "compute_metrics = not train" in epoch_src
+    assert "_repair_sparse_loss_only(" in epoch_src
+    assert "metrics=deferred_to_val" in epoch_src
+    assert "_CudaStageProfiler(" in epoch_src
+    assert "--profile-gpu-stages" in main_src
