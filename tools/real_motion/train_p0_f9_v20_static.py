@@ -871,7 +871,40 @@ def main():
     if va_idx["highres_lattice"] != tr_idx["highres_lattice"]:
         raise RuntimeError("train/val Ωmax mismatch")
 
-    _, weights_cpu = _class_weights(tr_root, tr_idx)
+    resume_path = Path(a.resume).resolve() if str(a.resume).strip() else None
+    resume_ck = None
+    if resume_path is not None:
+        print(f"startup: loading resume checkpoint {resume_path}", flush=True)
+        if not resume_path.is_file():
+            raise FileNotFoundError(resume_path)
+        resume_ck = torch.load(
+            resume_path, map_location="cpu", weights_only=False
+        )
+        if resume_ck.get("protocol") != "p0_f9_v20_checkpoint_v1":
+            raise RuntimeError("resume checkpoint protocol mismatch")
+        if resume_ck.get("stage") != "static":
+            raise RuntimeError("resume checkpoint is not V20 Static")
+        saved_weights = (
+            dict(resume_ck.get("extra") or {}).get("class_weights")
+        )
+        if saved_weights is None or len(saved_weights) != 18:
+            raise RuntimeError(
+                "resume checkpoint lacks valid saved class_weights"
+            )
+        weights_cpu = torch.as_tensor(
+            saved_weights, dtype=torch.float32
+        )
+        print("startup: reused class_weights from resume checkpoint", flush=True)
+    else:
+        print(
+            "startup: computing class_weights from train cache "
+            "(one-time full train scan)",
+            flush=True,
+        )
+        _, weights_cpu = _class_weights(tr_root, tr_idx)
+        print("startup: class_weights ready", flush=True)
+
+    print("startup: loading frozen V18 checkpoint", flush=True)
     v18_obj = torch.load(a.v18_checkpoint, map_location="cpu", weights_only=False)
     v18_model_cfg = dict(v18_obj.get("model_config") or {})
     if "d_model" not in v18_model_cfg:
@@ -905,9 +938,14 @@ def main():
     native_shape = tuple(int(x) for x in native["shape_xyz"])
     native_origin = tuple(float(x) for x in native["origin_xyz_m"])
     native_step = tuple(float(x) for x in native["voxel_size_xyz_m"])
+    print(
+        f"startup: model ready on {device}; "
+        f"prep_workers={int(a.prep_workers)} prefetch={int(a.prefetch)} "
+        f"tile_batch={int(a.tile_batch_size)}",
+        flush=True,
+    )
 
     out = Path(a.output_dir)
-    resume_path = Path(a.resume).resolve() if str(a.resume).strip() else None
     if resume_path is None:
         if out.exists() and any(out.iterdir()):
             raise FileExistsError(f"refusing non-empty output dir: {out}")
@@ -917,14 +955,10 @@ def main():
         resume_window = 0
         resume_accum = None
     else:
-        if not resume_path.is_file():
-            raise FileNotFoundError(resume_path)
         out.mkdir(parents=True, exist_ok=True)
-        ck = torch.load(resume_path, map_location="cpu", weights_only=False)
-        if ck.get("protocol") != "p0_f9_v20_checkpoint_v1":
-            raise RuntimeError("resume checkpoint protocol mismatch")
-        if ck.get("stage") != "static":
-            raise RuntimeError("resume checkpoint is not V20 Static")
+        if resume_ck is None:
+            raise RuntimeError("internal error: resume checkpoint not preloaded")
+        ck = resume_ck
         if str(Path(ck.get("v18_checkpoint", "")).resolve()) != str(
             Path(a.v18_checkpoint).resolve()
         ):
