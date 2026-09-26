@@ -29,6 +29,10 @@ from real_motion.v20_history_world import (
 )
 from real_motion.v20_runtime import decode_static_world_tiled, static_subset_masks
 from real_motion.v20_training import load_v20_checkpoint
+from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
+from tools.real_motion.build_p0_f9_v20_history_cache import (
+    PROTOCOL as STAGE1_PROTOCOL,
+)
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion.benchmark_p0_f9_v18_runtime import (
@@ -105,17 +109,53 @@ def _finish_subset(row):
     return x
 
 
+def _load_stage1_rows(cache_dir):
+    root = Path(cache_dir)
+    idx = json.loads((root / "index.json").read_text(encoding="utf-8"))
+    if idx.get("protocol") != STAGE1_PROTOCOL:
+        raise RuntimeError(
+            f"unexpected Stage1 protocol: {idx.get('protocol')}"
+        )
+    rows = {}
+    for shard in idx["shards"]:
+        obj = torch.load(
+            root / shard["file"], map_location="cpu", weights_only=False
+        )
+        if obj.get("protocol") != STAGE1_PROTOCOL:
+            raise RuntimeError(f"bad Stage1 shard: {shard['file']}")
+        for row in obj["rows"]:
+            key = (str(row["scene_name"]), str(row["t0_token"]))
+            if key in rows:
+                raise RuntimeError(f"duplicate Stage1 row: {key}")
+            rows[key] = row
+    return idx, rows
+
+
+def _decode_stage1_history(row):
+    shape = (6,) + tuple(int(x) for x in row["coarse_shape_xyz"])
+    obs = unpack_bool(row["history_observed_bits"], shape)
+    free = unpack_bool(row["history_observed_free_bits"], shape)
+    sem = unpack_history_semantic(row, obs, free)
+    return sem, obs, free
+
+
 def main():
     p = argparse.ArgumentParser()
     add_config_args(p)
     p.add_argument("--val-cache", required=True)
     p.add_argument("--base-checkpoint", required=True)
     p.add_argument("--v20-checkpoint", required=True)
+    p.add_argument(
+        "--stage1-cache",
+        default="",
+        help="Optional matching Stage1 cache to reuse aligned history.",
+    )
     p.add_argument("--dataroot", required=True)
     p.add_argument("--info-pkl", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--max-windows", type=int, default=0)
     p.add_argument("--alignment-workers", type=int, default=6)
+    p.add_argument("--tile-batch-size", type=int, default=32)
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
     a = p.parse_args()
@@ -126,6 +166,23 @@ def main():
         records = records[:min(len(records), int(a.max_windows))]
     if not records:
         raise RuntimeError("empty validation population")
+
+    stage1_idx = stage1_rows = None
+    if str(a.stage1_cache):
+        print("startup: loading Stage1 aligned-history cache", flush=True)
+        stage1_idx, stage1_rows = _load_stage1_rows(a.stage1_cache)
+        missing = [
+            (str(r["scene_name"]), str(r["t0_token"]))
+            for r in records
+            if (str(r["scene_name"]), str(r["t0_token"])) not in stage1_rows
+        ]
+        if missing:
+            raise RuntimeError(f"Stage1 cache misses eval rows: {missing[:5]}")
+        print(
+            f"startup: Stage1 rows ready ({len(stage1_rows)})",
+            flush=True,
+        )
+
     device = torch.device(a.device if a.device != "cuda" or torch.cuda.is_available() else "cpu")
     amp = device.type == "cuda" and not bool(a.no_amp)
 
@@ -149,8 +206,16 @@ def main():
     }
     total_query = total_tiles = total_oob = total_history_oob = 0
     started = time.perf_counter()
+    phase_s = {
+        "raw_v18": 0.0,
+        "history": 0.0,
+        "static": 0.0,
+        "subset": 0.0,
+        "moving": 0.0,
+    }
 
     for wi, rec in enumerate(records, start=1):
+        t_phase = time.perf_counter()
         w = window_from_record(rec)
         raw = load_nuscenes_window_raw(source, w, pcfg, include_gt=True)
         future_obs = np.stack([
@@ -166,26 +231,45 @@ def main():
         finally:
             _release_gpu_inputs(state)
         pred_stack = np.asarray(pred_all, dtype=np.uint8)
+        phase_s["raw_v18"] += time.perf_counter() - t_phase
 
+        t_phase = time.perf_counter()
         hist_pose = np.asarray(raw["history_poses"], dtype=np.float64)
         future_pose = np.asarray(raw["future_poses"], dtype=np.float64)
         t0 = hist_pose[-1]
         hist_rel = poses_to_t0_canonical(hist_pose, t0)
         future_rel = poses_to_t0_canonical(future_pose, t0)
-        aligned = align_history_once_to_canonical(
-            coarse,
-            history_semantic=np.asarray(raw["history_occ"], dtype=np.uint8),
-            history_observed=np.asarray(raw["history_observed"], dtype=bool),
-            history_ego_to_world=hist_pose,
-            t0_ego_to_world=t0,
-            native_origin_xyz_m=(pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min),
-            native_voxel_size_xyz_m=pcfg.grid.voxel_size,
-            free_label=int(pcfg.free_label),
-        )
-        sem = torch.from_numpy(aligned.semantic).to(device).unsqueeze(0)
-        obs = torch.from_numpy(aligned.observed).to(device).unsqueeze(0)
-        obsfree = torch.from_numpy(aligned.observed_free).to(device).unsqueeze(0)
+        if stage1_rows is not None:
+            srow = stage1_rows[(str(w.scene_name), str(w.t0_token))]
+            hsem, hobs, hfree = _decode_stage1_history(srow)
+            future_rel = np.asarray(
+                srow["future_ego_to_t0"], dtype=np.float64
+            )
+            history_oob = int(srow["history_oob_observed_samples"])
+        else:
+            aligned = align_history_once_to_canonical(
+                coarse,
+                history_semantic=np.asarray(raw["history_occ"], dtype=np.uint8),
+                history_observed=np.asarray(raw["history_observed"], dtype=bool),
+                history_ego_to_world=hist_pose,
+                t0_ego_to_world=t0,
+                native_origin_xyz_m=(
+                    pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min
+                ),
+                native_voxel_size_xyz_m=pcfg.grid.voxel_size,
+                free_label=int(pcfg.free_label),
+            )
+            hsem = aligned.semantic
+            hobs = aligned.observed
+            hfree = aligned.observed_free
+            history_oob = int(aligned.out_of_bounds_samples)
 
+        sem = torch.from_numpy(hsem).to(device).unsqueeze(0)
+        obs = torch.from_numpy(hobs).to(device).unsqueeze(0)
+        obsfree = torch.from_numpy(hfree).to(device).unsqueeze(0)
+        phase_s["history"] += time.perf_counter() - t_phase
+
+        t_phase = time.perf_counter()
         with torch.inference_mode(), _autocast(device, amp):
             scene = model.encode_history(sem, obs, obsfree)
             static = decode_static_world_tiled(
@@ -194,13 +278,15 @@ def main():
                 high_lattice=high,
                 coarse_lattice=coarse,
                 future_ego_to_canonical=future_rel,
-                history_observed_coarse=aligned.observed,
+                history_observed_coarse=hobs,
                 native_shape_xyz=pcfg.grid.shape_hwd,
                 native_origin_xyz_m=(pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min),
                 native_voxel_size_xyz_m=pcfg.grid.voxel_size,
                 tile_size_xyz=tile_size,
+                tile_batch_size=int(a.tile_batch_size),
                 free_label=int(pcfg.free_label),
             )
+        phase_s["static"] += time.perf_counter() - t_phase
         final_t = protected_add_only(
             torch.from_numpy(pred_stack),
             static_world=torch.from_numpy(static.future_semantic),
@@ -210,8 +296,9 @@ def main():
         total_query += int(static.query_voxels)
         total_tiles += int(static.active_tiles)
         total_oob += int(static.out_of_bounds_voxels)
-        total_history_oob += int(aligned.out_of_bounds_samples)
+        total_history_oob += history_oob
 
+        t_phase = time.perf_counter()
         masks = static_subset_masks(
             high_lattice=high,
             history_observed=np.asarray(raw["history_observed"], dtype=bool),
@@ -223,6 +310,7 @@ def main():
             native_voxel_size_xyz_m=pcfg.grid.voxel_size,
             free_label=int(pcfg.free_label),
         )
+        phase_s["subset"] += time.perf_counter() - t_phase
         for fi in range(6):
             gt = np.asarray(raw["future_gt_occ"][fi], dtype=np.uint8)
             _update_subset(
@@ -236,9 +324,11 @@ def main():
                 pred_stack[fi], final[fi], gt, int(pcfg.free_label),
             )
 
+        t_phase = time.perf_counter()
         moving_rows = _moving_support_sequence(
             source, w, grid=pcfg.grid, workers=int(a.alignment_workers)
         )
+        phase_s["moving"] += time.perf_counter() - t_phase
         for hi, _ in enumerate(HORIZONS):
             gt = np.asarray(raw["future_gt_occ"][hi], dtype=np.uint8)
             _update_many(
@@ -252,7 +342,15 @@ def main():
 
         if wi == 1 or wi % 25 == 0 or wi == len(records):
             elapsed = max(time.perf_counter() - started, 1e-9)
-            print(f"v20_static_eval {wi}/{len(records)} rate={wi/elapsed:.3f} win/s", flush=True)
+            means = " ".join(
+                f"{k}={1000.0*v/wi:.0f}ms"
+                for k, v in phase_s.items()
+            )
+            print(
+                f"v20_static_eval {wi}/{len(records)} "
+                f"rate={wi/elapsed:.3f} win/s {means}",
+                flush=True,
+            )
 
     metrics = {v: _finalize(raw_by_variant[v]) for v in VARIANTS}
     elapsed = max(time.perf_counter() - started, 1e-9)
@@ -281,6 +379,12 @@ def main():
         "timing": {
             "elapsed_s": float(elapsed),
             "windows_per_s": float(len(records) / elapsed),
+            "phase_mean_ms_per_window": {
+                k: float(1000.0 * v / max(len(records), 1))
+                for k, v in phase_s.items()
+            },
+            "tile_batch_size": int(a.tile_batch_size),
+            "stage1_history_reuse": bool(stage1_rows is not None),
             "note": "end-to-end evaluation wall time; dedicated benchmark reports decomposed latency",
         },
     }
