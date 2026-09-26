@@ -66,6 +66,8 @@ def repair_target_from_gt(
     y = np.asarray(gt, dtype=np.uint8)
     if y.ndim != 4 or y.shape[0] != 6:
         raise ValueError("future GT must be [6,X,Y,Z]")
+    if y.size and int(y.max()) >= 18:
+        raise ValueError("future GT contains label outside frozen 18-class taxonomy")
     out = y.copy()
     dyn = np.isin(out, np.asarray(DYNAMIC_IDS, dtype=np.uint8))
     out[dyn] = int(free_label)

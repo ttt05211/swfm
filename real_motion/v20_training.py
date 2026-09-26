@@ -46,7 +46,11 @@ def static_semantic_loss(
     class_weights: torch.Tensor | None = None,
     dynamic_class_ids: Sequence[int] = DYNAMIC_IDS,
 ) -> torch.Tensor:
-    """Semantic CE over future-observed static/free voxels only."""
+    """Legacy Static-v1 CE over future-observed static/free voxels only.
+
+    New Stage-2 experiments use p0_f9_v20_static_repair_train_v2 and must not
+    use this future-lidar-validity objective.
+    """
     if logits.ndim != 5:
         raise ValueError("static logits must be [B,C,X,Y,Z]")
     if target.shape != valid.shape or logits.shape[0] != target.shape[0] or logits.shape[2:] != target.shape[1:]:

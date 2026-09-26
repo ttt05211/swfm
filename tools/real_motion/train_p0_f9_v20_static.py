@@ -858,7 +858,23 @@ def main():
     p.add_argument("--seed", type=int, default=20260925)
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
+    p.add_argument(
+        "--allow-legacy-v1",
+        action="store_true",
+        help=(
+            "Required to reproduce the failed 2026-09-26 Static-v1 protocol. "
+            "New runs must use train_p0_f9_v20_static_repair.py."
+        ),
+    )
     a = p.parse_args()
+
+    if not bool(a.allow_legacy_v1):
+        raise RuntimeError(
+            "This is the legacy failed Static-v1 trainer "
+            "(future-lidar-only supervision / mismatched query channel). "
+            "Use train_p0_f9_v20_static_repair.py for new experiments, or "
+            "pass --allow-legacy-v1 only for explicit reproduction."
+        )
 
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     tr_root, tr_idx = _load_index(a.train_cache)

@@ -1121,3 +1121,96 @@ def test_static_repair_protocol_guards_are_wired():
     assert "STATIC_REPAIR_PROTOCOL" in vsrc
     assert "overfit_diagnostic_only" in dsrc
     assert "overfit_diagnostic_only" in vsrc
+
+
+def test_static_repair_gpu_geometry_matches_formal_cpu_mapping():
+    from real_motion.v20_history_world import (
+        future_native_to_canonical_indices,
+    )
+    from tools.real_motion.train_p0_f9_v20_static_repair import _Geometry
+
+    high = CanonicalLattice(
+        (-4.0, -4.0, -2.0), (0.5, 0.5, 0.5), (20, 20, 10)
+    )
+    coarse = CanonicalLattice(
+        (-4.0, -4.0, -2.0), (1.0, 1.0, 1.0), (10, 10, 5)
+    )
+    shape = (6, 5, 3)
+    origin = (-1.5, -1.0, -0.5)
+    step = (0.5, 0.5, 0.5)
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    poses[:, 0, 3] = np.linspace(-0.2, 0.3, FUTURE_FRAMES)
+    poses[:, 1, 3] = np.linspace(0.25, -0.15, FUTURE_FRAMES)
+
+    geom = _Geometry(
+        high, coarse, shape, origin, step, (4, 4, 2), torch.device("cpu")
+    )
+    linear, query = geom.future_linear_and_query(poses)
+    ri = future_native_to_canonical_indices(
+        high,
+        future_ego_to_canonical=poses,
+        native_shape_xyz=shape,
+        native_origin_xyz_m=origin,
+        native_voxel_size_xyz_m=step,
+    )
+    Y, Z = high.shape_xyz[1], high.shape_xyz[2]
+    ref_linear = (
+        ri.indices_xyz[..., 0].astype(np.int64) * (Y * Z)
+        + ri.indices_xyz[..., 1].astype(np.int64) * Z
+        + ri.indices_xyz[..., 2].astype(np.int64)
+    ).reshape(FUTURE_FRAMES, -1)
+    assert np.array_equal(linear.numpy(), ref_linear)
+
+    ref_q = np.zeros(high.shape_xyz, dtype=bool)
+    ref_q.reshape(-1)[ref_linear.reshape(-1)] = True
+    assert np.array_equal(query.numpy(), ref_q)
+
+
+def test_static_repair_preserves_conflicting_horizon_contributions():
+    from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _repair_loss_and_confusion,
+    )
+
+    allowed = list(STATIC_ALLOWED_IDS)
+    cid = next(i for i in allowed if i != 17)
+    A = len(allowed)
+    world = torch.zeros((A, 1, 1, 1), dtype=torch.float32)
+    # Make the shared canonical cell prefer cid. Two horizons supervise the
+    # same cell with conflicting labels; both must remain in confusion/loss.
+    world[allowed.index(cid), 0, 0, 0] = 2.0
+    linear = torch.zeros((FUTURE_FRAMES, 1), dtype=torch.long)
+    support = np.zeros((FUTURE_FRAMES, 1, 1, 1), dtype=bool)
+    target = np.full((FUTURE_FRAMES, 1, 1, 1), 17, dtype=np.uint8)
+    support[0, 0, 0, 0] = True
+    support[1, 0, 0, 0] = True
+    target[0, 0, 0, 0] = cid
+    target[1, 0, 0, 0] = 17
+
+    loss, conf = _repair_loss_and_confusion(
+        world, linear, support, target, device=torch.device("cpu")
+    )
+    got = conf.numpy()
+    assert torch.isfinite(loss)
+    assert got[cid, cid] == 1
+    assert got[17, cid] == 1
+    assert got.sum() == 2
+
+
+def test_legacy_static_trainer_requires_explicit_reproduction_flag():
+    import inspect
+    from tools.real_motion import train_p0_f9_v20_static as legacy
+
+    src = inspect.getsource(legacy.main)
+    assert "--allow-legacy-v1" in src
+    assert "train_p0_f9_v20_static_repair.py" in src
+
+
+def test_static_repair_builder_never_reads_future_gt_or_lidar_masks():
+    import inspect
+    from tools.real_motion import build_p0_f9_v20_static_repair_support as b
+
+    src = inspect.getsource(b._lean_raw)
+    assert "future_gt_occ" not in src
+    assert "load_lidar_observation" not in src
+    assert "load_semantics" in src  # only t-1/t0 causal V18 input semantics
