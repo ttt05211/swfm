@@ -144,6 +144,7 @@ class StaticWorldHead(nn.Module):
     def __init__(self, scene_dim: int, cfg: V20SceneConfig = V20SceneConfig()):
         super().__init__()
         self.cfg = cfg
+        self.prefer_channels_last_3d = False
         td = int(cfg.tile_dim)
         self.coarse_head = nn.Conv3d(int(scene_dim), SEMANTIC_CLASSES, 1)
         self.tile_refine = nn.Sequential(
@@ -166,6 +167,17 @@ class StaticWorldHead(nn.Module):
         nn.init.zeros_(last.bias)
         with torch.no_grad():
             last.bias[FREE_LABEL] = 8.0
+
+    def set_tile_channels_last_3d(self, enabled: bool = True) -> None:
+        """Select channels-last-3d for the expensive Static tile Conv3D path.
+
+        This changes only tensor memory format, never tensor values or the
+        state-dict contract.  It is enabled by the Static Repair trainer on
+        CUDA because cuDNN otherwise inserts repeated NCDHW<->NDHWC converts.
+        """
+        self.prefer_channels_last_3d = bool(enabled)
+        if self.prefer_channels_last_3d:
+            self.tile_refine.to(memory_format=torch.channels_last_3d)
 
     def forward_coarse(self, scene: torch.Tensor) -> torch.Tensor:
         return self.coarse_head(scene)
@@ -225,7 +237,12 @@ class StaticWorldHead(nn.Module):
         )
         if masks.shape[2:] != x.shape[2:]:
             raise ValueError("tile context mask shape mismatch")
-        return self.tile_refine(torch.cat((x, masks), dim=1))
+        tile_input = torch.cat((x, masks), dim=1)
+        if self.prefer_channels_last_3d:
+            tile_input = tile_input.contiguous(
+                memory_format=torch.channels_last_3d
+            )
+        return self.tile_refine(tile_input)
 
 
 class DormantSourceHead(nn.Module):
