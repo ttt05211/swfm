@@ -1646,4 +1646,6 @@ def test_static_repair_training_defers_metrics_and_has_stage_profiler():
     assert "_repair_sparse_loss_only(" in epoch_src
     assert "metrics=deferred_to_val" in epoch_src
     assert "_CudaStageProfiler(" in epoch_src
+    assert "recent_rate=" in epoch_src
+    assert "gpu_recent_ms=" in epoch_src
     assert "--profile-gpu-stages" in main_src
