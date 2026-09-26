@@ -29,7 +29,7 @@ from real_motion.runtime_config import (
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v20_static_repair import (
     SUPPORT_CACHE_PROTOCOL,
-    pack_v18_free_support,
+    pack_v18_prediction,
     population_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
@@ -177,19 +177,21 @@ def main():
                 _release_gpu_inputs(state)
 
             free = pred == int(pcfg.free_label)
-            bits = pack_v18_free_support(free)
+            packed = pack_v18_prediction(
+                pred, free_label=int(pcfg.free_label)
+            )
             free_counts += free.reshape(6, -1).sum(axis=1)
             voxel_counts += free.reshape(6, -1).shape[1]
-            packed_bytes += int(bits.numel())
+            packed_bytes += int(packed["v18_free_bits"].numel())
+            packed_bytes += int(
+                packed["v18_occupied_semantic_5bit"].numel()
+            )
             row = {
                 "scene_name": key[0],
                 "t0_token": key[1],
                 "future_tokens": tuple(str(x) for x in w.future_tokens),
                 "native_shape_xyz": tuple(int(x) for x in free.shape[1:]),
-                "v18_free_bits": bits,
-                "v18_free_count_by_horizon": torch.from_numpy(
-                    free.reshape(6, -1).sum(axis=1).astype(np.int64)
-                ),
+                **packed,
             }
             out_rows.append(row)
             identity_rows.append(row)
@@ -242,6 +244,7 @@ def main():
         "support_contract": (
             "formal_full_grid_positions_where_frozen_v18_prediction_is_free"
         ),
+        "contains_lossless_v18_semantic_prediction": True,
         "v18_free_fraction_by_horizon": (
             free_counts / np.maximum(voxel_counts, 1)
         ).tolist(),

@@ -57,6 +57,79 @@ def unpack_v18_free_support(
     return unpack_bool(bits, shape)
 
 
+def _pack_5bit(values: np.ndarray) -> torch.Tensor:
+    vals = np.asarray(values, dtype=np.uint8).reshape(-1)
+    if vals.size and int(vals.max()) > 31:
+        raise ValueError("5-bit pack received value >31")
+    if vals.size == 0:
+        return torch.empty(0, dtype=torch.uint8)
+    shifts = np.arange(5, dtype=np.uint8)
+    bits = ((vals[:, None] >> shifts[None]) & 1).astype(np.uint8)
+    return torch.from_numpy(
+        np.packbits(bits.reshape(-1), bitorder="little").copy()
+    )
+
+
+def _unpack_5bit(packed: torch.Tensor | np.ndarray, count: int) -> np.ndarray:
+    count = int(count)
+    if count == 0:
+        return np.empty(0, dtype=np.uint8)
+    arr = np.asarray(
+        packed.cpu() if isinstance(packed, torch.Tensor) else packed,
+        dtype=np.uint8,
+    )
+    bits = np.unpackbits(
+        arr.reshape(-1), bitorder="little", count=count * 5
+    ).reshape(count, 5)
+    weights = (1 << np.arange(5, dtype=np.uint8))[None]
+    return (bits * weights).sum(
+        axis=1, dtype=np.uint16
+    ).astype(np.uint8)
+
+
+def pack_v18_prediction(
+    pred: np.ndarray,
+    *,
+    free_label: int = FREE_LABEL,
+) -> dict[str, object]:
+    y = np.asarray(pred, dtype=np.uint8)
+    if y.ndim != 4 or y.shape[0] != 6:
+        raise ValueError("V18 prediction must be [6,X,Y,Z]")
+    if y.size and int(y.max()) >= 18:
+        raise ValueError("V18 prediction outside frozen taxonomy")
+    free = y == int(free_label)
+    occupied_labels = y[~free]
+    return {
+        "v18_free_bits": pack_v18_free_support(free),
+        "v18_occupied_semantic_5bit": _pack_5bit(occupied_labels),
+        "v18_occupied_semantic_count": int(occupied_labels.size),
+        "v18_free_count_by_horizon": torch.from_numpy(
+            free.reshape(6, -1).sum(axis=1).astype(np.int64)
+        ),
+    }
+
+
+def unpack_v18_prediction(
+    row: Mapping[str, object],
+    native_shape_xyz: Sequence[int],
+    *,
+    free_label: int = FREE_LABEL,
+) -> np.ndarray:
+    free = unpack_v18_free_support(
+        row["v18_free_bits"], native_shape_xyz
+    )
+    labels = _unpack_5bit(
+        row["v18_occupied_semantic_5bit"],
+        int(row["v18_occupied_semantic_count"]),
+    )
+    occupied = ~free
+    if int(occupied.sum()) != int(labels.size):
+        raise RuntimeError("V18 occupied semantic count mismatch")
+    out = np.full(free.shape, int(free_label), dtype=np.uint8)
+    out[occupied] = labels
+    return out
+
+
 def repair_target_from_gt(
     gt: np.ndarray,
     *,
@@ -139,4 +212,40 @@ def repair_diagnostics_from_confusion(
             float(np.mean(vals)) if vals else float("nan")
         ),
         "per_static_class_iou": per,
+    }
+
+
+def full_grid_metrics_from_confusion(conf_by_horizon: np.ndarray) -> dict[str, object]:
+    """Formal full-grid IoU/mIoU summary from six 18x18 confusions."""
+    c = np.asarray(conf_by_horizon, dtype=np.int64)
+    if c.shape != (6, 18, 18):
+        raise ValueError("full-grid confusion must be [6,18,18]")
+    occ, miou = [], []
+    per = {}
+    for hi in range(6):
+        ch = c[hi]
+        oi = int(ch[:17, :17].sum())
+        ou = int(ch.sum() - ch[17, 17])
+        ov = float(100.0 * oi / ou) if ou else float("nan")
+        vals = []
+        for cid in range(17):
+            tp = int(ch[cid, cid])
+            union = int(
+                ch[cid, :].sum() + ch[:, cid].sum() - tp
+            )
+            if union:
+                vals.append(float(tp / union))
+        mv = float(100.0 * np.mean(vals)) if vals else float("nan")
+        occ.append(ov)
+        miou.append(mv)
+        per[str(0.5 * (hi + 1))] = {"IoU": ov, "mIoU": mv}
+    main = (1, 3, 5)
+    return {
+        "IoU": float(np.nanmean(occ)),
+        "mIoU": float(np.nanmean(miou)),
+        "main_1_2_3s": {
+            "IoU": float(np.nanmean([occ[i] for i in main])),
+            "mIoU": float(np.nanmean([miou[i] for i in main])),
+        },
+        "per_horizon": per,
     }

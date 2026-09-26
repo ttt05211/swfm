@@ -44,9 +44,11 @@ from real_motion.v20_static_repair import (
     STATIC_ALLOWED_IDS,
     SUPPORT_CACHE_PROTOCOL,
     TRAIN_PROTOCOL,
+    full_grid_metrics_from_confusion,
     repair_diagnostics_from_confusion,
     repair_target_from_gt,
     unpack_v18_free_support,
+    unpack_v18_prediction,
 )
 from real_motion.v20_training import checkpoint_payload
 from tools.real_motion.build_p0_f9_v20_history_cache import (
@@ -169,6 +171,13 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
             f"future GT shape mismatch: {gt.shape}"
         )
     target = repair_target_from_gt(gt, free_label=int(free_label))
+    base_pred = unpack_v18_prediction(
+        rrow, native_shape, free_label=int(free_label)
+    )
+    if not np.array_equal(
+        base_pred == int(free_label), support
+    ):
+        raise RuntimeError("reconstructed V18 prediction/support mismatch")
     t0_pose = np.asarray(
         source.pose(str(rrow["t0_token"])), dtype=np.float64
     )
@@ -189,6 +198,8 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
         "obsfree": obsfree,
         "support": support,
         "target": target,
+        "gt": gt,
+        "base_pred": base_pred,
         "future_rel": future_rel,
         "cpu_seconds": float(time.perf_counter() - started),
     }
@@ -456,6 +467,8 @@ def _repair_loss_and_confusion(
     support,
     target,
     *,
+    gt=None,
+    base_pred=None,
     device,
 ):
     support_t = torch.from_numpy(
@@ -480,6 +493,22 @@ def _repair_loss_and_confusion(
     )
     loss_sum = world_allowed.sum() * 0.0
     conf = torch.zeros((18, 18), dtype=torch.int64, device=device)
+    base_conf = torch.zeros((6, 18, 18), dtype=torch.int64, device=device)
+    final_conf = torch.zeros((6, 18, 18), dtype=torch.int64, device=device)
+    gt_t = (
+        torch.from_numpy(np.asarray(gt, dtype=np.uint8)).to(
+            device, non_blocking=True
+        ).long()
+        if gt is not None else None
+    )
+    base_t = (
+        torch.from_numpy(np.asarray(base_pred, dtype=np.uint8)).to(
+            device, non_blocking=True
+        ).long()
+        if base_pred is not None else None
+    )
+    if (gt_t is None) != (base_t is None):
+        raise ValueError("gt/base_pred must be supplied together")
 
     for hi in range(6):
         s = support_t[hi].reshape(-1)
@@ -503,9 +532,27 @@ def _repair_loss_and_confusion(
                 y * 18 + pred,
                 minlength=18 * 18,
             ).reshape(18, 18)
+            if gt_t is not None:
+                gt_h = gt_t[hi].reshape(-1)
+                base_h = base_t[hi].reshape(-1)
+                final_h = base_h.clone()
+                final_h[s] = pred
+                base_conf[hi] = torch.bincount(
+                    gt_h * 18 + base_h,
+                    minlength=18 * 18,
+                ).reshape(18, 18)
+                final_conf[hi] = torch.bincount(
+                    gt_h * 18 + final_h,
+                    minlength=18 * 18,
+                ).reshape(18, 18)
 
     denom = support_t.sum().clamp_min(1)
-    return loss_sum / denom.to(loss_sum.dtype), conf
+    return (
+        loss_sum / denom.to(loss_sum.dtype),
+        conf,
+        base_conf,
+        final_conf,
+    )
 
 
 def _autocast(device, enabled):
@@ -592,6 +639,28 @@ def _epoch(
     conf_gpu = torch.as_tensor(
         conf0, dtype=torch.int64, device=device
     ).clone()
+    base_full_gpu = torch.as_tensor(
+        np.asarray(
+            saved.get(
+                "base_full_confusion",
+                np.zeros((6, 18, 18), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ),
+        dtype=torch.int64,
+        device=device,
+    ).clone()
+    final_full_gpu = torch.as_tensor(
+        np.asarray(
+            saved.get(
+                "final_full_confusion",
+                np.zeros((6, 18, 18), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        ),
+        dtype=torch.int64,
+        device=device,
+    ).clone()
     loss_sum_scalar = torch.tensor(
         float(saved.get("loss_sum", 0.0)),
         dtype=torch.float64,
@@ -657,12 +726,16 @@ def _epoch(
                 geom,
                 tile_batch_size=tile_batch_size,
             )
-            loss, conf = _repair_loss_and_confusion(
-                world,
-                linear,
-                item["support"],
-                item["target"],
-                device=device,
+            loss, conf, base_full, final_full = (
+                _repair_loss_and_confusion(
+                    world,
+                    linear,
+                    item["support"],
+                    item["target"],
+                    gt=item["gt"],
+                    base_pred=item["base_pred"],
+                    device=device,
+                )
             )
 
         finite = torch.isfinite(loss.detach()).all()
@@ -686,6 +759,8 @@ def _epoch(
 
         loss_sum_scalar.add_(loss.detach().double())
         conf_gpu.add_(conf)
+        base_full_gpu.add_(base_full)
+        final_full_gpu.add_(final_full)
         tiles_total += int(ntiles)
         n += 1
 
@@ -709,6 +784,12 @@ def _epoch(
             diag = repair_diagnostics_from_confusion(
                 conf_gpu.detach().cpu().numpy()
             )
+            base_metrics = full_grid_metrics_from_confusion(
+                base_full_gpu.detach().cpu().numpy()
+            )
+            final_metrics = full_grid_metrics_from_confusion(
+                final_full_gpu.detach().cpu().numpy()
+            )
             if report:
                 phase = "train" if train else "val"
                 print(
@@ -719,7 +800,10 @@ def _epoch(
                     f"tiles={tiles_total/max(n,1):.1f}/win "
                     f"loss={float(loss_sum_scalar.item()/max(n,1)):.5f} "
                     f"addP={diag['addition_precision']:.4f} "
-                    f"addR={diag['static_positive_recall']:.4f}",
+                    f"addR={diag['static_positive_recall']:.4f} "
+                    f"base_mIoU={base_metrics['mIoU']:.2f} "
+                    f"repair_mIoU={final_metrics['mIoU']:.2f} "
+                    f"delta={final_metrics['mIoU']-base_metrics['mIoU']:+.2f}",
                     flush=True,
                 )
             if save_now:
@@ -728,6 +812,12 @@ def _epoch(
                     {
                         "loss_sum": float(loss_sum_scalar.item()),
                         "confusion": conf_gpu.detach().cpu().numpy().tolist(),
+                        "base_full_confusion": (
+                            base_full_gpu.detach().cpu().numpy().tolist()
+                        ),
+                        "final_full_confusion": (
+                            final_full_gpu.detach().cpu().numpy().tolist()
+                        ),
                         "cpu_work_seconds": float(cpu_work),
                         "tiles_total": int(tiles_total),
                         "elapsed_seconds": float(
@@ -741,7 +831,11 @@ def _epoch(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     conf_np = conf_gpu.cpu().numpy()
+    base_full_np = base_full_gpu.cpu().numpy()
+    final_full_np = final_full_gpu.cpu().numpy()
     diag = repair_diagnostics_from_confusion(conf_np)
+    base_metrics = full_grid_metrics_from_confusion(base_full_np)
+    final_metrics = full_grid_metrics_from_confusion(final_full_np)
     return {
         "loss": float(loss_sum_scalar.item() / max(n, 1)),
         "windows": int(n),
@@ -755,6 +849,22 @@ def _epoch(
             prior_elapsed + time.perf_counter() - started
         ),
         "repair_diagnostics": diag,
+        "full_grid_v18_metrics": base_metrics,
+        "full_grid_v18_plus_static_metrics": final_metrics,
+        "full_grid_delta": {
+            "IoU": float(final_metrics["IoU"] - base_metrics["IoU"]),
+            "mIoU": float(final_metrics["mIoU"] - base_metrics["mIoU"]),
+            "main_1_2_3s": {
+                "IoU": float(
+                    final_metrics["main_1_2_3s"]["IoU"]
+                    - base_metrics["main_1_2_3s"]["IoU"]
+                ),
+                "mIoU": float(
+                    final_metrics["main_1_2_3s"]["mIoU"]
+                    - base_metrics["main_1_2_3s"]["mIoU"]
+                ),
+            },
+        },
         "confusion_18x18": conf_np.tolist(),
         "checkpoint_selection_metric": (
             "NONE; use formal composed dev mIoU"
@@ -839,6 +949,12 @@ def main():
         if bool(ridx.get("future_lidar_mask_used", True)):
             raise RuntimeError(
                 "repair support cache must not use future lidar mask"
+            )
+        if not bool(
+            ridx.get("contains_lossless_v18_semantic_prediction", False)
+        ):
+            raise RuntimeError(
+                "repair cache lacks lossless frozen-V18 semantic prediction"
             )
 
     overlap = set(st_idx["scene_names"]) & set(sv_idx["scene_names"])
