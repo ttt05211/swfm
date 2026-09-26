@@ -194,6 +194,95 @@ class AlignedHistoryEvidence:
     out_of_bounds_samples: int
 
 
+def observed_native_points(
+    semantic: np.ndarray,
+    observed: np.ndarray,
+    *,
+    native_origin_xyz_m: Sequence[float],
+    native_voxel_size_xyz_m: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract observed native voxel centers/labels once in deterministic C-order."""
+    sem = np.asarray(semantic, dtype=np.uint8)
+    obs = np.asarray(observed, dtype=bool)
+    if sem.shape != obs.shape or sem.ndim != 3:
+        raise ValueError("semantic/observed must be one [X,Y,Z] frame")
+    src_id = np.flatnonzero(obs.reshape(-1))
+    if src_id.size == 0:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.uint8)
+    native_idx = np.column_stack(
+        np.unravel_index(src_id, sem.shape)
+    ).astype(np.float32, copy=False)
+    origin = np.asarray(native_origin_xyz_m, dtype=np.float32)
+    step = np.asarray(native_voxel_size_xyz_m, dtype=np.float32)
+    local = origin[None] + (native_idx + 0.5) * step[None]
+    labels = sem.reshape(-1)[src_id].astype(np.uint8, copy=True)
+    return local.astype(np.float32, copy=False), labels
+
+
+def align_sparse_history_once_to_canonical(
+    lattice: CanonicalLattice,
+    *,
+    history_local_xyz: Sequence[np.ndarray],
+    history_semantic_observed: Sequence[np.ndarray],
+    history_ego_to_world: np.ndarray,
+    t0_ego_to_world: np.ndarray,
+    free_label: int = FREE_LABEL,
+) -> AlignedHistoryEvidence:
+    """Align cached sparse observed evidence without rescanning native dense grids.
+
+    Each frame's points/labels must preserve native C-order.  The result is
+    elementwise identical to align_history_once_to_canonical for the same
+    observed semantic input.
+    """
+    if len(history_local_xyz) != HISTORY_FRAMES or len(history_semantic_observed) != HISTORY_FRAMES:
+        raise ValueError("V20 requires exactly six sparse historical frames")
+    poses_world = np.asarray(history_ego_to_world, dtype=np.float64)
+    t0 = np.asarray(t0_ego_to_world, dtype=np.float64)
+    if poses_world.shape != (HISTORY_FRAMES, 4, 4) or t0.shape != (4, 4):
+        raise ValueError("history poses must be [6,4,4] and t0 pose [4,4]")
+    world_to_t0 = np.linalg.inv(t0)
+    poses = np.stack([world_to_t0 @ p for p in poses_world], axis=0)
+
+    cshape = (HISTORY_FRAMES,) + tuple(lattice.shape_xyz)
+    out_sem = np.full(cshape, int(free_label), dtype=np.uint8)
+    out_obs = np.zeros(cshape, dtype=bool)
+    conflict = np.zeros(cshape, dtype=bool)
+    oob = 0
+
+    for t in range(HISTORY_FRAMES):
+        local = np.asarray(history_local_xyz[t], dtype=np.float32)
+        labels = np.asarray(history_semantic_observed[t], dtype=np.uint8).reshape(-1)
+        if local.ndim != 2 or local.shape[1] != 3 or local.shape[0] != labels.size:
+            raise ValueError("sparse history frame must be local_xyz[N,3] + labels[N]")
+        if labels.size == 0:
+            continue
+        world = transform_points(poses[t], local)
+        idx, in_bounds = lattice.world_to_index(world)
+        oob += int((~in_bounds).sum())
+        frame_sem, frame_obs, frame_conflict = _rasterize_observed_frame_vectorized(
+            idx,
+            in_bounds,
+            labels,
+            np.ones(labels.size, dtype=bool),
+            canonical_shape_xyz=lattice.shape_xyz,
+            free_label=int(free_label),
+        )
+        out_sem[t] = frame_sem
+        out_obs[t] = frame_obs
+        conflict[t] = frame_conflict
+
+    observed_free = out_obs & (out_sem == int(free_label))
+    unknown = ~out_obs
+    return AlignedHistoryEvidence(
+        semantic=out_sem,
+        observed=out_obs,
+        observed_free=observed_free,
+        unknown=unknown,
+        conflict=conflict,
+        out_of_bounds_samples=int(oob),
+    )
+
+
 def _rasterize_observed_frame_vectorized(
     idx_xyz: np.ndarray,
     in_bounds: np.ndarray,

@@ -11,6 +11,8 @@ from real_motion.v20_history_world import (
     CanonicalLattice,
     DynamicResponsibility,
     align_history_once_to_canonical,
+    align_sparse_history_once_to_canonical,
+    observed_native_points,
     assert_zero_contribution_identity,
     audit_inference_inputs,
     future_union_query_mask,
@@ -663,3 +665,51 @@ def test_sparse_observed_history_alignment_matches_full_mapping_reference():
     assert np.array_equal(got.observed, ref_obs)
     assert np.array_equal(got.conflict, ref_conflict)
     assert got.out_of_bounds_samples == ref_oob
+
+
+def test_cached_sparse_history_alignment_is_elementwise_identical():
+    rng = np.random.default_rng(43)
+    native_shape = (5, 4, 3)
+    sem = rng.integers(
+        0, 18, size=(HISTORY_FRAMES,) + native_shape, dtype=np.uint8
+    )
+    obs = rng.random(sem.shape) > 0.58
+    poses = np.repeat(np.eye(4)[None], HISTORY_FRAMES, axis=0)
+    poses[:, 0, 3] = np.linspace(-0.3, 0.2, HISTORY_FRAMES)
+    poses[:, 1, 3] = np.linspace(0.1, -0.2, HISTORY_FRAMES)
+    lattice = CanonicalLattice((-4, -4, -2), (0.5, 0.5, 0.5), (20, 20, 12))
+    origin = (-1.0, -1.0, -0.5)
+    step = (0.5, 0.5, 0.5)
+
+    dense = align_history_once_to_canonical(
+        lattice,
+        history_semantic=sem,
+        history_observed=obs,
+        history_ego_to_world=poses,
+        t0_ego_to_world=poses[-1],
+        native_origin_xyz_m=origin,
+        native_voxel_size_xyz_m=step,
+        free_label=17,
+    )
+    xyz, labels = zip(*[
+        observed_native_points(
+            sem[t], obs[t],
+            native_origin_xyz_m=origin,
+            native_voxel_size_xyz_m=step,
+        )
+        for t in range(HISTORY_FRAMES)
+    ])
+    sparse = align_sparse_history_once_to_canonical(
+        lattice,
+        history_local_xyz=xyz,
+        history_semantic_observed=labels,
+        history_ego_to_world=poses,
+        t0_ego_to_world=poses[-1],
+        free_label=17,
+    )
+    assert np.array_equal(sparse.semantic, dense.semantic)
+    assert np.array_equal(sparse.observed, dense.observed)
+    assert np.array_equal(sparse.observed_free, dense.observed_free)
+    assert np.array_equal(sparse.unknown, dense.unknown)
+    assert np.array_equal(sparse.conflict, dense.conflict)
+    assert sparse.out_of_bounds_samples == dense.out_of_bounds_samples

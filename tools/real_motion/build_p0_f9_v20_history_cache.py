@@ -40,7 +40,8 @@ from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v20_history_world import (
     CanonicalLattice,
     DynamicResponsibility,
-    align_history_once_to_canonical,
+    align_sparse_history_once_to_canonical,
+    observed_native_points,
     poses_to_t0_canonical,
 )
 from real_motion.v20_stage1_codec import (
@@ -330,12 +331,15 @@ def main():
     scene_names = set()
     current_scene = None
     history_source_cache = {}
+    history_sparse_cache = {}
     future_ann_cache = {}
     static_supervision_cache = {}
     cache_stats = {
         "scene_resets": 0,
         "history_source_hits": 0,
         "history_source_misses": 0,
+        "history_sparse_hits": 0,
+        "history_sparse_misses": 0,
         "future_ann_hits": 0,
         "future_ann_misses": 0,
         "static_supervision_hits": 0,
@@ -356,6 +360,7 @@ def main():
         if scene_name != current_scene:
             current_scene = scene_name
             history_source_cache.clear()
+            history_sparse_cache.clear()
             future_ann_cache.clear()
             static_supervision_cache.clear()
             cache_stats["scene_resets"] += 1
@@ -370,20 +375,41 @@ def main():
         t0_pose = history_poses[-1]
         future_rel = poses_to_t0_canonical(future_poses_world, t0_pose)
 
+        hist_keys = [str(x) for x in w.history_tokens]
+        cache_stats["history_sparse_hits"] += sum(
+            key in history_sparse_cache for key in hist_keys
+        )
+        cache_stats["history_sparse_misses"] += sum(
+            key not in history_sparse_cache for key in hist_keys
+        )
         t_phase = time.perf_counter()
-        aligned = align_history_once_to_canonical(
+        sparse_xyz = []
+        sparse_sem = []
+        for ti, key in enumerate(hist_keys):
+            cached_sparse = history_sparse_cache.get(key)
+            if cached_sparse is None:
+                cached_sparse = observed_native_points(
+                    history_occ[ti],
+                    history_obs[ti],
+                    native_origin_xyz_m=(
+                        pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min
+                    ),
+                    native_voxel_size_xyz_m=pcfg.grid.voxel_size,
+                )
+                history_sparse_cache[key] = cached_sparse
+            xyz, labels = cached_sparse
+            sparse_xyz.append(xyz)
+            sparse_sem.append(labels)
+        aligned = align_sparse_history_once_to_canonical(
             coarse,
-            history_semantic=history_occ,
-            history_observed=history_obs,
+            history_local_xyz=sparse_xyz,
+            history_semantic_observed=sparse_sem,
             history_ego_to_world=history_poses,
             t0_ego_to_world=t0_pose,
-            native_origin_xyz_m=(pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min),
-            native_voxel_size_xyz_m=pcfg.grid.voxel_size,
             free_label=int(pcfg.free_label),
         )
         phase_seconds["history_align"] += time.perf_counter() - t_phase
 
-        hist_keys = [str(x) for x in w.history_tokens]
         cache_stats["history_source_hits"] += sum(
             key in history_source_cache for key in hist_keys
         )
@@ -520,6 +546,10 @@ def main():
                 "history_tokens",
                 "future_tokens",
             ],
+            "history_alignment": (
+                "token-cached sparse observed native centers/labels; "
+                "rigidly transformed per-window into t0 canonical"
+            ),
             "query_oob_source": (
                 "frozen full-population Omega-max audit; no per-window "
                 "future query rasterization during cache build"
