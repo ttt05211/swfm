@@ -875,3 +875,94 @@ def test_static_resume_checkpoint_contract_is_present():
     assert '"training_progress"' in src
     assert '"rng_state"' in src
     assert '"resume_latest.pt"' in src
+
+
+def test_runtime_query_mask_reuses_render_geometry_exactly():
+    from real_motion.v20_history_world import (
+        future_native_to_canonical_indices,
+        future_union_query_mask,
+    )
+    from real_motion.v20_runtime import _query_mask_from_render_index
+
+    lattice = CanonicalLattice(
+        (-4.0, -4.0, -2.0), (0.5, 0.5, 0.5), (20, 20, 10)
+    )
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    poses[:, 0, 3] = np.linspace(-0.3, 0.4, FUTURE_FRAMES)
+    poses[:, 1, 3] = np.linspace(0.2, -0.5, FUTURE_FRAMES)
+    kwargs = dict(
+        future_ego_to_canonical=poses,
+        native_shape_xyz=(6, 5, 3),
+        native_origin_xyz_m=(-1.5, -1.0, -0.5),
+        native_voxel_size_xyz_m=(0.5, 0.5, 0.5),
+    )
+    direct = future_union_query_mask(lattice, **kwargs)
+    ri = future_native_to_canonical_indices(lattice, **kwargs)
+    reused = _query_mask_from_render_index(lattice, ri)
+    assert np.array_equal(reused.mask, direct.mask)
+    assert reused.requested_voxels == direct.requested_voxels
+    assert reused.in_bounds_voxels == direct.in_bounds_voxels
+    assert reused.out_of_bounds_voxels == direct.out_of_bounds_voxels
+
+
+def test_runtime_batched_static_tiles_match_single_tile_decode():
+    from real_motion.v20_runtime import decode_static_world_tiled
+
+    static_id = next(
+        i for i in range(17) if i not in set(DYNAMIC_CLASS_IDS)
+    )
+
+    class FakeStatic:
+        def refine_tiles(
+            self,
+            scene_features,
+            *,
+            sample_grid,
+            query_mask,
+            seen_mask,
+            t0_missing_mask,
+        ):
+            B, X, Y, Z = query_mask.shape
+            logits = torch.zeros(
+                (B, 18, X, Y, Z),
+                dtype=scene_features.dtype,
+                device=scene_features.device,
+            )
+            logits[:, static_id] = (
+                1.0 + seen_mask.to(logits.dtype)
+            )
+            logits[:, 17] = (~query_mask).to(logits.dtype) * 5.0
+            return logits
+
+    class FakeModel:
+        static = FakeStatic()
+
+    high = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (0.5, 0.5, 0.5), (10, 10, 6)
+    )
+    coarse = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (1.0, 1.0, 1.0), (5, 5, 3)
+    )
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    hist = np.zeros((HISTORY_FRAMES, 5, 5, 3), dtype=bool)
+    hist[:, 1:4, 1:4, :] = True
+    scene = torch.zeros((1, 4, 5, 5, 3))
+    kwargs = dict(
+        model=FakeModel(),
+        scene_features=scene,
+        high_lattice=high,
+        coarse_lattice=coarse,
+        future_ego_to_canonical=poses,
+        history_observed_coarse=hist,
+        native_shape_xyz=(4, 4, 2),
+        native_origin_xyz_m=(-1.0, -1.0, -0.5),
+        native_voxel_size_xyz_m=(0.5, 0.5, 0.5),
+        tile_size_xyz=(4, 4, 3),
+    )
+    a = decode_static_world_tiled(**kwargs, tile_batch_size=1)
+    b = decode_static_world_tiled(**kwargs, tile_batch_size=8)
+    assert np.array_equal(a.canonical_semantic, b.canonical_semantic)
+    assert np.array_equal(a.future_semantic, b.future_semantic)
+    assert a.query_voxels == b.query_voxels
+    assert a.active_tiles == b.active_tiles
+    assert a.out_of_bounds_voxels == b.out_of_bounds_voxels
