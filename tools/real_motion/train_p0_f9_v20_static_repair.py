@@ -241,7 +241,15 @@ def _decode_history(row):
     return sem, obs, free
 
 
-def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
+def _prepare_pair_cpu(
+    srow,
+    rrow,
+    source,
+    native_shape,
+    free_label,
+    *,
+    need_metrics,
+):
     started = time.perf_counter()
     sem, obs, obsfree = _decode_history(srow)
     support = unpack_v18_free_support(
@@ -256,13 +264,6 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
             f"future GT shape mismatch: {gt.shape}"
         )
     target = repair_target_from_gt(gt, free_label=int(free_label))
-    base_pred = unpack_v18_prediction(
-        rrow, native_shape, free_label=int(free_label)
-    )
-    if not np.array_equal(
-        base_pred == int(free_label), support
-    ):
-        raise RuntimeError("reconstructed V18 prediction/support mismatch")
     # Stage1 already stores the authoritative future->t0 transforms used
     # by V20. Reusing them removes seven pose lookups and duplicate SE(3)
     # algebra per training window.
@@ -272,20 +273,31 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
     if future_rel.shape != (6, 4, 4):
         raise RuntimeError("Stage1 future_ego_to_t0 shape mismatch")
 
-    base_full_conf = np.zeros((6, 18, 18), dtype=np.int64)
-    base_support_conf = np.zeros((6, 18, 18), dtype=np.int64)
-    for hi in range(6):
-        gh = gt[hi].reshape(-1).astype(np.int64, copy=False)
-        bh = base_pred[hi].reshape(-1).astype(np.int64, copy=False)
-        sh = support[hi].reshape(-1)
-        base_full_conf[hi] = np.bincount(
-            gh * 18 + bh, minlength=18 * 18
-        ).reshape(18, 18)
-        # On Static decision support frozen V18 is exactly FREE.
-        gs = gh[sh]
-        base_support_conf[hi] = np.bincount(
-            gs * 18 + int(free_label), minlength=18 * 18
-        ).reshape(18, 18)
+    base_full_conf = None
+    base_support_conf = None
+    if need_metrics:
+        # Evaluation-only work. Dense frozen-V18 reconstruction and full-grid
+        # confusion do not contribute to the training CE gradient.
+        base_pred = unpack_v18_prediction(
+            rrow, native_shape, free_label=int(free_label)
+        )
+        if not np.array_equal(
+            base_pred == int(free_label), support
+        ):
+            raise RuntimeError("reconstructed V18 prediction/support mismatch")
+        base_full_conf = np.zeros((6, 18, 18), dtype=np.int64)
+        base_support_conf = np.zeros((6, 18, 18), dtype=np.int64)
+        for hi in range(6):
+            gh = gt[hi].reshape(-1).astype(np.int64, copy=False)
+            bh = base_pred[hi].reshape(-1).astype(np.int64, copy=False)
+            sh = support[hi].reshape(-1)
+            base_full_conf[hi] = np.bincount(
+                gh * 18 + bh, minlength=18 * 18
+            ).reshape(18, 18)
+            gs = gh[sh]
+            base_support_conf[hi] = np.bincount(
+                gs * 18 + int(free_label), minlength=18 * 18
+            ).reshape(18, 18)
 
     cached_counts = np.asarray(
         rrow["v18_free_count_by_horizon"], dtype=np.int64
@@ -293,18 +305,20 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
     got_counts = support.reshape(6, -1).sum(axis=1).astype(np.int64)
     if not np.array_equal(cached_counts, got_counts):
         raise RuntimeError("V18-free packed support count mismatch")
-    return {
+    out = {
         "sem": sem,
         "obs": obs,
         "obsfree": obsfree,
         "support": support,
         "target": target,
-        "gt": gt,
-        "base_full_conf": base_full_conf,
-        "base_support_conf": base_support_conf,
         "future_rel": future_rel,
         "cpu_seconds": float(time.perf_counter() - started),
     }
+    if need_metrics:
+        out["gt"] = gt
+        out["base_full_conf"] = base_full_conf
+        out["base_support_conf"] = base_support_conf
+    return out
 
 
 def _iter_prepared(
@@ -322,6 +336,7 @@ def _iter_prepared(
     workers,
     prefetch,
     fixed_identities=None,
+    need_metrics=True,
 ):
     raw = iter(_iter_paired_rows(
         stage_root,
@@ -336,7 +351,12 @@ def _iter_prepared(
 
     def prepare(pair):
         return _prepare_pair_cpu(
-            pair[0], pair[1], source, native_shape, free_label
+            pair[0],
+            pair[1],
+            source,
+            native_shape,
+            free_label,
+            need_metrics=bool(need_metrics),
         )
 
     nw = max(int(workers), 0)
@@ -715,6 +735,59 @@ def _decode_query_logits_sparse(
     return query_logits, row_map, int(ntiles)
 
 
+def _repair_sparse_loss_only(
+    query_logits,
+    query_row_map,
+    linear,
+    support,
+    target,
+    *,
+    geom,
+    device,
+):
+    """Exact Repair-v2 CE without evaluation-only prediction metrics."""
+    support_t = torch.from_numpy(
+        np.asarray(support, dtype=bool)
+    ).to(device, non_blocking=True)
+    target_t = torch.from_numpy(
+        np.asarray(target, dtype=np.uint8)
+    ).to(device, non_blocking=True)
+
+    loss_sum = query_logits.sum() * 0.0
+    for hi in range(6):
+        s = support_t[hi].reshape(-1)
+        lin = linear[hi][s]
+        qrow = query_row_map[lin].long()
+        valid_rows = (qrow >= 0).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                valid_rows,
+                "Static Repair support escaped decoded query union",
+            )
+        elif not bool(valid_rows.item()):
+            raise RuntimeError(
+                "Static Repair support escaped decoded query union"
+            )
+
+        rows = query_logits[qrow]
+        y = target_t[hi].reshape(-1)[s].long()
+        yl = geom.global_to_local[y]
+        valid_labels = (yl >= 0).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                valid_labels,
+                "dynamic label entered Static Repair target",
+            )
+        elif not bool(valid_labels.item()):
+            raise RuntimeError("dynamic label entered Static Repair target")
+        loss_sum = loss_sum + F.cross_entropy(
+            rows, yl, reduction="sum"
+        )
+
+    denom = support_t.sum().clamp_min(1)
+    return loss_sum / denom.to(loss_sum.dtype)
+
+
 def _repair_sparse_loss_and_confusion(
     query_logits,
     query_row_map,
@@ -942,6 +1015,77 @@ def _atomic_save(obj, path):
             tmp.unlink()
 
 
+class _CudaStageProfiler:
+    """Low-overhead CUDA-event timing, flushed only at existing sync points."""
+
+    STAGES = (
+        "h2d",
+        "encoder",
+        "geometry",
+        "tile_decode",
+        "loss",
+        "backward",
+        "optim",
+    )
+
+    def __init__(self, device, *, enabled=False, warmup_windows=5):
+        self.enabled = bool(enabled) and device.type == "cuda"
+        self.warmup_windows = max(int(warmup_windows), 0)
+        self.window_index = 0
+        self.pending = []
+        self.total_ms = {name: 0.0 for name in self.STAGES}
+        self.count = {name: 0 for name in self.STAGES}
+
+    def begin_window(self):
+        active = self.enabled and self.window_index >= self.warmup_windows
+        self.window_index += 1
+        return {} if active else None
+
+    def start(self, events, name):
+        if events is None:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        events[name] = [ev, None]
+
+    def stop(self, events, name):
+        if events is None:
+            return
+        pair = events.get(name)
+        if pair is None:
+            raise RuntimeError(f"profiler stage {name!r} was not started")
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        pair[1] = ev
+
+    def finish_window(self, events):
+        if events:
+            self.pending.append(events)
+
+    def flush_after_sync(self):
+        if not self.enabled:
+            return {}
+        for events in self.pending:
+            for name, pair in events.items():
+                if pair[1] is None:
+                    raise RuntimeError(
+                        f"profiler stage {name!r} was not stopped"
+                    )
+                self.total_ms[name] += float(pair[0].elapsed_time(pair[1]))
+                self.count[name] += 1
+        self.pending.clear()
+        return self.summary()
+
+    def summary(self):
+        return {
+            name: (
+                float(self.total_ms[name] / self.count[name])
+                if self.count[name] > 0 else None
+            )
+            for name in self.STAGES
+        }
+
+
 def _epoch(
     model,
     stage_root,
@@ -964,6 +1108,8 @@ def _epoch(
     checkpoint_every=0,
     checkpoint_callback=None,
     fixed_identities=None,
+    profile_gpu_stages=False,
+    profile_warmup_windows=5,
 ):
     train = optimizer is not None
     model.train(train)
@@ -984,35 +1130,41 @@ def _epoch(
         raise ValueError("invalid resume window")
 
     saved = dict(resume_state or {})
-    conf0 = np.asarray(
-        saved.get("confusion", np.zeros((18, 18), dtype=np.int64)),
-        dtype=np.int64,
-    )
-    conf_gpu = torch.as_tensor(
-        conf0, dtype=torch.int64, device=device
-    ).clone()
-    base_full_gpu = torch.as_tensor(
-        np.asarray(
-            saved.get(
-                "base_full_confusion",
-                np.zeros((6, 18, 18), dtype=np.int64),
+    compute_metrics = not train
+    if compute_metrics:
+        conf0 = np.asarray(
+            saved.get("confusion", np.zeros((18, 18), dtype=np.int64)),
+            dtype=np.int64,
+        )
+        conf_gpu = torch.as_tensor(
+            conf0, dtype=torch.int64, device=device
+        ).clone()
+        base_full_gpu = torch.as_tensor(
+            np.asarray(
+                saved.get(
+                    "base_full_confusion",
+                    np.zeros((6, 18, 18), dtype=np.int64),
+                ),
+                dtype=np.int64,
             ),
             dtype=np.int64,
-        ),
-        dtype=torch.int64,
-        device=device,
-    ).clone()
-    final_full_gpu = torch.as_tensor(
-        np.asarray(
-            saved.get(
-                "final_full_confusion",
-                np.zeros((6, 18, 18), dtype=np.int64),
+            device=device,
+        ).clone()
+        final_full_gpu = torch.as_tensor(
+            np.asarray(
+                saved.get(
+                    "final_full_confusion",
+                    np.zeros((6, 18, 18), dtype=np.int64),
+                ),
+                dtype=np.int64,
             ),
-            dtype=np.int64,
-        ),
-        dtype=torch.int64,
-        device=device,
-    ).clone()
+            dtype=torch.int64,
+            device=device,
+        ).clone()
+    else:
+        conf_gpu = None
+        base_full_gpu = None
+        final_full_gpu = None
     loss_sum_scalar = torch.tensor(
         float(saved.get("loss_sum", 0.0)),
         dtype=torch.float64,
@@ -1036,11 +1188,17 @@ def _epoch(
         workers=prep_workers,
         prefetch=prefetch,
         fixed_identities=fixed_identities,
+        need_metrics=compute_metrics,
     ))
 
     n = int(start_window)
     started = time.perf_counter()
     cpu_wait = 0.0
+    profiler = _CudaStageProfiler(
+        device,
+        enabled=bool(profile_gpu_stages),
+        warmup_windows=int(profile_warmup_windows),
+    )
 
     while n < total:
         tw = time.perf_counter()
@@ -1051,6 +1209,8 @@ def _epoch(
         cpu_wait += time.perf_counter() - tw
         cpu_work += float(item["cpu_seconds"])
 
+        prof_events = profiler.begin_window()
+        profiler.start(prof_events, "h2d")
         sem = torch.from_numpy(item["sem"]).to(
             device, non_blocking=True
         ).unsqueeze(0)
@@ -1060,13 +1220,21 @@ def _epoch(
         obsfree = torch.from_numpy(item["obsfree"]).to(
             device, non_blocking=True
         ).unsqueeze(0)
+        profiler.stop(prof_events, "h2d")
 
         if train:
             optimizer.zero_grad(set_to_none=True)
 
         with _autocast(device, amp):
+            profiler.start(prof_events, "encoder")
             scene = model.encode_history(sem, obs, obsfree)
+            profiler.stop(prof_events, "encoder")
+
+            profiler.start(prof_events, "geometry")
             linear, q = geom.future_linear_and_query(item["future_rel"])
+            profiler.stop(prof_events, "geometry")
+
+            profiler.start(prof_events, "tile_decode")
             query_logits, query_row_map, ntiles = (
                 _decode_query_logits_sparse(
                     model,
@@ -1077,20 +1245,36 @@ def _epoch(
                     tile_batch_size=tile_batch_size,
                 )
             )
-            loss, conf, base_full, final_full = (
-                _repair_sparse_loss_and_confusion(
+            profiler.stop(prof_events, "tile_decode")
+
+            profiler.start(prof_events, "loss")
+            if compute_metrics:
+                loss, conf, base_full, final_full = (
+                    _repair_sparse_loss_and_confusion(
+                        query_logits,
+                        query_row_map,
+                        linear,
+                        item["support"],
+                        item["target"],
+                        gt=item["gt"],
+                        base_full_conf=item["base_full_conf"],
+                        base_support_conf=item["base_support_conf"],
+                        geom=geom,
+                        device=device,
+                    )
+                )
+            else:
+                loss = _repair_sparse_loss_only(
                     query_logits,
                     query_row_map,
                     linear,
                     item["support"],
                     item["target"],
-                    gt=item["gt"],
-                    base_full_conf=item["base_full_conf"],
-                    base_support_conf=item["base_support_conf"],
                     geom=geom,
                     device=device,
                 )
-            )
+                conf = base_full = final_full = None
+            profiler.stop(prof_events, "loss")
 
         finite = torch.isfinite(loss.detach()).all()
         if device.type == "cuda" and hasattr(torch, "_assert_async"):
@@ -1099,7 +1283,10 @@ def _epoch(
             raise RuntimeError("non-finite Static Repair loss")
 
         if train:
+            profiler.start(prof_events, "backward")
             loss.backward()
+            profiler.stop(prof_events, "backward")
+            profiler.start(prof_events, "optim")
             torch.nn.utils.clip_grad_norm_(
                 trainable_params,
                 5.0,
@@ -1107,11 +1294,14 @@ def _epoch(
                 foreach=(device.type == "cuda"),
             )
             optimizer.step()
+            profiler.stop(prof_events, "optim")
 
+        profiler.finish_window(prof_events)
         loss_sum_scalar.add_(loss.detach().double())
-        conf_gpu.add_(conf)
-        base_full_gpu.add_(base_full)
-        final_full_gpu.add_(final_full)
+        if compute_metrics:
+            conf_gpu.add_(conf)
+            base_full_gpu.add_(base_full)
+            final_full_gpu.add_(final_full)
         tiles_total += int(ntiles)
         n += 1
 
@@ -1132,17 +1322,41 @@ def _epoch(
                 torch.cuda.synchronize(device)
             now = time.perf_counter()
             seg = max(n - int(start_window), 1)
-            diag = repair_diagnostics_from_confusion(
-                conf_gpu.detach().cpu().numpy()
-            )
-            base_metrics = full_grid_metrics_from_confusion(
-                base_full_gpu.detach().cpu().numpy()
-            )
-            final_metrics = full_grid_metrics_from_confusion(
-                final_full_gpu.detach().cpu().numpy()
-            )
+            gpu_stage_ms = profiler.flush_after_sync()
+            if compute_metrics:
+                diag = repair_diagnostics_from_confusion(
+                    conf_gpu.detach().cpu().numpy()
+                )
+                base_metrics = full_grid_metrics_from_confusion(
+                    base_full_gpu.detach().cpu().numpy()
+                )
+                final_metrics = full_grid_metrics_from_confusion(
+                    final_full_gpu.detach().cpu().numpy()
+                )
+            else:
+                diag = {}
+                base_metrics = {}
+                final_metrics = {}
             if report:
                 phase = "train" if train else "val"
+                metric_text = (
+                    f"addP={diag['addition_precision']:.4f} "
+                    f"addR={diag['static_positive_recall']:.4f} "
+                    f"base_mIoU={base_metrics['mIoU']:.2f} "
+                    f"repair_mIoU={final_metrics['mIoU']:.2f} "
+                    f"delta={final_metrics['mIoU']-base_metrics['mIoU']:+.2f}"
+                    if compute_metrics
+                    else "metrics=deferred_to_val"
+                )
+                gpu_text = ""
+                if gpu_stage_ms:
+                    parts = [
+                        f"{name}:{value:.2f}"
+                        for name, value in gpu_stage_ms.items()
+                        if value is not None
+                    ]
+                    if parts:
+                        gpu_text = " gpu_ms=" + ",".join(parts)
                 print(
                     f"v20_static_repair_{phase} {n}/{total} "
                     f"rate={seg/max(now-started,1e-9):.3f} win/s "
@@ -1150,11 +1364,7 @@ def _epoch(
                     f"cpu_work={cpu_work/max(n,1):.3f}s/win "
                     f"tiles={tiles_total/max(n,1):.1f}/win "
                     f"loss={float(loss_sum_scalar.item()/max(n,1)):.5f} "
-                    f"addP={diag['addition_precision']:.4f} "
-                    f"addR={diag['static_positive_recall']:.4f} "
-                    f"base_mIoU={base_metrics['mIoU']:.2f} "
-                    f"repair_mIoU={final_metrics['mIoU']:.2f} "
-                    f"delta={final_metrics['mIoU']-base_metrics['mIoU']:+.2f}",
+                    f"{metric_text}{gpu_text}",
                     flush=True,
                 )
             if save_now:
@@ -1162,13 +1372,17 @@ def _epoch(
                     n,
                     {
                         "loss_sum": float(loss_sum_scalar.item()),
-                        "confusion": conf_gpu.detach().cpu().numpy().tolist(),
-                        "base_full_confusion": (
-                            base_full_gpu.detach().cpu().numpy().tolist()
-                        ),
-                        "final_full_confusion": (
-                            final_full_gpu.detach().cpu().numpy().tolist()
-                        ),
+                        **({
+                            "confusion": (
+                                conf_gpu.detach().cpu().numpy().tolist()
+                            ),
+                            "base_full_confusion": (
+                                base_full_gpu.detach().cpu().numpy().tolist()
+                            ),
+                            "final_full_confusion": (
+                                final_full_gpu.detach().cpu().numpy().tolist()
+                            ),
+                        } if compute_metrics else {}),
                         "cpu_work_seconds": float(cpu_work),
                         "tiles_total": int(tiles_total),
                         "elapsed_seconds": float(
@@ -1181,13 +1395,37 @@ def _epoch(
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    conf_np = conf_gpu.cpu().numpy()
-    base_full_np = base_full_gpu.cpu().numpy()
-    final_full_np = final_full_gpu.cpu().numpy()
-    diag = repair_diagnostics_from_confusion(conf_np)
-    base_metrics = full_grid_metrics_from_confusion(base_full_np)
-    final_metrics = full_grid_metrics_from_confusion(final_full_np)
+    gpu_stage_ms = profiler.flush_after_sync()
+    if compute_metrics:
+        conf_np = conf_gpu.cpu().numpy()
+        base_full_np = base_full_gpu.cpu().numpy()
+        final_full_np = final_full_gpu.cpu().numpy()
+        diag = repair_diagnostics_from_confusion(conf_np)
+        base_metrics = full_grid_metrics_from_confusion(base_full_np)
+        final_metrics = full_grid_metrics_from_confusion(final_full_np)
+        full_delta = {
+            "IoU": float(final_metrics["IoU"] - base_metrics["IoU"]),
+            "mIoU": float(final_metrics["mIoU"] - base_metrics["mIoU"]),
+            "main_1_2_3s": {
+                "IoU": float(
+                    final_metrics["main_1_2_3s"]["IoU"]
+                    - base_metrics["main_1_2_3s"]["IoU"]
+                ),
+                "mIoU": float(
+                    final_metrics["main_1_2_3s"]["mIoU"]
+                    - base_metrics["main_1_2_3s"]["mIoU"]
+                ),
+            },
+        }
+        conf_list = conf_np.tolist()
+    else:
+        diag = {}
+        base_metrics = {}
+        final_metrics = {}
+        full_delta = {}
+        conf_list = None
     return {
+        "metrics_computed": bool(compute_metrics),
         "loss": float(loss_sum_scalar.item() / max(n, 1)),
         "windows": int(n),
         "mean_tiles_per_window": float(
@@ -1202,21 +1440,9 @@ def _epoch(
         "repair_diagnostics": diag,
         "full_grid_v18_metrics": base_metrics,
         "full_grid_v18_plus_static_metrics": final_metrics,
-        "full_grid_delta": {
-            "IoU": float(final_metrics["IoU"] - base_metrics["IoU"]),
-            "mIoU": float(final_metrics["mIoU"] - base_metrics["mIoU"]),
-            "main_1_2_3s": {
-                "IoU": float(
-                    final_metrics["main_1_2_3s"]["IoU"]
-                    - base_metrics["main_1_2_3s"]["IoU"]
-                ),
-                "mIoU": float(
-                    final_metrics["main_1_2_3s"]["mIoU"]
-                    - base_metrics["main_1_2_3s"]["mIoU"]
-                ),
-            },
-        },
-        "confusion_18x18": conf_np.tolist(),
+        "full_grid_delta": full_delta,
+        "confusion_18x18": conf_list,
+        "gpu_stage_ms_per_window": gpu_stage_ms,
         "checkpoint_selection_metric": (
             "NONE; use formal composed dev mIoU"
         ),
@@ -1264,6 +1490,20 @@ def main():
     p.add_argument("--seed", type=int, default=20260926)
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-amp", action="store_true")
+    p.add_argument(
+        "--profile-gpu-stages",
+        action="store_true",
+        help=(
+            "Use CUDA events to report mean h2d/encoder/geometry/tile/loss/"
+            "backward/optimizer milliseconds at normal progress sync points."
+        ),
+    )
+    p.add_argument(
+        "--profile-warmup-windows",
+        type=int,
+        default=5,
+        help="Windows excluded from CUDA stage timing warmup.",
+    )
     a = p.parse_args()
 
     random.seed(a.seed)
@@ -1614,6 +1854,8 @@ def main():
         "fixed_overfit_population_sha256": (
             fixed_overfit_population_sha256 or None
         ),
+        "profile_gpu_stages": bool(a.profile_gpu_stages),
+        "profile_warmup_windows": int(a.profile_warmup_windows),
         "support": "formal full grid AND frozen V18 free",
         "target": "static semantic; free/dynamic -> no-add",
         "class_weighting": "none",
@@ -1659,6 +1901,8 @@ def main():
             checkpoint_every=int(a.checkpoint_every_windows),
             checkpoint_callback=save_partial,
             fixed_identities=fixed_overfit_identities,
+            profile_gpu_stages=bool(a.profile_gpu_stages),
+            profile_warmup_windows=int(a.profile_warmup_windows),
         )
         with torch.inference_mode():
             va = _epoch(
@@ -1678,6 +1922,8 @@ def main():
                 amp=amp,
                 max_windows=int(a.max_val_windows),
                 fixed_identities=fixed_overfit_identities,
+                profile_gpu_stages=bool(a.profile_gpu_stages),
+                profile_warmup_windows=int(a.profile_warmup_windows),
             )
 
         row = {"epoch": int(epoch), "train": tr, "val": va}
