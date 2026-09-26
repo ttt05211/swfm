@@ -795,3 +795,62 @@ def test_static_vectorized_aggregate_matches_dict_reference():
     )
     assert np.array_equal(got_i, ref_i)
     assert np.array_equal(got_y, ref_y)
+
+
+def test_static_paired_aggregation_matches_two_independent_aggregations():
+    from real_motion.v20_stage1_codec import pack_static_supervision
+    from tools.real_motion.train_p0_f9_v20_static import (
+        _aggregate_sparse_targets,
+        _aggregate_sparse_targets_pair,
+    )
+
+    rng = np.random.default_rng(53)
+    native_shape = (7, 6, 3)
+    coarse = CanonicalLattice((-3, -3, -1), (1.0, 1.0, 1.0), (10, 10, 5))
+    high = CanonicalLattice((-3, -3, -1), (0.5, 0.5, 0.5), (20, 20, 10))
+    rel = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    rel[:, 0, 3] = np.linspace(-0.4, 0.5, FUTURE_FRAMES)
+    rel[:, 1, 3] = np.linspace(0.3, -0.2, FUTURE_FRAMES)
+    sups = []
+    for _ in range(FUTURE_FRAMES):
+        gt = rng.integers(0, 18, size=native_shape, dtype=np.uint8)
+        obs = rng.random(native_shape) > 0.2
+        sups.append(pack_static_supervision(gt, obs))
+    row = {
+        "future_ego_to_t0": torch.from_numpy(rel.astype(np.float32)),
+        "static_supervision": sups,
+    }
+    args = (native_shape, (-1.5, -1.5, -0.5), (0.5, 0.5, 0.5))
+    ci, cy = _aggregate_sparse_targets(row, coarse, *args)
+    hi, hy = _aggregate_sparse_targets(row, high, *args)
+    pci, pcy, phi, phy = _aggregate_sparse_targets_pair(
+        row, coarse, high, *args
+    )
+    assert np.array_equal(pci, ci)
+    assert np.array_equal(pcy, cy)
+    assert np.array_equal(phi, hi)
+    assert np.array_equal(phy, hy)
+
+
+def test_equal_tile_weighted_ce_matches_per_tile_loop():
+    from tools.real_motion.train_p0_f9_v20_static import (
+        _equal_tile_weighted_ce,
+    )
+
+    g = torch.Generator().manual_seed(59)
+    logits = torch.randn(13, 18, generator=g)
+    targets = torch.tensor([0, 1, 2, 17, 3, 0, 5, 17, 1, 2, 3, 5, 0])
+    tile_ids = torch.tensor([0,0,0,0,1,1,1,1,1,2,2,2,2])
+    weights = torch.linspace(0.5, 2.0, 18)
+    got = _equal_tile_weighted_ce(
+        logits, targets, tile_ids, weights, 3
+    )
+    ref = sum(
+        torch.nn.functional.cross_entropy(
+            logits[tile_ids == tid],
+            targets[tile_ids == tid],
+            weight=weights,
+        )
+        for tid in range(3)
+    )
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-6)
