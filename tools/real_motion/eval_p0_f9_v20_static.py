@@ -113,6 +113,102 @@ def _finish_subset(row):
     return x
 
 
+def _addition_quality_empty():
+    return {
+        "added": np.zeros(6, dtype=np.int64),
+        "occupancy_tp": np.zeros(6, dtype=np.int64),
+        "occupancy_fp": np.zeros(6, dtype=np.int64),
+        "semantic_correct": np.zeros(6, dtype=np.int64),
+        "static_responsibility_tp": np.zeros(6, dtype=np.int64),
+        "static_responsibility_fp": np.zeros(6, dtype=np.int64),
+        "static_gt_positive": np.zeros(6, dtype=np.int64),
+    }
+
+
+def _update_addition_quality(row, hi, base_pred, final_pred, gt, free_label):
+    base_p = np.asarray(base_pred)
+    final_p = np.asarray(final_pred)
+    y = np.asarray(gt)
+    free = int(free_label)
+    added = (base_p == free) & (final_p != free)
+    occupied = y != free
+    dynamic = np.isin(
+        y, np.asarray(DYNAMIC_CLASS_IDS, dtype=y.dtype)
+    )
+    static_positive = occupied & ~dynamic
+    row["added"][hi] += int(added.sum())
+    row["occupancy_tp"][hi] += int((added & occupied).sum())
+    row["occupancy_fp"][hi] += int((added & ~occupied).sum())
+    row["semantic_correct"][hi] += int(
+        (added & occupied & (final_p == y)).sum()
+    )
+    row["static_responsibility_tp"][hi] += int(
+        (added & static_positive).sum()
+    )
+    row["static_responsibility_fp"][hi] += int(
+        (added & ~static_positive).sum()
+    )
+    row["static_gt_positive"][hi] += int(static_positive.sum())
+
+
+def _finish_addition_quality(row):
+    out = {}
+    horizons = [0.5 * (i + 1) for i in range(6)]
+    for hi, horizon in enumerate(horizons):
+        added = int(row["added"][hi])
+        otp = int(row["occupancy_tp"][hi])
+        ofp = int(row["occupancy_fp"][hi])
+        stp = int(row["static_responsibility_tp"][hi])
+        sfp = int(row["static_responsibility_fp"][hi])
+        out[str(horizon)] = {
+            "added_voxels": added,
+            "occupancy_tp": otp,
+            "occupancy_fp": ofp,
+            "occupancy_addition_precision": float(
+                otp / max(otp + ofp, 1)
+            ),
+            "semantic_accuracy_on_occupancy_tp": float(
+                int(row["semantic_correct"][hi]) / max(otp, 1)
+            ),
+            "static_responsibility_tp": stp,
+            "static_responsibility_fp": sfp,
+            "static_responsibility_precision": float(
+                stp / max(stp + sfp, 1)
+            ),
+            "static_positive_recall": float(
+                stp / max(int(row["static_gt_positive"][hi]), 1)
+            ),
+        }
+    sums = {k: int(np.asarray(v).sum()) for k, v in row.items()}
+    out["overall"] = {
+        "added_voxels": sums["added"],
+        "occupancy_tp": sums["occupancy_tp"],
+        "occupancy_fp": sums["occupancy_fp"],
+        "occupancy_addition_precision": float(
+            sums["occupancy_tp"]
+            / max(sums["occupancy_tp"] + sums["occupancy_fp"], 1)
+        ),
+        "semantic_accuracy_on_occupancy_tp": float(
+            sums["semantic_correct"] / max(sums["occupancy_tp"], 1)
+        ),
+        "static_responsibility_tp": sums["static_responsibility_tp"],
+        "static_responsibility_fp": sums["static_responsibility_fp"],
+        "static_responsibility_precision": float(
+            sums["static_responsibility_tp"]
+            / max(
+                sums["static_responsibility_tp"]
+                + sums["static_responsibility_fp"],
+                1,
+            )
+        ),
+        "static_positive_recall": float(
+            sums["static_responsibility_tp"]
+            / max(sums["static_gt_positive"], 1)
+        ),
+    }
+    return out
+
+
 def _load_stage1_rows(cache_dir):
     root = Path(cache_dir)
     idx = json.loads((root / "index.json").read_text(encoding="utf-8"))
@@ -222,6 +318,7 @@ def main():
         "history_seen_t0_missing": _subset_empty(),
         "never_seen_static_domain": _subset_empty(),
     }
+    addition_quality = _addition_quality_empty()
     total_query = total_tiles = total_oob = total_history_oob = 0
     static_runtime_cache = StaticRuntimeCache()
     print(
@@ -367,6 +464,14 @@ def main():
         phase_s["moving"] += time.perf_counter() - t_phase
         for hi, _ in enumerate(HORIZONS):
             gt = np.asarray(raw["future_gt_occ"][hi], dtype=np.uint8)
+            _update_addition_quality(
+                addition_quality,
+                hi,
+                pred_stack[hi],
+                final[hi],
+                gt,
+                int(pcfg.free_label),
+            )
             _update_many(
                 raw_by_variant,
                 hi,
@@ -401,6 +506,9 @@ def main():
         "static_memory_unconditional_output": False,
         "metrics": metrics,
         "delta_v20_static_vs_v18": _delta(metrics["v20_static"], metrics["v18"]),
+        "global_addition_quality": _finish_addition_quality(
+            addition_quality
+        ),
         "static_capability_subsets": (
             None
             if bool(a.selection_only)
@@ -439,6 +547,7 @@ def main():
     print(json.dumps({
         "metrics": metrics,
         "delta": result["delta_v20_static_vs_v18"],
+        "global_addition_quality": result["global_addition_quality"],
         "subsets": result["static_capability_subsets"],
         "geometry_audit": result["geometry_audit"],
     }, indent=2))
