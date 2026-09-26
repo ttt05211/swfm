@@ -636,6 +636,7 @@ def _decode_query_logits_sparse(
     geom,
     *,
     tile_batch_size,
+    tile_batch_pad_multiple=1,
 ):
     """Decode only canonical query cells, preserving exact tiled semantics.
 
@@ -710,13 +711,55 @@ def _decode_query_logits_sparse(
                 mrows.append(seen & ~t0_seen)
 
             qstack = torch.stack(qrows, dim=0)
+            grid_batch = torch.cat(grids, dim=0)
+            seen_batch = torch.stack(srows, dim=0)
+            missing_batch = torch.stack(mrows, dim=0)
+
+            # Stabilize the expensive Conv3D batch dimension without changing
+            # any real tile. Padding is only along B; dummy outputs are cropped
+            # before they can contribute to the loss. GroupNorm is per sample,
+            # so real-tile activations/gradients are unchanged.
+            real_b = int(qstack.shape[0])
+            pad_multiple = max(int(tile_batch_pad_multiple), 1)
+            padded_b = real_b
+            if pad_multiple > 1 and real_b >= pad_multiple:
+                padded_b = (
+                    (real_b + pad_multiple - 1) // pad_multiple
+                ) * pad_multiple
+                padded_b = min(padded_b, bsz)
+            if padded_b > real_b:
+                pad = padded_b - real_b
+                grid_batch = torch.cat(
+                    (
+                        grid_batch,
+                        grid_batch[-1:].expand(
+                            pad, *grid_batch.shape[1:]
+                        ),
+                    ),
+                    dim=0,
+                )
+                zero_mask = torch.zeros(
+                    (pad,) + tuple(qstack.shape[1:]),
+                    dtype=qstack.dtype,
+                    device=qstack.device,
+                )
+                q_model = torch.cat((qstack, zero_mask), dim=0)
+                seen_model = torch.cat((seen_batch, zero_mask), dim=0)
+                missing_model = torch.cat(
+                    (missing_batch, zero_mask), dim=0
+                )
+            else:
+                q_model = qstack
+                seen_model = seen_batch
+                missing_model = missing_batch
+
             logits = model.static.refine_tiles(
                 scene,
-                sample_grid=torch.cat(grids, dim=0),
-                query_mask=qstack,
-                seen_mask=torch.stack(srows, dim=0),
-                t0_missing_mask=torch.stack(mrows, dim=0),
-            ).index_select(1, geom.allowed_ids)
+                sample_grid=grid_batch,
+                query_mask=q_model,
+                seen_mask=seen_model,
+                t0_missing_mask=missing_model,
+            ).index_select(1, geom.allowed_ids)[:real_b]
 
             # [B,C,X,Y,Z] -> [B,X,Y,Z,C], then retain only M_query cells.
             selected_logits = logits.permute(0, 2, 3, 4, 1)[qstack]
@@ -754,12 +797,10 @@ def _repair_sparse_loss_only(
 ):
     """Exact Repair-v2 CE with repeated canonical rows aggregated first.
 
-    The formal objective is still one equally weighted CE term for every
-    future voxel/horizon in frozen-V18-free support. Multiple future voxels
-    can map to the same canonical query row, so evaluating CE independently
-    repeats the same logit vector millions of times. Count those repeated
-    (query-row, class) pairs first, then evaluate the algebraically identical
-    weighted negative log-likelihood once per canonical query row.
+    Every future voxel/horizon keeps unit weight.  Repeated mappings to the
+    same canonical (query row, class) pair are counted before log-softmax, so
+    the loss and logits gradient are algebraically identical to repeated CE
+    while avoiding six ~600k-row NLL backward kernels.
     """
     support_t = torch.from_numpy(
         np.asarray(support, dtype=bool)
@@ -770,7 +811,12 @@ def _repair_sparse_loss_only(
 
     nclass = int(query_logits.shape[1])
     qcount = int(query_logits.shape[0])
-    pair_keys = []
+    count_dtype = torch.float32
+    counts_flat = torch.zeros(
+        qcount * nclass,
+        dtype=count_dtype,
+        device=device,
+    )
     total_support = 0
 
     for hi in range(6):
@@ -799,39 +845,27 @@ def _repair_sparse_loss_only(
         elif not bool(valid_labels.item()):
             raise RuntimeError("dynamic label entered Static Repair target")
 
-        pair_keys.append(qrow * nclass + yl)
+        keys = qrow * nclass + yl
+        counts_flat.scatter_add_(
+            0,
+            keys,
+            torch.ones(
+                keys.shape,
+                dtype=count_dtype,
+                device=device,
+            ),
+        )
         total_support += int(qrow.numel())
 
     if total_support <= 0:
         return query_logits.sum() * 0.0
 
-    keys = torch.cat(pair_keys, dim=0)
-    # float32 integer counts are exact at the collision multiplicities present
-    # here and avoid an 8-byte int64 count volume followed by another copy.
-    count_dtype = (
-        torch.float32
-        if query_logits.dtype in {torch.float16, torch.bfloat16}
-        else query_logits.dtype
-    )
-    counts_flat = torch.zeros(
-        qcount * nclass,
-        dtype=count_dtype,
-        device=device,
-    )
-    counts_flat.scatter_add_(
-        0,
-        keys,
-        torch.ones(keys.shape, dtype=count_dtype, device=device),
-    )
     counts = counts_flat.view(qcount, nclass)
+    logits = query_logits.float()
 
-    logits = query_logits
-    if logits.dtype != count_dtype:
-        logits = logits.to(count_dtype)
-
-    # Sum_{examples} CE(logits[row], y)
-    # = Sum_row [N_row * logsumexp(logits_row)
-    #            - Sum_class N_{row,class} * logits_{row,class}]
+    # Sum_examples CE(logits[row], y)
+    # = Sum_row [N_row*logsumexp(logits_row)
+    #            - Sum_class N_{row,class}*logits_{row,class}].
     row_count = counts.sum(dim=1)
     loss_sum = (
         row_count * torch.logsumexp(logits, dim=1)
@@ -1165,6 +1199,7 @@ def _epoch(
     device,
     optimizer,
     tile_batch_size,
+    tile_batch_pad_multiple,
     prep_workers,
     prefetch,
     progress_every,
@@ -1316,6 +1351,7 @@ def _epoch(
                     item["obs"],
                     geom,
                     tile_batch_size=tile_batch_size,
+                    tile_batch_pad_multiple=tile_batch_pad_multiple,
                 )
             )
             profiler.stop(prof_events, "tile_decode")
@@ -1568,6 +1604,23 @@ def main():
     p.add_argument("--tile-size", default="32,32,16")
     p.add_argument("--tile-batch-size", type=int, default=128)
     p.add_argument(
+        "--tile-batch-pad-multiple",
+        type=int,
+        default=16,
+        help=(
+            "Exact speed optimization: pad only the tile batch dimension to "
+            "a small multiple before Conv3D, then crop dummy outputs."
+        ),
+    )
+    p.add_argument(
+        "--no-channels-last-3d",
+        action="store_true",
+        help=(
+            "Disable channels-last-3d for the Static tile Conv3D path. "
+            "CUDA defaults to channels-last-3d."
+        ),
+    )
+    p.add_argument(
         "--val-tile-batch-size",
         type=int,
         default=256,
@@ -1607,6 +1660,9 @@ def main():
         help="Windows excluded from CUDA stage timing warmup.",
     )
     a = p.parse_args()
+
+    if int(a.tile_batch_pad_multiple) < 1:
+        raise ValueError("--tile-batch-pad-multiple must be >= 1")
 
     random.seed(a.seed)
     np.random.seed(a.seed)
@@ -1737,6 +1793,10 @@ def main():
     for p0 in model.static.coarse_head.parameters():
         p0.requires_grad = False
     model.to(device)
+    channels_last_3d = (
+        device.type == "cuda" and not bool(a.no_channels_last_3d)
+    )
+    model.static.set_tile_channels_last_3d(channels_last_3d)
 
     optimizer = torch.optim.AdamW(
         [p0 for p0 in model.parameters() if p0.requires_grad],
@@ -1810,6 +1870,8 @@ def main():
             "repair_train_cache": str(Path(a.repair_train_cache).resolve()),
             "seed": int(a.seed),
             "tile_size_xyz": list(tile_size),
+            "tile_batch_pad_multiple": int(a.tile_batch_pad_multiple),
+            "channels_last_3d": bool(channels_last_3d),
             "overfit_windows": int(overfit),
             "max_train_windows": int(a.max_train_windows),
             "max_val_windows": int(a.max_val_windows),
@@ -1894,6 +1956,10 @@ def main():
                 "coarse_lattice": st_idx["coarse_lattice"],
                 "tile_size_xyz": list(tile_size),
                 "tile_batch_size": int(a.tile_batch_size),
+                "tile_batch_pad_multiple": int(
+                    a.tile_batch_pad_multiple
+                ),
+                "channels_last_3d": bool(channels_last_3d),
                 "training_contract": {
                     "stage1_train_cache": str(
                         Path(a.stage1_train_cache).resolve()
@@ -1909,6 +1975,10 @@ def main():
                     ),
                     "seed": int(a.seed),
                     "tile_size_xyz": list(tile_size),
+                    "tile_batch_pad_multiple": int(
+                        a.tile_batch_pad_multiple
+                    ),
+                    "channels_last_3d": bool(channels_last_3d),
                     "lr": float(a.lr),
                     "weight_decay": float(a.weight_decay),
                     "overfit_windows": int(overfit),
@@ -1944,6 +2014,8 @@ def main():
         "amp_bfloat16": bool(amp),
         "train_windows": int(train_total),
         "tile_batch_size": int(a.tile_batch_size),
+        "tile_batch_pad_multiple": int(a.tile_batch_pad_multiple),
+        "channels_last_3d": bool(channels_last_3d),
         "val_tile_batch_size": int(a.val_tile_batch_size),
         "val_windows": (
             min(int(rv_idx["num_windows"]), int(a.max_val_windows))
@@ -1992,6 +2064,7 @@ def main():
             device=device,
             optimizer=optimizer,
             tile_batch_size=int(a.tile_batch_size),
+            tile_batch_pad_multiple=int(a.tile_batch_pad_multiple),
             prep_workers=int(a.prep_workers),
             prefetch=int(a.prefetch),
             progress_every=int(a.progress_every),
@@ -2017,6 +2090,7 @@ def main():
                 device=device,
                 optimizer=None,
                 tile_batch_size=int(a.val_tile_batch_size),
+                tile_batch_pad_multiple=int(a.tile_batch_pad_multiple),
                 prep_workers=int(a.prep_workers),
                 prefetch=int(a.prefetch),
                 progress_every=int(a.progress_every),
