@@ -1523,6 +1523,7 @@ def test_static_repair_sparse_loss_matches_dense_reference():
 
 
 def test_static_repair_aggregated_loss_matches_repeated_ce_gradient():
+    import torch.nn.functional as F
     from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
     from tools.real_motion.train_p0_f9_v20_static_repair import (
         _Geometry,
