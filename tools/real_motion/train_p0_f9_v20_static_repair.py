@@ -607,11 +607,7 @@ def _decode_query_logits(
         device=scene.device,
     )
 
-    active = (
-        geom.active_tiles(q)
-        if active_tiles is None
-        else np.asarray(active_tiles, dtype=np.int64)
-    )
+    active = geom.active_tiles(q)
     buckets = {}
     high_shape = np.asarray(geom.high_shape, dtype=np.int64)
     tile = np.asarray(geom.tile, dtype=np.int64)
@@ -711,7 +707,11 @@ def _decode_query_logits_sparse(
     seen_flat = obs_t.any(dim=0).reshape(-1)
     t0_flat = obs_t[-1].reshape(-1)
 
-    active = geom.active_tiles(q)
+    active = (
+        geom.active_tiles(q)
+        if active_tiles is None
+        else np.asarray(active_tiles, dtype=np.int64)
+    )
     buckets = {}
     high_shape = np.asarray(geom.high_shape, dtype=np.int64)
     tile = np.asarray(geom.tile, dtype=np.int64)
