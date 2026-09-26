@@ -202,7 +202,7 @@ class StaticWorldHead(nn.Module):
             C = int(packed.shape[1])
             x = packed[0].reshape(C, Bgrid, D, H, W).permute(
                 1, 0, 2, 3, 4
-            )
+            ).contiguous()
         else:
             if scene_features.shape[0] not in {1, Bgrid}:
                 raise ValueError(
