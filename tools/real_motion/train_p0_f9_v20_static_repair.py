@@ -36,6 +36,7 @@ from real_motion.v20_history_world import (
     FREE_LABEL,
     canonical_tile_grid_sample_coordinates,
     grid_centers_xyz,
+    poses_to_t0_canonical,
 )
 from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
 from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
@@ -168,6 +169,14 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
             f"future GT shape mismatch: {gt.shape}"
         )
     target = repair_target_from_gt(gt, free_label=int(free_label))
+    t0_pose = np.asarray(
+        source.pose(str(rrow["t0_token"])), dtype=np.float64
+    )
+    future_poses = np.stack([
+        np.asarray(source.pose(str(tok)), dtype=np.float64)
+        for tok in rrow["future_tokens"]
+    ])
+    future_rel = poses_to_t0_canonical(future_poses, t0_pose)
     cached_counts = np.asarray(
         rrow["v18_free_count_by_horizon"], dtype=np.int64
     )
@@ -180,9 +189,7 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
         "obsfree": obsfree,
         "support": support,
         "target": target,
-        "future_rel": np.asarray(
-            srow["future_ego_to_t0"], dtype=np.float64
-        ),
+        "future_rel": future_rel,
         "cpu_seconds": float(time.perf_counter() - started),
     }
 

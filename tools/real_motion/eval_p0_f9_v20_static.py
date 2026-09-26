@@ -360,9 +360,8 @@ def main():
         if stage1_rows is not None:
             srow = stage1_rows[(str(w.scene_name), str(w.t0_token))]
             hsem, hobs, hfree = _decode_stage1_history(srow)
-            future_rel = np.asarray(
-                srow["future_ego_to_t0"], dtype=np.float64
-            )
+            # Reuse only aligned history from Stage1. Future query/render
+            # geometry stays on the formal runtime path from raw float64 poses.
             history_oob = int(srow["history_oob_observed_samples"])
         else:
             aligned = align_history_once_to_canonical(
