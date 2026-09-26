@@ -460,7 +460,9 @@ def future_native_to_canonical_indices(
     for T in poses:
         world = transform_points(T, local)
         idx, valid = lattice.world_to_index(world)
-        all_idx.append(idx.reshape(shape + (3,)))
+        all_idx.append(
+            idx.astype(np.int32, copy=False).reshape(shape + (3,))
+        )
         all_valid.append(valid.reshape(shape))
         oob += int((~valid).sum())
     indices = np.stack(all_idx, axis=0)
@@ -468,8 +470,11 @@ def future_native_to_canonical_indices(
     # Keep a compact flattened canonical lookup.  Runtime query-union and
     # rendering can then avoid repeatedly materializing Nx3 advanced-index
     # arrays. Invalid entries are zeroed and ignored through valid_all.
-    safe = indices.copy()
-    safe[~valid_all] = 0
+    if bool(valid_all.all()):
+        safe = indices
+    else:
+        safe = indices.copy()
+        safe[~valid_all] = 0
     Y, Z = int(lattice.shape_xyz[1]), int(lattice.shape_xyz[2])
     linear = (
         safe[..., 0] * (Y * Z)
@@ -492,18 +497,22 @@ def render_canonical_semantic_to_future(
 ) -> np.ndarray:
     """Nearest-cell deterministic render of one canonical semantic world."""
     world = np.asarray(canonical_semantic)
-    idx = np.asarray(render_index.indices_xyz, dtype=np.int64)
+    idx = np.asarray(render_index.indices_xyz)
     valid = np.asarray(render_index.valid, dtype=bool)
     if world.ndim != 3 or idx.shape[:-1] != valid.shape or idx.shape[-1] != 3:
         raise ValueError("canonical/render-index shape mismatch")
-    out = np.full(valid.shape, int(free_label), dtype=world.dtype)
     linear = getattr(render_index, "linear_index", None)
     if linear is not None:
         lin = np.asarray(linear)
-        out[valid] = world.reshape(-1)[lin[valid]]
-    else:
-        q = idx[valid]
-        out[valid] = world[q[:, 0], q[:, 1], q[:, 2]]
+        flat_world = world.reshape(-1)
+        if bool(valid.all()):
+            return flat_world[lin.reshape(-1)].reshape(valid.shape)
+        out = np.full(valid.shape, int(free_label), dtype=world.dtype)
+        out[valid] = flat_world[lin[valid]]
+        return out
+    out = np.full(valid.shape, int(free_label), dtype=world.dtype)
+    q = idx[valid]
+    out[valid] = world[q[:, 0], q[:, 1], q[:, 2]]
     return out
 
 

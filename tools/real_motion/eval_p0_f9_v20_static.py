@@ -224,6 +224,12 @@ def main():
     }
     total_query = total_tiles = total_oob = total_history_oob = 0
     static_runtime_cache = StaticRuntimeCache()
+    print(
+        f"startup: selection_only={bool(a.selection_only)} "
+        f"tile_batch_size={int(a.tile_batch_size)} "
+        f"stage1_reuse={stage1_rows is not None}",
+        flush=True,
+    )
     started = time.perf_counter()
     phase_s = {
         "raw_v18": 0.0,
@@ -273,7 +279,6 @@ def main():
                 ),
                 native_voxel_size_xyz_m=pcfg.grid.voxel_size,
                 free_label=int(pcfg.free_label),
-                runtime_cache=static_runtime_cache,
             )
             hsem = aligned.semantic
             hobs = aligned.observed
@@ -301,6 +306,7 @@ def main():
                 tile_size_xyz=tile_size,
                 tile_batch_size=int(a.tile_batch_size),
                 free_label=int(pcfg.free_label),
+                runtime_cache=static_runtime_cache,
             )
         phase_s["static"] += time.perf_counter() - t_phase
         final_t = protected_add_only(

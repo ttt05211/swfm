@@ -157,7 +157,11 @@ def _query_mask_from_render_index(
     out = np.zeros(high_lattice.shape_xyz, dtype=bool)
     linear = getattr(render_index, "linear_index", None)
     if linear is not None:
-        out.reshape(-1)[np.asarray(linear)[valid]] = True
+        lin = np.asarray(linear)
+        if bool(valid.all()):
+            out.reshape(-1)[lin.reshape(-1)] = True
+        else:
+            out.reshape(-1)[lin[valid]] = True
     else:
         idx = np.asarray(render_index.indices_xyz, dtype=np.int64)
         good = idx[valid]

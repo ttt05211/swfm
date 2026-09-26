@@ -1046,3 +1046,23 @@ def test_future_render_linear_index_matches_xyz_render():
     )
     slow = render_canonical_semantic_to_future(world, legacy, free_label=-1)
     assert np.array_equal(fast, slow)
+
+
+def test_future_render_index_uses_compact_int32_xyz():
+    from real_motion.v20_history_world import (
+        future_native_to_canonical_indices,
+    )
+
+    lattice = CanonicalLattice(
+        (-3.0, -3.0, -1.0), (0.5, 0.5, 0.5), (14, 14, 6)
+    )
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+    ri = future_native_to_canonical_indices(
+        lattice,
+        future_ego_to_canonical=poses,
+        native_shape_xyz=(5, 4, 2),
+        native_origin_xyz_m=(-1.0, -1.0, -0.5),
+        native_voxel_size_xyz_m=(0.5, 0.5, 0.5),
+    )
+    assert ri.indices_xyz.dtype == np.int32
+    assert ri.linear_index.dtype == np.int32
