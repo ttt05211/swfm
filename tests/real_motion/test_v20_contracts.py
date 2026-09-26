@@ -1522,6 +1522,62 @@ def test_static_repair_sparse_loss_matches_dense_reference():
     assert torch.equal(fs, fd)
 
 
+def test_static_repair_sparse_decode_matches_dense_under_bfloat16_autocast():
+    from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _Geometry,
+        _decode_query_logits,
+        _decode_query_logits_sparse,
+        _high_context,
+    )
+
+    torch.manual_seed(97)
+    coarse = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (1.0, 1.0, 1.0), (4, 4, 2)
+    )
+    high = CanonicalLattice(
+        (-2.0, -2.0, -1.0), (0.5, 0.5, 0.5), (8, 8, 4)
+    )
+    geom = _Geometry(
+        high, coarse, (4, 4, 2),
+        (-1.0, -1.0, -0.5), (0.5, 0.5, 0.5),
+        (4, 4, 2), torch.device("cpu"),
+    )
+    model = V20HistoryWorldModel(
+        V20SceneConfig(
+            semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+        )
+    ).eval()
+    sem = torch.randint(0, 18, (1, 6, 4, 4, 2))
+    obs = (torch.rand(1, 6, 4, 4, 2) > 0.25)
+    obsfree = obs & (sem == 17)
+    poses = np.repeat(np.eye(4)[None], FUTURE_FRAMES, axis=0)
+
+    with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16):
+        scene = model.encode_history(sem, obs, obsfree)
+        linear, q = geom.future_linear_and_query(poses)
+        seen_h, missing_h = _high_context(
+            obs[0].numpy(), geom, torch.device("cpu")
+        )
+        dense, _ = _decode_query_logits(
+            model, scene, q, seen_h, missing_h, geom,
+            tile_batch_size=8,
+        )
+        sparse, row_map, _ = _decode_query_logits_sparse(
+            model, scene, q, obs[0].numpy(), geom,
+            tile_batch_size=8,
+        )
+
+    qlin = torch.nonzero(q.reshape(-1), as_tuple=False).reshape(-1)
+    ref = dense.reshape(dense.shape[0], -1)[:, qlin].transpose(0, 1)
+    assert sparse.dtype == ref.dtype
+    assert torch.allclose(sparse, ref, atol=0.0, rtol=0.0)
+    assert torch.equal(
+        row_map[qlin].long(),
+        torch.arange(len(qlin), dtype=torch.long),
+    )
+
+
 def test_static_repair_sparse_decode_backpropagates():
     from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
     from tools.real_motion.train_p0_f9_v20_static_repair import (
