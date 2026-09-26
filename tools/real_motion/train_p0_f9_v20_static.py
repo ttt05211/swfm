@@ -552,7 +552,7 @@ def _tile_loss(
             )
 
             logits = model.static.refine_tiles(
-                scene.expand(B, -1, -1, -1, -1),
+                scene,
                 sample_grid=grid,
                 query_mask=query_t,
                 seen_mask=seen_t,

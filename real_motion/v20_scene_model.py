@@ -180,13 +180,35 @@ class StaticWorldHead(nn.Module):
         """
         if sample_grid.ndim != 5 or sample_grid.shape[-1] != 3:
             raise ValueError("sample_grid must be [B,D,H,W,3]")
-        x = F.grid_sample(
-            scene_features,
-            sample_grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
+        Bgrid, D, H, W, _ = sample_grid.shape
+        if scene_features.shape[0] == 1 and Bgrid > 1:
+            # All tiles come from the same canonical scene. Pack their output
+            # grids along D and sample the scene once instead of logically
+            # expanding the full coarse 3D input B times.
+            packed_grid = sample_grid.reshape(1, Bgrid * D, H, W, 3)
+            packed = F.grid_sample(
+                scene_features,
+                packed_grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            C = int(packed.shape[1])
+            x = packed[0].reshape(C, Bgrid, D, H, W).permute(
+                1, 0, 2, 3, 4
+            )
+        else:
+            if scene_features.shape[0] not in {1, Bgrid}:
+                raise ValueError(
+                    "scene/grid batch mismatch for static tile refinement"
+                )
+            x = F.grid_sample(
+                scene_features,
+                sample_grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
         masks = torch.stack(
             (
                 query_mask.to(x.dtype),

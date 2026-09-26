@@ -966,3 +966,34 @@ def test_runtime_batched_static_tiles_match_single_tile_decode():
     assert a.query_voxels == b.query_voxels
     assert a.active_tiles == b.active_tiles
     assert a.out_of_bounds_voxels == b.out_of_bounds_voxels
+
+
+def test_static_refine_packed_single_scene_matches_expanded_scene():
+    from real_motion.v20_scene_model import StaticWorldHead, V20SceneConfig
+
+    torch.manual_seed(61)
+    cfg = V20SceneConfig(base_dim=4, tile_dim=6)
+    head = StaticWorldHead(scene_dim=8, cfg=cfg).eval()
+    B, D, H, W = 3, 4, 5, 3
+    scene = torch.randn(1, 8, 7, 6, 5)
+    grid = torch.empty(B, D, H, W, 3).uniform_(-1, 1)
+    q = torch.rand(B, D, H, W) > 0.2
+    seen = torch.rand(B, D, H, W) > 0.5
+    miss = seen & (torch.rand(B, D, H, W) > 0.5)
+
+    with torch.inference_mode():
+        packed = head.refine_tiles(
+            scene,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=miss,
+        )
+        expanded = head.refine_tiles(
+            scene.expand(B, -1, -1, -1, -1).contiguous(),
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=miss,
+        )
+    assert torch.allclose(packed, expanded, atol=1e-5, rtol=1e-5)

@@ -67,6 +67,7 @@ class StaticRuntimeReport:
     query_voxels: int
     active_tiles: int
     out_of_bounds_voxels: int
+    render_index: object | None = None
 
 
 def _query_mask_from_render_index(
@@ -211,7 +212,7 @@ def decode_static_world_tiled(
 
                 B = len(chunk)
                 logits = model.static.refine_tiles(
-                    scene_features.expand(B, -1, -1, -1, -1),
+                    scene_features,
                     sample_grid=torch.cat(grids, dim=0),
                     query_mask=torch.from_numpy(
                         np.stack(qtiles, axis=0)
@@ -250,6 +251,7 @@ def decode_static_world_tiled(
         query_voxels=int(q.mask.sum()),
         active_tiles=int(len(starts)),
         out_of_bounds_voxels=int(ri.out_of_bounds_voxels),
+        render_index=ri,
     )
 
 
@@ -264,6 +266,7 @@ def static_subset_masks(
     native_origin_xyz_m: Sequence[float],
     native_voxel_size_xyz_m: Sequence[float],
     free_label: int = 17,
+    future_render_index=None,
 ) -> dict[str, np.ndarray]:
     """Future-native subset domains derived only from historical observation geometry."""
     hist_obs = np.asarray(history_observed, dtype=bool)
@@ -284,13 +287,15 @@ def static_subset_masks(
             seen[good[:, 0], good[:, 1], good[:, 2]] = True
             if ti == 5:
                 t0_seen[good[:, 0], good[:, 1], good[:, 2]] = True
-    ri = future_native_to_canonical_indices(
-        high_lattice,
-        future_ego_to_canonical=np.asarray(future_ego_to_canonical),
-        native_shape_xyz=hist_obs.shape[1:],
-        native_origin_xyz_m=native_origin_xyz_m,
-        native_voxel_size_xyz_m=native_voxel_size_xyz_m,
-    )
+    ri = future_render_index
+    if ri is None:
+        ri = future_native_to_canonical_indices(
+            high_lattice,
+            future_ego_to_canonical=np.asarray(future_ego_to_canonical),
+            native_shape_xyz=hist_obs.shape[1:],
+            native_origin_xyz_m=native_origin_xyz_m,
+            native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+        )
     seen_f = render_canonical_semantic_to_future(seen, ri, free_label=0).astype(bool)
     t0_f = render_canonical_semantic_to_future(t0_seen, ri, free_label=0).astype(bool)
     gt = np.asarray(future_gt_semantic)

@@ -309,6 +309,7 @@ def main():
             native_origin_xyz_m=(pcfg.grid.x_min, pcfg.grid.y_min, pcfg.grid.z_min),
             native_voxel_size_xyz_m=pcfg.grid.voxel_size,
             free_label=int(pcfg.free_label),
+            future_render_index=static.render_index,
         )
         phase_s["subset"] += time.perf_counter() - t_phase
         for fi in range(6):
