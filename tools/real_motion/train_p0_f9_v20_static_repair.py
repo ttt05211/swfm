@@ -1042,6 +1042,7 @@ class _CudaStageProfiler:
         self.pending = []
         self.total_ms = {name: 0.0 for name in self.STAGES}
         self.count = {name: 0 for name in self.STAGES}
+        self.last_interval_ms = {}
 
     def begin_window(self):
         active = self.enabled and self.window_index >= self.warmup_windows
@@ -1071,17 +1072,33 @@ class _CudaStageProfiler:
 
     def flush_after_sync(self):
         if not self.enabled:
+            self.last_interval_ms = {}
             return {}
+        interval_sum = {name: 0.0 for name in self.STAGES}
+        interval_count = {name: 0 for name in self.STAGES}
         for events in self.pending:
             for name, pair in events.items():
                 if pair[1] is None:
                     raise RuntimeError(
                         f"profiler stage {name!r} was not stopped"
                     )
-                self.total_ms[name] += float(pair[0].elapsed_time(pair[1]))
+                ms = float(pair[0].elapsed_time(pair[1]))
+                self.total_ms[name] += ms
                 self.count[name] += 1
+                interval_sum[name] += ms
+                interval_count[name] += 1
         self.pending.clear()
+        self.last_interval_ms = {
+            name: (
+                float(interval_sum[name] / interval_count[name])
+                if interval_count[name] > 0 else None
+            )
+            for name in self.STAGES
+        }
         return self.summary()
+
+    def interval_summary(self):
+        return dict(self.last_interval_ms)
 
     def summary(self):
         return {
@@ -1206,6 +1223,11 @@ def _epoch(
         enabled=bool(profile_gpu_stages),
         warmup_windows=int(profile_warmup_windows),
     )
+    last_report_n = int(start_window)
+    last_report_time = started
+    last_report_cpu_wait = 0.0
+    last_report_cpu_work = float(cpu_work)
+    last_report_tiles = int(tiles_total)
 
     while n < total:
         tw = time.perf_counter()
@@ -1330,6 +1352,7 @@ def _epoch(
             now = time.perf_counter()
             seg = max(n - int(start_window), 1)
             gpu_stage_ms = profiler.flush_after_sync()
+            gpu_recent_ms = profiler.interval_summary()
             if compute_metrics:
                 diag = repair_diagnostics_from_confusion(
                     conf_gpu.detach().cpu().numpy()
@@ -1364,16 +1387,44 @@ def _epoch(
                     ]
                     if parts:
                         gpu_text = " gpu_ms=" + ",".join(parts)
+                if gpu_recent_ms:
+                    parts = [
+                        f"{name}:{value:.2f}"
+                        for name, value in gpu_recent_ms.items()
+                        if value is not None
+                    ]
+                    if parts:
+                        gpu_text += " gpu_recent_ms=" + ",".join(parts)
+                recent_n = max(n - last_report_n, 1)
+                recent_elapsed = max(now - last_report_time, 1e-9)
+                recent_cpu_wait = (
+                    cpu_wait - last_report_cpu_wait
+                ) / recent_n
+                recent_cpu_work = (
+                    cpu_work - last_report_cpu_work
+                ) / recent_n
+                recent_tiles = (
+                    tiles_total - last_report_tiles
+                ) / recent_n
                 print(
                     f"v20_static_repair_{phase} {n}/{total} "
                     f"rate={seg/max(now-started,1e-9):.3f} win/s "
+                    f"recent_rate={recent_n/recent_elapsed:.3f} win/s "
                     f"cpu_wait={cpu_wait/seg:.3f}s/win "
+                    f"recent_cpu_wait={recent_cpu_wait:.3f}s/win "
                     f"cpu_work={cpu_work/max(n,1):.3f}s/win "
+                    f"recent_cpu_work={recent_cpu_work:.3f}s/win "
                     f"tiles={tiles_total/max(n,1):.1f}/win "
+                    f"recent_tiles={recent_tiles:.1f}/win "
                     f"loss={float(loss_sum_scalar.item()/max(n,1)):.5f} "
                     f"{metric_text}{gpu_text}",
                     flush=True,
                 )
+                last_report_n = n
+                last_report_time = now
+                last_report_cpu_wait = cpu_wait
+                last_report_cpu_work = cpu_work
+                last_report_tiles = tiles_total
             if save_now:
                 checkpoint_callback(
                     n,
