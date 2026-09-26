@@ -50,6 +50,7 @@ class HistoricalEvidence3DEncoder(nn.Module):
     def __init__(self, cfg: V20SceneConfig = V20SceneConfig()):
         super().__init__()
         self.cfg = cfg
+        self.prefer_channels_last_3d = False
         d = int(cfg.semantic_dim)
         b = int(cfg.base_dim)
         self.semantic_embedding = nn.Embedding(SEMANTIC_CLASSES, d)
@@ -75,6 +76,13 @@ class HistoricalEvidence3DEncoder(nn.Module):
     @property
     def output_dim(self) -> int:
         return 2 * int(self.cfg.base_dim)
+
+    def set_channels_last_3d(self, enabled: bool = True) -> None:
+        """Select 3D channels-last for the convolutional history encoder."""
+        self.prefer_channels_last_3d = bool(enabled)
+        if self.prefer_channels_last_3d:
+            self.stem.to(memory_format=torch.channels_last_3d)
+            self.refine.to(memory_format=torch.channels_last_3d)
 
     def forward(
         self,
@@ -103,6 +111,8 @@ class HistoricalEvidence3DEncoder(nn.Module):
         x = torch.cat((emb, obs, free), dim=-1)
         # B,T,X,Y,Z,C -> B,T*C,X,Y,Z
         x = x.permute(0, 1, 5, 2, 3, 4).reshape(B, -1, X, Y, Z)
+        if self.prefer_channels_last_3d:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         x = self.stem(x)
         return x + self.refine(x)
 
@@ -190,6 +200,7 @@ class StaticWorldHead(nn.Module):
         query_mask: torch.Tensor,
         seen_mask: torch.Tensor,
         t0_missing_mask: torch.Tensor,
+        output_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Refine one packed native-resolution tile batch.
 
@@ -242,7 +253,32 @@ class StaticWorldHead(nn.Module):
             tile_input = tile_input.contiguous(
                 memory_format=torch.channels_last_3d
             )
-        return self.tile_refine(tile_input)
+
+        if output_ids is None:
+            return self.tile_refine(tile_input)
+
+        # Exact subset path: the final layer is a 1x1x1 Conv3d, so selecting
+        # its output channels before convolution is algebraically identical to
+        # full 18-class convolution followed by index_select. It avoids
+        # computing unused dynamic-class logits during Static Repair.
+        h = self.tile_refine[:-1](tile_input)
+        last = self.tile_refine[-1]
+        ids = output_ids.to(device=last.weight.device, dtype=torch.long)
+        weight = last.weight.index_select(0, ids)
+        bias = (
+            None
+            if last.bias is None
+            else last.bias.index_select(0, ids)
+        )
+        return F.conv3d(
+            h,
+            weight,
+            bias,
+            stride=last.stride,
+            padding=last.padding,
+            dilation=last.dilation,
+            groups=last.groups,
+        )
 
 
 class DormantSourceHead(nn.Module):
