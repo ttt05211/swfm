@@ -1371,5 +1371,6 @@ def test_static_eval_binds_checkpoint_to_requested_v18():
 
     src = inspect.getsource(m.main)
     assert 'vck.get("v18_checkpoint"' in src
-    assert "different frozen V18 checkpoint" in src
+    assert "Path(checkpoint_v18).resolve()" in src
+    assert "Path(a.base_checkpoint).resolve()" in src
     assert "evaluation_population_truncated" in src
