@@ -169,14 +169,14 @@ def _tile_masks(obs_np, start, shape, high, coarse):
 
 def _tile_loss(model, scene, high_idx, labels, obs_np, high, coarse, tile_size, weights):
     if len(high_idx) == 0:
-        return scene.sum() * 0.0, np.zeros((17, 17), dtype=np.int64)
+        return scene.sum() * 0.0, np.zeros((18, 18), dtype=np.int64)
     tile_size = np.asarray(tile_size, dtype=np.int64)
     groups = {}
     for i, cell in enumerate(high_idx):
         key = tuple((cell // tile_size).tolist())
         groups.setdefault(key, []).append(i)
     loss = scene.sum() * 0.0
-    conf = np.zeros((17, 17), dtype=np.int64)
+    conf = np.zeros((18, 18), dtype=np.int64)
     ng = 0
     for key, ids in groups.items():
         start = np.asarray(key, dtype=np.int64) * tile_size
@@ -203,10 +203,16 @@ def _tile_loss(model, scene, high_idx, labels, obs_np, high, coarse, tile_size, 
         rows[:, dyn] = torch.finfo(rows.dtype).min
         loss = loss + F.cross_entropy(rows, yt, weight=weights)
         pred = rows.detach().float().argmax(-1).cpu().numpy()
+        # GT free cells are excluded from this occupied-semantic diagnostic,
+        # but prediction may legitimately be free=17.  Keep an 18-column
+        # confusion matrix so semantic->free errors count as false negatives
+        # instead of overflowing a 17x17 matrix.
         valid_sem = y < 17
         if np.any(valid_sem):
-            code = y[valid_sem] * 17 + pred[valid_sem]
-            conf += np.bincount(code, minlength=17 * 17).reshape(17, 17)
+            code = y[valid_sem] * 18 + pred[valid_sem]
+            conf += np.bincount(
+                code, minlength=18 * 18
+            ).reshape(18, 18)
         ng += 1
     return loss / max(ng, 1), conf
 
