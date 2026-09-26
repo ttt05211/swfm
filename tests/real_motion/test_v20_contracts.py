@@ -1288,3 +1288,88 @@ def test_static_eval_defaults_to_repair_v2_only():
     assert "STATIC_REPAIR_PROTOCOL" in src
     assert "--allow-legacy-v1" in src
     assert "checkpoint_eligible_for_formal_selection" in src
+
+
+def test_static_repair_overfit_freezes_identity_subset_before_shuffle(tmp_path):
+    from tools.real_motion.build_p0_f9_v20_history_cache import (
+        PROTOCOL as STAGE1_PROTOCOL,
+    )
+    from real_motion.v20_static_repair import SUPPORT_CACHE_PROTOCOL
+    from tools.real_motion.train_p0_f9_v20_static_repair import (
+        _fixed_identity_subset,
+        _iter_paired_rows,
+    )
+
+    stage = tmp_path / "stage"
+    repair = tmp_path / "repair"
+    stage.mkdir()
+    repair.mkdir()
+    srows = [
+        {"scene_name": "scene", "t0_token": f"t{i}"}
+        for i in range(8)
+    ]
+    rrows = [dict(x) for x in srows]
+    torch.save(
+        {"protocol": STAGE1_PROTOCOL, "rows": srows},
+        stage / "stage.pt",
+    )
+    torch.save(
+        {"protocol": SUPPORT_CACHE_PROTOCOL, "rows": rrows},
+        repair / "repair.pt",
+    )
+    idx = {
+        "shards": [{
+            "file": "repair.pt",
+            "source_stage1_shard": "stage.pt",
+        }]
+    }
+    fixed = _fixed_identity_subset(stage, repair, idx, 4)
+    assert fixed == tuple(("scene", f"t{i}") for i in range(4))
+
+    def keys(seed, shuffle):
+        return [
+            (str(rr["scene_name"]), str(rr["t0_token"]))
+            for _, rr in _iter_paired_rows(
+                stage,
+                repair,
+                idx,
+                shuffle=shuffle,
+                seed=seed,
+                max_windows=4,
+                fixed_identities=fixed,
+            )
+        ]
+
+    assert set(keys(1, True)) == set(fixed)
+    assert set(keys(999, True)) == set(fixed)
+    assert keys(0, False) == list(fixed)
+
+
+def test_static_repair_truncation_is_fail_closed():
+    import inspect
+    from tools.real_motion import build_p0_f9_v20_static_repair_support as b
+    from tools.real_motion import train_p0_f9_v20_static_repair as t
+    from tools.real_motion import train_p0_f9_v20_dormant as d
+    from tools.real_motion import v20_validate_run_inputs as v
+
+    bsrc = inspect.getsource(b.main)
+    tsrc = inspect.getsource(t.main)
+    dsrc = inspect.getsource(d.main)
+    vsrc = inspect.getsource(v.main)
+    assert "truncated_population" in bsrc
+    assert "diagnostic_only" in tsrc
+    assert "max_train_windows" in tsrc
+    assert "max_val_windows" in tsrc
+    assert "checkpoint_eligible_for_formal_selection" in tsrc
+    assert "diagnostic_only" in dsrc
+    assert "diagnostic_only" in vsrc
+
+
+def test_static_eval_binds_checkpoint_to_requested_v18():
+    import inspect
+    from tools.real_motion import eval_p0_f9_v20_static as m
+
+    src = inspect.getsource(m.main)
+    assert 'vck.get("v18_checkpoint"' in src
+    assert "different frozen V18 checkpoint" in src
+    assert "evaluation_population_truncated" in src

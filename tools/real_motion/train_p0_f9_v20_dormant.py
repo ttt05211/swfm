@@ -302,9 +302,13 @@ def main():
         raise RuntimeError(
             "Dormant training requires corrected Static Repair v2 checkpoint"
         )
-    if bool(sx.get("overfit_diagnostic_only", False)):
+    if bool(
+        sx.get("diagnostic_only", False)
+        or sx.get("overfit_diagnostic_only", False)
+        or sx.get("checkpoint_eligible_for_formal_selection") is False
+    ):
         raise RuntimeError(
-            "Dormant training refuses non-formal Static overfit checkpoint"
+            "Dormant training refuses diagnostic/non-formal Static checkpoint"
         )
     model.to(device)
     for p0 in model.parameters(): p0.requires_grad = False

@@ -279,6 +279,7 @@ def main():
 
     pcfg = make_prepare_config(load_runtime_config(a.config, a.override))
     _, records = base.load_cache(a.val_cache)
+    full_population_windows = int(len(records))
     if int(a.max_windows) > 0:
         records = records[:min(len(records), int(a.max_windows))]
     if not records:
@@ -312,9 +313,28 @@ def main():
     model, vck = load_v20_checkpoint(a.v20_checkpoint, map_location="cpu")
     if str(vck.get("stage")) != "static":
         raise RuntimeError(f"expected V20 static checkpoint, got {vck.get('stage')}")
+    checkpoint_v18 = str(vck.get("v18_checkpoint", ""))
+    if not checkpoint_v18:
+        raise RuntimeError("V20 Static checkpoint does not record its frozen V18 checkpoint")
+    if str(Path(checkpoint_v18).resolve()) != str(
+        Path(a.base_checkpoint).resolve()
+    ):
+        raise RuntimeError(
+            "V20 Static checkpoint was trained against a different frozen V18 "
+            f"checkpoint: {Path(checkpoint_v18).resolve()} != "
+            f"{Path(a.base_checkpoint).resolve()}"
+        )
     extra = dict(vck.get("extra") or {})
     train_protocol = str(extra.get("train_protocol", ""))
     is_repair_v2 = train_protocol == STATIC_REPAIR_PROTOCOL
+    checkpoint_diagnostic_only = bool(
+        extra.get("diagnostic_only", False)
+        or extra.get("overfit_diagnostic_only", False)
+        or extra.get("checkpoint_eligible_for_formal_selection") is False
+    )
+    evaluation_population_truncated = bool(
+        len(records) < full_population_windows
+    )
     if not is_repair_v2 and not bool(a.allow_legacy_v1):
         raise RuntimeError(
             "formal Static evaluation refuses non-Repair-v2 checkpoints. "
@@ -521,9 +541,14 @@ def main():
         "overfit_diagnostic_only": bool(
             extra.get("overfit_diagnostic_only", False)
         ),
+        "checkpoint_diagnostic_only": bool(checkpoint_diagnostic_only),
+        "evaluation_population_truncated": bool(
+            evaluation_population_truncated
+        ),
         "checkpoint_eligible_for_formal_selection": bool(
             is_repair_v2
-            and not bool(extra.get("overfit_diagnostic_only", False))
+            and not checkpoint_diagnostic_only
+            and not evaluation_population_truncated
         ),
         "future_gt_used_for_prediction": False,
         "static_memory_unconditional_output": False,

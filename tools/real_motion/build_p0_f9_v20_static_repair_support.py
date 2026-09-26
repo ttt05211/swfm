@@ -211,6 +211,8 @@ def main():
                 )
 
     limit = int(a.max_windows)
+    if limit < 0:
+        raise ValueError("--max-windows must be >= 0")
     total_target = (
         min(int(stage_idx["num_windows"]), limit)
         if limit > 0 else int(stage_idx["num_windows"])
@@ -366,6 +368,14 @@ def main():
     index = {
         "protocol": SUPPORT_CACHE_PROTOCOL,
         "num_windows": int(windows_done),
+        "source_stage1_num_windows": int(stage_idx["num_windows"]),
+        "max_windows_requested": int(limit),
+        "truncated_population": bool(
+            int(windows_done) < int(stage_idx["num_windows"])
+        ),
+        "formal_population_complete": bool(
+            int(windows_done) == int(stage_idx["num_windows"])
+        ),
         "num_scenes": int(len({str(x["scene_name"]) for x in identity_rows})),
         "population_fingerprint_sha256": population_fingerprint(identity_rows),
         "stage1_cache": str(Path(a.stage1_cache).resolve()),

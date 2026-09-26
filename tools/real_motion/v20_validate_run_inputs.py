@@ -102,9 +102,13 @@ def main():
             raise RuntimeError(
                 "Static checkpoint is not the corrected Stage-2 Repair v2 protocol"
             )
-        if bool(sx.get("overfit_diagnostic_only", False)):
+        if bool(
+            sx.get("diagnostic_only", False)
+            or sx.get("overfit_diagnostic_only", False)
+            or sx.get("checkpoint_eligible_for_formal_selection") is False
+        ):
             raise RuntimeError(
-                "overfit diagnostic Static checkpoint cannot enter Stage-3/4/5 chain"
+                "diagnostic/non-formal Static checkpoint cannot enter Stage-3/4/5 chain"
             )
         _same_lattice(sx["highres_lattice"], tr["highres_lattice"], "Static/cache highres")
         _same_lattice(sx["coarse_lattice"], tr["coarse_lattice"], "Static/cache coarse")

@@ -17,6 +17,7 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -97,6 +98,61 @@ def _repair_rows(root, shard_name):
     return list(obj["rows"])
 
 
+def _row_identity(row):
+    return (str(row["scene_name"]), str(row["t0_token"]))
+
+
+def _iter_paired_rows_canonical(stage_root, repair_root, repair_idx):
+    """Yield Stage1/support pairs in the frozen cache population order."""
+    for rmeta in repair_idx["shards"]:
+        rrows = _repair_rows(repair_root, rmeta["file"])
+        srows = _stage1_rows(stage_root, rmeta["source_stage1_shard"])
+        if len(rrows) > len(srows):
+            raise RuntimeError(
+                f"repair shard longer than Stage1 source shard: {rmeta['file']}"
+            )
+        srows = srows[:len(rrows)]
+        for sr, rr in zip(srows, rrows):
+            rkey = _row_identity(rr)
+            skey = _row_identity(sr)
+            if rkey != skey:
+                raise RuntimeError(
+                    f"Stage1/repair identity mismatch: {skey} != {rkey}"
+                )
+            yield sr, rr
+
+
+def _fixed_identity_subset(stage_root, repair_root, repair_idx, count):
+    """Freeze the first N identities before any epoch shuffling."""
+    n = int(count)
+    if n <= 0:
+        return ()
+    out = []
+    for sr, rr in _iter_paired_rows_canonical(
+        stage_root, repair_root, repair_idx
+    ):
+        out.append(_row_identity(rr))
+        if len(out) == n:
+            break
+    if len(out) != n:
+        raise RuntimeError(
+            f"requested fixed subset of {n} windows but cache has {len(out)}"
+        )
+    if len(set(out)) != len(out):
+        raise RuntimeError("fixed Static Repair subset contains duplicate identities")
+    return tuple(out)
+
+
+def _identity_fingerprint(identities):
+    h = hashlib.sha256()
+    for scene, token in identities:
+        h.update(str(scene).encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(token).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
 def _iter_paired_rows(
     stage_root,
     repair_root,
@@ -106,17 +162,48 @@ def _iter_paired_rows(
     seed,
     max_windows=0,
     skip_windows=0,
+    fixed_identities=None,
 ):
-    order = list(range(len(repair_idx["shards"])))
     rng = random.Random(int(seed))
+    max_windows = int(max_windows)
+    skip_windows = int(skip_windows)
+
+    if fixed_identities is not None:
+        fixed = tuple(tuple(x) for x in fixed_identities)
+        wanted = set(fixed)
+        if len(wanted) != len(fixed):
+            raise RuntimeError("fixed identity subset contains duplicates")
+        found = {}
+        for sr, rr in _iter_paired_rows_canonical(
+            stage_root, repair_root, repair_idx
+        ):
+            key = _row_identity(rr)
+            if key in wanted:
+                found[key] = (sr, rr)
+                if len(found) == len(wanted):
+                    break
+        missing = [key for key in fixed if key not in found]
+        if missing:
+            raise RuntimeError(
+                f"fixed Static Repair subset misses identities: {missing[:5]}"
+            )
+        pairs = [found[key] for key in fixed]
+        if shuffle:
+            rng.shuffle(pairs)
+        if skip_windows > len(pairs):
+            raise RuntimeError("resume skip exceeds fixed Static Repair subset")
+        pairs = pairs[skip_windows:]
+        if max_windows > 0:
+            pairs = pairs[:max_windows]
+        yield from pairs
+        return
+
+    order = list(range(len(repair_idx["shards"])))
     if shuffle:
         rng.shuffle(order)
 
     yielded = 0
     skipped = 0
-    max_windows = int(max_windows)
-    skip_windows = int(skip_windows)
-
     for rsi in order:
         rmeta = repair_idx["shards"][rsi]
         rrows = _repair_rows(repair_root, rmeta["file"])
@@ -133,8 +220,8 @@ def _iter_paired_rows(
         for j in row_order:
             rr = rrows[j]
             sr = srows[j]
-            rkey = (str(rr["scene_name"]), str(rr["t0_token"]))
-            skey = (str(sr["scene_name"]), str(sr["t0_token"]))
+            rkey = _row_identity(rr)
+            skey = _row_identity(sr)
             if rkey != skey:
                 raise RuntimeError(
                     f"Stage1/repair identity mismatch: {skey} != {rkey}"
@@ -146,7 +233,6 @@ def _iter_paired_rows(
                 return
             yield sr, rr
             yielded += 1
-
 
 def _decode_history(row):
     shape = (6,) + tuple(int(x) for x in row["coarse_shape_xyz"])
@@ -219,6 +305,7 @@ def _iter_prepared(
     skip_windows,
     workers,
     prefetch,
+    fixed_identities=None,
 ):
     raw = iter(_iter_paired_rows(
         stage_root,
@@ -228,6 +315,7 @@ def _iter_prepared(
         seed=seed,
         max_windows=max_windows,
         skip_windows=skip_windows,
+        fixed_identities=fixed_identities,
     ))
 
     def prepare(pair):
@@ -615,6 +703,7 @@ def _epoch(
     resume_state=None,
     checkpoint_every=0,
     checkpoint_callback=None,
+    fixed_identities=None,
 ):
     train = optimizer is not None
     model.train(train)
@@ -682,6 +771,7 @@ def _epoch(
         skip_windows=start_window,
         workers=prep_workers,
         prefetch=prefetch,
+        fixed_identities=fixed_identities,
     ))
 
     n = int(start_window)
@@ -961,7 +1051,16 @@ def main():
         raise RuntimeError(f"train/val scene overlap: {sorted(overlap)[:5]}")
 
     overfit = int(a.overfit_windows)
+    fixed_overfit_identities = None
+    fixed_overfit_population_sha256 = ""
     if overfit > 0:
+        fixed_overfit_identities = _fixed_identity_subset(
+            st_root, rt_root, rt_idx, overfit
+        )
+        fixed_overfit_population_sha256 = _identity_fingerprint(
+            fixed_overfit_identities
+        )
+        # Validation is intentionally the exact same frozen N identities.
         sv_root, sv_idx = st_root, st_idx
         rv_root, rv_idx = rt_root, rt_idx
         a.max_train_windows = overfit
@@ -969,6 +1068,31 @@ def main():
         val_info = a.train_info_pkl
     else:
         val_info = a.val_info_pkl
+
+    train_support_truncated = bool(
+        rt_idx.get(
+            "truncated_population",
+            int(rt_idx["num_windows"]) < int(st_idx["num_windows"]),
+        )
+    )
+    val_support_truncated = bool(
+        rv_idx.get(
+            "truncated_population",
+            int(rv_idx["num_windows"]) < int(sv_idx["num_windows"]),
+        )
+    )
+    diagnostic_reasons = []
+    if overfit > 0:
+        diagnostic_reasons.append("overfit_windows")
+    if int(a.max_train_windows) > 0:
+        diagnostic_reasons.append("max_train_windows")
+    if int(a.max_val_windows) > 0:
+        diagnostic_reasons.append("max_val_windows")
+    if train_support_truncated:
+        diagnostic_reasons.append("truncated_train_support_cache")
+    if val_support_truncated:
+        diagnostic_reasons.append("truncated_val_support_cache")
+    diagnostic_only = bool(diagnostic_reasons)
 
     if st_idx["highres_lattice"] != sv_idx["highres_lattice"]:
         raise RuntimeError("train/val high-resolution lattice mismatch")
@@ -1077,6 +1201,12 @@ def main():
             "seed": int(a.seed),
             "tile_size_xyz": list(tile_size),
             "overfit_windows": int(overfit),
+            "max_train_windows": int(a.max_train_windows),
+            "max_val_windows": int(a.max_val_windows),
+            "diagnostic_only": bool(diagnostic_only),
+            "fixed_overfit_population_sha256": (
+                fixed_overfit_population_sha256
+            ),
         }
         for key, value in expected.items():
             if contract.get(key) != value:
@@ -1142,6 +1272,14 @@ def main():
                     "preserved_as_independent_future_voxel_contributions"
                 ),
                 "overfit_diagnostic_only": bool(overfit > 0),
+                "diagnostic_only": bool(diagnostic_only),
+                "diagnostic_reasons": list(diagnostic_reasons),
+                "checkpoint_eligible_for_formal_selection": bool(
+                    not diagnostic_only
+                ),
+                "fixed_overfit_population_sha256": (
+                    fixed_overfit_population_sha256
+                ),
                 "highres_lattice": st_idx["highres_lattice"],
                 "coarse_lattice": st_idx["coarse_lattice"],
                 "tile_size_xyz": list(tile_size),
@@ -1164,6 +1302,12 @@ def main():
                     "lr": float(a.lr),
                     "weight_decay": float(a.weight_decay),
                     "overfit_windows": int(overfit),
+                    "max_train_windows": int(a.max_train_windows),
+                    "max_val_windows": int(a.max_val_windows),
+                    "diagnostic_only": bool(diagnostic_only),
+                    "fixed_overfit_population_sha256": (
+                        fixed_overfit_population_sha256
+                    ),
                 },
                 "history": list(hist),
                 "selection": (
@@ -1195,6 +1339,11 @@ def main():
             else int(rv_idx["num_windows"])
         ),
         "overfit_diagnostic_only": bool(overfit > 0),
+        "diagnostic_only": bool(diagnostic_only),
+        "diagnostic_reasons": list(diagnostic_reasons),
+        "fixed_overfit_population_sha256": (
+            fixed_overfit_population_sha256 or None
+        ),
         "support": "formal full grid AND frozen V18 free",
         "target": "static semantic; free/dynamic -> no-add",
         "class_weighting": "none",
@@ -1239,6 +1388,7 @@ def main():
             resume_state=this_partial,
             checkpoint_every=int(a.checkpoint_every_windows),
             checkpoint_callback=save_partial,
+            fixed_identities=fixed_overfit_identities,
         )
         with torch.inference_mode():
             va = _epoch(
@@ -1257,6 +1407,7 @@ def main():
                 seed=int(a.seed),
                 amp=amp,
                 max_windows=int(a.max_val_windows),
+                fixed_identities=fixed_overfit_identities,
             )
 
         row = {"epoch": int(epoch), "train": tr, "val": va}
