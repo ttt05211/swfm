@@ -37,7 +37,6 @@ from real_motion.v20_history_world import (
     FREE_LABEL,
     canonical_tile_grid_sample_coordinates,
     grid_centers_xyz,
-    poses_to_t0_canonical,
 )
 from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
 from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
@@ -264,14 +263,30 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
         base_pred == int(free_label), support
     ):
         raise RuntimeError("reconstructed V18 prediction/support mismatch")
-    t0_pose = np.asarray(
-        source.pose(str(rrow["t0_token"])), dtype=np.float64
+    # Stage1 already stores the authoritative future->t0 transforms used
+    # by V20. Reusing them removes seven pose lookups and duplicate SE(3)
+    # algebra per training window.
+    future_rel = np.asarray(
+        srow["future_ego_to_t0"], dtype=np.float64
     )
-    future_poses = np.stack([
-        np.asarray(source.pose(str(tok)), dtype=np.float64)
-        for tok in rrow["future_tokens"]
-    ])
-    future_rel = poses_to_t0_canonical(future_poses, t0_pose)
+    if future_rel.shape != (6, 4, 4):
+        raise RuntimeError("Stage1 future_ego_to_t0 shape mismatch")
+
+    base_full_conf = np.zeros((6, 18, 18), dtype=np.int64)
+    base_support_conf = np.zeros((6, 18, 18), dtype=np.int64)
+    for hi in range(6):
+        gh = gt[hi].reshape(-1).astype(np.int64, copy=False)
+        bh = base_pred[hi].reshape(-1).astype(np.int64, copy=False)
+        sh = support[hi].reshape(-1)
+        base_full_conf[hi] = np.bincount(
+            gh * 18 + bh, minlength=18 * 18
+        ).reshape(18, 18)
+        # On Static decision support frozen V18 is exactly FREE.
+        gs = gh[sh]
+        base_support_conf[hi] = np.bincount(
+            gs * 18 + int(free_label), minlength=18 * 18
+        ).reshape(18, 18)
+
     cached_counts = np.asarray(
         rrow["v18_free_count_by_horizon"], dtype=np.int64
     )
@@ -285,7 +300,8 @@ def _prepare_pair_cpu(srow, rrow, source, native_shape, free_label):
         "support": support,
         "target": target,
         "gt": gt,
-        "base_pred": base_pred,
+        "base_full_conf": base_full_conf,
+        "base_support_conf": base_support_conf,
         "future_rel": future_rel,
         "cpu_seconds": float(time.perf_counter() - started),
     }
@@ -384,6 +400,17 @@ class _Geometry:
             raise RuntimeError("coarse/high lattice ratio is not integral")
         self.factor = tuple(int(x) for x in factor)
         self.grid_cache = {}
+        self.coarse_index_cache = {}
+        self.high_numel = int(np.prod(self.high_shape))
+        self.allowed_ids = torch.as_tensor(
+            STATIC_ALLOWED_IDS, dtype=torch.long, device=device
+        )
+        self.global_to_local = torch.full(
+            (18,), -1, dtype=torch.long, device=device
+        )
+        self.global_to_local[self.allowed_ids] = torch.arange(
+            len(STATIC_ALLOWED_IDS), device=device
+        )
 
     def future_linear_and_query(self, future_rel):
         T = torch.as_tensor(
@@ -453,6 +480,38 @@ class _Geometry:
         )
         self.grid_cache[key] = grid
         return grid
+
+    def tile_coarse_linear(self, start, shape):
+        key = (
+            tuple(int(x) for x in start),
+            tuple(int(x) for x in shape),
+        )
+        got = self.coarse_index_cache.get(key)
+        if got is not None:
+            return got
+        start = tuple(int(x) for x in start)
+        shape = tuple(int(x) for x in shape)
+        fx, fy, fz = self.factor
+        x = torch.arange(
+            start[0], start[0] + shape[0],
+            dtype=torch.long, device=self.device,
+        ) // int(fx)
+        y = torch.arange(
+            start[1], start[1] + shape[1],
+            dtype=torch.long, device=self.device,
+        ) // int(fy)
+        z = torch.arange(
+            start[2], start[2] + shape[2],
+            dtype=torch.long, device=self.device,
+        ) // int(fz)
+        Y, Z = self.coarse_shape[1], self.coarse_shape[2]
+        linear = (
+            x[:, None, None] * (Y * Z)
+            + y[None, :, None] * Z
+            + z[None, None, :]
+        ).reshape(-1)
+        self.coarse_index_cache[key] = linear
+        return linear
 
 
 def _high_context(obs, geom, device):
@@ -547,6 +606,207 @@ def _decode_query_logits(
                 ] = logits[b]
             ntiles += len(chunk)
     return world, int(ntiles)
+
+
+def _decode_query_logits_sparse(
+    model,
+    scene,
+    q,
+    obs,
+    geom,
+    *,
+    tile_batch_size,
+):
+    """Decode only canonical query cells, preserving exact tiled semantics.
+
+    The legacy path materialized an [C,X,Y,Z] world over the entire Ωmax
+    lattice even though loss only reads M_query. This path keeps the exact same
+    tile refinement calls but stores logits only for query cells.
+    """
+    q_flat = q.reshape(-1)
+    query_linear = torch.nonzero(q_flat, as_tuple=False).reshape(-1)
+    qcount = int(query_linear.numel())
+    if qcount <= 0:
+        raise RuntimeError("Static Repair query union is empty")
+
+    row_map = torch.full(
+        (geom.high_numel,),
+        -1,
+        dtype=torch.int32,
+        device=scene.device,
+    )
+    row_map[query_linear] = torch.arange(
+        qcount, dtype=torch.int32, device=scene.device
+    )
+    query_logits = torch.empty(
+        (qcount, len(STATIC_ALLOWED_IDS)),
+        dtype=scene.dtype,
+        device=scene.device,
+    )
+    filled = torch.zeros(qcount, dtype=torch.bool, device=scene.device)
+
+    obs_t = torch.from_numpy(np.asarray(obs, dtype=bool)).to(
+        scene.device, non_blocking=True
+    )
+    seen_flat = obs_t.any(dim=0).reshape(-1)
+    t0_flat = obs_t[-1].reshape(-1)
+
+    active = geom.active_tiles(q)
+    buckets = {}
+    high_shape = np.asarray(geom.high_shape, dtype=np.int64)
+    tile = np.asarray(geom.tile, dtype=np.int64)
+    for tc in active:
+        start = tc.astype(np.int64) * tile
+        stop = np.minimum(start + tile, high_shape)
+        tshape = tuple((stop - start).tolist())
+        buckets.setdefault(tshape, []).append(tuple(start.tolist()))
+
+    row_map_3d = row_map.reshape(geom.high_shape)
+    bsz = max(int(tile_batch_size), 1)
+    ntiles = 0
+    for tshape, starts in buckets.items():
+        for bi in range(0, len(starts), bsz):
+            chunk = starts[bi:bi + bsz]
+            grids, qrows, srows, mrows, rrows = [], [], [], [], []
+            for start_t in chunk:
+                start = np.asarray(start_t, dtype=np.int64)
+                stop = np.minimum(start + tile, high_shape)
+                sl = (
+                    slice(start[0], stop[0]),
+                    slice(start[1], stop[1]),
+                    slice(start[2], stop[2]),
+                )
+                grids.append(
+                    geom.tile_grid(start_t, tshape, scene.dtype)
+                )
+                qtile = q[sl]
+                qrows.append(qtile)
+                rrows.append(row_map_3d[sl])
+
+                cmap = geom.tile_coarse_linear(start_t, tshape)
+                seen = seen_flat[cmap].reshape(tshape)
+                t0_seen = t0_flat[cmap].reshape(tshape)
+                srows.append(seen)
+                mrows.append(seen & ~t0_seen)
+
+            qstack = torch.stack(qrows, dim=0)
+            logits = model.static.refine_tiles(
+                scene,
+                sample_grid=torch.cat(grids, dim=0),
+                query_mask=qstack,
+                seen_mask=torch.stack(srows, dim=0),
+                t0_missing_mask=torch.stack(mrows, dim=0),
+            ).index_select(1, geom.allowed_ids)
+
+            # [B,C,X,Y,Z] -> [B,X,Y,Z,C], then retain only M_query cells.
+            selected_logits = logits.permute(0, 2, 3, 4, 1)[qstack]
+            selected_rows = torch.stack(rrows, dim=0)[qstack].long()
+            query_logits.index_copy_(0, selected_rows, selected_logits)
+            filled[selected_rows] = True
+            ntiles += len(chunk)
+
+    complete = filled.all()
+    if scene.device.type == "cuda" and hasattr(torch, "_assert_async"):
+        torch._assert_async(
+            complete, "Static Repair sparse query decode missed query cells"
+        )
+    elif not bool(complete.item()):
+        raise RuntimeError("Static Repair sparse query decode missed query cells")
+    return query_logits, row_map, int(ntiles)
+
+
+def _repair_sparse_loss_and_confusion(
+    query_logits,
+    query_row_map,
+    linear,
+    support,
+    target,
+    *,
+    gt,
+    base_full_conf,
+    base_support_conf,
+    geom,
+    device,
+):
+    """Exact Repair-v2 loss/metrics without dense Ωmax logits/full-grid bincounts."""
+    support_t = torch.from_numpy(
+        np.asarray(support, dtype=bool)
+    ).to(device, non_blocking=True)
+    # Keep labels compact during host->device transfer; cast only selected rows.
+    target_t = torch.from_numpy(
+        np.asarray(target, dtype=np.uint8)
+    ).to(device, non_blocking=True)
+    gt_t = torch.from_numpy(
+        np.asarray(gt, dtype=np.uint8)
+    ).to(device, non_blocking=True)
+
+    base_conf = torch.as_tensor(
+        np.asarray(base_full_conf, dtype=np.int64),
+        dtype=torch.int64,
+        device=device,
+    )
+    base_support = torch.as_tensor(
+        np.asarray(base_support_conf, dtype=np.int64),
+        dtype=torch.int64,
+        device=device,
+    )
+    final_conf = base_conf.clone()
+    conf = torch.zeros((18, 18), dtype=torch.int64, device=device)
+    loss_sum = query_logits.sum() * 0.0
+
+    for hi in range(6):
+        s = support_t[hi].reshape(-1)
+        lin = linear[hi][s]
+        qrow = query_row_map[lin].long()
+        valid_rows = (qrow >= 0).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                valid_rows,
+                "Static Repair support escaped decoded query union",
+            )
+        elif not bool(valid_rows.item()):
+            raise RuntimeError(
+                "Static Repair support escaped decoded query union"
+            )
+
+        rows = query_logits[qrow]
+        y = target_t[hi].reshape(-1)[s].long()
+        yl = geom.global_to_local[y]
+        valid_labels = (yl >= 0).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                valid_labels,
+                "dynamic label entered Static Repair target",
+            )
+        elif not bool(valid_labels.item()):
+            raise RuntimeError("dynamic label entered Static Repair target")
+
+        loss_sum = loss_sum + F.cross_entropy(
+            rows, yl, reduction="sum"
+        )
+        with torch.no_grad():
+            pred = geom.allowed_ids[
+                rows.detach().float().argmax(dim=1)
+            ]
+            conf += torch.bincount(
+                y * 18 + pred,
+                minlength=18 * 18,
+            ).reshape(18, 18)
+
+            # Exact formal final confusion = frozen V18 full confusion
+            # - V18-free contribution + repaired contribution.
+            gy = gt_t[hi].reshape(-1)[s].long()
+            repaired = torch.bincount(
+                gy * 18 + pred,
+                minlength=18 * 18,
+            ).reshape(18, 18)
+            final_conf[hi] = (
+                base_conf[hi] - base_support[hi] + repaired
+            )
+
+    denom = support_t.sum().clamp_min(1)
+    loss = loss_sum / denom.to(loss_sum.dtype)
+    return loss, conf, base_conf, final_conf
 
 
 def _repair_loss_and_confusion(
@@ -710,6 +970,10 @@ def _epoch(
     model.dormant.eval()
     model.birth.eval()
     model.static.coarse_head.eval()
+    trainable_params = (
+        [p for p in model.parameters() if p.requires_grad]
+        if train else []
+    )
 
     total = (
         min(int(repair_idx["num_windows"]), int(max_windows))
@@ -803,26 +1067,27 @@ def _epoch(
         with _autocast(device, amp):
             scene = model.encode_history(sem, obs, obsfree)
             linear, q = geom.future_linear_and_query(item["future_rel"])
-            seen_h, missing_h = _high_context(
-                item["obs"], geom, device
-            )
-            world, ntiles = _decode_query_logits(
-                model,
-                scene,
-                q,
-                seen_h,
-                missing_h,
-                geom,
-                tile_batch_size=tile_batch_size,
+            query_logits, query_row_map, ntiles = (
+                _decode_query_logits_sparse(
+                    model,
+                    scene,
+                    q,
+                    item["obs"],
+                    geom,
+                    tile_batch_size=tile_batch_size,
+                )
             )
             loss, conf, base_full, final_full = (
-                _repair_loss_and_confusion(
-                    world,
+                _repair_sparse_loss_and_confusion(
+                    query_logits,
+                    query_row_map,
                     linear,
                     item["support"],
                     item["target"],
                     gt=item["gt"],
-                    base_pred=item["base_pred"],
+                    base_full_conf=item["base_full_conf"],
+                    base_support_conf=item["base_support_conf"],
+                    geom=geom,
                     device=device,
                 )
             )
@@ -836,10 +1101,7 @@ def _epoch(
         if train:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                [
-                    p for p in model.parameters()
-                    if p.requires_grad
-                ],
+                trainable_params,
                 5.0,
                 error_if_nonfinite=True,
                 foreach=(device.type == "cuda"),
@@ -915,7 +1177,7 @@ def _epoch(
                     },
                 )
 
-        del world, linear, q, scene
+        del query_logits, query_row_map, linear, q, scene
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -976,7 +1238,13 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--tile-size", default="32,32,16")
-    p.add_argument("--tile-batch-size", type=int, default=32)
+    p.add_argument("--tile-batch-size", type=int, default=128)
+    p.add_argument(
+        "--val-tile-batch-size",
+        type=int,
+        default=256,
+        help="Larger inference-only tile batch for validation.",
+    )
     p.add_argument("--prep-workers", type=int, default=4)
     p.add_argument("--prefetch", type=int, default=16)
     p.add_argument("--progress-every", type=int, default=50)
@@ -1333,6 +1601,8 @@ def main():
         "device": str(device),
         "amp_bfloat16": bool(amp),
         "train_windows": int(train_total),
+        "tile_batch_size": int(a.tile_batch_size),
+        "val_tile_batch_size": int(a.val_tile_batch_size),
         "val_windows": (
             min(int(rv_idx["num_windows"]), int(a.max_val_windows))
             if int(a.max_val_windows) > 0
@@ -1400,7 +1670,7 @@ def main():
                 geom,
                 device=device,
                 optimizer=None,
-                tile_batch_size=int(a.tile_batch_size),
+                tile_batch_size=int(a.val_tile_batch_size),
                 prep_workers=int(a.prep_workers),
                 prefetch=int(a.prefetch),
                 progress_every=int(a.progress_every),
