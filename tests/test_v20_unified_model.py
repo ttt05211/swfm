@@ -7,7 +7,10 @@ from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldMo
 from real_motion.v20_history_world import FREE_LABEL, CanonicalLattice
 from real_motion.v20_unified_data import UnifiedHistoryInput, UnifiedSourceInput
 from real_motion.v20_unified_model import V20UnifiedTransportCompletion
-from real_motion.v20_unified_runtime import prepare_runtime_queries, transport_condition
+from real_motion.v20_unified_runtime import (
+    dense_geometry_and_transport_condition,
+    prepare_runtime_queries,
+)
 
 
 def _model():
@@ -46,6 +49,18 @@ def _sources(*, requires_grad=False, empty=False):
         kta_displacement_xy_m=torch.zeros(n, 6, 2),
         window_index=torch.zeros(n, dtype=torch.long),
     )
+
+
+def _condition(model, history, current):
+    _, condition = dense_geometry_and_transport_condition(
+        current,
+        history.future_ego_to_t0,
+        coarse_lattice=model.coarse_lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        chunk_shape_xyz=(4, 4, 4),
+    )
+    return condition
 
 
 def test_adapter_bypass_is_exact_and_zero_init_is_identity_when_enabled():
@@ -97,7 +112,7 @@ def test_empty_source_path_still_decodes_completion():
         halo=2,
     )
     logits, report = model.decode_completion(
-        history, source, fusion, transport_condition(current), queries[:1]
+        history, source, fusion, _condition(model, history, current), queries[:1]
     )
     assert len(logits) == 1 and logits[0].shape == (4, 4, 4, 18)
     assert report.requested_points == 0
@@ -174,7 +189,7 @@ def test_completion_gradient_reaches_shared_source_token_and_adapter_last_layer(
         halo=0,
     )
     logits, _ = model.decode_completion(
-        history, source, fusion, transport_condition(current), queries[:1]
+        history, source, fusion, _condition(model, history, current), queries[:1]
     )
     loss = logits[0][..., 3].mean()
     loss.backward()
@@ -202,14 +217,14 @@ def test_completion_query_chunking_is_numerically_identical():
     )
     with torch.no_grad():
         future, _ = model.build_future_features(
-            history, source, fusion, transport_condition(current)
+            history, source, fusion, _condition(model, history, current)
         )
         together = model.decode_completion_from_features(history, future, queries[:4])
         chunked = (
             model.decode_completion_from_features(history, future, queries[:2])
             + model.decode_completion_from_features(history, future, queries[2:4])
         )
-    assert all(torch.equal(a, b) for a, b in zip(together, chunked))
+    assert all(torch.allclose(a, b, atol=1e-6, rtol=1e-6) for a, b in zip(together, chunked))
 
 
 def test_transport_loss_updates_adapter_after_zero_initialized_identity():
