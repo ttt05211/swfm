@@ -34,6 +34,7 @@ from real_motion.v20_unified_training import (
     scaler_step_succeeded,
     set_optimizer_phase_lrs,
     training_phase,
+    verify_resume_inputs,
 )
 from tools.real_motion.eval_p0_f9_v20_unified import evaluate_model, load_clean_v18
 from tools.real_motion.v20_unified_common import (
@@ -126,14 +127,34 @@ def main() -> None:
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="Run one real-data update and one full-support dev window.",
+        help="Run one warmup + one joint real-data update with one-window monitors.",
+    )
+    parser.add_argument(
+        "--screen1024",
+        action="store_true",
+        help=(
+            "Use a deterministic fixed 1024-window train subset for 1024 "
+            "successful updates with grad_accum=4."
+        ),
+    )
+    parser.add_argument(
+        "--io-locality-order",
+        action="store_true",
+        help="Group selected train windows by scene for better token-cache locality.",
     )
     args = parser.parse_args()
+    if args.smoke and args.screen1024:
+        raise ValueError("--smoke and --screen1024 are mutually exclusive")
     if args.smoke:
-        args.max_updates = 1
+        args.warmup_updates = 1
+        args.max_updates = 2
         args.grad_accum = 1
         args.monitor_every = 1
         args.monitor_windows = 1
+    if args.screen1024:
+        args.max_updates = 1024
+        args.grad_accum = 4
+        args.io_locality_order = True
     if min(
         int(args.grad_accum),
         int(args.max_updates),
@@ -158,6 +179,19 @@ def main() -> None:
     _, dev_records = load_v18_cache(args.dev_cache)
     if not dev_records:
         raise RuntimeError("empty development population")
+    overlap = sorted(
+        {str(r["scene_name"]) for r in train_records}
+        & {str(r["scene_name"]) for r in dev_records}
+    )
+    if overlap:
+        raise RuntimeError(f"train/dev scene overlap: {overlap[:8]}")
+    if args.screen1024:
+        if len(train_records) < 1024:
+            raise RuntimeError("screen1024 requires at least 1024 train windows")
+        select = list(range(len(train_records)))
+        random.Random(int(args.seed) + 1024).shuffle(select)
+        selected = sorted(select[:1024])
+        train_records = [train_records[i] for i in selected]
     stage1_index_path, stage1_index, stage1_rows = load_stage1_rows(args.stage1_cache)
     dev_stage1_index_path, dev_stage1_index, dev_stage1_rows = load_stage1_rows(
         args.dev_stage1_cache
@@ -172,14 +206,36 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Stage1 train cache misses rows: {missing[:5]}")
     order = list(range(len(train_records)))
-    random.Random(int(args.seed)).shuffle(order)
+    if bool(args.io_locality_order):
+        by_scene: dict[str, list[int]] = {}
+        for i, record in enumerate(train_records):
+            by_scene.setdefault(str(record["scene_name"]), []).append(i)
+        scenes = list(by_scene)
+        random.Random(int(args.seed)).shuffle(scenes)
+        order = [i for scene in scenes for i in by_scene[scene]]
+    else:
+        random.Random(int(args.seed)).shuffle(order)
     if not order:
         raise RuntimeError("empty training population")
 
+    manifest_paths = {
+        "train_cache": args.train_cache,
+        "train_stage1_index": stage1_index_path,
+        "dev_cache": args.dev_cache,
+        "dev_stage1_index": dev_stage1_index_path,
+    }
     if args.resume:
         model, resume_checkpoint = load_model_checkpoint(args.resume, map_location="cpu")
-        if resume_checkpoint["base_checkpoint_sha256"] != file_sha256(args.base_checkpoint):
-            raise RuntimeError("resume/base checkpoint hash mismatch")
+        verify_resume_inputs(
+            resume_checkpoint,
+            base_checkpoint=args.base_checkpoint,
+            manifest_paths=manifest_paths,
+        )
+        if resume_checkpoint.get("coarse_lattice") != stage1_index["coarse_lattice"]:
+            raise RuntimeError("resume/current Stage1 coarse lattice mismatch")
+        saved_native = (resume_checkpoint.get("config") or {}).get("native_grid")
+        if saved_native is not None and saved_native != stage1_index["native_grid"]:
+            raise RuntimeError("resume/current native grid mismatch")
     else:
         _, v18 = load_clean_v18(args.base_checkpoint, device)
         model = V20UnifiedTransportCompletion(
@@ -339,12 +395,7 @@ def main() -> None:
             scaler=scaler,
             progress=progress_state,
             base_checkpoint=args.base_checkpoint,
-            manifest_paths={
-                "train_cache": args.train_cache,
-                "train_stage1_index": stage1_index_path,
-                "dev_cache": args.dev_cache,
-                "dev_stage1_index": dev_stage1_index_path,
-            },
+            manifest_paths=manifest_paths,
             config={
                 **vars(args),
                 "warmup_updates": int(args.warmup_updates),
