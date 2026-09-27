@@ -1591,7 +1591,7 @@ def test_factorized_static_fresh_head_is_zero_contribution_and_decodes_semantics
     assert torch.equal(pred, torch.full_like(pred, chosen_global))
 
 
-def test_factorized_static_loss_matches_expanded_balanced_objective():
+def test_factorized_static_loss_matches_expanded_weighted_objective():
     import torch.nn.functional as F
     from real_motion.v20_history_world import FREE_LABEL
     from real_motion.v20_static_repair import STATIC_SEMANTIC_IDS
@@ -1620,6 +1620,7 @@ def test_factorized_static_loss_matches_expanded_balanced_objective():
         support,
         target,
         device=torch.device("cpu"),
+        positive_mass=0.2,
     )
     loss.backward()
     gp = p0.grad.detach().clone()
@@ -1630,11 +1631,13 @@ def test_factorized_static_loss_matches_expanded_balanced_objective():
     y_presence = torch.tensor([1.0, 0.0, 1.0, 0.0])
     expanded_p = p1[qrow]
     pos = y_presence.bool()
-    presence_ref = 0.5 * (
-        F.binary_cross_entropy_with_logits(
+    presence_ref = (
+        0.2
+        * F.binary_cross_entropy_with_logits(
             expanded_p[pos], y_presence[pos]
         )
-        + F.binary_cross_entropy_with_logits(
+        + 0.8
+        * F.binary_cross_entropy_with_logits(
             expanded_p[~pos], y_presence[~pos]
         )
     )
@@ -1649,6 +1652,23 @@ def test_factorized_static_loss_matches_expanded_balanced_objective():
     assert torch.allclose(gs, s1.grad, atol=1e-6, rtol=1e-6)
     assert float(parts["positive_contributions"]) == 2.0
     assert float(parts["negative_contributions"]) == 2.0
+    assert parts["presence_positive_mass"] == 0.2
+
+
+def test_factorized_static_trainer_exposes_fast_sweep_controls():
+    import inspect
+    from tools.real_motion import (
+        train_p0_f9_v20_static_repair_factorized as m,
+    )
+
+    src = inspect.getsource(m.main)
+    loss_src = inspect.getsource(m._factorized_loss)
+    assert "--presence-positive-mass" in src
+    assert "--val-every" in src
+    assert "--resume" in src
+    assert "epoch == int(a.epochs)" in src
+    assert "optimizer_state" in src
+    assert "positive_mass" in loss_src
 
 
 def test_factorized_static_checkpoint_roundtrip_and_legacy_default(tmp_path):
