@@ -282,6 +282,7 @@ def main() -> None:
             raise RuntimeError("resume checkpoint lacks tile sampler RNG state")
         tile_generator.set_state(saved_tile_rng)
     monitor_log: list[dict] = []
+    frozen_reference_raw = None
     started = time.perf_counter()
 
     while progress_state.successful_updates < int(args.max_updates):
@@ -419,7 +420,9 @@ def main() -> None:
 
         # Monitoring is full-support/no enrichment and uses an independent
         # frozen reference loaded from the declared Clean-E14 checkpoint.
-        _, frozen_v18 = load_clean_v18(args.base_checkpoint, device)
+        frozen_v18 = None
+        if frozen_reference_raw is None:
+            _, frozen_v18 = load_clean_v18(args.base_checkpoint, device)
         monitor = evaluate_model(
             model=model,
             frozen_v18=frozen_v18,
@@ -432,7 +435,12 @@ def main() -> None:
             amp=amp,
             alignment_workers=int(args.alignment_workers),
             progress=False,
+            frozen_reference_raw=frozen_reference_raw,
         )
+        if frozen_reference_raw is None:
+            frozen_reference_raw = monitor["raw_metric_counts"][
+                "frozen_v18_reference"
+            ]
         monitor.update(
             {
                 "successful_updates": progress_state.successful_updates,
