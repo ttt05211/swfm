@@ -1060,6 +1060,11 @@ def main():
                 best_miou = miou
                 _atomic_save(payload, out / "best_dev_miou.pt")
 
+        # Keep sweep/resume metadata crash-safe at epoch granularity.
+        (out / "history.json").write_text(
+            json.dumps(history, indent=2), encoding="utf-8"
+        )
+
     (out / "history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"
     )
