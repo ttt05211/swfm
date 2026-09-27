@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import torch
+
+from real_motion.v20_history_world import FREE_LABEL, CanonicalLattice
+from real_motion.v20_unified_data import sample_training_tiles
+from real_motion.v20_unified_loss import (
+    completion_cross_entropy,
+    completion_tiles_cross_entropy,
+)
+from real_motion.v20_unified_runtime import (
+    assemble_completion_logits,
+    prepare_runtime_queries,
+    transport_condition,
+)
+from tools.real_motion.eval_p0_f9_v20_unified import _finalize, _new_raw, _update_many
+
+
+def test_tile_sampler_contract_and_no_support_behavior():
+    support = torch.zeros(1, 6, 4, 4, 2, dtype=torch.bool)
+    labels = torch.full(support.shape, FREE_LABEL)
+    valid = torch.ones_like(support)
+    assert sample_training_tiles(support, labels, valid, core_shape_xyz=(2, 2, 2)) == []
+
+    support[:] = True
+    labels[:, :, :2, :2, :] = 3
+    g = torch.Generator().manual_seed(7)
+    tiles = sample_training_tiles(
+        support,
+        labels,
+        valid,
+        core_shape_xyz=(2, 2, 2),
+        draws_per_horizon=16,
+        positive_draws=8,
+        generator=g,
+    )
+    assert len(tiles) == 6 * 16
+    for horizon in range(6):
+        chosen = [t for t in tiles if t.horizon == horizon]
+        assert len(chosen) == 16
+        assert sum(t.core_start_xyz[0] == 0 and t.core_start_xyz[1] == 0 for t in chosen) >= 8
+
+
+def test_tile_sampler_uses_all_uniform_when_no_positive():
+    support = torch.ones(1, 6, 2, 2, 1, dtype=torch.bool)
+    labels = torch.full(support.shape, FREE_LABEL)
+    valid = torch.ones_like(support)
+    tiles = sample_training_tiles(
+        support,
+        labels,
+        valid,
+        core_shape_xyz=(1, 1, 1),
+        draws_per_horizon=5,
+        positive_draws=3,
+        generator=torch.Generator().manual_seed(2),
+    )
+    assert len(tiles) == 6 * 5
+
+
+def test_completion_empty_mask_is_graph_connected_zero():
+    logits = torch.randn(2, 2, 1, 18, requires_grad=True)
+    result = completion_cross_entropy(
+        logits,
+        torch.zeros(2, 2, 1, dtype=torch.long),
+        torch.zeros(2, 2, 1, dtype=torch.bool),
+    )
+    assert result.count == 0 and float(result.mean) == 0.0
+    result.mean.backward()
+    assert logits.grad is not None and torch.equal(logits.grad, torch.zeros_like(logits))
+
+
+def test_repeated_tile_draws_keep_exact_ce_multiplicity():
+    a = torch.zeros(1, 1, 1, 18, requires_grad=True)
+    b = torch.zeros(1, 1, 1, 18, requires_grad=True)
+    with torch.no_grad():
+        a[..., 1] = 2.0
+        b[..., 1] = -2.0
+    target = torch.ones(1, 1, 1, dtype=torch.long)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    got = completion_tiles_cross_entropy([a, a, b], [target] * 3, [mask] * 3)
+    expected = (
+        torch.nn.functional.cross_entropy(a.reshape(-1, 18), target.reshape(-1)) * 2
+        + torch.nn.functional.cross_entropy(b.reshape(-1, 18), target.reshape(-1))
+    ) / 3
+    assert torch.allclose(got.mean, expected)
+    assert got.count == 3
+
+
+def test_single_tile_and_aggregate_loss_statistics_are_identical():
+    torch.manual_seed(4)
+    logits = torch.randn(2, 3, 1, 18)
+    target = torch.randint(0, 18, (2, 3, 1))
+    mask = torch.tensor([[[True], [False], [True]], [[True], [True], [False]]])
+    direct = completion_cross_entropy(logits, target, mask)
+    aggregate = completion_tiles_cross_entropy([logits], [target], [mask])
+    assert direct.count == aggregate.count
+    assert torch.equal(direct.loss_sum, aggregate.loss_sum)
+    assert torch.equal(direct.mean, aggregate.mean)
+
+
+def test_transport_condition_is_proportions_plus_coverage_and_detached():
+    current = torch.full((1, 6, 2, 1, 1), FREE_LABEL)
+    current[:, :, 0] = 4
+    valid = torch.ones_like(current, dtype=torch.bool)
+    valid[:, :, 1] = False
+    cond = transport_condition(current, valid)
+    assert cond.shape == (1, 6, 19)
+    assert torch.allclose(cond[..., 4], torch.ones_like(cond[..., 4]))
+    assert torch.allclose(cond[..., -1], torch.full_like(cond[..., -1], 0.5))
+    assert not cond.requires_grad
+
+
+def test_halo_queries_write_core_only():
+    lattice = CanonicalLattice((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (4, 4, 2))
+    current = torch.full((1, 6, 4, 4, 2), FREE_LABEL)
+    pose = torch.eye(4).view(1, 1, 4, 4).expand(1, 6, 4, 4).clone()
+    queries, report = prepare_runtime_queries(
+        current,
+        pose,
+        coarse_lattice=lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        core_shape_xyz=(2, 2, 2),
+        halo=1,
+    )
+    assert report.out_of_bounds_voxels == 0
+    logits = []
+    for i, q in enumerate(queries):
+        x = torch.zeros(*q.tile.halo_shape_xyz, 18)
+        x[..., i % 17] = 5.0
+        logits.append(x)
+    dense = assemble_completion_logits(logits, queries, output_shape=current.shape)
+    assert dense.shape == (*current.shape, 18)
+    assert torch.isfinite(dense).all()
+
+
+def test_evaluator_uses_exact_dataset_accumulated_metric_semantics():
+    names = {"perfect": _new_raw(), "free": _new_raw()}
+    gt = torch.full((2, 2, 1), FREE_LABEL, dtype=torch.uint8).numpy()
+    gt[0, 0, 0] = 4
+    perfect = gt.copy()
+    free = torch.full((2, 2, 1), FREE_LABEL, dtype=torch.uint8).numpy()
+    moving = torch.zeros(2, 2, 1, dtype=torch.bool).numpy()
+    moving[0, 0, 0] = True
+    for horizon in range(6):
+        _update_many(
+            names,
+            horizon,
+            {"perfect": perfect, "free": free},
+            gt,
+            moving,
+            FREE_LABEL,
+        )
+    perfect_result = _finalize(names["perfect"])
+    free_result = _finalize(names["free"])
+    assert perfect_result["IoU"] == 100.0
+    assert perfect_result["MovingMicro"] == 100.0
+    assert free_result["IoU"] == 0.0
+    assert free_result["MovingMicro"] == 0.0

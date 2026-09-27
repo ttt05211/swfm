@@ -153,6 +153,26 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         nn.init.zeros_(self.yaw_head.weight)
         nn.init.zeros_(self.yaw_head.bias)
 
+    def decode_transport_queries(self, q: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Decode an already-computed V18 transport query tensor.
+
+        V20 uses this pure decoder after its source/scene adapter updates the
+        query representation.  Keeping the heads here avoids a second V18
+        encoder pass and keeps the original V18 forward path bit-for-bit
+        identical when the adapter is bypassed.
+        """
+        expected = (FUTURE_FRAMES, int(self.config.d_model))
+        if q.ndim != 3 or tuple(q.shape[1:]) != expected:
+            raise ValueError(
+                "q must be [B,6,d_model], got "
+                f"{tuple(q.shape)} for d_model={int(self.config.d_model)}"
+            )
+        return {
+            "residual_xy_m": self.residual_head(q),
+            "existence_logits": self.existence_head(q)[..., 0],
+            "yaw_delta_rad": self.yaw_head(q)[..., 0],
+        }
+
     def forward(
         self,
         features: torch.Tensor,
@@ -162,6 +182,7 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         target_source_mask_tube: torch.Tensor | None = None,
         *,
         return_latents: bool = False,
+        decode_outputs: bool = True,
     ) -> dict[str, torch.Tensor]:
         cfg = self.config
         if features.ndim != 2 or features.shape[-1] != FEATURE_DIM:
@@ -179,6 +200,8 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             raise ValueError("frame_motion_features must be [B,6,5]")
         if target_source_mask_tube is None or target_source_mask_tube.shape != local_semantic_tube.shape:
             raise ValueError("target_source_mask_tube must match local_semantic_tube")
+        if not decode_outputs and not return_latents:
+            raise ValueError("decode_outputs=False requires return_latents=True")
 
         labels = local_semantic_tube.long()
         if bool((labels < 0).any()) or bool((labels >= SEMANTIC_CLASSES).any()):
@@ -188,11 +211,9 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             raise ValueError("target source mask must be binary")
 
         if B == 0:
-            out = {
-                "residual_xy_m": features.new_empty((0, FUTURE_FRAMES, 2)),
-                "existence_logits": features.new_empty((0, FUTURE_FRAMES)),
-                "yaw_delta_rad": features.new_empty((0, FUTURE_FRAMES)),
-            }
+            out = self.decode_transport_queries(
+                features.new_empty((0, FUTURE_FRAMES, int(cfg.d_model)))
+            ) if decode_outputs else {}
             if return_latents:
                 out["history_source_context"] = features.new_empty(
                     (0, int(cfg.d_model))
@@ -226,11 +247,7 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         for block in self.decoder:
             q = block(q, context)
 
-        out = {
-            "residual_xy_m": self.residual_head(q),
-            "existence_logits": self.existence_head(q)[..., 0],
-            "yaw_delta_rad": self.yaw_head(q)[..., 0],
-        }
+        out = self.decode_transport_queries(q) if decode_outputs else {}
         if return_latents:
             # V20 observation-only interface.  These tensors are computed from
             # the exact frozen V18 path; exposing them does not modify q or any

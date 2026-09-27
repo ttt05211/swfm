@@ -15,9 +15,13 @@ import argparse
 import json
 import math
 from pathlib import Path
-import resource
 import sys
 import time
+
+try:
+    import resource
+except ImportError:  # Windows has no POSIX getrusage module.
+    resource = None
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -576,11 +580,14 @@ def main():
             "shard_write_seconds": float(sum(shard_write_seconds)),
             "cache_bytes": int(shard_bytes),
             "bytes_per_window": float(shard_bytes / max(len(records), 1)),
-            "process_max_rss_mib": float(
-                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+            "process_max_rss_mib": (
+                float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0)
+                if resource is not None
+                else None
             ),
             "note": (
-                "Linux ru_maxrss is process peak resident memory. "
+                "Linux ru_maxrss is process peak resident memory; unavailable "
+                "platforms record null. "
                 "Run --max-windows smoke before full cache construction."
             ),
         },
