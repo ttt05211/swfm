@@ -282,8 +282,9 @@ def main():
         "--unified-compact",
         action="store_true",
         help=(
-            "Omit legacy future static_supervision; unified reads future GT "
-            "directly for sampled loss/evaluation."
+            "Omit legacy future static_supervision and dynamic identity/trajectory "
+            "supervision. Unified reads future GT directly for sampled loss/eval "
+            "and treats Static/Dormant/Birth only as optional diagnostics."
         ),
     )
     p.add_argument(
@@ -422,36 +423,39 @@ def main():
         )
         phase_seconds["history_align"] += time.perf_counter() - t_phase
 
-        cache_stats["history_source_hits"] += sum(
-            key in history_source_cache for key in hist_keys
-        )
-        cache_stats["history_source_misses"] += sum(
-            key not in history_source_cache for key in hist_keys
-        )
         fut_keys = [str(x) for x in w.future_tokens]
-        cache_stats["future_ann_hits"] += sum(
-            key in future_ann_cache for key in fut_keys
-        )
-        cache_stats["future_ann_misses"] += sum(
-            key not in future_ann_cache for key in fut_keys
-        )
-
-        t_phase = time.perf_counter()
-        _, matched, ambiguous = _history_source_evidence(
-            source, w, raw, pcfg, strong_cfg, float(a.match_max_distance_m),
-            token_cache=history_source_cache,
-        )
-        dyn, counts = _future_dynamic_targets(
-            source, w, raw, matched, ambiguous,
-            ann_cache=future_ann_cache,
-        )
-        phase_seconds["dynamic_labels"] += time.perf_counter() - t_phase
-        for k, v in counts.items():
-            dyn_totals[k] += int(v)
-
         if bool(a.unified_compact):
+            # Unified training/runtime never consumes Stage-1 GT identity,
+            # trajectories or static supervision. Skipping them here removes
+            # expensive annotation matching and prevents redundant cache growth.
+            dyn = None
             static_sup = None
         else:
+            cache_stats["history_source_hits"] += sum(
+                key in history_source_cache for key in hist_keys
+            )
+            cache_stats["history_source_misses"] += sum(
+                key not in history_source_cache for key in hist_keys
+            )
+            cache_stats["future_ann_hits"] += sum(
+                key in future_ann_cache for key in fut_keys
+            )
+            cache_stats["future_ann_misses"] += sum(
+                key not in future_ann_cache for key in fut_keys
+            )
+            t_phase = time.perf_counter()
+            _, matched, ambiguous = _history_source_evidence(
+                source, w, raw, pcfg, strong_cfg, float(a.match_max_distance_m),
+                token_cache=history_source_cache,
+            )
+            dyn, counts = _future_dynamic_targets(
+                source, w, raw, matched, ambiguous,
+                ann_cache=future_ann_cache,
+            )
+            phase_seconds["dynamic_labels"] += time.perf_counter() - t_phase
+            for k, v in counts.items():
+                dyn_totals[k] += int(v)
+
             cache_stats["static_supervision_hits"] += sum(
                 key in static_supervision_cache for key in fut_keys
             )
@@ -493,8 +497,9 @@ def main():
             "future_ego_to_t0": torch.from_numpy(future_rel.astype(np.float32)),
             "query_oob_voxels": 0,
             "history_oob_observed_samples": int(aligned.out_of_bounds_samples),
-            "dynamic_supervision": dyn,
         }
+        if dyn is not None:
+            row["dynamic_supervision"] = dyn
         if static_sup is not None:
             row["static_supervision"] = static_sup
         rows.append(row)
@@ -568,6 +573,11 @@ def main():
                 if bool(a.unified_compact)
                 else "packed native valid mask + 4-bit remapped static/free labels in C-order"
             ),
+            "dynamic_supervision": (
+                "omitted: unified runtime/training does not consume GT identity/trajectory metadata"
+                if bool(a.unified_compact)
+                else "legacy responsibility/trajectory metadata for diagnostics"
+            ),
             "omitted_recomputable_fields": [
                 "query_mask_bits",
                 "history_conflict_bits",
@@ -585,6 +595,7 @@ def main():
         },
         "inference_fields_use_future_semantics": False,
         "dynamic_identity_is_supervision_only": True,
+        "dynamic_supervision_stored": not bool(a.unified_compact),
         "query_out_of_bounds_voxels": int(oob_query),
         "history_out_of_bounds_observed_samples": int(oob_history),
         "compressed_history_semantic_values": int(history_semantic_values),
