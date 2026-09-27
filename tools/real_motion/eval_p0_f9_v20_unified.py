@@ -180,12 +180,18 @@ def evaluate_model(
     progress: bool = True,
     ablate_source_latents: bool = False,
     include_per_scene: bool = False,
+    frozen_reference_raw: dict | None = None,
 ) -> dict:
     model.eval()
-    frozen_v18.eval()
+    if frozen_v18 is not None:
+        frozen_v18.eval()
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     component_cache = ComponentLRU(maxsize=1024)
     raw_by_variant = {name: _new_raw() for name in VARIANTS}
+    if frozen_reference_raw is not None:
+        cached = raw_by_variant["frozen_v18_reference"]
+        for key in cached:
+            cached[key][...] = np.asarray(frozen_reference_raw[key], dtype=np.int64)
     raw_by_scene = {}
     total_runtime_oob = total_scatter_oob = total_completion_support = 0
     diagnostic_groups = {
@@ -223,22 +229,30 @@ def evaluate_model(
         try:
             with torch.inference_mode(), _autocast(device, amp):
                 gpu = prepared.state["gpu"]
-                reference_out = frozen_v18(
-                    gpu["features"],
-                    gpu["tube"],
-                    gpu["kta"],
-                    gpu["frame_motion"],
-                    gpu["source_mask"],
+                reference_out = (
+                    frozen_v18(
+                        gpu["features"],
+                        gpu["tube"],
+                        gpu["kta"],
+                        gpu["frame_motion"],
+                        gpu["source_mask"],
+                    )
+                    if frozen_reference_raw is None
+                    else None
                 )
                 first = first_stage_forward(model, prepared, adapter_enabled=True)
-            reference = hard_render_transport(
-                model,
-                prepared,
-                reference_out,
-                pcfg=pcfg,
-                strong_cfg=strong_cfg,
-                device=device,
-            )[0].cpu().numpy().astype(np.uint8)
+            reference = (
+                hard_render_transport(
+                    model,
+                    prepared,
+                    reference_out,
+                    pcfg=pcfg,
+                    strong_cfg=strong_cfg,
+                    device=device,
+                )[0].cpu().numpy().astype(np.uint8)
+                if reference_out is not None
+                else None
+            )
             current_t = hard_render_transport(
                 model,
                 prepared,
@@ -281,10 +295,11 @@ def evaluate_model(
                     diagnostic_groups[name] += 1
             for hi, _ in enumerate(HORIZONS):
                 pred_by_name = {
-                    "frozen_v18_reference": reference[hi],
                     "current_transport_only": current[hi],
                     "transport_plus_completion": final[hi],
                 }
+                if reference is not None:
+                    pred_by_name["frozen_v18_reference"] = reference[hi]
                 _update_many(
                     raw_by_variant,
                     hi,
@@ -393,6 +408,7 @@ def evaluate_model(
         "future_gt_used_for_prediction": False,
         "static_dormant_birth_are_diagnostics_only": True,
         "completion_source_latents_ablated": bool(ablate_source_latents),
+        "frozen_reference_reused": frozen_reference_raw is not None,
     }
 
 
