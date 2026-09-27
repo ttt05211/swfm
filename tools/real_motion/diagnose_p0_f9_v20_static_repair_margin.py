@@ -53,6 +53,9 @@ from tools.real_motion.train_p0_f9_v20_static_repair import (
     _lattice,
     _load_index,
 )
+from tools.real_motion.train_p0_f9_v20_static_repair_factorized import (
+    _decode_query_factorized_sparse,
+)
 
 
 DEFAULT_THRESHOLDS = (
@@ -276,18 +279,35 @@ def _scan_split(
             device, non_blocking=True
         ).unsqueeze(0)
 
+        factorized = str(model.cfg.static_head_type) == "factorized"
         with _autocast(device, amp):
             scene = model.encode_history(sem, obs, obsfree)
             linear, q = geom.future_linear_and_query(item["future_rel"])
-            query_logits, row_map, ntiles = _decode_query_logits_sparse(
-                model,
-                scene,
-                q,
-                item["obs"],
-                geom,
-                tile_batch_size=int(tile_batch_size),
-                tile_batch_pad_multiple=int(tile_batch_pad_multiple),
-            )
+            if factorized:
+                presence_logits, semantic_logits, row_map, ntiles = (
+                    _decode_query_factorized_sparse(
+                        model,
+                        scene,
+                        q,
+                        item["obs"],
+                        geom,
+                        tile_batch_size=int(tile_batch_size),
+                        tile_batch_pad_multiple=int(tile_batch_pad_multiple),
+                    )
+                )
+                query_logits = None
+            else:
+                query_logits, row_map, ntiles = _decode_query_logits_sparse(
+                    model,
+                    scene,
+                    q,
+                    item["obs"],
+                    geom,
+                    tile_batch_size=int(tile_batch_size),
+                    tile_batch_pad_multiple=int(tile_batch_pad_multiple),
+                )
+                presence_logits = None
+                semantic_logits = None
         tiles += int(ntiles)
 
         support_t = torch.from_numpy(
@@ -313,12 +333,17 @@ def _scan_split(
                     "margin diagnostic support escaped query union"
                 )
 
-            rows = query_logits[qrow].float()
-            static_scores, static_choice = rows.index_select(
-                1, static_local
-            ).max(dim=1)
-            pred_static = static_global[static_choice]
-            margin = static_scores - rows[:, free_local]
+            if factorized:
+                margin = presence_logits[qrow].float()
+                static_choice = semantic_logits[qrow].float().argmax(dim=1)
+                pred_static = static_global[static_choice]
+            else:
+                rows = query_logits[qrow].float()
+                static_scores, static_choice = rows.index_select(
+                    1, static_local
+                ).max(dim=1)
+                pred_static = static_global[static_choice]
+                margin = static_scores - rows[:, free_local]
 
             # b = number of thresholds <= margin. The candidate is active at
             # threshold index i iff b > i.
@@ -356,7 +381,13 @@ def _scan_split(
                     sample.detach().cpu().numpy().astype(np.float32)
                 )
 
-        del sem, obs, obsfree, scene, linear, q, query_logits, row_map
+        del sem, obs, obsfree, scene, linear, q, row_map
+        if query_logits is not None:
+            del query_logits
+        if presence_logits is not None:
+            del presence_logits
+        if semantic_logits is not None:
+            del semantic_logits
         if progress_every > 0 and (
             windows == 1
             or windows % int(progress_every) == 0
