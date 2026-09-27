@@ -8,9 +8,13 @@ decision into:
   semantic: one of the nine frozen static classes, only when GT is positive.
 
 Loss:
-  L_presence = 0.5 * mean_pos BCE + 0.5 * mean_neg BCE
+  L_presence = alpha * mean_pos BCE + (1-alpha) * mean_neg BCE
   L_semantic = CE on GT static-positive contributions only
   L = L_presence + L_semantic
+
+alpha is exposed as --presence-positive-mass. The original 0.5 setting is
+retained as the default for protocol compatibility, while fast overfit sweeps
+can search a much more conservative range.
 
 All future voxel/horizon contributions remain equally represented. Repeated
 future-to-canonical mappings are aggregated before loss evaluation.
@@ -42,7 +46,7 @@ from real_motion.v20_static_repair import (
     full_grid_metrics_from_confusion,
     repair_diagnostics_from_confusion,
 )
-from real_motion.v20_training import checkpoint_payload
+from real_motion.v20_training import checkpoint_payload, load_v20_checkpoint
 from tools.real_motion.build_p0_f9_v20_history_cache import (
     PROTOCOL as STAGE1_PROTOCOL,
 )
@@ -290,6 +294,7 @@ def _factorized_loss(
     target,
     *,
     device,
+    positive_mass=0.5,
 ):
     pos, neg, sem = _aggregate_targets(
         row_map,
@@ -308,7 +313,10 @@ def _factorized_loss(
 
     pos_bce = (pos * F.softplus(-p)).sum() / pos_total
     neg_bce = (neg * F.softplus(p)).sum() / neg_total
-    presence_loss = 0.5 * (pos_bce + neg_bce)
+    alpha = float(positive_mass)
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("positive_mass must be in (0,1)")
+    presence_loss = alpha * pos_bce + (1.0 - alpha) * neg_bce
 
     row_count = sem.sum(dim=1)
     semantic_loss = (
@@ -321,6 +329,7 @@ def _factorized_loss(
         "semantic_loss": semantic_loss.detach(),
         "positive_bce": pos_bce.detach(),
         "negative_bce": neg_bce.detach(),
+        "presence_positive_mass": alpha,
         "positive_contributions": pos.sum().detach(),
         "negative_contributions": neg.sum().detach(),
     }
@@ -413,6 +422,7 @@ def _run_epoch(
     fixed_identities,
     progress_every,
     presence_threshold,
+    presence_positive_mass,
 ):
     train = optimizer is not None
     model.train(train)
@@ -495,6 +505,7 @@ def _run_epoch(
                 item["support"],
                 item["target"],
                 device=device,
+                positive_mass=float(presence_positive_mass),
             )
         finite = torch.isfinite(loss.detach()).all()
         if device.type == "cuda" and hasattr(torch, "_assert_async"):
@@ -612,7 +623,12 @@ def _run_epoch(
 
 
 def _summ(row):
-    v = row["val"]
+    v = row.get("val")
+    if v is None:
+        return (
+            f"epoch={row['epoch']} train_only "
+            f"loss={row['train']['loss']:.5f}"
+        )
     d = v["repair_diagnostics"]
     delta = v["full_grid_delta"]
     return (
@@ -642,6 +658,29 @@ def main():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--presence-bias-init", type=float, default=-4.0)
     p.add_argument("--presence-threshold", type=float, default=0.5)
+    p.add_argument(
+        "--presence-positive-mass",
+        type=float,
+        default=0.5,
+        help=(
+            "alpha in alpha*mean_pos_BCE + "
+            "(1-alpha)*mean_neg_BCE"
+        ),
+    )
+    p.add_argument(
+        "--val-every",
+        type=int,
+        default=1,
+        help=(
+            "Run validation every N epochs; the final requested epoch is "
+            "always validated."
+        ),
+    )
+    p.add_argument(
+        "--resume",
+        default="",
+        help="Resume model+optimizer/history from an existing latest.pt.",
+    )
     p.add_argument("--tile-size", default="32,32,16")
     p.add_argument("--tile-batch-size", type=int, default=256)
     p.add_argument("--val-tile-batch-size", type=int, default=256)
@@ -659,6 +698,10 @@ def main():
 
     if not (0.0 < float(a.presence_threshold) < 1.0):
         raise ValueError("presence threshold must be in (0,1)")
+    if not (0.0 < float(a.presence_positive_mass) < 1.0):
+        raise ValueError("presence-positive-mass must be in (0,1)")
+    if int(a.val_every) < 1:
+        raise ValueError("val-every must be >=1")
 
     random.seed(a.seed)
     np.random.seed(a.seed)
@@ -739,12 +782,59 @@ def main():
     if "d_model" not in v18_cfg:
         raise RuntimeError("V18 checkpoint lacks model_config.d_model")
 
-    cfg = V20SceneConfig(
-        source_dim=int(v18_cfg["d_model"]),
-        static_head_type="factorized",
-        static_presence_bias_init=float(a.presence_bias_init),
-    )
-    model = V20HistoryWorldModel(cfg)
+    resume_ck = None
+    resume_extra = {}
+    if str(a.resume):
+        model, resume_ck = load_v20_checkpoint(
+            a.resume, map_location="cpu"
+        )
+        resume_extra = dict(resume_ck.get("extra") or {})
+        if str(resume_ck.get("stage")) != "static":
+            raise RuntimeError("resume checkpoint must be stage='static'")
+        if resume_extra.get("train_protocol") != PROTOCOL:
+            raise RuntimeError(
+                "resume checkpoint uses a different training protocol"
+            )
+        if str(model.cfg.static_head_type) != "factorized":
+            raise RuntimeError(
+                "resume checkpoint does not use factorized Static head"
+            )
+        if str(Path(resume_ck["v18_checkpoint"]).resolve()) != str(
+            Path(a.v18_checkpoint).resolve()
+        ):
+            raise RuntimeError(
+                "resume checkpoint references a different V18 checkpoint"
+            )
+        old_alpha = float(
+            resume_extra.get("presence_positive_mass", 0.5)
+        )
+        if abs(old_alpha - float(a.presence_positive_mass)) > 1e-12:
+            raise RuntimeError(
+                "resume presence-positive-mass mismatch: "
+                f"{old_alpha} != {a.presence_positive_mass}"
+            )
+        old_bias = float(
+            resume_extra.get(
+                "presence_bias_init",
+                model.cfg.static_presence_bias_init,
+            )
+        )
+        if abs(old_bias - float(a.presence_bias_init)) > 1e-12:
+            raise RuntimeError(
+                "resume presence-bias-init mismatch"
+            )
+    else:
+        cfg = V20SceneConfig(
+            source_dim=int(v18_cfg["d_model"]),
+            static_head_type="factorized",
+            static_presence_bias_init=float(a.presence_bias_init),
+        )
+        model = V20HistoryWorldModel(cfg)
+
+    if int(model.cfg.source_dim) != int(v18_cfg["d_model"]):
+        raise RuntimeError(
+            "V20/V18 source dimension mismatch"
+        )
     for p0 in model.dormant.parameters():
         p0.requires_grad = False
     for p0 in model.birth.parameters():
@@ -762,6 +852,14 @@ def main():
         weight_decay=float(a.weight_decay),
         foreach=(device.type == "cuda"),
     )
+    if resume_ck is not None:
+        if "optimizer_state" not in resume_ck:
+            raise RuntimeError(
+                "resume checkpoint lacks optimizer_state"
+            )
+        optimizer.load_state_dict(resume_ck["optimizer_state"])
+        if resume_ck.get("rng_state") is not None:
+            _restore_rng(resume_ck["rng_state"])
 
     high = _lattice(st_idx["highres_lattice"])
     coarse = _lattice(st_idx["coarse_lattice"])
@@ -789,9 +887,18 @@ def main():
     )
 
     out = Path(a.output_dir)
-    if out.exists() and any(out.iterdir()):
-        raise FileExistsError(f"refusing non-empty output dir: {out}")
-    out.mkdir(parents=True, exist_ok=True)
+    if resume_ck is None:
+        if out.exists() and any(out.iterdir()):
+            raise FileExistsError(
+                f"refusing non-empty output dir: {out}"
+            )
+        out.mkdir(parents=True, exist_ok=True)
+    else:
+        out.mkdir(parents=True, exist_ok=True)
+        if Path(a.resume).resolve().parent != out.resolve():
+            raise RuntimeError(
+                "--resume checkpoint must live inside --output-dir"
+            )
 
     print(json.dumps({
         "protocol": PROTOCOL,
@@ -800,8 +907,11 @@ def main():
         "static_head_type": "factorized",
         "presence_bias_init": float(a.presence_bias_init),
         "presence_threshold": float(a.presence_threshold),
+        "presence_positive_mass": float(a.presence_positive_mass),
+        "val_every": int(a.val_every),
+        "resume": str(Path(a.resume).resolve()) if str(a.resume) else None,
         "loss": (
-            "0.5*mean_positive_BCE + 0.5*mean_negative_BCE "
+            "alpha*mean_positive_BCE + (1-alpha)*mean_negative_BCE "
             "+ static_positive_semantic_CE"
         ),
         "train_windows": (
@@ -818,9 +928,24 @@ def main():
         "diagnostic_reasons": diagnostic_reasons,
     }, indent=2), flush=True)
 
-    history = []
-    best_miou = -float("inf")
-    for epoch in range(1, int(a.epochs) + 1):
+    history = list(resume_extra.get("history") or [])
+    start_epoch = (
+        int(resume_extra.get("epoch", 0)) + 1
+        if resume_ck is not None else 1
+    )
+    if int(a.epochs) < start_epoch - 1:
+        raise RuntimeError(
+            "requested --epochs is behind resume checkpoint"
+        )
+    best_miou = max(
+        [
+            float(r["val"]["full_grid_v18_plus_static_metrics"]["mIoU"])
+            for r in history
+            if r.get("val") is not None
+        ],
+        default=-float("inf"),
+    )
+    for epoch in range(start_epoch, int(a.epochs) + 1):
         tr = _run_epoch(
             model,
             st_root,
@@ -840,29 +965,42 @@ def main():
             fixed_identities=fixed,
             progress_every=int(a.progress_every),
             presence_threshold=float(a.presence_threshold),
+            presence_positive_mass=float(a.presence_positive_mass),
         )
-        with torch.inference_mode():
-            va = _run_epoch(
-                model,
-                sv_root,
-                rv_root,
-                rv_idx,
-                val_source,
-                geom,
-                device=device,
-                optimizer=None,
-                tile_batch_size=int(a.val_tile_batch_size),
-                tile_batch_pad_multiple=int(a.tile_batch_pad_multiple),
-                workers=int(a.prep_workers),
-                prefetch=int(a.prefetch),
-                seed=int(a.seed),
-                amp=amp,
-                max_windows=int(a.max_val_windows),
-                fixed_identities=fixed,
-                progress_every=int(a.progress_every),
-                presence_threshold=float(a.presence_threshold),
-            )
-        row = {"epoch": int(epoch), "train": tr, "val": va}
+        should_validate = (
+            epoch % int(a.val_every) == 0
+            or epoch == int(a.epochs)
+        )
+        va = None
+        if should_validate:
+            with torch.inference_mode():
+                va = _run_epoch(
+                    model,
+                    sv_root,
+                    rv_root,
+                    rv_idx,
+                    val_source,
+                    geom,
+                    device=device,
+                    optimizer=None,
+                    tile_batch_size=int(a.val_tile_batch_size),
+                    tile_batch_pad_multiple=int(a.tile_batch_pad_multiple),
+                    workers=int(a.prep_workers),
+                    prefetch=int(a.prefetch),
+                    seed=int(a.seed),
+                    amp=amp,
+                    max_windows=int(a.max_val_windows),
+                    fixed_identities=fixed,
+                    progress_every=int(a.progress_every),
+                    presence_threshold=float(a.presence_threshold),
+                    presence_positive_mass=float(a.presence_positive_mass),
+                )
+        row = {
+            "epoch": int(epoch),
+            "train": tr,
+            "val": va,
+            "validation_performed": bool(should_validate),
+        }
         history.append(row)
         print(json.dumps(row), flush=True)
         print(_summ(row), flush=True)
@@ -878,9 +1016,12 @@ def main():
                 "static_head_type": "factorized",
                 "presence_bias_init": float(a.presence_bias_init),
                 "presence_threshold": float(a.presence_threshold),
+                "presence_positive_mass": float(a.presence_positive_mass),
                 "presence_objective": (
-                    "0.5*mean_positive_BCE + 0.5*mean_negative_BCE"
+                    "alpha*mean_positive_BCE + "
+                    "(1-alpha)*mean_negative_BCE"
                 ),
+                "val_every": int(a.val_every),
                 "semantic_objective": "CE only on GT static-positive contributions",
                 "supervision_domain": (
                     "formal_full_future_grid_intersection_v18_free"
@@ -906,13 +1047,18 @@ def main():
                 ),
             },
         )
+        payload["optimizer_state"] = optimizer.state_dict()
+        payload["rng_state"] = _capture_rng()
         _atomic_save(payload, out / f"epoch_{epoch:04d}.pt")
         _atomic_save(payload, out / "latest.pt")
 
-        miou = float(va["full_grid_v18_plus_static_metrics"]["mIoU"])
-        if miou > best_miou:
-            best_miou = miou
-            _atomic_save(payload, out / "best_dev_miou.pt")
+        if va is not None:
+            miou = float(
+                va["full_grid_v18_plus_static_metrics"]["mIoU"]
+            )
+            if miou > best_miou:
+                best_miou = miou
+                _atomic_save(payload, out / "best_dev_miou.pt")
 
     (out / "history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"
