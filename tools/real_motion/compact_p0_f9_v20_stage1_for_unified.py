@@ -64,6 +64,7 @@ def main():
     out = dict(index)
     out["consumer_profile"] = "unified_transport_completion"
     out["unified_compact"] = True
+    out["dynamic_supervision_stored"] = False
     layout = dict(out.get("cache_layout") or {})
     layout["static_supervision"] = (
         "omitted by compact conversion; unified reads future GT at runtime"
