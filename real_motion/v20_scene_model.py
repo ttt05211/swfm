@@ -35,6 +35,10 @@ class V20SceneConfig:
     birth_shape_voxel_size_m: float = 0.4
     vertical_bins: int = 16
     dynamic_classes: int = len(DYNAMIC_IDS)
+    # Backward-compatible Static head selector. Existing checkpoints omit
+    # these fields and therefore reconstruct the legacy softmax head exactly.
+    static_head_type: str = "softmax"
+    static_presence_bias_init: float = -4.0
 
 
 class HistoricalEvidence3DEncoder(nn.Module):
@@ -155,28 +159,62 @@ class StaticWorldHead(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.prefer_channels_last_3d = False
+        self.head_type = str(cfg.static_head_type)
+        if self.head_type not in {"softmax", "factorized"}:
+            raise ValueError(
+                "static_head_type must be 'softmax' or 'factorized'"
+            )
         td = int(cfg.tile_dim)
         self.coarse_head = nn.Conv3d(int(scene_dim), SEMANTIC_CLASSES, 1)
-        self.tile_refine = nn.Sequential(
+
+        trunk = [
             nn.Conv3d(int(scene_dim) + 3, td, 3, padding=1),
             nn.GroupNorm(1, td),
             nn.GELU(),
             nn.Conv3d(td, td, 3, padding=1),
             nn.GroupNorm(1, td),
             nn.GELU(),
-            nn.Conv3d(td, SEMANTIC_CLASSES, 1),
-        )
+        ]
+        if self.head_type == "softmax":
+            self.tile_refine = nn.Sequential(
+                *trunk,
+                nn.Conv3d(td, SEMANTIC_CLASSES, 1),
+            )
+        else:
+            self.tile_refine = nn.Sequential(*trunk)
+            static_ids = tuple(
+                i for i in range(FREE_LABEL)
+                if i not in set(int(x) for x in DYNAMIC_IDS)
+            )
+            self.register_buffer(
+                "factorized_static_ids",
+                torch.as_tensor(static_ids, dtype=torch.long),
+                persistent=False,
+            )
+            self.presence_head = nn.Conv3d(td, 1, 1)
+            self.semantic_head = nn.Conv3d(td, len(static_ids), 1)
+
         # Zero-contribution initialization: before training, Static decodes to
         # free everywhere. This is stronger than merely disabling the branch.
         nn.init.zeros_(self.coarse_head.weight)
         nn.init.zeros_(self.coarse_head.bias)
         with torch.no_grad():
             self.coarse_head.bias[FREE_LABEL] = 8.0
-        last = self.tile_refine[-1]
-        nn.init.zeros_(last.weight)
-        nn.init.zeros_(last.bias)
-        with torch.no_grad():
-            last.bias[FREE_LABEL] = 8.0
+
+        if self.head_type == "softmax":
+            last = self.tile_refine[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+            with torch.no_grad():
+                last.bias[FREE_LABEL] = 8.0
+        else:
+            nn.init.zeros_(self.presence_head.weight)
+            nn.init.constant_(
+                self.presence_head.bias,
+                float(cfg.static_presence_bias_init),
+            )
+            nn.init.zeros_(self.semantic_head.weight)
+            nn.init.zeros_(self.semantic_head.bias)
 
     def set_tile_channels_last_3d(self, enabled: bool = True) -> None:
         """Select channels-last-3d for the expensive Static tile Conv3D path.
@@ -188,6 +226,9 @@ class StaticWorldHead(nn.Module):
         self.prefer_channels_last_3d = bool(enabled)
         if self.prefer_channels_last_3d:
             self.tile_refine.to(memory_format=torch.channels_last_3d)
+            if self.head_type == "factorized":
+                self.presence_head.to(memory_format=torch.channels_last_3d)
+                self.semantic_head.to(memory_format=torch.channels_last_3d)
 
     def forward_coarse(self, scene: torch.Tensor) -> torch.Tensor:
         return self.coarse_head(scene)
@@ -254,6 +295,33 @@ class StaticWorldHead(nn.Module):
                 memory_format=torch.channels_last_3d
             )
 
+        if self.head_type == "factorized":
+            presence, semantic = self._factorized_from_tile_input(tile_input)
+            # Pseudo logits preserve the exact factorized decision under the
+            # existing runtime decoder:
+            #   add iff presence_logit >= 0
+            #   class = argmax semantic_logits.
+            # The best static pseudo-logit equals presence_logit while free is
+            # zero; all dynamic classes stay safely below both.
+            sem_rel = semantic - semantic.amax(dim=1, keepdim=True)
+            static_logits = presence + sem_rel
+            out = torch.full(
+                (tile_input.shape[0], SEMANTIC_CLASSES)
+                + tuple(tile_input.shape[2:]),
+                -1.0e4,
+                dtype=static_logits.dtype,
+                device=static_logits.device,
+            )
+            ids = self.factorized_static_ids.to(static_logits.device)
+            out.index_copy_(1, ids, static_logits)
+            out[:, FREE_LABEL] = 0.0
+            if output_ids is None:
+                return out
+            return out.index_select(
+                1,
+                output_ids.to(device=out.device, dtype=torch.long),
+            )
+
         if output_ids is None:
             return self.tile_refine(tile_input)
 
@@ -279,6 +347,81 @@ class StaticWorldHead(nn.Module):
             dilation=last.dilation,
             groups=last.groups,
         )
+
+    def _factorized_from_tile_input(
+        self,
+        tile_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.head_type != "factorized":
+            raise RuntimeError(
+                "factorized Static logits requested from softmax head"
+            )
+        h = self.tile_refine(tile_input)
+        return self.presence_head(h), self.semantic_head(h)
+
+    def refine_tiles_factorized(
+        self,
+        scene_features: torch.Tensor,
+        *,
+        sample_grid: torch.Tensor,
+        query_mask: torch.Tensor,
+        seen_mask: torch.Tensor,
+        t0_missing_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return raw presence [B,1,X,Y,Z] and static semantic logits.
+
+        This is the training interface for the factorized Static Repair head.
+        Runtime inference continues to use refine_tiles(), which maps these two
+        outputs to an equivalent 18-class decision tensor.
+        """
+        if self.head_type != "factorized":
+            raise RuntimeError(
+                "refine_tiles_factorized requires static_head_type=factorized"
+            )
+        if sample_grid.ndim != 5 or sample_grid.shape[-1] != 3:
+            raise ValueError("sample_grid must be [B,D,H,W,3]")
+        Bgrid, D, H, W, _ = sample_grid.shape
+        if scene_features.shape[0] == 1 and Bgrid > 1:
+            packed_grid = sample_grid.reshape(1, Bgrid * D, H, W, 3)
+            packed = F.grid_sample(
+                scene_features,
+                packed_grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            C = int(packed.shape[1])
+            x = packed[0].reshape(C, Bgrid, D, H, W).permute(
+                1, 0, 2, 3, 4
+            ).contiguous()
+        else:
+            if scene_features.shape[0] not in {1, Bgrid}:
+                raise ValueError(
+                    "scene/grid batch mismatch for static tile refinement"
+                )
+            x = F.grid_sample(
+                scene_features,
+                sample_grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+        masks = torch.stack(
+            (
+                query_mask.to(x.dtype),
+                seen_mask.to(x.dtype),
+                t0_missing_mask.to(x.dtype),
+            ),
+            dim=1,
+        )
+        if masks.shape[2:] != x.shape[2:]:
+            raise ValueError("tile context mask shape mismatch")
+        tile_input = torch.cat((x, masks), dim=1)
+        if self.prefer_channels_last_3d:
+            tile_input = tile_input.contiguous(
+                memory_format=torch.channels_last_3d
+            )
+        return self._factorized_from_tile_input(tile_input)
 
 
 class DormantSourceHead(nn.Module):
