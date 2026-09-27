@@ -125,6 +125,12 @@ def main() -> None:
     parser.add_argument("--patch-resolution-m", type=float, default=0.8)
     parser.add_argument("--alignment-workers", type=int, default=6)
     parser.add_argument(
+        "--keep-checkpoints",
+        type=int,
+        default=3,
+        help="Keep only the newest N update_*.pt checkpoints; 0 keeps all.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Run one warmup + one joint real-data update with one-window monitors.",
@@ -405,6 +411,11 @@ def main() -> None:
         )
         checkpoint_path = out_dir / f"update_{progress_state.successful_updates:04d}.pt"
         save_checkpoint(checkpoint_path, payload)
+        keep = int(args.keep_checkpoints)
+        if keep > 0:
+            checkpoints = sorted(out_dir.glob("update_*.pt"))
+            for stale in checkpoints[:-keep]:
+                stale.unlink(missing_ok=True)
 
         # Monitoring is full-support/no enrichment and uses an independent
         # frozen reference loaded from the declared Clean-E14 checkpoint.
@@ -445,6 +456,9 @@ def main() -> None:
             (out_dir / f"update_{progress_state.successful_updates:04d}.pt").resolve()
         ),
         "smoke": bool(args.smoke),
+        "screen1024": bool(args.screen1024),
+        "train_windows": len(train_records),
+        "keep_checkpoints": int(args.keep_checkpoints),
         "real_data_run": True,
     }
     (out_dir / "summary.json").write_text(
