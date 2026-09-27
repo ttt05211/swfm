@@ -254,25 +254,30 @@ def _aggregate_targets(
 
         y = target_t[hi].reshape(-1)[s].long()
         is_pos = y != int(FREE_LABEL)
-        if bool(is_pos.any()):
-            qr = qrow[is_pos]
-            yl = lut[y[is_pos]]
-            if bool((yl < 0).any()):
-                raise RuntimeError(
-                    "Factorized Static positive target is not a static class"
-                )
-            pos.scatter_add_(
-                0, qr, torch.ones(qr.shape, device=device)
+        qr = qrow[is_pos]
+        yl = lut[y[is_pos]]
+        valid_sem = (yl >= 0).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                valid_sem,
+                "Factorized Static positive target is not a static class",
             )
-            keys = qr * len(STATIC_SEMANTIC_IDS) + yl
-            sem.view(-1).scatter_add_(
-                0, keys, torch.ones(keys.shape, device=device)
+        elif not bool(valid_sem.item()):
+            raise RuntimeError(
+                "Factorized Static positive target is not a static class"
             )
-        if bool((~is_pos).any()):
-            qr = qrow[~is_pos]
-            neg.scatter_add_(
-                0, qr, torch.ones(qr.shape, device=device)
-            )
+        pos.scatter_add_(
+            0, qr, torch.ones(qr.shape, device=device)
+        )
+        keys = qr * len(STATIC_SEMANTIC_IDS) + yl
+        sem.view(-1).scatter_add_(
+            0, keys, torch.ones(keys.shape, device=device)
+        )
+
+        qr_neg = qrow[~is_pos]
+        neg.scatter_add_(
+            0, qr_neg, torch.ones(qr_neg.shape, device=device)
+        )
     return pos, neg, sem
 
 
@@ -437,18 +442,22 @@ def _run_epoch(
         need_metrics=not train,
     )
 
-    loss_sum = 0.0
-    presence_sum = 0.0
-    semantic_sum = 0.0
-    pos_bce_sum = 0.0
-    neg_bce_sum = 0.0
-    pos_contrib = 0.0
-    neg_contrib = 0.0
+    loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+    presence_sum = torch.zeros((), dtype=torch.float64, device=device)
+    semantic_sum = torch.zeros((), dtype=torch.float64, device=device)
+    pos_bce_sum = torch.zeros((), dtype=torch.float64, device=device)
+    neg_bce_sum = torch.zeros((), dtype=torch.float64, device=device)
+    pos_contrib = torch.zeros((), dtype=torch.float64, device=device)
+    neg_contrib = torch.zeros((), dtype=torch.float64, device=device)
     tiles = 0
 
-    conf = np.zeros((18, 18), dtype=np.int64)
-    base_full = np.zeros((6, 18, 18), dtype=np.int64)
-    final_full = np.zeros((6, 18, 18), dtype=np.int64)
+    conf_gpu = torch.zeros((18, 18), dtype=torch.int64, device=device)
+    base_full_gpu = torch.zeros(
+        (6, 18, 18), dtype=torch.int64, device=device
+    )
+    final_full_gpu = torch.zeros(
+        (6, 18, 18), dtype=torch.int64, device=device
+    )
     started = time.perf_counter()
 
     for wi, item in enumerate(prepared, start=1):
@@ -487,7 +496,12 @@ def _run_epoch(
                 item["target"],
                 device=device,
             )
-        if not bool(torch.isfinite(loss.detach()).all()):
+        finite = torch.isfinite(loss.detach()).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                finite, "non-finite Factorized Static loss"
+            )
+        elif not bool(finite.item()):
             raise RuntimeError("non-finite Factorized Static loss")
 
         if train:
@@ -510,17 +524,17 @@ def _run_epoch(
                 device=device,
                 threshold=float(presence_threshold),
             )
-            conf += c.cpu().numpy()
-            base_full += b.cpu().numpy()
-            final_full += f.cpu().numpy()
+            conf_gpu += c
+            base_full_gpu += b
+            final_full_gpu += f
 
-        loss_sum += float(loss.detach().cpu())
-        presence_sum += float(parts["presence_loss"].cpu())
-        semantic_sum += float(parts["semantic_loss"].cpu())
-        pos_bce_sum += float(parts["positive_bce"].cpu())
-        neg_bce_sum += float(parts["negative_bce"].cpu())
-        pos_contrib += float(parts["positive_contributions"].cpu())
-        neg_contrib += float(parts["negative_contributions"].cpu())
+        loss_sum += loss.detach().double()
+        presence_sum += parts["presence_loss"].double()
+        semantic_sum += parts["semantic_loss"].double()
+        pos_bce_sum += parts["positive_bce"].double()
+        neg_bce_sum += parts["negative_bce"].double()
+        pos_contrib += parts["positive_contributions"].double()
+        neg_contrib += parts["negative_contributions"].double()
         tiles += int(ntiles)
 
         if (
@@ -528,35 +542,50 @@ def _run_epoch(
             or (int(progress_every) > 0 and wi % int(progress_every) == 0)
             or wi == total
         ):
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
             elapsed = max(time.perf_counter() - started, 1e-9)
             print(
                 f"v20_static_factorized_{'train' if train else 'val'} "
                 f"{wi}/{total} rate={wi/elapsed:.3f} win/s "
-                f"loss={loss_sum/wi:.5f} "
-                f"presence={presence_sum/wi:.5f} "
-                f"semantic={semantic_sum/wi:.5f} "
+                f"loss={float(loss_sum.item())/wi:.5f} "
+                f"presence={float(presence_sum.item())/wi:.5f} "
+                f"semantic={float(semantic_sum.item())/wi:.5f} "
                 f"tiles={tiles/wi:.1f}/win",
                 flush=True,
             )
 
         del scene, linear, q, p_logits, s_logits, row_map
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    loss_value = float(loss_sum.item())
+    presence_value = float(presence_sum.item())
+    semantic_value = float(semantic_sum.item())
+    pos_bce_value = float(pos_bce_sum.item())
+    neg_bce_value = float(neg_bce_sum.item())
+    pos_value = float(pos_contrib.item())
+    neg_value = float(neg_contrib.item())
+
     out = {
-        "loss": float(loss_sum / max(total, 1)),
-        "presence_loss": float(presence_sum / max(total, 1)),
-        "semantic_loss": float(semantic_sum / max(total, 1)),
-        "positive_bce": float(pos_bce_sum / max(total, 1)),
-        "negative_bce": float(neg_bce_sum / max(total, 1)),
-        "positive_contributions": int(pos_contrib),
-        "negative_contributions": int(neg_contrib),
+        "loss": float(loss_value / max(total, 1)),
+        "presence_loss": float(presence_value / max(total, 1)),
+        "semantic_loss": float(semantic_value / max(total, 1)),
+        "positive_bce": float(pos_bce_value / max(total, 1)),
+        "negative_bce": float(neg_bce_value / max(total, 1)),
+        "positive_contributions": int(pos_value),
+        "negative_contributions": int(neg_value),
         "positive_fraction": float(
-            pos_contrib / max(pos_contrib + neg_contrib, 1.0)
+            pos_value / max(pos_value + neg_value, 1.0)
         ),
         "windows": int(total),
         "mean_tiles_per_window": float(tiles / max(total, 1)),
         "elapsed_seconds": float(time.perf_counter() - started),
     }
     if not train:
+        conf = conf_gpu.cpu().numpy()
+        base_full = base_full_gpu.cpu().numpy()
+        final_full = final_full_gpu.cpu().numpy()
         diag = repair_diagnostics_from_confusion(conf)
         bm = full_grid_metrics_from_confusion(base_full)
         fm = full_grid_metrics_from_confusion(final_full)
