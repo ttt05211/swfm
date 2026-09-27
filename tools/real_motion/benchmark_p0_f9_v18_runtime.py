@@ -448,13 +448,14 @@ def _release_gpu_inputs(state):
     state["gpu"] = None
 
 
-def _model_forward(model, gi, device):
+def _model_forward(model, gi, device, *, return_latents: bool = False):
     with torch.inference_mode(), torch.autocast(
         device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
         return model(
             gi["features"], gi["tube"], gi["kta"],
             gi["frame_motion"], gi["source_mask"],
+            return_latents=bool(return_latents),
         )
 
 
@@ -609,7 +610,16 @@ def _target_world_from_xy_cached(xy_t0, source_z_t0, t0_pose):
     return (np.asarray(t0_pose, dtype=np.float64) @ p)[:3]
 
 
-def _forecast_once(model, state, pcfg, strong_cfg, device, profile=None):
+def _forecast_once(
+    model,
+    state,
+    pcfg,
+    strong_cfg,
+    device,
+    profile=None,
+    *,
+    precomputed_out=None,
+):
     rec = state["rec"]
     current = state["current"]
     current_pose = state["current_pose"]
@@ -620,7 +630,11 @@ def _forecast_once(model, state, pcfg, strong_cfg, device, profile=None):
     baseline_by_hi = state["baseline_by_hi"]
 
     _t_model = time.perf_counter() if profile is not None else None
-    out = _model_forward(model, state["gpu"], device)
+    out = (
+        precomputed_out
+        if precomputed_out is not None
+        else _model_forward(model, state["gpu"], device)
+    )
     pred_res = out["residual_xy_m"].float().cpu().numpy()
     pred_yaw = out["yaw_delta_rad"].float().cpu().numpy()
     if profile is not None:
