@@ -37,6 +37,8 @@ class V20UnifiedConfig:
     completion_classes: int = SEMANTIC_CLASSES
     free_logit_bias: float = 2.0
     completion_last_std: float = 1.0e-3
+    tile_decode_batch_size: int = 8
+    runtime_query_chunk: int = 32
 
 
 @dataclass(frozen=True)
@@ -100,7 +102,7 @@ class V20UnifiedTransportCompletion(nn.Module):
 
         c = int(config.future_dim)
         self.scatter_projection = nn.Linear(2 * d_model, c)
-        self.transport_condition_projection = nn.Linear(SEMANTIC_CLASSES + 1, c)
+        self.transport_condition_projection = nn.Conv3d(SEMANTIC_CLASSES + 1, c, 1)
         self.future_input = nn.Conv3d(int(config.scene_dim) + 2 * c + 1, c, 1)
         self.future_blocks = nn.Sequential(
             nn.Conv3d(c, c, 3, padding=1),
@@ -292,6 +294,30 @@ class V20UnifiedTransportCompletion(nn.Module):
     def decode_transport(self, shared_queries: torch.Tensor) -> dict[str, torch.Tensor]:
         return self.v18.decode_transport_queries(shared_queries)
 
+    def source_positions_from_transport(
+        self,
+        sources: UnifiedSourceInput,
+        transport_outputs: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return detached current predicted future source centers for scatter."""
+        residual = transport_outputs["residual_xy_m"]
+        expected = (
+            sources.future_transport_queries.shape[0],
+            FUTURE_FRAMES,
+            2,
+        )
+        if tuple(residual.shape) != expected:
+            raise ValueError("transport residual shape mismatch")
+        pos = sources.source_anchor_xyz_t0_m[:, None, :].expand(
+            -1, FUTURE_FRAMES, -1
+        ).clone()
+        pos[..., :2] = (
+            pos[..., :2]
+            + sources.kta_displacement_xy_m.to(pos.dtype)
+            + residual.to(pos.dtype)
+        )
+        return pos.detach()
+
     def _scatter_source_tokens(
         self,
         history: HistoryEncoding,
@@ -305,7 +331,6 @@ class V20UnifiedTransportCompletion(nn.Module):
         flat_voxels = shape[0] * shape[1] * shape[2]
         field = history.features.new_zeros((B, T, flat_voxels, C))
         weight = history.features.new_zeros((B, T, flat_voxels, 1))
-        density = history.features.new_zeros((B, T, flat_voxels, 1))
         token = self.scatter_projection(
             torch.cat(
                 (
@@ -330,6 +355,14 @@ class V20UnifiedTransportCompletion(nn.Module):
             shape, device=pos.device, dtype=pos.dtype
         )
         in_bounds_point = ((pos >= origin) & (pos < maximum)).all(dim=-1)
+
+        # Vectorize source/window/horizon; only eight trilinear corners remain.
+        field_flat = field.view(B * T * flat_voxels, C)
+        weight_flat = weight.view(B * T * flat_voxels, 1)
+        batch_index = sources.window_index.long()[:, None].expand(-1, T)
+        horizon_index = torch.arange(T, device=pos.device)[None].expand(
+            pos.shape[0], -1
+        )
         for dx in (0, 1):
             for dy in (0, 1):
                 for dz in (0, 1):
@@ -344,28 +377,32 @@ class V20UnifiedTransportCompletion(nn.Module):
                         & (idx[..., 2] >= 0)
                         & (idx[..., 2] < shape[2])
                     )
+                    if not bool(valid.any()):
+                        continue
+                    linear = (
+                        idx[..., 0] * (shape[1] * shape[2])
+                        + idx[..., 1] * shape[2]
+                        + idx[..., 2]
+                    )
+                    global_linear = (
+                        (batch_index * T + horizon_index) * flat_voxels + linear
+                    )[valid]
                     corner_weight = (
                         (frac[..., 0] if dx else 1.0 - frac[..., 0])
                         * (frac[..., 1] if dy else 1.0 - frac[..., 1])
                         * (frac[..., 2] if dz else 1.0 - frac[..., 2])
                     )
-                    for b in range(B):
-                        source_b = sources.window_index.long() == b
-                        for h in range(T):
-                            use = source_b & valid[:, h]
-                            if not bool(use.any()):
-                                continue
-                            ijk = idx[use, h]
-                            linear = ijk[:, 0] * (shape[1] * shape[2]) + ijk[:, 1] * shape[2] + ijk[:, 2]
-                            w = corner_weight[use, h].to(field.dtype).unsqueeze(-1)
-                            field[b, h].index_add_(0, linear, token[use, h] * w)
-                            weight[b, h].index_add_(0, linear, w)
-                            density[b, h].index_add_(0, linear, w)
+                    w = corner_weight[valid].to(field.dtype).unsqueeze(-1)
+                    field_flat.index_add_(0, global_linear, token[valid] * w)
+                    weight_flat.index_add_(0, global_linear, w)
+
         field = field / weight.clamp_min(1.0e-6)
         field = field.view(B, T, *shape, C).permute(0, 1, 5, 2, 3, 4)
-        density = density.view(B, T, *shape, 1).permute(0, 1, 5, 2, 3, 4)
+        density = weight.view(B, T, *shape, 1).permute(0, 1, 5, 2, 3, 4)
         in_count = int(in_bounds_point.sum().item())
-        return field, density, SourceScatterReport(requested, in_count, requested - in_count)
+        return field, density, SourceScatterReport(
+            requested, in_count, requested - in_count
+        )
 
     def build_future_features(
         self,
@@ -374,15 +411,27 @@ class V20UnifiedTransportCompletion(nn.Module):
         fusion: SourceFusionOutput,
         current_transport_condition: torch.Tensor,
     ) -> tuple[torch.Tensor, SourceScatterReport]:
-        if tuple(current_transport_condition.shape) != (
-            history.features.shape[0], FUTURE_FRAMES, SEMANTIC_CLASSES + 1
-        ):
-            raise ValueError("transport condition must be [B,6,19]")
+        expected_condition = (
+            history.features.shape[0],
+            FUTURE_FRAMES,
+            SEMANTIC_CLASSES + 1,
+            *self.coarse_lattice.shape_xyz,
+        )
+        if tuple(current_transport_condition.shape) != expected_condition:
+            raise ValueError(
+                "transport condition must be [B,6,19,Xc,Yc,Zc]"
+            )
         source_field, density, report = self._scatter_source_tokens(history, sources, fusion)
         B, T = int(history.features.shape[0]), FUTURE_FRAMES
         scene = history.features[:, None].expand(-1, T, -1, -1, -1, -1)
-        cond = self.transport_condition_projection(current_transport_condition.to(scene.dtype))
-        cond = cond[..., None, None, None].expand(-1, -1, -1, *self.coarse_lattice.shape_xyz)
+        cond_input = current_transport_condition.to(scene.dtype).reshape(
+            B * T,
+            SEMANTIC_CLASSES + 1,
+            *self.coarse_lattice.shape_xyz,
+        )
+        cond = self.transport_condition_projection(cond_input).view(
+            B, T, -1, *self.coarse_lattice.shape_xyz
+        )
         x = torch.cat((scene, source_field, density, cond), dim=2)
         x = x.reshape(B * T, x.shape[2], *x.shape[3:])
         x = self.future_input(x)
@@ -405,31 +454,78 @@ class V20UnifiedTransportCompletion(nn.Module):
         future_features: torch.Tensor,
         queries: Sequence[CompletionTileQuery],
     ) -> list[torch.Tensor]:
-        """Decode a query chunk while reusing the per-window future field."""
+        """Decode shape-homogeneous tiles in bounded micro-batches."""
         if future_features.ndim != 6 or future_features.shape[1] != FUTURE_FRAMES:
             raise ValueError("future_features must be [B,6,C,Xc,Yc,Zc]")
-        logits: list[torch.Tensor] = []
-        for query in queries:
+        if not queries:
+            return []
+        outputs: list[torch.Tensor | None] = [None] * len(queries)
+        groups: dict[
+            tuple[int, int, int], list[tuple[int, CompletionTileQuery]]
+        ] = {}
+        for qi, query in enumerate(queries):
             query.validate()
-            tile = query.tile
-            points = query.points_xyz_t0_m
-            windows = torch.full(
-                points.shape[:-1], tile.window_index, device=points.device, dtype=torch.long
-            )
-            local_future = self._sample_volume(
-                future_features[:, tile.horizon], points, windows
-            )
-            local_history = self._sample_volume(
-                history.observation_summary, points, windows
-            )
-            xyz = self._normalized_xyz(points)
-            valid = query.geometry_valid.to(local_future.dtype).unsqueeze(-1)
-            tile_input = torch.cat((local_future, local_history, xyz, valid), dim=-1)
-            tile_input = tile_input.permute(3, 0, 1, 2).unsqueeze(0)
-            hidden = self.completion_trunk(tile_input)
-            tile_logits = self.completion_head(hidden)[0].permute(1, 2, 3, 0)
-            logits.append(tile_logits)
-        return logits
+            groups.setdefault(
+                tuple(query.tile.halo_shape_xyz), []
+            ).append((qi, query))
+
+        B, T = int(future_features.shape[0]), FUTURE_FRAMES
+        flat_future = future_features.reshape(
+            B * T, future_features.shape[2], *future_features.shape[3:]
+        )
+        micro = max(int(self.config.tile_decode_batch_size), 1)
+        for rows in groups.values():
+            for start in range(0, len(rows), micro):
+                part = rows[start : start + micro]
+                points = torch.stack(
+                    [q.points_xyz_t0_m for _, q in part], dim=0
+                )
+                future_windows = torch.stack(
+                    [
+                        torch.full(
+                            q.points_xyz_t0_m.shape[:-1],
+                            q.tile.window_index * T + q.tile.horizon,
+                            device=points.device,
+                            dtype=torch.long,
+                        )
+                        for _, q in part
+                    ],
+                    dim=0,
+                )
+                history_windows = torch.stack(
+                    [
+                        torch.full(
+                            q.points_xyz_t0_m.shape[:-1],
+                            q.tile.window_index,
+                            device=points.device,
+                            dtype=torch.long,
+                        )
+                        for _, q in part
+                    ],
+                    dim=0,
+                )
+                local_future = self._sample_volume(
+                    flat_future, points, future_windows
+                )
+                local_history = self._sample_volume(
+                    history.observation_summary, points, history_windows
+                )
+                xyz = self._normalized_xyz(points)
+                valid = torch.stack(
+                    [q.geometry_valid for _, q in part], dim=0
+                ).to(local_future.dtype).unsqueeze(-1)
+                tile_input = torch.cat(
+                    (local_future, local_history, xyz, valid), dim=-1
+                ).permute(0, 4, 1, 2, 3)
+                hidden = self.completion_trunk(tile_input)
+                batched_logits = self.completion_head(hidden).permute(
+                    0, 2, 3, 4, 1
+                )
+                for bi, (qi, _) in enumerate(part):
+                    outputs[qi] = batched_logits[bi]
+        if any(x is None for x in outputs):
+            raise RuntimeError("completion tile batching lost an output")
+        return [x for x in outputs if x is not None]
 
     def decode_completion(
         self,
@@ -483,6 +579,13 @@ class V20UnifiedTransportCompletion(nn.Module):
             encoded_history, sources, adapter_enabled=adapter_enabled
         )
         transport = self.decode_transport(fusion.shared_queries)
+        fusion = SourceFusionOutput(
+            shared_queries=fusion.shared_queries,
+            adapter_delta=fusion.adapter_delta,
+            source_positions_xyz_t0_m=self.source_positions_from_transport(
+                sources, transport
+            ),
+        )
         return {
             "history": encoded_history,
             "sources": sources,
