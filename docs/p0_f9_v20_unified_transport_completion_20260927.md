@@ -10,7 +10,8 @@
 - 六帧历史语义、observed 和 observed-free 在固定 t0 canonical 3D 网格编码，unknown 与 observed-free 不混合。
 - source adapter 融合 V18 query/history token、当前位置和 KTA 位置的场景采样、全局场景、位置及时间；最后一层严格零初始化。
 - warmup 显式 bypass adapter，`Qshared = Q0`；joint 才启用 `Qshared = Q0 + delta`。
-- source token 以 trilinear normalized accumulation scatter 到六个未来场；scatter 坐标 detach，token 梯度保留。物理 OOB 点被计数且完全不写入。
+- source token 以当前 transport 预测中心（KTA + current residual）做 trilinear normalized accumulation scatter；scatter 坐标 detach，token 梯度保留。物理 OOB 点被计数且完全不写入。
+- transport condition 是对齐到 t0 canonical coarse grid 的空间 19 通道场（18 类比例 + coverage），不再使用整帧全局直方图。
 - completion 是一个跨 horizon 共享的 18 类头。Static、Dormant、Birth 只作为评测诊断统计，不参与推理路由。
 - completion support 固定为 `geometry_query_valid & (current_transport == 17)`；最终合成只允许在该 support 内将 free 改成非 free。
 - 训练 GT 只进入 tile 抽样与 CE 监督，不进入模型 forward、运输条件或 runtime query。
@@ -66,7 +67,7 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/train_p0_f9_v20_unified.py \
   --smoke
 ```
 
-`--smoke` 是真实数据的一次 optimizer update（一个窗口）和一个 full-support dev 窗口，不是合成演示。验收日志至少应包含：非空 completion voxel count、有限 loss/grad norm、OOB 统计、三变体指标和生成的 checkpoint。
+`--smoke` 固定执行 1 次 warmup update + 1 次 joint update，并在两个 update 后各跑 1 个 full-support dev 窗口；因此真实覆盖 V18 冻结与解冻两种状态。验收日志至少应包含非空 completion voxel count、有限 loss/grad norm、OOB 统计、三变体指标和 checkpoint。
 
 ## 4. 默认训练与精确续训
 
@@ -97,9 +98,35 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/train_p0_f9_v20_unified.py \
 
 base checkpoint hash 不一致时入口会拒绝运行。
 
-## 5. screen、dev512 与正式评测
+## 5. compact cache、screen、dev512 与正式评测
 
-1024-window screen：
+Unified 路径不使用旧 Stage-1 的 native `static_supervision`。新建 cache 时建议：
+
+```bash
+python tools/real_motion/build_p0_f9_v20_history_cache.py ... \
+  --unified-compact --shard-size 128
+```
+
+已有 Stage-1 v2 cache 不需要重算几何，可直接瘦身：
+
+```bash
+python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
+  --input-dir "$TRAIN_STAGE1_OLD" \
+  --output-dir "$TRAIN_STAGE1"
+```
+
+确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys，unified loader 使用小型 shard LRU，不再把全部 Stage-1 row 常驻 RAM。
+
+真正的 train-screen1024 是固定 1024 个训练窗口做 1024 successful updates（grad_accum=4，约四遍暴露）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/train_p0_f9_v20_unified.py \
+  ...同一组数据与基础 checkpoint 参数... \
+  --out-dir outputs/v20_unified_screen1024 \
+  --screen1024
+```
+
+1024-update checkpoint 的 dev 评测：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/eval_p0_f9_v20_unified.py \
