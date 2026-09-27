@@ -109,7 +109,12 @@ class HistoricalEvidence3DEncoder(nn.Module):
             )
         elif bool(invalid_free.item()):
             raise ValueError("observed_free cannot occur in unknown voxels")
-        emb = self.semantic_embedding(semantic.long())  # B,T,X,Y,Z,D
+        # Unknown voxels must not leak arbitrary semantic placeholders.
+        semantic_ids = semantic.long()
+        semantic_ids = torch.where(
+            observed.bool(), semantic_ids, torch.zeros_like(semantic_ids)
+        )
+        emb = self.semantic_embedding(semantic_ids)  # B,T,X,Y,Z,D
         obs = observed.to(emb.dtype).unsqueeze(-1)
         free = observed_free.to(emb.dtype).unsqueeze(-1)
         x = torch.cat((emb, obs, free), dim=-1)
