@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -15,6 +16,14 @@ if str(ROOT) not in sys.path:
 import torch
 
 PROTOCOL = "p0_f9_v20_stage1_history_cache_v2"
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main():
@@ -33,6 +42,7 @@ def main():
     dst.mkdir(parents=True, exist_ok=True)
 
     before = after = 0
+    dynamic_diagnostics_complete = True
     shards = []
     started = time.perf_counter()
     for si, meta in enumerate(index["shards"]):
@@ -44,7 +54,16 @@ def main():
         for row in obj["rows"]:
             slim = dict(row)
             slim.pop("static_supervision", None)
-            slim.pop("dynamic_supervision", None)
+            dynamic = slim.pop("dynamic_supervision", None)
+            if dynamic is not None:
+                # Preserve only the tiny evaluation-only responsibility labels.
+                # Trajectories, identities and box metadata are not model inputs.
+                slim["dynamic_diagnostic_groups"] = [
+                    str(item.get("responsibility_name", "IGNORE"))
+                    for item in dynamic
+                ]
+            elif "dynamic_diagnostic_groups" not in slim:
+                dynamic_diagnostics_complete = False
             rows.append(slim)
         before += int((src / file).stat().st_size)
         torch.save({"protocol": PROTOCOL, "rows": rows}, dst / file)
@@ -54,6 +73,7 @@ def main():
             "file": file,
             "count": len(rows),
             "bytes": nbytes,
+            "sha256": _file_sha256(dst / file),
             "keys": [
                 [str(row["scene_name"]), str(row["t0_token"])]
                 for row in rows
@@ -66,12 +86,17 @@ def main():
     out["consumer_profile"] = "unified_transport_completion"
     out["unified_compact"] = True
     out["dynamic_supervision_stored"] = False
+    out["dynamic_diagnostic_groups_stored"] = bool(
+        dynamic_diagnostics_complete
+    )
     layout = dict(out.get("cache_layout") or {})
     layout["static_supervision"] = (
         "omitted by compact conversion; unified reads future GT at runtime"
     )
     layout["dynamic_supervision"] = (
-        "omitted by compact conversion; unified does not consume GT identity/trajectory metadata"
+        "identity/trajectory metadata omitted; responsibility-name-only diagnostics retained"
+        if dynamic_diagnostics_complete
+        else "omitted; dynamic responsibility diagnostics unavailable"
     )
     out["cache_layout"] = layout
     out["compressed_static_semantic_values"] = 0

@@ -13,7 +13,12 @@ from real_motion.v20_unified_runtime import (
     dense_geometry_and_transport_condition,
     prepare_runtime_queries,
 )
-from tools.real_motion.eval_p0_f9_v20_unified import _finalize, _new_raw, _update_many
+from tools.real_motion.eval_p0_f9_v20_unified import (
+    _dynamic_diagnostic_group_names,
+    _finalize,
+    _new_raw,
+    _update_many,
+)
 
 
 def test_tile_sampler_contract_and_no_support_behavior():
@@ -39,6 +44,13 @@ def test_tile_sampler_contract_and_no_support_behavior():
         chosen = [t for t in tiles if t.horizon == horizon]
         assert len(chosen) == 16
         assert sum(t.core_start_xyz[0] == 0 and t.core_start_xyz[1] == 0 for t in chosen) >= 8
+
+
+def test_compact_dynamic_diagnostics_are_distinct_from_unavailable():
+    assert _dynamic_diagnostic_group_names({}) is None
+    assert _dynamic_diagnostic_group_names(
+        {"dynamic_diagnostic_groups": ["BIRTH", "DORMANT_ANCESTRAL"]}
+    ) == ["BIRTH", "DORMANT_ANCESTRAL"]
 
 
 def test_tile_sampler_uses_all_uniform_when_no_positive():

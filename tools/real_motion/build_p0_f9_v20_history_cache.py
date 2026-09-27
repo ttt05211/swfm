@@ -12,6 +12,7 @@ No V18/V19 artifact is overwritten.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -59,6 +60,14 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 
 PROTOCOL = "p0_f9_v20_stage1_history_cache_v2"
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_v20(path):
@@ -517,6 +526,7 @@ def main():
                 "file": name,
                 "count": len(rows),
                 "bytes": nbytes,
+                "sha256": _file_sha256(out / name),
                 "write_seconds": float(write_s),
                 "keys": [
                     [str(row["scene_name"]), str(row["t0_token"])]
@@ -596,6 +606,7 @@ def main():
         "inference_fields_use_future_semantics": False,
         "dynamic_identity_is_supervision_only": True,
         "dynamic_supervision_stored": not bool(a.unified_compact),
+        "dynamic_diagnostic_groups_stored": not bool(a.unified_compact),
         "query_out_of_bounds_voxels": int(oob_query),
         "history_out_of_bounds_observed_samples": int(oob_history),
         "compressed_history_semantic_values": int(history_semantic_values),

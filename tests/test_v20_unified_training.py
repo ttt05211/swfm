@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import random
 
 import numpy as np
+import pytest
 import torch
 
 from real_motion.local_st_world_model_v17 import LocalSTWMV17Config
@@ -18,7 +20,9 @@ from real_motion.v20_unified_training import (
     restore_training_checkpoint,
     save_checkpoint,
     set_optimizer_phase_lrs,
+    verify_resume_inputs,
 )
+from tools.real_motion.train_p0_f9_v20_unified import _load_monitor_history
 
 
 def _model():
@@ -96,3 +100,75 @@ def test_checkpoint_resume_restores_counters_model_optimizer_and_rng(tmp_path):
     assert got_progress == progress
     for a, b in zip(model.parameters(), loaded_model.parameters()):
         assert torch.equal(a, b)
+
+
+def test_resume_contract_normalizes_json_lattice_and_rejects_drift(tmp_path):
+    model = _model()
+    optimizer = build_optimizer(model)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    base = tmp_path / "base.pt"
+    manifest = tmp_path / "index.json"
+    torch.save({"base": True}, base)
+    manifest.write_text('{"protocol":"test"}', encoding="utf-8")
+    contract = {"seed": 7, "warmup_updates": 128, "screen1024": True}
+    payload = checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        scheduler_state={"successful_updates": 8},
+        scaler=scaler,
+        progress=TrainerProgress(8, 8, "warmup"),
+        base_checkpoint=base,
+        manifest_paths={"train": manifest},
+        config={"warmup_updates": 128},
+        repository_root=tmp_path,
+        resume_contract=contract,
+    )
+    json_lattice = {
+        "origin_xyz_m": [0.0, 0.0, 0.0],
+        "voxel_size_xyz_m": [1.0, 1.0, 1.0],
+        "shape_xyz": [4, 4, 4],
+    }
+    verify_resume_inputs(
+        payload,
+        base_checkpoint=base,
+        manifest_paths={"train": manifest},
+        resume_contract=contract,
+        coarse_lattice=json_lattice,
+    )
+    with pytest.raises(RuntimeError, match="run contract differs"):
+        verify_resume_inputs(
+            payload,
+            base_checkpoint=base,
+            manifest_paths={"train": manifest},
+            resume_contract={**contract, "warmup_updates": 1},
+            coarse_lattice=json_lattice,
+        )
+    with pytest.raises(RuntimeError, match="coarse lattice mismatch"):
+        verify_resume_inputs(
+            payload,
+            base_checkpoint=base,
+            manifest_paths={"train": manifest},
+            resume_contract=contract,
+            coarse_lattice={**json_lattice, "shape_xyz": [5, 4, 4]},
+        )
+
+
+def test_resume_monitor_history_preserves_rows_and_protects_later_run(tmp_path):
+    old_out = tmp_path / "old"
+    old_out.mkdir()
+    rows = [
+        {"successful_updates": 128, "value": "kept"},
+        {"successful_updates": 256, "value": "future"},
+    ]
+    (old_out / "monitor.json").write_text(
+        json.dumps(rows), encoding="utf-8"
+    )
+    checkpoint = {
+        "config": {"out_dir": str(old_out)},
+        "monitor_history": [],
+    }
+    fresh_out = tmp_path / "fresh"
+    fresh_out.mkdir()
+    assert _load_monitor_history(fresh_out, checkpoint, 128) == rows[:1]
+    with pytest.raises(RuntimeError, match="newer than the resume checkpoint"):
+        _load_monitor_history(old_out, checkpoint, 128)

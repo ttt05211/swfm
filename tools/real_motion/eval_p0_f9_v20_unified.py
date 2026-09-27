@@ -165,6 +165,17 @@ def _autocast(device: torch.device, enabled: bool):
     return nullcontext()
 
 
+def _dynamic_diagnostic_group_names(row: dict) -> list[str] | None:
+    if "dynamic_supervision" in row:
+        return [
+            str(item.get("responsibility_name", "IGNORE"))
+            for item in row["dynamic_supervision"]
+        ]
+    if "dynamic_diagnostic_groups" in row:
+        return [str(name) for name in row["dynamic_diagnostic_groups"]]
+    return None
+
+
 def evaluate_model(
     *,
     model,
@@ -201,6 +212,7 @@ def evaluate_model(
         "BIRTH_instances": 0,
         "IGNORE_instances": 0,
     }
+    dynamic_diagnostic_windows = 0
     addition = {
         "support_valid_voxels": np.zeros(6, dtype=np.int64),
         "target_positive_voxels": np.zeros(6, dtype=np.int64),
@@ -289,8 +301,11 @@ def evaluate_model(
             diagnostic_groups["STATIC_target_voxels"] += int(
                 ((gt_all != int(pcfg.free_label)) & ~np.isin(gt_all, dynamic_ids)).sum()
             )
-            for item in prepared.row.get("dynamic_supervision", []):
-                name = f"{str(item.get('responsibility_name', 'IGNORE'))}_instances"
+            dynamic_groups = _dynamic_diagnostic_group_names(prepared.row)
+            if dynamic_groups is not None:
+                dynamic_diagnostic_windows += 1
+            for group_name in dynamic_groups or ():
+                name = f"{group_name}_instances"
                 if name in diagnostic_groups:
                     diagnostic_groups[name] += 1
             for hi, _ in enumerate(HORIZONS):
@@ -385,6 +400,15 @@ def evaluate_model(
         }
         for name, raw in raw_by_variant.items()
     }
+    dynamic_diagnostics_available = dynamic_diagnostic_windows == len(records)
+    if not dynamic_diagnostics_available:
+        for key in (
+            "CURRENT_ANCESTRAL_instances",
+            "DORMANT_ANCESTRAL_instances",
+            "BIRTH_instances",
+            "IGNORE_instances",
+        ):
+            diagnostic_groups[key] = None
     return {
         "protocol": PROTOCOL,
         "windows": len(records),
@@ -402,6 +426,12 @@ def evaluate_model(
             "elapsed_seconds": time.perf_counter() - started,
         },
         "diagnostic_groups_only": diagnostic_groups,
+        "diagnostic_groups_availability": {
+            "static_target_voxels": True,
+            "dynamic_responsibility": dynamic_diagnostics_available,
+            "dynamic_windows_with_metadata": dynamic_diagnostic_windows,
+            "windows": len(records),
+        },
         "addition_quality": addition_json,
         "raw_metric_counts": raw_counts,
         "per_scene": per_scene,

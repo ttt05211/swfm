@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 import random
 import subprocess
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ class TrainerProgress:
     phase: str = "warmup"
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=4096)
 def _file_sha256_cached(path: str, size: int, mtime_ns: int) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -156,6 +156,9 @@ def checkpoint_payload(
     manifest_paths: Mapping[str, str | Path],
     config: Mapping,
     repository_root: str | Path,
+    resume_contract: Mapping | None = None,
+    monitor_history: Sequence[Mapping] | None = None,
+    frozen_reference_raw: Mapping | None = None,
 ) -> dict:
     manifests = {
         str(name): {
@@ -184,6 +187,15 @@ def checkpoint_payload(
         "base_checkpoint_sha256": file_sha256(base_checkpoint),
         "manifests": manifests,
         "config": dict(config),
+        "resume_contract": (
+            dict(resume_contract) if resume_contract is not None else None
+        ),
+        "monitor_history": [dict(row) for row in (monitor_history or ())],
+        "frozen_reference_raw": (
+            dict(frozen_reference_raw)
+            if frozen_reference_raw is not None
+            else None
+        ),
         "v18_model_config": asdict(model.v18.config),
         "unified_model_config": asdict(model.config),
         "coarse_lattice": lattice_dict,
@@ -197,6 +209,8 @@ def verify_resume_inputs(
     *,
     base_checkpoint: str | Path,
     manifest_paths: Mapping[str, str | Path],
+    resume_contract: Mapping | None = None,
+    coarse_lattice: Mapping | CanonicalLattice | None = None,
 ) -> None:
     if checkpoint.get("base_checkpoint_sha256") != file_sha256(base_checkpoint):
         raise RuntimeError("resume/base checkpoint hash mismatch")
@@ -211,6 +225,45 @@ def verify_resume_inputs(
                 f"resume manifest hash mismatch for {name}: "
                 f"{entry.get('sha256')} != {current}"
             )
+    extra = sorted(set(saved) - {str(name) for name in manifest_paths})
+    if extra:
+        raise RuntimeError(
+            "current run omits resume manifests: " + ", ".join(extra[:8])
+        )
+    if resume_contract is not None:
+        previous = checkpoint.get("resume_contract")
+        if previous is None:
+            raise RuntimeError("resume checkpoint lacks the exact-run contract")
+        keys = sorted(set(previous) | set(resume_contract))
+        different = [
+            key for key in keys
+            if previous.get(key) != resume_contract.get(key)
+        ]
+        if different:
+            detail = ", ".join(
+                f"{key}={previous.get(key)!r}->{resume_contract.get(key)!r}"
+                for key in different[:8]
+            )
+            raise RuntimeError(f"resume run contract differs: {detail}")
+    if coarse_lattice is not None:
+        saved_lattice = _normalized_lattice(checkpoint.get("coarse_lattice"))
+        current_lattice = _normalized_lattice(coarse_lattice)
+        if saved_lattice != current_lattice:
+            raise RuntimeError("resume/current Stage1 coarse lattice mismatch")
+
+
+def _normalized_lattice(
+    value: Mapping | CanonicalLattice | None,
+) -> dict | None:
+    """Normalize JSON lists and dataclass tuples before identity checks."""
+    if value is None:
+        return None
+    raw = asdict(value) if isinstance(value, CanonicalLattice) else dict(value)
+    return {
+        "origin_xyz_m": tuple(float(x) for x in raw["origin_xyz_m"]),
+        "voxel_size_xyz_m": tuple(float(x) for x in raw["voxel_size_xyz_m"]),
+        "shape_xyz": tuple(int(x) for x in raw["shape_xyz"]),
+    }
 
 
 def save_checkpoint(path: str | Path, payload: Mapping) -> None:

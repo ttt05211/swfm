@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import torch
 
+import real_motion.v20_unified_model as unified_model_module
 from real_motion.local_st_world_model_v17 import LocalSTWMV17Config
 from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
 from real_motion.v20_history_world import FREE_LABEL, CanonicalLattice
@@ -188,9 +191,15 @@ def test_completion_gradient_reaches_shared_source_token_and_adapter_last_layer(
         core_shape_xyz=(4, 4, 4),
         halo=0,
     )
-    logits, _ = model.decode_completion(
-        history, source, fusion, _condition(model, history, current), queries[:1]
-    )
+    with patch.object(
+        unified_model_module,
+        "activation_checkpoint",
+        wraps=unified_model_module.activation_checkpoint,
+    ) as checkpointed:
+        logits, _ = model.decode_completion(
+            history, source, fusion, _condition(model, history, current), queries[:1]
+        )
+    assert checkpointed.call_count == 1
     loss = logits[0][..., 3].mean()
     loss.backward()
     assert source.future_transport_queries.grad is not None

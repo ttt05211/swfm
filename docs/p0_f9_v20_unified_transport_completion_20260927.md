@@ -19,7 +19,8 @@
 - core tile 为 `32x32x16`，两层 `3x3x3` completion trunk 使用 halo=2，只有 core 写回或参与监督。
 - 原始 V18 Clean-E14 loss 保持为 `L_trans + L_exist + 19*L_yaw + 0.25*L_shape_SE2`；completion 使用单一 18-way CE。
 - optimizer 参数组只创建一次。warmup 的 V18 LR 为 0 且 `eval/requires_grad=False`；joint 设置 V18 LR 为 `2e-5`，新模块 LR 为 `2e-4`。
-- checkpoint 保存 model、optimizer、scheduler、scaler、attempted/successful update、phase、全局 RNG、tile RNG、manifest/checkpoint/grid hash、配置和 Git SHA。
+- checkpoint 保存 model、optimizer、scheduler、scaler、attempted/successful update、phase、全局 RNG、tile RNG、全部 cache/index/shard/info manifest hash、规范化 grid、精确运行合同、已有 monitor 历史和 Git SHA。resume 会拒绝 warmup、seed、screen population/order、优化器超参、AMP 或输入资产漂移；JSON list 与 checkpoint tuple 在 grid 比较前统一规范化。
+- 训练态 completion trunk+head 默认使用 non-reentrant activation checkpointing；tile micro-batch 只改变执行分块，不改变 draw multiplicity、loss denominator 或梯度路径。
 
 ## 2. 入口
 
@@ -115,7 +116,7 @@ python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
   --output-dir "$TRAIN_STAGE1"
 ```
 
-确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys，unified loader 使用小型 shard LRU，不再把全部 Stage-1 row 常驻 RAM。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。训练内的固定 dev monitor 第一次计算 frozen V18 reference 后只复用其 raw intersection/union counts，后续 checkpoint 不再重复跑冻结 V18 forward/render；这不改变任何指标口径，也不生成额外的大型预测 cache。
+确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys、字节数和 SHA-256；unified loader 使用小型 shard LRU，并在首次读取时核对文件、row count、顺序与实际 row identity，不再把全部 Stage-1 row 常驻 RAM。由旧完整 cache 转换时只保留 dynamic responsibility 名称供评测计数，移除 identity/trajectory/box；直接 `--unified-compact` 构建无法提供该诊断时，evaluator 明确报告 `dynamic_responsibility=false` 和 `null`，不会把“不可用”伪报为零实例。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。训练内的固定 dev monitor 第一次计算 frozen V18 reference 后只复用其 raw intersection/union counts，monitor 历史在 resume 时保留；后续 checkpoint 不再重复跑冻结 V18 forward/render。这不改变任何指标口径，也不生成额外的大型预测 cache。
 
 真正的 train-screen1024 是固定 1024 个训练窗口做 1024 successful updates（grad_accum=4，约四遍暴露）：
 

@@ -11,6 +11,7 @@ from typing import Mapping, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .local_st_world_model import SEMANTIC_CLASSES
 from .local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
@@ -39,6 +40,7 @@ class V20UnifiedConfig:
     completion_last_std: float = 1.0e-3
     tile_decode_batch_size: int = 8
     runtime_query_chunk: int = 32
+    checkpoint_completion_tiles: bool = True
 
 
 @dataclass(frozen=True)
@@ -517,15 +519,28 @@ class V20UnifiedTransportCompletion(nn.Module):
                 tile_input = torch.cat(
                     (local_future, local_history, xyz, valid), dim=-1
                 ).permute(0, 4, 1, 2, 3)
-                hidden = self.completion_trunk(tile_input)
-                batched_logits = self.completion_head(hidden).permute(
-                    0, 2, 3, 4, 1
-                )
+                if (
+                    self.training
+                    and torch.is_grad_enabled()
+                    and bool(self.config.checkpoint_completion_tiles)
+                ):
+                    decoded = activation_checkpoint(
+                        self._decode_completion_batch,
+                        tile_input,
+                        use_reentrant=False,
+                    )
+                else:
+                    decoded = self._decode_completion_batch(tile_input)
+                batched_logits = decoded.permute(0, 2, 3, 4, 1)
                 for bi, (qi, _) in enumerate(part):
                     outputs[qi] = batched_logits[bi]
         if any(x is None for x in outputs):
             raise RuntimeError("completion tile batching lost an output")
         return [x for x in outputs if x is not None]
+
+    def _decode_completion_batch(self, tile_input: torch.Tensor) -> torch.Tensor:
+        """Checkpointable tile trunk+head; returns [M,18,X,Y,Z]."""
+        return self.completion_head(self.completion_trunk(tile_input))
 
     def decode_completion(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -18,7 +19,12 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
+from real_motion.runtime_config import (
+    add_config_args,
+    config_fingerprint,
+    load_runtime_config,
+    make_prepare_config,
+)
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v20_unified_loss import compute_training_loss
 from real_motion.v20_unified_model import V20UnifiedTransportCompletion
@@ -46,6 +52,7 @@ from tools.real_motion.v20_unified_common import (
     load_stage1_rows,
     load_v18_cache,
     prepare_unified_window,
+    stage1_manifest_paths,
     training_completion_inputs,
 )
 
@@ -89,6 +96,58 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _population_sha256(records, order=None) -> str:
+    indices = range(len(records)) if order is None else order
+    rows = [
+        (
+            str(records[i]["scene_name"]),
+            str(records[i]["t0_token"]),
+            str(records[i].get("sample_id", "")),
+        )
+        for i in indices
+    ]
+    payload = json.dumps(rows, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_monitor_history(
+    out_dir: Path,
+    resume_checkpoint: dict | None,
+    successful_updates: int,
+) -> list[dict]:
+    if resume_checkpoint is None:
+        return []
+    candidates = [out_dir / "monitor.json"]
+    saved_out = (resume_checkpoint.get("config") or {}).get("out_dir")
+    if saved_out:
+        saved_path = Path(saved_out) / "monitor.json"
+        if saved_path not in candidates:
+            candidates.append(saved_path)
+    histories = [list(resume_checkpoint.get("monitor_history") or [])]
+    for path in candidates:
+        if not path.exists():
+            continue
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, list):
+            raise RuntimeError(f"monitor history is not a list: {path}")
+        has_future = any(
+            int(row.get("successful_updates", -1)) > int(successful_updates)
+            for row in value
+        )
+        if has_future and path.resolve() == (out_dir / "monitor.json").resolve():
+            raise RuntimeError(
+                f"{path} contains monitor rows newer than the resume checkpoint; "
+                "use a fresh --out-dir to preserve the existing run"
+            )
+        histories.append(
+            [
+                row for row in value
+                if int(row.get("successful_updates", -1)) <= int(successful_updates)
+            ]
+        )
+    return max(histories, key=len)
 
 
 def main() -> None:
@@ -180,7 +239,8 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    pcfg = make_prepare_config(load_runtime_config(args.config, args.override))
+    runtime_cfg = load_runtime_config(args.config, args.override)
+    pcfg = make_prepare_config(runtime_cfg)
     _, train_records = load_v18_cache(args.train_cache)
     _, dev_records = load_v18_cache(args.dev_cache)
     if not dev_records:
@@ -226,9 +286,47 @@ def main() -> None:
 
     manifest_paths = {
         "train_cache": args.train_cache,
-        "train_stage1_index": stage1_index_path,
         "dev_cache": args.dev_cache,
-        "dev_stage1_index": dev_stage1_index_path,
+        "train_info_pkl": args.info_pkl,
+        "dev_info_pkl": args.dev_info_pkl or args.info_pkl,
+    }
+    manifest_paths.update(
+        stage1_manifest_paths("train_stage1", stage1_index_path, stage1_index)
+    )
+    manifest_paths.update(
+        stage1_manifest_paths(
+            "dev_stage1", dev_stage1_index_path, dev_stage1_index
+        )
+    )
+    resume_contract = {
+        "runtime_config_sha256": config_fingerprint(runtime_cfg, kind="resume"),
+        "seed": int(args.seed),
+        "batch_size": int(args.batch_size),
+        "grad_accum": int(args.grad_accum),
+        "warmup_updates": int(args.warmup_updates),
+        "max_updates": int(args.max_updates),
+        "monitor_every": int(args.monitor_every),
+        "monitor_windows": int(args.monitor_windows),
+        "new_lr": float(args.new_lr),
+        "v18_lr": float(args.v18_lr),
+        "weight_decay": float(args.weight_decay),
+        "clip_grad": float(args.clip_grad),
+        "completion_weight": float(args.completion_weight),
+        "patch_resolution_m": float(args.patch_resolution_m),
+        "alignment_workers": int(args.alignment_workers),
+        "amp": bool(amp),
+        "device": str(device),
+        "smoke": bool(args.smoke),
+        "screen1024": bool(args.screen1024),
+        "io_locality_order": bool(args.io_locality_order),
+        "train_windows": len(train_records),
+        "train_order_sha256": _population_sha256(train_records, order),
+        "dev_monitor_population_sha256": _population_sha256(
+            dev_records[: int(args.monitor_windows)]
+        ),
+        "dataroot": str(Path(args.dataroot).resolve()),
+        "tile_draws_per_horizon": 16,
+        "positive_tile_draws": 8,
     }
     if args.resume:
         model, resume_checkpoint = load_model_checkpoint(args.resume, map_location="cpu")
@@ -236,9 +334,9 @@ def main() -> None:
             resume_checkpoint,
             base_checkpoint=args.base_checkpoint,
             manifest_paths=manifest_paths,
+            resume_contract=resume_contract,
+            coarse_lattice=stage1_index["coarse_lattice"],
         )
-        if resume_checkpoint.get("coarse_lattice") != stage1_index["coarse_lattice"]:
-            raise RuntimeError("resume/current Stage1 coarse lattice mismatch")
         saved_native = (resume_checkpoint.get("config") or {}).get("native_grid")
         if saved_native is not None and saved_native != stage1_index["native_grid"]:
             raise RuntimeError("resume/current native grid mismatch")
@@ -267,6 +365,19 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if resume_checkpoint is not None:
+        future_checkpoints = [
+            path
+            for path in out_dir.glob("update_*.pt")
+            if path.stem.startswith("update_")
+            and path.stem[7:].isdigit()
+            and int(path.stem[7:]) > progress_state.successful_updates
+        ]
+        if future_checkpoints:
+            raise RuntimeError(
+                "output directory contains checkpoints newer than --resume; "
+                "use a fresh --out-dir to avoid deleting a later run"
+            )
     source = CachedSource(args.dataroot, info_pkl=args.info_pkl, verbose=False)
     dev_source = CachedSource(
         args.dataroot,
@@ -281,8 +392,18 @@ def main() -> None:
         if saved_tile_rng is None:
             raise RuntimeError("resume checkpoint lacks tile sampler RNG state")
         tile_generator.set_state(saved_tile_rng)
-    monitor_log: list[dict] = []
-    frozen_reference_raw = None
+    monitor_log = _load_monitor_history(
+        out_dir, resume_checkpoint, progress_state.successful_updates
+    )
+    frozen_reference_raw = (
+        resume_checkpoint.get("frozen_reference_raw")
+        if resume_checkpoint is not None
+        else None
+    )
+    if frozen_reference_raw is None and monitor_log:
+        frozen_reference_raw = (
+            monitor_log[0].get("raw_metric_counts") or {}
+        ).get("frozen_v18_reference")
     started = time.perf_counter()
 
     while progress_state.successful_updates < int(args.max_updates):
@@ -405,10 +526,14 @@ def main() -> None:
             manifest_paths=manifest_paths,
             config={
                 **vars(args),
+                "out_dir": str(out_dir.resolve()),
                 "warmup_updates": int(args.warmup_updates),
                 "native_grid": stage1_index["native_grid"],
             },
             repository_root=ROOT,
+            resume_contract=resume_contract,
+            monitor_history=monitor_log,
+            frozen_reference_raw=frozen_reference_raw,
         )
         checkpoint_path = out_dir / f"update_{progress_state.successful_updates:04d}.pt"
         save_checkpoint(checkpoint_path, payload)

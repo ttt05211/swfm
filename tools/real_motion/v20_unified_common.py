@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from functools import lru_cache
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -52,24 +53,43 @@ class Stage1RowStore:
         self.max_cached_shards = max(1, int(max_cached_shards))
         self.locations: dict[tuple[str, str], tuple[str, int]] = {}
         self.cache: OrderedDict[str, list[dict]] = OrderedDict()
+        self.shard_meta: dict[str, dict] = {}
+        self.expected_keys: dict[str, tuple[tuple[str, str], ...]] = {}
+        self.verified_files: set[str] = set()
+        root_resolved = self.root.resolve()
         for shard in index["shards"]:
             file = str(shard["file"])
+            path = (self.root / file).resolve()
+            if path != root_resolved and root_resolved not in path.parents:
+                raise RuntimeError(f"Stage1 shard escapes cache root: {file}")
+            if file in self.shard_meta:
+                raise RuntimeError(f"duplicate Stage1 shard entry: {file}")
+            self.shard_meta[file] = dict(shard)
             keys = shard.get("keys")
             if keys is None:
                 obj = torch.load(
-                    self.root / file, map_location="cpu", weights_only=False
+                    path, map_location="cpu", weights_only=False
                 )
                 if obj.get("protocol") != STAGE1_PROTOCOL:
                     raise RuntimeError(f"bad Stage1 shard: {file}")
-                keys = [
-                    [str(r["scene_name"]), str(r["t0_token"])]
-                    for r in obj["rows"]
-                ]
+                rows = list(obj["rows"])
+                keys = [[str(r["scene_name"]), str(r["t0_token"])] for r in rows]
+                self.cache[file] = rows
+            expected_count = int(shard.get("count", len(keys)))
+            if len(keys) != expected_count:
+                raise RuntimeError(
+                    f"Stage1 shard key/count mismatch: {file}: "
+                    f"{len(keys)} != {expected_count}"
+                )
+            normalized_keys = tuple((str(key[0]), str(key[1])) for key in keys)
+            self.expected_keys[file] = normalized_keys
             for row_index, key in enumerate(keys):
                 pair = (str(key[0]), str(key[1]))
                 if pair in self.locations:
                     raise RuntimeError(f"duplicate Stage1 row: {pair}")
                 self.locations[pair] = (file, int(row_index))
+        while len(self.cache) > self.max_cached_shards:
+            self.cache.popitem(last=False)
 
     def __contains__(self, key) -> bool:
         return tuple(key) in self.locations
@@ -82,12 +102,34 @@ class Stage1RowStore:
             rows = self.cache.pop(file)
             self.cache[file] = rows
             return rows
-        obj = torch.load(
-            self.root / file, map_location="cpu", weights_only=False
-        )
+        path = (self.root / file).resolve()
+        meta = self.shard_meta[file]
+        if file not in self.verified_files:
+            actual_bytes = int(path.stat().st_size)
+            if "bytes" in meta and actual_bytes != int(meta["bytes"]):
+                raise RuntimeError(
+                    f"Stage1 shard byte-size mismatch: {file}: "
+                    f"{actual_bytes} != {meta['bytes']}"
+                )
+            expected_sha = meta.get("sha256")
+            if expected_sha is not None and _file_sha256(path) != str(expected_sha):
+                raise RuntimeError(f"Stage1 shard sha256 mismatch: {file}")
+            self.verified_files.add(file)
+        obj = torch.load(path, map_location="cpu", weights_only=False)
         if obj.get("protocol") != STAGE1_PROTOCOL:
             raise RuntimeError(f"bad Stage1 shard: {file}")
         rows = list(obj["rows"])
+        expected = self.expected_keys[file]
+        if len(rows) != len(expected):
+            raise RuntimeError(
+                f"Stage1 shard row/count mismatch: {file}: "
+                f"{len(rows)} != {len(expected)}"
+            )
+        actual = tuple(
+            (str(row["scene_name"]), str(row["t0_token"])) for row in rows
+        )
+        if actual != expected:
+            raise RuntimeError(f"Stage1 shard row order/key mismatch: {file}")
         self.cache[file] = rows
         while len(self.cache) > self.max_cached_shards:
             self.cache.popitem(last=False)
@@ -95,7 +137,35 @@ class Stage1RowStore:
 
     def __getitem__(self, key):
         file, row_index = self.locations[tuple(key)]
-        return self._rows(file)[row_index]
+        row = self._rows(file)[row_index]
+        actual = (str(row["scene_name"]), str(row["t0_token"]))
+        if actual != tuple(key):
+            raise RuntimeError(
+                f"Stage1 row identity mismatch: requested={tuple(key)} actual={actual}"
+            )
+        return row
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stage1_manifest_paths(
+    prefix: str,
+    index_path: str | Path,
+    index: dict,
+) -> dict[str, Path]:
+    """Return the index and every shard for exact resume hashing."""
+    index_path = Path(index_path)
+    out = {f"{prefix}_index": index_path}
+    for shard in index["shards"]:
+        file = str(shard["file"])
+        out[f"{prefix}_shard:{file}"] = index_path.parent / file
+    return out
 
 
 def _load_unified_raw(source, window, pcfg):
