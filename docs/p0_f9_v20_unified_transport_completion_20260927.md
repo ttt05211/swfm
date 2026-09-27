@@ -100,7 +100,7 @@ base checkpoint hash 不一致时入口会拒绝运行。
 
 ## 5. compact cache、screen、dev512 与正式评测
 
-Unified 路径不使用旧 Stage-1 的 native `static_supervision`。新建 cache 时建议：
+Unified 路径不使用旧 Stage-1 的 native `static_supervision`，也不使用 GT dynamic identity/trajectory metadata。compact 构建会跳过这两类监督的计算与存储，只保留 history evidence、future pose 和必要索引。新建 cache 时建议：
 
 ```bash
 python tools/real_motion/build_p0_f9_v20_history_cache.py ... \
@@ -115,7 +115,7 @@ python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
   --output-dir "$TRAIN_STAGE1"
 ```
 
-确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys，unified loader 使用小型 shard LRU，不再把全部 Stage-1 row 常驻 RAM。
+确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys，unified loader 使用小型 shard LRU，不再把全部 Stage-1 row 常驻 RAM。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。
 
 真正的 train-screen1024 是固定 1024 个训练窗口做 1024 successful updates（grad_accum=4，约四遍暴露）：
 
