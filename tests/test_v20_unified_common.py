@@ -71,7 +71,7 @@ def test_stage1_store_rejects_changed_shard_and_manifest_lists_every_file(tmp_pa
     }
 
 
-def test_compactor_keeps_only_responsibility_names_and_writes_verified_index(
+def test_compactor_keeps_only_responsibility_counts_and_writes_verified_index(
     tmp_path, monkeypatch
 ):
     src = tmp_path / "src"
@@ -108,8 +108,9 @@ def test_compactor_keeps_only_responsibility_names_and_writes_verified_index(
     compact_stage1_main()
     index = json.loads((dst / "index.json").read_text(encoding="utf-8"))
     assert index["dynamic_diagnostic_groups_stored"] is True
+    assert index["dynamic_diagnostic_counts_stored"] is True
     store = Stage1RowStore(dst, index)
     compact = store[("scene", "token")]
-    assert compact["dynamic_diagnostic_groups"] == ["BIRTH"]
+    assert compact["dynamic_diagnostic_counts"] == {"BIRTH": 1}
     assert "static_supervision" not in compact
     assert "dynamic_supervision" not in compact

@@ -165,15 +165,26 @@ def _autocast(device: torch.device, enabled: bool):
     return nullcontext()
 
 
-def _dynamic_diagnostic_group_names(row: dict) -> list[str] | None:
+def _dynamic_diagnostic_group_counts(row: dict) -> dict[str, int] | None:
     if "dynamic_supervision" in row:
-        return [
-            str(item.get("responsibility_name", "IGNORE"))
+        names = (
+            item.get("responsibility_name", "IGNORE")
             for item in row["dynamic_supervision"]
-        ]
-    if "dynamic_diagnostic_groups" in row:
-        return [str(name) for name in row["dynamic_diagnostic_groups"]]
-    return None
+        )
+    elif "dynamic_diagnostic_counts" in row:
+        return {
+            str(name): int(count)
+            for name, count in row["dynamic_diagnostic_counts"].items()
+        }
+    elif "dynamic_diagnostic_groups" in row:
+        names = row["dynamic_diagnostic_groups"]
+    else:
+        return None
+    counts: dict[str, int] = {}
+    for name in names:
+        key = str(name)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def evaluate_model(
@@ -301,13 +312,13 @@ def evaluate_model(
             diagnostic_groups["STATIC_target_voxels"] += int(
                 ((gt_all != int(pcfg.free_label)) & ~np.isin(gt_all, dynamic_ids)).sum()
             )
-            dynamic_groups = _dynamic_diagnostic_group_names(prepared.row)
-            if dynamic_groups is not None:
+            dynamic_counts = _dynamic_diagnostic_group_counts(prepared.row)
+            if dynamic_counts is not None:
                 dynamic_diagnostic_windows += 1
-            for group_name in dynamic_groups or ():
+            for group_name, count in (dynamic_counts or {}).items():
                 name = f"{group_name}_instances"
                 if name in diagnostic_groups:
-                    diagnostic_groups[name] += 1
+                    diagnostic_groups[name] += int(count)
             for hi, _ in enumerate(HORIZONS):
                 pred_by_name = {
                     "current_transport_only": current[hi],

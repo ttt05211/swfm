@@ -562,6 +562,8 @@ def training_completion_inputs(
         native_origin_xyz_m=native_grid["origin_xyz_m"],
         native_voxel_size_xyz_m=native_grid["voxel_size_xyz_m"],
         tiles=tiles,
+        dense_geometry_valid=geometry_valid,
+        dense_completion_support=support,
     )
     logits, scatter_report = model.decode_completion(
         first_stage["history"],
@@ -607,6 +609,8 @@ def full_completion_prediction(
         prepared.history.future_ego_to_t0,
         native_origin_xyz_m=native_grid["origin_xyz_m"],
         native_voxel_size_xyz_m=native_grid["voxel_size_xyz_m"],
+        dense_geometry_valid=geometry_valid,
+        dense_completion_support=support,
     )
     completion_sources = first_stage["sources"]
     completion_fusion = first_stage["fusion"]

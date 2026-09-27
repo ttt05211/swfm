@@ -104,8 +104,6 @@ def dense_geometry_and_transport_condition(
                 valid = points_in_lattice(points, coarse_lattice)
                 sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
                 valid_dense[(b, h, *sl)] = valid
-                if not bool(valid.any()):
-                    continue
                 coarse_idx = torch.floor(
                     (points - coarse_origin) / coarse_step
                 ).long()
@@ -126,14 +124,13 @@ def dense_geometry_and_transport_condition(
                 )
                 labels = current_transport[(b, h, *sl)][valid].long()
                 occupied = labels != FREE_LABEL
-                if bool(occupied.any()):
-                    counts_flat.index_add_(
-                        0,
-                        global_linear[occupied],
-                        F.one_hot(
-                            labels[occupied], SEMANTIC_CLASSES
-                        ).to(torch.float32),
-                    )
+                counts_flat.index_add_(
+                    0,
+                    global_linear[occupied],
+                    F.one_hot(
+                        labels[occupied], SEMANTIC_CLASSES
+                    ).to(torch.float32),
+                )
 
     counts[..., FREE_LABEL] = (
         coverage_count[..., 0] - counts[..., :FREE_LABEL].sum(dim=-1)
@@ -235,6 +232,8 @@ def prepare_runtime_queries(
     tiles: Sequence[CompletionTile] | None = None,
     core_shape_xyz: Sequence[int] = (32, 32, 16),
     halo: int = 2,
+    dense_geometry_valid: torch.Tensor | None = None,
+    dense_completion_support: torch.Tensor | None = None,
 ) -> tuple[list[CompletionTileQuery], UnifiedRuntimeReport]:
     """Prepare future-native queries without semantic supervision."""
     if current_transport.ndim != 5 or current_transport.shape[1] != FUTURE_FRAMES:
@@ -243,6 +242,10 @@ def prepare_runtime_queries(
     native = tuple(int(v) for v in current_transport.shape[2:])
     if tuple(future_ego_to_t0.shape) != (B, FUTURE_FRAMES, 4, 4):
         raise ValueError("future_ego_to_t0 must be [B,6,4,4]")
+    if dense_geometry_valid is not None and dense_geometry_valid.shape != current_transport.shape:
+        raise ValueError("dense_geometry_valid must match current_transport")
+    if dense_completion_support is not None and dense_completion_support.shape != current_transport.shape:
+        raise ValueError("dense_completion_support must match current_transport")
     if tiles is None:
         tiles = [
             make_completion_tile(
@@ -258,26 +261,61 @@ def prepare_runtime_queries(
             for start, size in iter_core_tiles(native, core_shape_xyz)
         ]
     queries: list[CompletionTileQuery] = []
-    requested = in_bounds = eligible = 0
+    requested = 0
+    in_bounds_counts: list[torch.Tensor] = []
+    eligible_counts: list[torch.Tensor] = []
+    tensor_cache: dict[
+        tuple[int, int, tuple[int, int, int], tuple[int, int, int]],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ] = {}
     for tile in tiles:
-        points = native_tile_points_to_t0(
-            tile,
-            future_ego_to_t0,
-            native_origin_xyz_m=native_origin_xyz_m,
-            native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+        cache_key = (
+            int(tile.window_index),
+            int(tile.horizon),
+            tuple(tile.halo_start_xyz),
+            tuple(tile.halo_shape_xyz),
         )
-        geometry_valid = points_in_lattice(points, coarse_lattice)
-        hs = tile.halo_start_xyz
-        he = tuple(hs[d] + tile.halo_shape_xyz[d] for d in range(3))
-        sl = tuple(slice(hs[d], he[d]) for d in range(3))
-        transport_tile = current_transport[(tile.window_index, tile.horizon, *sl)]
-        support = completion_support(transport_tile, geometry_valid)
+        cached = tensor_cache.get(cache_key)
+        if cached is None:
+            points = native_tile_points_to_t0(
+                tile,
+                future_ego_to_t0,
+                native_origin_xyz_m=native_origin_xyz_m,
+                native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+            )
+            hs = tile.halo_start_xyz
+            he = tuple(hs[d] + tile.halo_shape_xyz[d] for d in range(3))
+            sl = tuple(slice(hs[d], he[d]) for d in range(3))
+            dense_index = (tile.window_index, tile.horizon, *sl)
+            geometry_valid = (
+                dense_geometry_valid[dense_index]
+                if dense_geometry_valid is not None
+                else points_in_lattice(points, coarse_lattice)
+            )
+            support = (
+                dense_completion_support[dense_index]
+                if dense_completion_support is not None
+                else completion_support(current_transport[dense_index], geometry_valid)
+            )
+            cached = (points, geometry_valid, support)
+            tensor_cache[cache_key] = cached
+        points, geometry_valid, support = cached
         query = CompletionTileQuery(tile, points, geometry_valid, support)
         query.validate()
         queries.append(query)
         requested += int(geometry_valid.numel())
-        in_bounds += int(geometry_valid.sum().item())
-        eligible += int(support.sum().item())
+        in_bounds_counts.append(geometry_valid.sum(dtype=torch.int64))
+        eligible_counts.append(support.sum(dtype=torch.int64))
+    if in_bounds_counts:
+        totals = torch.stack(
+            (
+                torch.stack(in_bounds_counts).sum(),
+                torch.stack(eligible_counts).sum(),
+            )
+        ).detach().cpu().tolist()
+        in_bounds, eligible = (int(totals[0]), int(totals[1]))
+    else:
+        in_bounds = eligible = 0
     return queries, UnifiedRuntimeReport(
         requested_voxels=requested,
         in_bounds_voxels=in_bounds,

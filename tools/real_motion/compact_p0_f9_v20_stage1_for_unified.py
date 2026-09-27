@@ -18,6 +18,14 @@ import torch
 PROTOCOL = "p0_f9_v20_stage1_history_cache_v2"
 
 
+def _diagnostic_counts(names) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for name in names:
+        key = str(name)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -56,13 +64,17 @@ def main():
             slim.pop("static_supervision", None)
             dynamic = slim.pop("dynamic_supervision", None)
             if dynamic is not None:
-                # Preserve only the tiny evaluation-only responsibility labels.
+                # Preserve only tiny evaluation-only responsibility counts.
                 # Trajectories, identities and box metadata are not model inputs.
-                slim["dynamic_diagnostic_groups"] = [
-                    str(item.get("responsibility_name", "IGNORE"))
+                slim["dynamic_diagnostic_counts"] = _diagnostic_counts(
+                    item.get("responsibility_name", "IGNORE")
                     for item in dynamic
-                ]
-            elif "dynamic_diagnostic_groups" not in slim:
+                )
+            elif "dynamic_diagnostic_groups" in slim:
+                slim["dynamic_diagnostic_counts"] = _diagnostic_counts(
+                    slim.pop("dynamic_diagnostic_groups")
+                )
+            elif "dynamic_diagnostic_counts" not in slim:
                 dynamic_diagnostics_complete = False
             rows.append(slim)
         before += int((src / file).stat().st_size)
@@ -89,12 +101,15 @@ def main():
     out["dynamic_diagnostic_groups_stored"] = bool(
         dynamic_diagnostics_complete
     )
+    out["dynamic_diagnostic_counts_stored"] = bool(
+        dynamic_diagnostics_complete
+    )
     layout = dict(out.get("cache_layout") or {})
     layout["static_supervision"] = (
         "omitted by compact conversion; unified reads future GT at runtime"
     )
     layout["dynamic_supervision"] = (
-        "identity/trajectory metadata omitted; responsibility-name-only diagnostics retained"
+        "identity/trajectory metadata omitted; responsibility-count-only diagnostics retained"
         if dynamic_diagnostics_complete
         else "omitted; dynamic responsibility diagnostics unavailable"
     )

@@ -26,20 +26,29 @@ def completion_cross_entropy(
     loss_mask: torch.Tensor,
 ) -> CompletionLoss:
     """FP32 18-way CE with an explicit sum/count statistic."""
+    loss_sum, count_tensor = _completion_cross_entropy_tensors(
+        logits, target, loss_mask
+    )
+    count = int(count_tensor.detach().cpu())
+    mean = loss_sum / count_tensor.clamp_min(1).to(loss_sum.dtype)
+    return CompletionLoss(mean=mean, loss_sum=loss_sum, count=count)
+
+
+def _completion_cross_entropy_tensors(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return graph-connected CE sum/count without synchronizing the device."""
     if logits.shape[:-1] != target.shape or target.shape != loss_mask.shape:
         raise ValueError("completion logits/target/mask shape mismatch")
     if logits.shape[-1] != 18:
         raise ValueError("completion requires exactly 18 classes")
     mask = loss_mask.bool()
-    count = int(mask.sum().item())
-    if count:
-        values = F.cross_entropy(logits.float()[mask], target.long()[mask], reduction="none")
-        loss_sum = values.sum(dtype=torch.float32)
-        mean = loss_sum / float(count)
-    else:
-        loss_sum = logits.float().sum() * 0.0
-        mean = loss_sum
-    return CompletionLoss(mean=mean, loss_sum=loss_sum, count=count)
+    values = F.cross_entropy(
+        logits.float()[mask], target.long()[mask], reduction="none"
+    )
+    return values.sum(dtype=torch.float32), mask.sum(dtype=torch.int64)
 
 
 def completion_tiles_cross_entropy(
@@ -49,18 +58,24 @@ def completion_tiles_cross_entropy(
     *,
     graph_anchor: torch.Tensor | None = None,
 ) -> CompletionLoss:
-    """Combine repeated tile draws with exact multiplicity."""
+    """Combine repeated tile draws with exact multiplicity and one sync."""
     if not (len(logits) == len(targets) == len(loss_masks)):
         raise ValueError("tile loss inputs must have equal length")
-    pieces = [completion_cross_entropy(a, b, c) for a, b, c in zip(logits, targets, loss_masks)]
-    count = sum(p.count for p in pieces)
+    pieces = [
+        _completion_cross_entropy_tensors(a, b, c)
+        for a, b, c in zip(logits, targets, loss_masks)
+    ]
     if pieces:
-        loss_sum = torch.stack([p.loss_sum for p in pieces]).sum()
+        loss_sum = torch.stack([piece[0] for piece in pieces]).sum()
+        count_tensor = torch.stack([piece[1] for piece in pieces]).sum()
     elif graph_anchor is not None:
         loss_sum = graph_anchor.sum() * 0.0
+        count_tensor = torch.zeros((), dtype=torch.int64, device=loss_sum.device)
     else:
         loss_sum = torch.zeros((), dtype=torch.float32, requires_grad=True)
-    mean = loss_sum / float(count) if count else loss_sum
+        count_tensor = torch.zeros((), dtype=torch.int64)
+    count = int(count_tensor.detach().cpu())
+    mean = loss_sum / count_tensor.clamp_min(1).to(loss_sum.dtype)
     return CompletionLoss(mean=mean, loss_sum=loss_sum, count=count)
 
 

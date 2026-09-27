@@ -116,7 +116,9 @@ python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
   --output-dir "$TRAIN_STAGE1"
 ```
 
-确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys、字节数和 SHA-256；unified loader 使用小型 shard LRU，并在首次读取时核对文件、row count、顺序与实际 row identity，不再把全部 Stage-1 row 常驻 RAM。由旧完整 cache 转换时只保留 dynamic responsibility 名称供评测计数，移除 identity/trajectory/box；直接 `--unified-compact` 构建无法提供该诊断时，evaluator 明确报告 `dynamic_responsibility=false` 和 `null`，不会把“不可用”伪报为零实例。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。训练内的固定 dev monitor 第一次计算 frozen V18 reference 后只复用其 raw intersection/union counts，monitor 历史在 resume 时保留；后续 checkpoint 不再重复跑冻结 V18 forward/render。这不改变任何指标口径，也不生成额外的大型预测 cache。
+确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys、字节数和 SHA-256；unified loader 使用小型 shard LRU，并在首次读取时核对文件、row count、顺序与实际 row identity，不再把全部 Stage-1 row 常驻 RAM。由旧完整 cache 转换时只保留 dynamic responsibility 计数供评测使用，移除重复名称、identity/trajectory/box；直接 `--unified-compact` 构建无法提供该诊断时，evaluator 明确报告 `dynamic_responsibility=false` 和 `null`，不会把“不可用”伪报为零实例。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。训练内的固定 dev monitor 第一次计算 frozen V18 reference 后只复用其 raw intersection/union counts，monitor 历史在 resume 时保留；后续 checkpoint 不再重复跑冻结 V18 forward/render。这不改变任何指标口径，也不生成额外的大型预测 cache。
+
+热路径还会复用已生成的 dense geometry/support mask和有放回抽样产生的重复 tile 查询张量；tile 抽样、runtime 统计和 completion CE 分别按 horizon/整批合并设备同步。completion decoder 按窗口与 horizon 分组，直接采样对应的 future/history volume，不再为每个 micro-batch 扫描所有 volume 或构造逐体素 volume-index 张量。空间映射和 source scatter 的空集合由 tensor kernel 原生处理，避免 Python `any()` 强制同步。这些优化不改变 tile draw、loss denominator、support、合成或指标口径。
 
 真正的 train-screen1024 是固定 1024 个训练窗口做 1024 successful updates（grad_accum=4，约四遍暴露）：
 
@@ -154,4 +156,4 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/eval_p0_f9_v20_unified.py \
 
 ## 6. 本地验证状态
 
-本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、CLI import 和相关单元/回归测试。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。
+本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、四个 CLI 入口 import 和全量单元/回归测试（`479 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。

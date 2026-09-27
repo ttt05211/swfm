@@ -206,16 +206,22 @@ def sample_training_tiles(
     out: list[CompletionTile] = []
     for b in range(int(support.shape[0])):
         for h in range(FUTURE_FRAMES):
-            uniform: list[int] = []
-            positive: list[int] = []
-            for i, (start, size) in enumerate(grid):
+            uniform_flags: list[torch.Tensor] = []
+            positive_flags: list[torch.Tensor] = []
+            for start, size in grid:
                 sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
                 valid_support = support[(b, h, *sl)].bool() & formal_valid[(b, h, *sl)].bool()
-                if bool(valid_support.any()):
-                    uniform.append(i)
-                    targets = future_semantic[(b, h, *sl)]
-                    if bool((valid_support & (targets != FREE_LABEL)).any()):
-                        positive.append(i)
+                targets = future_semantic[(b, h, *sl)]
+                uniform_flags.append(valid_support.any())
+                positive_flags.append(
+                    (valid_support & (targets != FREE_LABEL)).any()
+                )
+            # One synchronization per horizon instead of two per core tile.
+            flags = torch.stack(
+                (torch.stack(uniform_flags), torch.stack(positive_flags)), dim=0
+            ).detach().cpu()
+            uniform = torch.nonzero(flags[0], as_tuple=False).flatten().tolist()
+            positive = torch.nonzero(flags[1], as_tuple=False).flatten().tolist()
             if not uniform:
                 continue
             n_pos = positive_draws if positive else 0

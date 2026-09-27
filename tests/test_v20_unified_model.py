@@ -140,6 +140,20 @@ def test_grid_sample_uses_voxel_centers_and_explicit_xyz_order():
     assert torch.equal(got[:, 0], torch.tensor([0.0, 321.0]))
 
 
+def test_known_volume_sampler_matches_generic_sampler():
+    model = _model().eval()
+    torch.manual_seed(21)
+    volume = torch.randn(3, 2, 4, 4, 4)
+    points = torch.rand(2, 3, 2, 3) * 4.0
+    generic = model._sample_volume(
+        volume,
+        points,
+        torch.ones(points.shape[:-1], dtype=torch.long),
+    )
+    indexed = model._sample_volume_index(volume, points, 1)
+    assert torch.equal(indexed, generic)
+
+
 def test_out_of_bounds_source_is_counted_and_has_no_scatter_contribution():
     model = _model().eval()
     history = _history(model)

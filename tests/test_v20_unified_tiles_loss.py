@@ -10,11 +10,12 @@ from real_motion.v20_unified_loss import (
 )
 from real_motion.v20_unified_runtime import (
     assemble_completion_logits,
+    completion_support,
     dense_geometry_and_transport_condition,
     prepare_runtime_queries,
 )
 from tools.real_motion.eval_p0_f9_v20_unified import (
-    _dynamic_diagnostic_group_names,
+    _dynamic_diagnostic_group_counts,
     _finalize,
     _new_raw,
     _update_many,
@@ -47,10 +48,13 @@ def test_tile_sampler_contract_and_no_support_behavior():
 
 
 def test_compact_dynamic_diagnostics_are_distinct_from_unavailable():
-    assert _dynamic_diagnostic_group_names({}) is None
-    assert _dynamic_diagnostic_group_names(
+    assert _dynamic_diagnostic_group_counts({}) is None
+    assert _dynamic_diagnostic_group_counts(
         {"dynamic_diagnostic_groups": ["BIRTH", "DORMANT_ANCESTRAL"]}
-    ) == ["BIRTH", "DORMANT_ANCESTRAL"]
+    ) == {"BIRTH": 1, "DORMANT_ANCESTRAL": 1}
+    assert _dynamic_diagnostic_group_counts(
+        {"dynamic_diagnostic_counts": {"BIRTH": 3}}
+    ) == {"BIRTH": 3}
 
 
 def test_tile_sampler_uses_all_uniform_when_no_positive():
@@ -160,6 +164,55 @@ def test_halo_queries_write_core_only():
     dense = assemble_completion_logits(logits, queries, output_shape=current.shape)
     assert dense.shape == (*current.shape, 18)
     assert torch.isfinite(dense).all()
+
+
+def test_runtime_queries_reuse_dense_masks_without_changing_contract():
+    lattice = CanonicalLattice((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (4, 4, 2))
+    current = torch.full((1, 6, 4, 4, 2), FREE_LABEL)
+    current[:, :, 0, 0, 0] = 3
+    pose = torch.eye(4).view(1, 1, 4, 4).expand(1, 6, 4, 4).clone()
+    valid, _ = dense_geometry_and_transport_condition(
+        current,
+        pose,
+        coarse_lattice=lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        chunk_shape_xyz=(4, 4, 2),
+    )
+    support = completion_support(current, valid)
+    kwargs = dict(
+        coarse_lattice=lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        core_shape_xyz=(2, 2, 2),
+        halo=1,
+    )
+    plain, plain_report = prepare_runtime_queries(current, pose, **kwargs)
+    cached, cached_report = prepare_runtime_queries(
+        current,
+        pose,
+        dense_geometry_valid=valid,
+        dense_completion_support=support,
+        **kwargs,
+    )
+    assert cached_report == plain_report
+    assert len(cached) == len(plain)
+    for left, right in zip(cached, plain):
+        assert left.tile == right.tile
+        assert torch.equal(left.points_xyz_t0_m, right.points_xyz_t0_m)
+        assert torch.equal(left.geometry_valid, right.geometry_valid)
+        assert torch.equal(left.support, right.support)
+
+    repeated, repeated_report = prepare_runtime_queries(
+        current,
+        pose,
+        tiles=[plain[0].tile, plain[0].tile],
+        dense_geometry_valid=valid,
+        dense_completion_support=support,
+        **kwargs,
+    )
+    assert repeated_report.requested_voxels == 2 * plain[0].support.numel()
+    assert repeated[0].points_xyz_t0_m.data_ptr() == repeated[1].points_xyz_t0_m.data_ptr()
 
 
 def test_evaluator_uses_exact_dataset_accumulated_metric_semantics():

@@ -241,6 +241,35 @@ class V20UnifiedTransportCompletion(nn.Module):
             result[select] = sampled[0, :, :, 0, 0].transpose(0, 1)
         return result.reshape(*leading, volume.shape[1])
 
+    def _sample_volume_index(
+        self,
+        volume: torch.Tensor,
+        points_xyz: torch.Tensor,
+        volume_index: int,
+    ) -> torch.Tensor:
+        """Sample one known volume for a batch of same-window/horizon tiles."""
+        if volume.ndim != 5 or tuple(volume.shape[2:]) != self.coarse_lattice.shape_xyz:
+            raise ValueError("volume shape does not match coarse lattice")
+        if points_xyz.shape[-1] != 3:
+            raise ValueError("points_xyz must end in xyz")
+        index = int(volume_index)
+        if index < 0 or index >= int(volume.shape[0]):
+            raise IndexError("volume index out of range")
+        leading = points_xyz.shape[:-1]
+        flat_points = points_xyz.reshape(-1, 3)
+        norm = self._normalized_xyz(flat_points)
+        # Input [D,H,W]=[X,Y,Z], grid tuple=(W,H,D)=(Z,Y,X).
+        grid = norm[:, (2, 1, 0)].view(1, -1, 1, 1, 3)
+        sampled = F.grid_sample(
+            volume[index : index + 1],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        result = sampled[0, :, :, 0, 0].transpose(0, 1)
+        return result.reshape(*leading, volume.shape[1])
+
     def fuse_source_scene(
         self,
         history: HistoryEncoding,
@@ -379,8 +408,6 @@ class V20UnifiedTransportCompletion(nn.Module):
                         & (idx[..., 2] >= 0)
                         & (idx[..., 2] < shape[2])
                     )
-                    if not bool(valid.any()):
-                        continue
                     linear = (
                         idx[..., 0] * (shape[1] * shape[2])
                         + idx[..., 1] * shape[2]
@@ -463,12 +490,19 @@ class V20UnifiedTransportCompletion(nn.Module):
             return []
         outputs: list[torch.Tensor | None] = [None] * len(queries)
         groups: dict[
-            tuple[int, int, int], list[tuple[int, CompletionTileQuery]]
+            tuple[int, int, int, int, int],
+            list[tuple[int, CompletionTileQuery]],
         ] = {}
         for qi, query in enumerate(queries):
             query.validate()
+            tile = query.tile
             groups.setdefault(
-                tuple(query.tile.halo_shape_xyz), []
+                (
+                    *tuple(tile.halo_shape_xyz),
+                    int(tile.window_index),
+                    int(tile.horizon),
+                ),
+                [],
             ).append((qi, query))
 
         B, T = int(future_features.shape[0]), FUTURE_FRAMES
@@ -476,41 +510,22 @@ class V20UnifiedTransportCompletion(nn.Module):
             B * T, future_features.shape[2], *future_features.shape[3:]
         )
         micro = max(int(self.config.tile_decode_batch_size), 1)
-        for rows in groups.values():
+        for group_key, rows in groups.items():
+            window_index, horizon = group_key[-2:]
             for start in range(0, len(rows), micro):
                 part = rows[start : start + micro]
                 points = torch.stack(
                     [q.points_xyz_t0_m for _, q in part], dim=0
                 )
-                future_windows = torch.stack(
-                    [
-                        torch.full(
-                            q.points_xyz_t0_m.shape[:-1],
-                            q.tile.window_index * T + q.tile.horizon,
-                            device=points.device,
-                            dtype=torch.long,
-                        )
-                        for _, q in part
-                    ],
-                    dim=0,
+                local_future = self._sample_volume_index(
+                    flat_future,
+                    points,
+                    int(window_index) * T + int(horizon),
                 )
-                history_windows = torch.stack(
-                    [
-                        torch.full(
-                            q.points_xyz_t0_m.shape[:-1],
-                            q.tile.window_index,
-                            device=points.device,
-                            dtype=torch.long,
-                        )
-                        for _, q in part
-                    ],
-                    dim=0,
-                )
-                local_future = self._sample_volume(
-                    flat_future, points, future_windows
-                )
-                local_history = self._sample_volume(
-                    history.observation_summary, points, history_windows
+                local_history = self._sample_volume_index(
+                    history.observation_summary,
+                    points,
+                    int(window_index),
                 )
                 xyz = self._normalized_xyz(points)
                 valid = torch.stack(
