@@ -279,6 +279,14 @@ def main():
     p.add_argument("--shard-size", type=int, default=16)
     p.add_argument("--match-max-distance-m", type=float, default=4.0)
     p.add_argument(
+        "--unified-compact",
+        action="store_true",
+        help=(
+            "Omit legacy future static_supervision; unified reads future GT "
+            "directly for sampled loss/evaluation."
+        ),
+    )
+    p.add_argument(
         "--record-order",
         choices=("scene", "source"),
         default="scene",
@@ -441,18 +449,21 @@ def main():
         for k, v in counts.items():
             dyn_totals[k] += int(v)
 
-        cache_stats["static_supervision_hits"] += sum(
-            key in static_supervision_cache for key in fut_keys
-        )
-        cache_stats["static_supervision_misses"] += sum(
-            key not in static_supervision_cache for key in fut_keys
-        )
-        t_phase = time.perf_counter()
-        static_sup = _static_sparse_supervision(
-            source, w, raw, int(pcfg.free_label),
-            token_cache=static_supervision_cache,
-        )
-        phase_seconds["static_supervision"] += time.perf_counter() - t_phase
+        if bool(a.unified_compact):
+            static_sup = None
+        else:
+            cache_stats["static_supervision_hits"] += sum(
+                key in static_supervision_cache for key in fut_keys
+            )
+            cache_stats["static_supervision_misses"] += sum(
+                key not in static_supervision_cache for key in fut_keys
+            )
+            t_phase = time.perf_counter()
+            static_sup = _static_sparse_supervision(
+                source, w, raw, int(pcfg.free_label),
+                token_cache=static_supervision_cache,
+            )
+            phase_seconds["static_supervision"] += time.perf_counter() - t_phase
         # Future query OOB was already proven zero by the frozen full-population
         # Omega audit. Stage-1 v2 deliberately does not re-rasterize 3.84M
         # future native points per window just to reproduce that proof.
@@ -467,11 +478,12 @@ def main():
         history_semantic_values += int(
             packed_history["history_semantic_count"]
         )
-        static_semantic_values += int(
-            sum(int(x["semantic_count"]) for x in static_sup)
-        )
+        if static_sup is not None:
+            static_semantic_values += int(
+                sum(int(x["semantic_count"]) for x in static_sup)
+            )
         phase_seconds["packing"] += time.perf_counter() - t_phase
-        rows.append({
+        row = {
             "scene_name": str(w.scene_name),
             "t0_token": str(w.t0_token),
             **packed_history,
@@ -481,9 +493,11 @@ def main():
             "future_ego_to_t0": torch.from_numpy(future_rel.astype(np.float32)),
             "query_oob_voxels": 0,
             "history_oob_observed_samples": int(aligned.out_of_bounds_samples),
-            "static_supervision": static_sup,
             "dynamic_supervision": dyn,
-        })
+        }
+        if static_sup is not None:
+            row["static_supervision"] = static_sup
+        rows.append(row)
 
         window_compute_seconds.append(time.perf_counter() - window_started)
         if len(rows) >= int(a.shard_size) or wi == len(records):
@@ -499,6 +513,10 @@ def main():
                 "count": len(rows),
                 "bytes": nbytes,
                 "write_seconds": float(write_s),
+                "keys": [
+                    [str(row["scene_name"]), str(row["t0_token"])]
+                    for row in rows
+                ],
             })
             rows = []
         if wi == 1 or wi % 25 == 0 or wi == len(records):
@@ -534,6 +552,11 @@ def main():
             ],
             "voxel_size_xyz_m": [float(x) for x in pcfg.grid.voxel_size],
         },
+        "consumer_profile": (
+            "unified_transport_completion" if bool(a.unified_compact)
+            else "legacy_v20"
+        ),
+        "unified_compact": bool(a.unified_compact),
         "cache_layout": {
             "version": 2,
             "history_semantic": (
@@ -541,8 +564,9 @@ def main():
                 "positions reconstructed from observed/free masks"
             ),
             "static_supervision": (
-                "packed native valid mask + 4-bit remapped static/free labels "
-                "in C-order"
+                "omitted: unified reads future GT only at training/eval time"
+                if bool(a.unified_compact)
+                else "packed native valid mask + 4-bit remapped static/free labels in C-order"
             ),
             "omitted_recomputable_fields": [
                 "query_mask_bits",
