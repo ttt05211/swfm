@@ -1694,6 +1694,102 @@ def test_static_tile_channels_last_3d_preserves_values():
     assert torch.allclose(y0, y1, atol=1e-5, rtol=1e-5)
 
 
+def test_static_repair_margin_bucket_sweep_matches_bruteforce():
+    from real_motion.v20_history_world import FREE_LABEL
+    from real_motion.v20_static_repair import (
+        full_grid_metrics_from_confusion,
+        repair_diagnostics_from_confusion,
+    )
+    from tools.real_motion.diagnose_p0_f9_v20_static_repair_margin import (
+        _finalize_thresholds,
+    )
+
+    thresholds = [-1.0, 0.0, 0.5]
+    margins = np.asarray([-2.0, -0.5, 0.0, 0.2, 0.7, 1.2])
+    target = np.asarray([17, 11, 17, 13, 14, 17], dtype=np.int64)
+    gt = np.asarray([17, 11, 4, 13, 14, 17], dtype=np.int64)
+    pred_static = np.asarray([11, 11, 13, 13, 14, 15], dtype=np.int64)
+
+    T = len(thresholds)
+    b = np.searchsorted(
+        np.asarray(thresholds), margins, side="right"
+    )
+    bucket_target = np.zeros((T + 1, 18, 18), dtype=np.int64)
+    bucket_gt = np.zeros((6, T + 1, 18, 18), dtype=np.int64)
+    for bi, yt, yg, ps in zip(b, target, gt, pred_static):
+        bucket_target[bi, yt, ps] += 1
+        bucket_gt[0, bi, yg, ps] += 1
+
+    # V18 predicts free on these six support voxels; all other horizons empty.
+    base_full = np.zeros((6, 18, 18), dtype=np.int64)
+    for yg in gt:
+        base_full[0, yg, FREE_LABEL] += 1
+
+    rows = _finalize_thresholds(
+        thresholds, bucket_target, bucket_gt, base_full
+    )
+    by_tau = {float(x["tau"]): x for x in rows}
+
+    for tau in thresholds:
+        active = margins >= float(tau)
+        pred = np.where(active, pred_static, FREE_LABEL)
+
+        conf = np.zeros((18, 18), dtype=np.int64)
+        final = np.array(base_full, copy=True)
+        for yt, yg, pp, aa in zip(target, gt, pred, active):
+            conf[yt, pp] += 1
+            if aa:
+                final[0, yg, FREE_LABEL] -= 1
+                final[0, yg, pp] += 1
+
+        expected_diag = repair_diagnostics_from_confusion(conf)
+        expected_final = full_grid_metrics_from_confusion(final)
+        got = by_tau[float(tau)]
+        assert got["repair_diagnostics"]["added_tp"] == expected_diag["added_tp"]
+        assert got["repair_diagnostics"]["added_fp"] == expected_diag["added_fp"]
+        assert got["repair_diagnostics"]["predicted_add_voxels"] == expected_diag[
+            "predicted_add_voxels"
+        ]
+        assert got["composed_metrics"]["IoU"] == pytest.approx(
+            expected_final["IoU"]
+        )
+        assert got["composed_metrics"]["mIoU"] == pytest.approx(
+            expected_final["mIoU"]
+        )
+
+
+def test_static_repair_margin_tau_zero_matches_allowed_argmax_ties():
+    from real_motion.v20_history_world import FREE_LABEL
+    from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
+
+    allowed = torch.as_tensor(STATIC_ALLOWED_IDS, dtype=torch.long)
+    free_local = int(torch.nonzero(allowed == FREE_LABEL).item())
+    static_local = torch.nonzero(allowed != FREE_LABEL).reshape(-1)
+    static_global = allowed[static_local]
+
+    logits = torch.full((3, len(STATIC_ALLOWED_IDS)), -3.0)
+    # clear static win
+    logits[0, static_local[0]] = 2.0
+    logits[0, free_local] = 1.0
+    # clear free win
+    logits[1, static_local[0]] = 1.0
+    logits[1, free_local] = 2.0
+    # exact tie: allowed argmax selects the earlier static channel because
+    # free is the final allowed ID, so margin >= 0 must do the same.
+    logits[2, static_local[0]] = 2.0
+    logits[2, free_local] = 2.0
+
+    argmax_pred = allowed[logits.argmax(dim=1)]
+    static_score, choice = logits.index_select(1, static_local).max(dim=1)
+    margin = static_score - logits[:, free_local]
+    margin_pred = torch.where(
+        margin >= 0,
+        static_global[choice],
+        torch.full_like(choice, FREE_LABEL),
+    )
+    assert torch.equal(margin_pred, argmax_pred)
+
+
 def test_static_repair_aggregated_loss_matches_repeated_ce_gradient():
     import torch.nn.functional as F
     from real_motion.v20_static_repair import STATIC_ALLOWED_IDS
