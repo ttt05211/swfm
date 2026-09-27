@@ -1522,6 +1522,184 @@ def test_static_repair_sparse_loss_matches_dense_reference():
     assert torch.equal(fs, fd)
 
 
+def test_factorized_static_fresh_head_is_zero_contribution_and_decodes_semantics():
+    from real_motion.v20_history_world import FREE_LABEL
+    from real_motion.v20_training import decode_static_logits
+
+    torch.manual_seed(201)
+    cfg = V20SceneConfig(
+        semantic_dim=4,
+        base_dim=4,
+        tile_dim=6,
+        source_dim=8,
+        static_head_type="factorized",
+        static_presence_bias_init=-4.0,
+    )
+    model = V20HistoryWorldModel(cfg).eval()
+    scene = torch.randn(1, model.encoder.output_dim, 4, 4, 2)
+    grid = torch.rand(3, 4, 4, 2, 3) * 2.0 - 1.0
+    q = torch.ones(3, 4, 4, 2, dtype=torch.bool)
+    seen = torch.ones_like(q)
+    missing = torch.zeros_like(q)
+
+    with torch.no_grad():
+        raw_p, raw_s = model.static.refine_tiles_factorized(
+            scene,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=missing,
+        )
+        pseudo = model.static.refine_tiles(
+            scene,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=missing,
+        )
+        pred = decode_static_logits(pseudo)
+
+    assert torch.allclose(raw_p, torch.full_like(raw_p, -4.0))
+    assert torch.allclose(raw_s, torch.zeros_like(raw_s))
+    assert torch.equal(pred, torch.full_like(pred, FREE_LABEL))
+
+    # Make presence active and one static semantic class preferred. The
+    # existing runtime decoder must reproduce the factorized decision.
+    with torch.no_grad():
+        model.static.presence_head.bias.fill_(1.0)
+        model.static.semantic_head.bias.zero_()
+        model.static.semantic_head.bias[2] = 3.0
+        raw_p, raw_s = model.static.refine_tiles_factorized(
+            scene,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=missing,
+        )
+        pseudo = model.static.refine_tiles(
+            scene,
+            sample_grid=grid,
+            query_mask=q,
+            seen_mask=seen,
+            t0_missing_mask=missing,
+        )
+        pred = decode_static_logits(pseudo)
+
+    chosen_global = int(model.static.factorized_static_ids[2])
+    assert bool((raw_p >= 0).all())
+    assert bool((raw_s.argmax(dim=1) == 2).all())
+    assert torch.equal(pred, torch.full_like(pred, chosen_global))
+
+
+def test_factorized_static_loss_matches_expanded_balanced_objective():
+    import torch.nn.functional as F
+    from real_motion.v20_history_world import FREE_LABEL
+    from real_motion.v20_static_repair import STATIC_SEMANTIC_IDS
+    from tools.real_motion.train_p0_f9_v20_static_repair_factorized import (
+        _factorized_loss,
+    )
+
+    static_ids = list(STATIC_SEMANTIC_IDS)
+    qrow = torch.tensor([0, 1, 1, 2], dtype=torch.long)
+    row_map = torch.tensor([0, 1, 2], dtype=torch.int32)
+    linear = torch.zeros((6, 4), dtype=torch.long)
+    linear[0] = qrow
+    support = np.zeros((6, 2, 2, 1), dtype=bool)
+    support[0, :, :, 0] = True
+    target = np.full((6, 2, 2, 1), FREE_LABEL, dtype=np.uint8)
+    target[0, 0, 0, 0] = static_ids[0]
+    target[0, 1, 0, 0] = static_ids[1]
+
+    p0 = torch.tensor([-0.7, 0.2, -1.1], requires_grad=True)
+    s0 = torch.randn(3, len(static_ids), requires_grad=True)
+    loss, parts = _factorized_loss(
+        p0,
+        s0,
+        row_map,
+        linear,
+        support,
+        target,
+        device=torch.device("cpu"),
+    )
+    loss.backward()
+    gp = p0.grad.detach().clone()
+    gs = s0.grad.detach().clone()
+
+    p1 = p0.detach().clone().requires_grad_(True)
+    s1 = s0.detach().clone().requires_grad_(True)
+    y_presence = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    expanded_p = p1[qrow]
+    pos = y_presence.bool()
+    presence_ref = 0.5 * (
+        F.binary_cross_entropy_with_logits(
+            expanded_p[pos], y_presence[pos]
+        )
+        + F.binary_cross_entropy_with_logits(
+            expanded_p[~pos], y_presence[~pos]
+        )
+    )
+    sem_rows = torch.tensor([0, 1], dtype=torch.long)
+    sem_target = torch.tensor([0, 1], dtype=torch.long)
+    semantic_ref = F.cross_entropy(s1[sem_rows], sem_target)
+    ref = presence_ref + semantic_ref
+    ref.backward()
+
+    assert torch.allclose(loss, ref, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(gp, p1.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(gs, s1.grad, atol=1e-6, rtol=1e-6)
+    assert float(parts["positive_contributions"]) == 2.0
+    assert float(parts["negative_contributions"]) == 2.0
+
+
+def test_factorized_static_checkpoint_roundtrip_and_legacy_default(tmp_path):
+    from real_motion.v20_training import (
+        checkpoint_payload,
+        load_v20_checkpoint,
+    )
+
+    cfg = V20SceneConfig(
+        semantic_dim=4,
+        base_dim=4,
+        tile_dim=6,
+        source_dim=8,
+        static_head_type="factorized",
+        static_presence_bias_init=-4.0,
+    )
+    model = V20HistoryWorldModel(cfg)
+    obj = checkpoint_payload(
+        model,
+        stage="static",
+        v18_checkpoint="/tmp/v18.pt",
+        thresholds={"static_presence": 0.5},
+        extra={"train_protocol": "factorized-test"},
+    )
+    fp = tmp_path / "factorized.pt"
+    torch.save(obj, fp)
+    loaded, ck = load_v20_checkpoint(fp)
+    assert loaded.cfg.static_head_type == "factorized"
+    assert loaded.static.head_type == "factorized"
+    assert ck["thresholds"]["static_presence"] == 0.5
+
+    legacy = V20HistoryWorldModel(
+        V20SceneConfig(
+            semantic_dim=4, base_dim=4, tile_dim=6, source_dim=8
+        )
+    )
+    old = checkpoint_payload(
+        legacy,
+        stage="static",
+        v18_checkpoint="/tmp/v18.pt",
+        thresholds={},
+    )
+    old["scene_config"].pop("static_head_type", None)
+    old["scene_config"].pop("static_presence_bias_init", None)
+    lp = tmp_path / "legacy.pt"
+    torch.save(old, lp)
+    restored, _ = load_v20_checkpoint(lp)
+    assert restored.cfg.static_head_type == "softmax"
+    assert restored.static.head_type == "softmax"
+
+
 def test_static_output_subset_matches_full_logits_and_gradients():
     import copy
     from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
