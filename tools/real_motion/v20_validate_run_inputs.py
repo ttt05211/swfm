@@ -15,7 +15,10 @@ import torch
 import yaml
 
 from real_motion.v20_training import CHECKPOINT_PROTOCOL
-from real_motion.v20_static_repair import TRAIN_PROTOCOL as STATIC_REPAIR_PROTOCOL
+from real_motion.v20_static_repair import (
+    TRAIN_PROTOCOL as STATIC_REPAIR_PROTOCOL,
+    FACTORIZED_TRAIN_PROTOCOL as STATIC_REPAIR_FACTORIZED_PROTOCOL,
+)
 from tools.real_motion.build_p0_f9_v20_history_cache import PROTOCOL as STAGE1_PROTOCOL
 
 
@@ -98,9 +101,12 @@ def main():
         if _norm_path(static["v18_checkpoint"]) != base_path:
             raise RuntimeError("Static checkpoint uses a different V18 checkpoint")
         sx = dict(static.get("extra") or {})
-        if sx.get("train_protocol") != STATIC_REPAIR_PROTOCOL:
+        if sx.get("train_protocol") not in {
+            STATIC_REPAIR_PROTOCOL,
+            STATIC_REPAIR_FACTORIZED_PROTOCOL,
+        }:
             raise RuntimeError(
-                "Static checkpoint is not the corrected Stage-2 Repair v2 protocol"
+                "Static checkpoint is not a supported formal Stage-2 Repair protocol"
             )
         if bool(
             sx.get("diagnostic_only", False)
