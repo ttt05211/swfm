@@ -37,6 +37,7 @@ from real_motion.v20_static_repair import (
     STATIC_ALLOWED_IDS,
     SUPPORT_CACHE_PROTOCOL,
     TRAIN_PROTOCOL,
+    FACTORIZED_TRAIN_PROTOCOL,
     full_grid_metrics_from_confusion,
     repair_diagnostics_from_confusion,
 )
@@ -600,9 +601,12 @@ def main():
             f"margin diagnostic requires stage='static', got {ck.get('stage')!r}"
         )
     extra = dict(ck.get("extra") or {})
-    if extra.get("train_protocol") != TRAIN_PROTOCOL:
+    if extra.get("train_protocol") not in {
+        TRAIN_PROTOCOL,
+        FACTORIZED_TRAIN_PROTOCOL,
+    }:
         raise RuntimeError(
-            "checkpoint is not Static Repair v2"
+            "checkpoint is not a supported Static Repair protocol"
         )
     if bool(extra.get("diagnostic_only", True)) and not bool(
         a.allow_diagnostic_checkpoint
@@ -684,6 +688,11 @@ def main():
         "dev_windows": int(dev_total),
         "thresholds_ascending": thresholds,
         "selection_metric": "composed semantic mIoU on dev only",
+        "static_head_type": str(model.cfg.static_head_type),
+        "margin_definition": (
+            "max_static_logit-free_logit for softmax; "
+            "raw presence logit for factorized"
+        ),
         "train_subset": "first N canonical train-cache identities; diagnostic only",
         "amp_bfloat16": bool(amp),
         "channels_last_3d": bool(channels_last),
