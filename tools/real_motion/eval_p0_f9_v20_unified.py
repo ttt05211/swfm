@@ -179,12 +179,14 @@ def evaluate_model(
     alignment_workers: int = 6,
     progress: bool = True,
     ablate_source_latents: bool = False,
+    include_per_scene: bool = False,
 ) -> dict:
     model.eval()
     frozen_v18.eval()
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     component_cache = ComponentLRU(maxsize=1024)
     raw_by_variant = {name: _new_raw() for name in VARIANTS}
+    raw_by_scene = {}
     total_runtime_oob = total_scatter_oob = total_completion_support = 0
     diagnostic_groups = {
         "STATIC_target_voxels": 0,
@@ -193,7 +195,17 @@ def evaluate_model(
         "BIRTH_instances": 0,
         "IGNORE_instances": 0,
     }
-    addition = {"written": 0, "correct": 0, "false_positive": 0}
+    addition = {
+        "support_valid_voxels": np.zeros(6, dtype=np.int64),
+        "target_positive_voxels": np.zeros(6, dtype=np.int64),
+        "predicted_add_voxels": np.zeros(6, dtype=np.int64),
+        "added_occ_tp": np.zeros(6, dtype=np.int64),
+        "added_occ_fp": np.zeros(6, dtype=np.int64),
+        "added_semantic_correct": np.zeros(6, dtype=np.int64),
+        "added_semantic_wrong_occupied": np.zeros(6, dtype=np.int64),
+        "missed_positive_voxels": np.zeros(6, dtype=np.int64),
+        "full_confusion_matrix": np.zeros((18, 18), dtype=np.int64),
+    }
     started = time.perf_counter()
     for wi, record in enumerate(records, start=1):
         key = (str(record["scene_name"]), str(record["t0_token"]))
@@ -253,6 +265,12 @@ def evaluate_model(
                 source, record, grid=pcfg.grid, workers=int(alignment_workers)
             )
             gt_all = prepared.future_semantic[0].cpu().numpy().astype(np.uint8)
+            support_all = reports["support"][0].cpu().numpy().astype(bool)
+            scene_name = str(record["scene_name"])
+            if include_per_scene and scene_name not in raw_by_scene:
+                raw_by_scene[scene_name] = {
+                    name: _new_raw() for name in VARIANTS
+                }
             dynamic_ids = np.asarray(DYNAMIC_CLASS_IDS, dtype=gt_all.dtype)
             diagnostic_groups["STATIC_target_voxels"] += int(
                 ((gt_all != int(pcfg.free_label)) & ~np.isin(gt_all, dynamic_ids)).sum()
@@ -261,31 +279,97 @@ def evaluate_model(
                 name = f"{str(item.get('responsibility_name', 'IGNORE'))}_instances"
                 if name in diagnostic_groups:
                     diagnostic_groups[name] += 1
-            written = (current == int(pcfg.free_label)) & (final != int(pcfg.free_label))
-            addition["written"] += int(written.sum())
-            addition["correct"] += int((written & (final == gt_all)).sum())
-            addition["false_positive"] += int(
-                (written & (gt_all == int(pcfg.free_label))).sum()
-            )
             for hi, _ in enumerate(HORIZONS):
+                pred_by_name = {
+                    "frozen_v18_reference": reference[hi],
+                    "current_transport_only": current[hi],
+                    "transport_plus_completion": final[hi],
+                }
                 _update_many(
                     raw_by_variant,
                     hi,
-                    {
-                        "frozen_v18_reference": reference[hi],
-                        "current_transport_only": current[hi],
-                        "transport_plus_completion": final[hi],
-                    },
+                    pred_by_name,
                     gt_all[hi],
                     moving[hi],
                     int(pcfg.free_label),
                 )
+                if include_per_scene:
+                    _update_many(
+                        raw_by_scene[scene_name],
+                        hi,
+                        pred_by_name,
+                        gt_all[hi],
+                        moving[hi],
+                        int(pcfg.free_label),
+                    )
+
+                free = int(pcfg.free_label)
+                support = support_all[hi]
+                target_positive = support & (gt_all[hi] != free)
+                written = support & (current[hi] == free) & (final[hi] != free)
+                addition["support_valid_voxels"][hi] += int(support.sum())
+                addition["target_positive_voxels"][hi] += int(
+                    target_positive.sum()
+                )
+                addition["predicted_add_voxels"][hi] += int(written.sum())
+                addition["added_occ_tp"][hi] += int(
+                    (written & (gt_all[hi] != free)).sum()
+                )
+                addition["added_occ_fp"][hi] += int(
+                    (written & (gt_all[hi] == free)).sum()
+                )
+                addition["added_semantic_correct"][hi] += int(
+                    (written & (final[hi] == gt_all[hi])).sum()
+                )
+                addition["added_semantic_wrong_occupied"][hi] += int(
+                    (
+                        written
+                        & (gt_all[hi] != free)
+                        & (final[hi] != gt_all[hi])
+                    ).sum()
+                )
+                addition["missed_positive_voxels"][hi] += int(
+                    (target_positive & (final[hi] == free)).sum()
+                )
+                pair = (
+                    gt_all[hi].reshape(-1).astype(np.int64) * 18
+                    + final[hi].reshape(-1).astype(np.int64)
+                )
+                addition["full_confusion_matrix"] += np.bincount(
+                    pair, minlength=18 * 18
+                ).reshape(18, 18)
         finally:
             prepared.release()
         if progress and (wi == 1 or wi % 25 == 0 or wi == len(records)):
             print(f"v20_unified_eval {wi}/{len(records)}", flush=True)
 
     metrics = {name: _finalize(raw_by_variant[name]) for name in VARIANTS}
+    addition_json = {
+        key: value.tolist() if isinstance(value, np.ndarray) else value
+        for key, value in addition.items()
+    }
+    addition_json["totals"] = {
+        key: int(value.sum())
+        for key, value in addition.items()
+        if isinstance(value, np.ndarray) and value.ndim == 1
+    }
+    per_scene = (
+        {
+            scene: {
+                name: _finalize(raw[name]) for name in VARIANTS
+            }
+            for scene, raw in raw_by_scene.items()
+        }
+        if include_per_scene
+        else None
+    )
+    raw_counts = {
+        name: {
+            key: value.tolist()
+            for key, value in raw.items()
+        }
+        for name, raw in raw_by_variant.items()
+    }
     return {
         "protocol": PROTOCOL,
         "windows": len(records),
@@ -303,7 +387,9 @@ def evaluate_model(
             "elapsed_seconds": time.perf_counter() - started,
         },
         "diagnostic_groups_only": diagnostic_groups,
-        "addition_quality": addition,
+        "addition_quality": addition_json,
+        "raw_metric_counts": raw_counts,
+        "per_scene": per_scene,
         "future_gt_used_for_prediction": False,
         "static_dormant_birth_are_diagnostics_only": True,
         "completion_source_latents_ablated": bool(ablate_source_latents),
@@ -359,6 +445,7 @@ def main() -> None:
         amp=device.type == "cuda" and not bool(args.no_amp),
         alignment_workers=int(args.alignment_workers),
         ablate_source_latents=bool(args.ablate_completion_source_latents),
+        include_per_scene=True,
     )
     result.update(
         {
