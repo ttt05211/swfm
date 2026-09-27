@@ -44,6 +44,7 @@ def main():
         for row in obj["rows"]:
             slim = dict(row)
             slim.pop("static_supervision", None)
+            slim.pop("dynamic_supervision", None)
             rows.append(slim)
         before += int((src / file).stat().st_size)
         torch.save({"protocol": PROTOCOL, "rows": rows}, dst / file)
@@ -68,6 +69,9 @@ def main():
     layout = dict(out.get("cache_layout") or {})
     layout["static_supervision"] = (
         "omitted by compact conversion; unified reads future GT at runtime"
+    )
+    layout["dynamic_supervision"] = (
+        "omitted by compact conversion; unified does not consume GT identity/trajectory metadata"
     )
     out["cache_layout"] = layout
     out["compressed_static_semantic_values"] = 0
