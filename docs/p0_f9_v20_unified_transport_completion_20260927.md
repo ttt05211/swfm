@@ -115,7 +115,7 @@ python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
   --output-dir "$TRAIN_STAGE1"
 ```
 
-确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys，unified loader 使用小型 shard LRU，不再把全部 Stage-1 row 常驻 RAM。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。
+确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys，unified loader 使用小型 shard LRU，不再把全部 Stage-1 row 常驻 RAM。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。训练内的固定 dev monitor 第一次计算 frozen V18 reference 后只复用其 raw intersection/union counts，后续 checkpoint 不再重复跑冻结 V18 forward/render；这不改变任何指标口径，也不生成额外的大型预测 cache。
 
 真正的 train-screen1024 是固定 1024 个训练窗口做 1024 successful updates（grad_accum=4，约四遍暴露）：
 
