@@ -36,27 +36,178 @@ def completion_support(
     return geometry_query_valid.bool() & (current_transport.long() == FREE_LABEL)
 
 
-def transport_condition(
+def dense_geometry_and_transport_condition(
     current_transport: torch.Tensor,
-    geometry_query_valid: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Semantic proportions plus geometric coverage, with no GT dependency."""
+    future_ego_to_t0: torch.Tensor,
+    *,
+    coarse_lattice: CanonicalLattice,
+    native_origin_xyz_m: Sequence[float],
+    native_voxel_size_xyz_m: Sequence[float],
+    chunk_shape_xyz: Sequence[int] = (32, 32, 16),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build query validity and a spatial 19-channel transport condition.
+
+    Channels 0..17 are per-coarse-cell semantic proportions and channel 18 is
+    geometric coverage. No future GT or supervision enters this path.
+    """
     if current_transport.ndim != 5 or current_transport.shape[1] != FUTURE_FRAMES:
         raise ValueError("current_transport must be [B,6,X,Y,Z]")
-    if geometry_query_valid is None:
-        geometry_query_valid = torch.ones_like(current_transport, dtype=torch.bool)
-    if geometry_query_valid.shape != current_transport.shape:
+    B = int(current_transport.shape[0])
+    native = tuple(int(v) for v in current_transport.shape[2:])
+    if tuple(future_ego_to_t0.shape) != (B, FUTURE_FRAMES, 4, 4):
+        raise ValueError("future_ego_to_t0 must be [B,6,4,4]")
+
+    device = current_transport.device
+    valid_dense = torch.zeros(
+        (B, FUTURE_FRAMES, *native), device=device, dtype=torch.bool
+    )
+    coarse_shape = tuple(int(v) for v in coarse_lattice.shape_xyz)
+    coarse_voxels = int(coarse_shape[0] * coarse_shape[1] * coarse_shape[2])
+    counts = torch.zeros(
+        (B, FUTURE_FRAMES, coarse_voxels, SEMANTIC_CLASSES),
+        device=device,
+        dtype=torch.float32,
+    )
+    coverage_count = torch.zeros(
+        (B, FUTURE_FRAMES, coarse_voxels, 1),
+        device=device,
+        dtype=torch.float32,
+    )
+    counts_flat = counts.reshape(-1, SEMANTIC_CLASSES)
+    coverage_flat = coverage_count.reshape(-1, 1)
+    coarse_origin = torch.as_tensor(
+        coarse_lattice.origin_xyz_m, device=device, dtype=future_ego_to_t0.dtype
+    )
+    coarse_step = torch.as_tensor(
+        coarse_lattice.voxel_size_xyz_m,
+        device=device,
+        dtype=future_ego_to_t0.dtype,
+    )
+
+    for b in range(B):
+        for h in range(FUTURE_FRAMES):
+            for start, size in iter_core_tiles(native, chunk_shape_xyz):
+                tile = make_completion_tile(
+                    window_index=b,
+                    horizon=h,
+                    core_start_xyz=start,
+                    core_shape_xyz=size,
+                    native_shape_xyz=native,
+                    halo=0,
+                )
+                points = native_tile_points_to_t0(
+                    tile,
+                    future_ego_to_t0,
+                    native_origin_xyz_m=native_origin_xyz_m,
+                    native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+                )
+                valid = points_in_lattice(points, coarse_lattice)
+                sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
+                valid_dense[(b, h, *sl)] = valid
+                if not bool(valid.any()):
+                    continue
+                coarse_idx = torch.floor(
+                    (points - coarse_origin) / coarse_step
+                ).long()
+                linear = (
+                    coarse_idx[..., 0] * (coarse_shape[1] * coarse_shape[2])
+                    + coarse_idx[..., 1] * coarse_shape[2]
+                    + coarse_idx[..., 2]
+                )[valid]
+                global_linear = (b * FUTURE_FRAMES + h) * coarse_voxels + linear
+                coverage_flat.index_add_(
+                    0,
+                    global_linear,
+                    torch.ones(
+                        (global_linear.numel(), 1),
+                        device=device,
+                        dtype=torch.float32,
+                    ),
+                )
+                labels = current_transport[(b, h, *sl)][valid].long()
+                occupied = labels != FREE_LABEL
+                if bool(occupied.any()):
+                    counts_flat.index_add_(
+                        0,
+                        global_linear[occupied],
+                        F.one_hot(
+                            labels[occupied], SEMANTIC_CLASSES
+                        ).to(torch.float32),
+                    )
+
+    counts[..., FREE_LABEL] = (
+        coverage_count[..., 0] - counts[..., :FREE_LABEL].sum(dim=-1)
+    ).clamp_min_(0.0)
+    proportions = counts / coverage_count.clamp_min(1.0)
+    native_step = torch.as_tensor(
+        native_voxel_size_xyz_m, dtype=torch.float32, device=device
+    )
+    coarse_step_f = torch.as_tensor(
+        coarse_lattice.voxel_size_xyz_m, dtype=torch.float32, device=device
+    )
+    nominal = (
+        coarse_step_f.prod() / native_step.prod().clamp_min(1.0e-12)
+    ).clamp_min(1.0)
+    coverage = (coverage_count / nominal).clamp_(0.0, 1.0)
+    condition = torch.cat((proportions, coverage), dim=-1)
+    condition = condition.view(
+        B, FUTURE_FRAMES, *coarse_shape, SEMANTIC_CLASSES + 1
+    ).permute(0, 1, 5, 2, 3, 4).contiguous()
+    return valid_dense, condition.detach()
+
+
+def transport_condition(
+    current_transport: torch.Tensor,
+    geometry_query_valid: torch.Tensor,
+    future_ego_to_t0: torch.Tensor,
+    *,
+    coarse_lattice: CanonicalLattice,
+    native_origin_xyz_m: Sequence[float],
+    native_voxel_size_xyz_m: Sequence[float],
+) -> torch.Tensor:
+    valid, condition = dense_geometry_and_transport_condition(
+        current_transport,
+        future_ego_to_t0,
+        coarse_lattice=coarse_lattice,
+        native_origin_xyz_m=native_origin_xyz_m,
+        native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+    )
+    if geometry_query_valid.shape != valid.shape:
         raise ValueError("geometry_query_valid must match current_transport")
-    valid = geometry_query_valid.bool()
-    safe = current_transport.long().clamp(0, SEMANTIC_CLASSES - 1)
-    one_hot = F.one_hot(safe, SEMANTIC_CLASSES).to(torch.float32)
-    weights = valid.unsqueeze(-1).to(one_hot.dtype)
-    counts = (one_hot * weights).sum(dim=(2, 3, 4))
-    denom = valid.sum(dim=(2, 3, 4), keepdim=False).clamp_min(1).unsqueeze(-1)
-    proportions = counts / denom
-    total = current_transport.shape[2] * current_transport.shape[3] * current_transport.shape[4]
-    coverage = valid.sum(dim=(2, 3, 4), dtype=torch.float32).unsqueeze(-1) / float(total)
-    return torch.cat((proportions, coverage), dim=-1).detach()
+    if not torch.equal(geometry_query_valid.bool(), valid):
+        raise RuntimeError(
+            "provided geometry validity disagrees with spatial transport mapping"
+        )
+    return condition
+
+
+def compose_completion_tiles(
+    current_transport: torch.Tensor,
+    tile_logits: Sequence[torch.Tensor],
+    tile_queries: Sequence[CompletionTileQuery],
+) -> torch.Tensor:
+    """Compose tile predictions directly without dense 18-way logits."""
+    if len(tile_logits) != len(tile_queries):
+        raise ValueError("tile logit/query count mismatch")
+    out = current_transport.clone()
+    for logits, query in zip(tile_logits, tile_queries):
+        tile = query.tile
+        if tuple(logits.shape) != (*tile.halo_shape_xyz, SEMANTIC_CLASSES):
+            raise ValueError("tile logits must cover the full halo tile")
+        proposal = logits[(*tile.core_slice_xyz, slice(None))].argmax(dim=-1)
+        support = query.support[tile.core_slice_xyz]
+        start, size = tile.core_start_xyz, tile.core_shape_xyz
+        sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
+        current_core = out[(tile.window_index, tile.horizon, *sl)]
+        write = (
+            support.bool()
+            & (current_core.long() == FREE_LABEL)
+            & (proposal != FREE_LABEL)
+        )
+        out[(tile.window_index, tile.horizon, *sl)] = torch.where(
+            write, proposal.to(current_core.dtype), current_core
+        )
+    return out
 
 
 def compose(
