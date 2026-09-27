@@ -10,8 +10,8 @@ from real_motion.v20_unified_loss import (
 )
 from real_motion.v20_unified_runtime import (
     assemble_completion_logits,
+    dense_geometry_and_transport_condition,
     prepare_runtime_queries,
-    transport_condition,
 )
 from tools.real_motion.eval_p0_f9_v20_unified import _finalize, _new_raw, _update_many
 
@@ -98,15 +98,31 @@ def test_single_tile_and_aggregate_loss_statistics_are_identical():
     assert torch.equal(direct.mean, aggregate.mean)
 
 
-def test_transport_condition_is_proportions_plus_coverage_and_detached():
+def test_transport_condition_is_spatial_proportions_plus_coverage():
+    lattice = CanonicalLattice(
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (2, 1, 1)
+    )
     current = torch.full((1, 6, 2, 1, 1), FREE_LABEL)
     current[:, :, 0] = 4
-    valid = torch.ones_like(current, dtype=torch.bool)
-    valid[:, :, 1] = False
-    cond = transport_condition(current, valid)
-    assert cond.shape == (1, 6, 19)
-    assert torch.allclose(cond[..., 4], torch.ones_like(cond[..., 4]))
-    assert torch.allclose(cond[..., -1], torch.full_like(cond[..., -1], 0.5))
+    pose = torch.eye(4).view(1, 1, 4, 4).expand(1, 6, 4, 4).clone()
+    valid, cond = dense_geometry_and_transport_condition(
+        current,
+        pose,
+        coarse_lattice=lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        chunk_shape_xyz=(2, 1, 1),
+    )
+    assert bool(valid.all())
+    assert cond.shape == (1, 6, 19, 2, 1, 1)
+    assert torch.allclose(
+        cond[:, :, 4, 0], torch.ones_like(cond[:, :, 4, 0])
+    )
+    assert torch.allclose(
+        cond[:, :, FREE_LABEL, 1],
+        torch.ones_like(cond[:, :, FREE_LABEL, 1]),
+    )
+    assert torch.allclose(cond[:, :, -1], torch.ones_like(cond[:, :, -1]))
     assert not cond.requires_grad
 
 
