@@ -43,7 +43,7 @@ def dense_geometry_and_transport_condition(
     coarse_lattice: CanonicalLattice,
     native_origin_xyz_m: Sequence[float],
     native_voxel_size_xyz_m: Sequence[float],
-    chunk_shape_xyz: Sequence[int] = (32, 32, 16),
+    chunk_shape_xyz: Sequence[int] = (64, 64, 32),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build query validity and a spatial 19-channel transport condition.
 
