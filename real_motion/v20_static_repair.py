@@ -25,6 +25,9 @@ from .v20_stage1_codec import pack_bool, unpack_bool
 
 SUPPORT_CACHE_PROTOCOL = "p0_f9_v20_static_repair_support_v2"
 TRAIN_PROTOCOL = "p0_f9_v20_static_repair_train_v2"
+FACTORIZED_TRAIN_PROTOCOL = (
+    "p0_f9_v20_static_repair_factorized_train_v1"
+)
 
 DYNAMIC_IDS = tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 DYNAMIC_SET = frozenset(DYNAMIC_IDS)
