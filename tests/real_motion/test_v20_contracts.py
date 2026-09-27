@@ -1695,6 +1695,7 @@ def test_static_tile_channels_last_3d_preserves_values():
 
 
 def test_static_repair_margin_bucket_sweep_matches_bruteforce():
+    import pytest
     from real_motion.v20_history_world import FREE_LABEL
     from real_motion.v20_static_repair import (
         full_grid_metrics_from_confusion,
