@@ -60,6 +60,26 @@ def test_adapter_bypass_is_exact_and_zero_init_is_identity_when_enabled():
     assert torch.equal(enabled.adapter_delta, torch.zeros_like(enabled.adapter_delta))
 
 
+def test_unknown_semantic_placeholder_is_invariant():
+    model = _model().eval()
+    semantic_a = torch.full((1, 6, 4, 4, 4), FREE_LABEL)
+    semantic_b = semantic_a.clone()
+    observed = torch.ones_like(semantic_a, dtype=torch.bool)
+    observed_free = torch.ones_like(observed)
+    observed[:, :, 1, 2, 3] = False
+    observed_free[:, :, 1, 2, 3] = False
+    semantic_a[:, :, 1, 2, 3] = 0
+    semantic_b[:, :, 1, 2, 3] = 11
+    pose = torch.eye(4).view(1, 1, 4, 4).expand(1, 6, 4, 4).clone()
+    a = model.encode_history(
+        UnifiedHistoryInput(semantic_a, observed, observed_free, pose)
+    )
+    b = model.encode_history(
+        UnifiedHistoryInput(semantic_b, observed, observed_free, pose)
+    )
+    assert torch.equal(a.features, b.features)
+
+
 def test_empty_source_path_still_decodes_completion():
     model = _model().eval()
     history = _history(model)
@@ -119,6 +139,22 @@ def test_out_of_bounds_source_is_counted_and_has_no_scatter_contribution():
     assert report.out_of_bounds_points == 6
     assert torch.equal(field, torch.zeros_like(field))
     assert torch.equal(density, torch.zeros_like(density))
+
+
+def test_source_scatter_position_uses_current_transport_residual():
+    model = _model().eval()
+    source = _sources()
+    transport = {
+        "residual_xy_m": torch.zeros(1, 6, 2),
+        "existence_logits": torch.zeros(1, 6),
+        "yaw_delta_rad": torch.zeros(1, 6),
+    }
+    transport["residual_xy_m"][0, 0] = torch.tensor([0.75, -0.25])
+    pos = model.source_positions_from_transport(source, transport)
+    expected = source.source_anchor_xyz_t0_m[0, :2] + torch.tensor(
+        [0.75, -0.25]
+    )
+    assert torch.allclose(pos[0, 0, :2], expected)
 
 
 def test_completion_gradient_reaches_shared_source_token_and_adapter_last_layer():
