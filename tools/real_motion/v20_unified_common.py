@@ -18,7 +18,6 @@ from real_motion.nuscenes_adapter import (
     WindowTokens,
     gt_moving_support_sequence,
 )
-from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.rigid_transport import (
     compose_component_replacements_in_input_order,
     rasterize_rigid_component,
@@ -37,12 +36,93 @@ from real_motion.v20_unified_data import (
     sample_training_tiles,
 )
 from real_motion.v20_unified_runtime import (
-    assemble_completion_logits,
     completion_support,
-    dense_geometry_query_valid,
-    transport_condition,
+    compose_completion_tiles,
+    dense_geometry_and_transport_condition,
 )
 STAGE1_PROTOCOL = "p0_f9_v20_stage1_history_cache_v2"
+
+
+class Stage1RowStore:
+    """Lazy shard-backed Stage-1 rows with a small shard LRU."""
+
+    def __init__(self, root: Path, index: dict, max_cached_shards: int = 8):
+        self.root = Path(root)
+        self.index = index
+        self.max_cached_shards = max(1, int(max_cached_shards))
+        self.locations: dict[tuple[str, str], tuple[str, int]] = {}
+        self.cache: OrderedDict[str, list[dict]] = OrderedDict()
+        for shard in index["shards"]:
+            file = str(shard["file"])
+            keys = shard.get("keys")
+            if keys is None:
+                obj = torch.load(
+                    self.root / file, map_location="cpu", weights_only=False
+                )
+                if obj.get("protocol") != STAGE1_PROTOCOL:
+                    raise RuntimeError(f"bad Stage1 shard: {file}")
+                keys = [
+                    [str(r["scene_name"]), str(r["t0_token"])]
+                    for r in obj["rows"]
+                ]
+            for row_index, key in enumerate(keys):
+                pair = (str(key[0]), str(key[1]))
+                if pair in self.locations:
+                    raise RuntimeError(f"duplicate Stage1 row: {pair}")
+                self.locations[pair] = (file, int(row_index))
+
+    def __contains__(self, key) -> bool:
+        return tuple(key) in self.locations
+
+    def __len__(self) -> int:
+        return len(self.locations)
+
+    def _rows(self, file: str) -> list[dict]:
+        if file in self.cache:
+            rows = self.cache.pop(file)
+            self.cache[file] = rows
+            return rows
+        obj = torch.load(
+            self.root / file, map_location="cpu", weights_only=False
+        )
+        if obj.get("protocol") != STAGE1_PROTOCOL:
+            raise RuntimeError(f"bad Stage1 shard: {file}")
+        rows = list(obj["rows"])
+        self.cache[file] = rows
+        while len(self.cache) > self.max_cached_shards:
+            self.cache.popitem(last=False)
+        return rows
+
+    def __getitem__(self, key):
+        file, row_index = self.locations[tuple(key)]
+        return self._rows(file)[row_index]
+
+
+def _load_unified_raw(source, window, pcfg):
+    """Load only arrays unified V20 consumes; skip OccFM trajectory work."""
+    history_occ, history_observed = [], []
+    for token in window.history_tokens:
+        sem, obs = source.load_occ3d(
+            str(window.scene_name), str(token), require_lidar_mask=True
+        )
+        history_occ.append(np.asarray(sem, dtype=np.uint8))
+        history_observed.append(np.asarray(obs, dtype=bool))
+    future_gt = np.stack(
+        [
+            np.asarray(
+                source.load_semantics(str(window.scene_name), str(token)),
+                dtype=np.uint8,
+            )
+            for token in window.future_tokens
+        ]
+    )
+    return {
+        "history_occ": np.stack(history_occ),
+        "history_observed": np.stack(history_observed),
+        "future_gt_occ": future_gt,
+        "history_poses": [source.pose(t) for t in window.history_tokens],
+        "future_poses": [source.pose(t) for t in window.future_tokens],
+    }
 
 
 class CachedSource(NuScenesWindowSource):
@@ -140,23 +220,19 @@ def lattice_from_dict(value: dict) -> CanonicalLattice:
     )
 
 
-def load_stage1_rows(path: str | Path) -> tuple[Path, dict, dict]:
+def load_stage1_rows(
+    path: str | Path, *, max_cached_shards: int = 8
+) -> tuple[Path, dict, Stage1RowStore]:
     root = Path(path)
     index_path = root / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
     if index.get("protocol") != STAGE1_PROTOCOL:
         raise RuntimeError(f"unexpected Stage1 protocol: {index.get('protocol')}")
-    rows = {}
-    for shard in index["shards"]:
-        obj = torch.load(root / shard["file"], map_location="cpu", weights_only=False)
-        if obj.get("protocol") != STAGE1_PROTOCOL:
-            raise RuntimeError(f"bad Stage1 shard: {shard['file']}")
-        for row in obj["rows"]:
-            key = (str(row["scene_name"]), str(row["t0_token"]))
-            if key in rows:
-                raise RuntimeError(f"duplicate Stage1 row: {key}")
-            rows[key] = row
-    return index_path, index, rows
+    return (
+        index_path,
+        index,
+        Stage1RowStore(root, index, max_cached_shards=max_cached_shards),
+    )
 
 
 def decode_stage1_history(row: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -193,7 +269,7 @@ def prepare_unified_window(
     device: torch.device,
 ) -> PreparedUnifiedWindow:
     window = window_from_record(record)
-    raw = load_nuscenes_window_raw(source, window, pcfg, include_gt=True)
+    raw = _load_unified_raw(source, window, pcfg)
     current_semantic = np.asarray(raw["history_occ"][-1], dtype=np.uint8)
     current_pose = np.asarray(raw["history_poses"][-1], dtype=np.float64)
     current = component_cache.get_or_build(
@@ -368,15 +444,24 @@ def moving_support_sequence(source, record: dict, *, grid, workers: int):
     return np.stack([row[0] for row in rows], axis=0)
 
 
-def geometry_and_support(model, prepared: PreparedUnifiedWindow, current_transport: torch.Tensor, native_grid: dict):
-    geometry_valid = dense_geometry_query_valid(
+def geometry_and_support(
+    model,
+    prepared: PreparedUnifiedWindow,
+    current_transport: torch.Tensor,
+    native_grid: dict,
+):
+    geometry_valid, condition = dense_geometry_and_transport_condition(
+        current_transport,
         prepared.history.future_ego_to_t0,
         coarse_lattice=model.coarse_lattice,
-        native_shape_xyz=native_grid["shape_xyz"],
         native_origin_xyz_m=native_grid["origin_xyz_m"],
         native_voxel_size_xyz_m=native_grid["voxel_size_xyz_m"],
     )
-    return geometry_valid, completion_support(current_transport, geometry_valid)
+    return (
+        geometry_valid,
+        completion_support(current_transport, geometry_valid),
+        condition,
+    )
 
 
 def training_completion_inputs(
@@ -390,7 +475,7 @@ def training_completion_inputs(
     draws_per_horizon: int = 16,
     positive_draws: int = 8,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], dict]:
-    geometry_valid, support = geometry_and_support(
+    geometry_valid, support, condition = geometry_and_support(
         model, prepared, current_transport, native_grid
     )
     tiles = sample_training_tiles(
@@ -412,7 +497,7 @@ def training_completion_inputs(
         first_stage["history"],
         first_stage["sources"],
         first_stage["fusion"],
-        transport_condition(current_transport, geometry_valid),
+        condition,
         queries,
     )
     core_logits: list[torch.Tensor] = []
@@ -444,7 +529,7 @@ def full_completion_prediction(
     native_grid: dict,
     ablate_source_latents: bool = False,
 ) -> tuple[torch.Tensor, dict]:
-    geometry_valid, support = geometry_and_support(
+    geometry_valid, support, condition = geometry_and_support(
         model, prepared, current_transport, native_grid
     )
     queries, runtime_report = model.prepare_runtime_queries(
@@ -467,15 +552,22 @@ def full_completion_prediction(
             shared_queries=torch.zeros_like(completion_fusion.shared_queries),
             adapter_delta=torch.zeros_like(completion_fusion.adapter_delta),
         )
-    logits, scatter_report = model.decode_completion(
+    future_features, scatter_report = model.build_future_features(
         first_stage["history"],
         completion_sources,
         completion_fusion,
-        transport_condition(current_transport, geometry_valid),
-        queries,
+        condition,
     )
-    dense = assemble_completion_logits(
-        logits, queries, output_shape=current_transport.shape
-    )
-    final = model.compose(current_transport, dense, support)
-    return final, {"runtime": runtime_report, "scatter": scatter_report}
+    final = current_transport.clone()
+    chunk = max(int(model.config.runtime_query_chunk), 1)
+    for start in range(0, len(queries), chunk):
+        q = queries[start : start + chunk]
+        logits = model.decode_completion_from_features(
+            first_stage["history"], future_features, q
+        )
+        final = compose_completion_tiles(final, logits, q)
+    return final, {
+        "runtime": runtime_report,
+        "scatter": scatter_report,
+        "support": support,
+    }
