@@ -192,6 +192,27 @@ def checkpoint_payload(
     }
 
 
+def verify_resume_inputs(
+    checkpoint: Mapping,
+    *,
+    base_checkpoint: str | Path,
+    manifest_paths: Mapping[str, str | Path],
+) -> None:
+    if checkpoint.get("base_checkpoint_sha256") != file_sha256(base_checkpoint):
+        raise RuntimeError("resume/base checkpoint hash mismatch")
+    saved = checkpoint.get("manifests") or {}
+    for name, path in manifest_paths.items():
+        entry = saved.get(str(name))
+        if entry is None:
+            raise RuntimeError(f"resume checkpoint lacks manifest {name!r}")
+        current = file_sha256(path)
+        if str(entry.get("sha256")) != current:
+            raise RuntimeError(
+                f"resume manifest hash mismatch for {name}: "
+                f"{entry.get('sha256')} != {current}"
+            )
+
+
 def save_checkpoint(path: str | Path, payload: Mapping) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
