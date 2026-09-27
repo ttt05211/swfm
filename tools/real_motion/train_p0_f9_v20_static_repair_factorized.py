@@ -38,6 +38,7 @@ from real_motion.v20_scene_model import V20HistoryWorldModel, V20SceneConfig
 from real_motion.v20_static_repair import (
     STATIC_SEMANTIC_IDS,
     SUPPORT_CACHE_PROTOCOL,
+    FACTORIZED_TRAIN_PROTOCOL,
     full_grid_metrics_from_confusion,
     repair_diagnostics_from_confusion,
 )
@@ -58,7 +59,7 @@ from tools.real_motion.train_p0_f9_v20_static_repair import (
     _restore_rng,
 )
 
-PROTOCOL = "p0_f9_v20_static_repair_factorized_train_v1"
+PROTOCOL = FACTORIZED_TRAIN_PROTOCOL
 
 
 def _autocast(device, enabled):
