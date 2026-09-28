@@ -90,6 +90,20 @@ def main():
     tr = _cache(a.train_stage1_cache)
     dv = _cache(a.dev_stage1_cache)
     population_alignment = {}
+    if a.dev_v18_cache:
+        _, dev_records = load_v18_cache(a.dev_v18_cache)
+        _, _, dev_stage1_rows = load_stage1_rows(a.dev_stage1_cache)
+        _, population_alignment["dev"] = align_v18_records_to_stage1(
+            dev_records,
+            dev_stage1_rows,
+            population_name="validation dev",
+        )
+        print(
+            json.dumps(
+                {"population_alignment": population_alignment["dev"]}
+            ),
+            flush=True,
+        )
     if a.train_v18_cache:
         _, train_records = load_v18_cache(a.train_v18_cache)
         _, _, train_stage1_rows = load_stage1_rows(a.train_stage1_cache)
@@ -98,13 +112,11 @@ def main():
             train_stage1_rows,
             population_name="validation train",
         )
-    if a.dev_v18_cache:
-        _, dev_records = load_v18_cache(a.dev_v18_cache)
-        _, _, dev_stage1_rows = load_stage1_rows(a.dev_stage1_cache)
-        _, population_alignment["dev"] = align_v18_records_to_stage1(
-            dev_records,
-            dev_stage1_rows,
-            population_name="validation dev",
+        print(
+            json.dumps(
+                {"population_alignment": population_alignment["train"]}
+            ),
+            flush=True,
         )
     overlap = set(tr["scene_names"]) & set(dv["scene_names"])
     if overlap:

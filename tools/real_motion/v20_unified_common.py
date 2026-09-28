@@ -7,6 +7,7 @@ from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Sequence
 
 import numpy as np
@@ -263,7 +264,19 @@ def load_v18_cache(path: str | Path) -> tuple[dict, list[dict]]:
         SE2_TARGET_CONTRACT,
     )
 
-    obj = torch.load(path, map_location="cpu", weights_only=False)
+    cache_path = Path(path)
+    started = time.perf_counter()
+    print(
+        json.dumps(
+            {
+                "v18_cache_load": "start",
+                "path": str(cache_path.resolve()),
+                "bytes": int(cache_path.stat().st_size),
+            }
+        ),
+        flush=True,
+    )
+    obj = torch.load(cache_path, map_location="cpu", weights_only=False)
     if obj.get("version") != SE2_CACHE_VERSION:
         raise RuntimeError(f"expected {SE2_CACHE_VERSION}: {path}")
     metadata = obj.get("metadata") or {}
@@ -272,6 +285,17 @@ def load_v18_cache(path: str | Path) -> tuple[dict, list[dict]]:
     records = obj.get("records") or []
     if not records:
         raise RuntimeError("V18 cache has no records")
+    print(
+        json.dumps(
+            {
+                "v18_cache_load": "complete",
+                "path": str(cache_path.resolve()),
+                "records": len(records),
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+        ),
+        flush=True,
+    )
     return metadata, records
 
 
