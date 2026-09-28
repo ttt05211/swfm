@@ -159,6 +159,84 @@ def rasterize_rigid_component(
     return RasterizedRigidComponent(int(class_id), dst_idx, int(len(src_idx)))
 
 
+def rasterize_rigid_components_batched(
+    source_points_world: Sequence[np.ndarray],
+    source_centers_world: np.ndarray,
+    target_centers_world: np.ndarray,
+    yaw_delta_rad: Sequence[float] | np.ndarray,
+    future_world_to_ego: np.ndarray,
+    *,
+    grid: OccupancyGrid = OccupancyGrid(),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rasterize many rigid components with one vectorized point transform.
+
+    Returned destination indices are globally unique. ``owners`` contains the
+    source-component index that wins at each destination under input-order
+    composition, matching repeated per-component writes exactly.
+    """
+    count = len(source_points_world)
+    source_centers = np.asarray(source_centers_world, dtype=np.float64)
+    target_centers = np.asarray(target_centers_world, dtype=np.float64)
+    yaw = np.asarray(yaw_delta_rad, dtype=np.float64)
+    world_to_future = np.asarray(future_world_to_ego, dtype=np.float64)
+    if source_centers.shape != (count, 3):
+        raise ValueError("source_centers_world must be [N,3]")
+    if target_centers.shape != (count, 3):
+        raise ValueError("target_centers_world must be [N,3]")
+    if yaw.shape != (count,):
+        raise ValueError("yaw_delta_rad must be [N]")
+    if world_to_future.shape != (4, 4):
+        raise ValueError("future_world_to_ego must be 4x4")
+    if count == 0:
+        return (
+            np.zeros((0, 3), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+        )
+
+    normalized = [np.asarray(points, dtype=np.float64) for points in source_points_world]
+    if any(points.ndim != 2 or points.shape[1] != 3 for points in normalized):
+        raise ValueError("every source_points_world entry must be [M,3]")
+    lengths = np.asarray([len(points) for points in normalized], dtype=np.int64)
+    if int(lengths.sum()) == 0:
+        return (
+            np.zeros((0, 3), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+        )
+    points = np.concatenate(normalized, axis=0)
+    owners = np.repeat(np.arange(count, dtype=np.int64), lengths)
+
+    # Use Python's scalar sin/cos, as the reference per-component renderer does,
+    # then broadcast those exact values over every point belonging to a source.
+    cosine = np.asarray([math.cos(float(value)) for value in yaw], dtype=np.float64)
+    sine = np.asarray([math.sin(float(value)) for value in yaw], dtype=np.float64)
+    rel = points[:, :2] - source_centers[owners, :2]
+    moved_world = points.copy()
+    moved_world[:, 0] = (
+        target_centers[owners, 0]
+        + cosine[owners] * rel[:, 0]
+        - sine[owners] * rel[:, 1]
+    )
+    moved_world[:, 1] = (
+        target_centers[owners, 1]
+        + sine[owners] * rel[:, 0]
+        + cosine[owners] * rel[:, 1]
+    )
+    moved_future = _transform_points(world_to_future, moved_world)
+    destination, valid = _metric_to_indices(moved_future, grid)
+    destination = destination[valid]
+    owners = owners[valid]
+    if len(destination) == 0:
+        return destination.reshape(0, 3), owners
+
+    # Resolve destination collisions once, retaining the last input component.
+    # This is the exact winner of the historical input-order assignment loop.
+    _, Y, Z = [int(x) for x in grid.shape_hwd]
+    linear = (destination[:, 0] * Y + destination[:, 1]) * Z + destination[:, 2]
+    _, reverse_first = np.unique(linear[::-1], return_index=True)
+    last = len(linear) - 1 - reverse_first
+    return destination[last], owners[last]
+
+
 def _compose_component_replacements_impl(
     anchor_occ: np.ndarray,
     baseline_components: Iterable[RasterizedRigidComponent],

@@ -7,6 +7,8 @@ from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.rigid_transport import (
     compose_component_replacements,
     rasterize_rigid_component,
+    rasterize_rigid_components_batched,
+    rigid_source_points_world,
     wrap_angle,
 )
 
@@ -137,3 +139,54 @@ def test_disappearance_is_clear_without_write():
         grid=grid,
     )
     assert out[2, 2, 0] == free
+
+
+def test_batched_rigid_rasterizer_matches_input_order_component_writes():
+    grid = _grid()
+    source_indices = [
+        np.asarray([[2, 2, 0], [3, 2, 0]], dtype=np.int64),
+        np.asarray([[2, 3, 0], [3, 3, 0]], dtype=np.int64),
+    ]
+    source_centers = np.asarray(
+        [[0.5, 0.5, 0.5], [0.5, 1.5, 0.5]], dtype=np.float64
+    )
+    targets = np.asarray(
+        [[1.2, 0.7, 0.5], [0.4, 0.9, 0.5]], dtype=np.float64
+    )
+    yaw = np.asarray([0.17, -0.31], dtype=np.float64)
+    pose = np.eye(4)
+    pose[:2, 3] = (0.1, -0.2)
+    inverse = np.linalg.inv(pose)
+    points = [
+        rigid_source_points_world(indices, np.eye(4), grid=grid)
+        for indices in source_indices
+    ]
+
+    expected = np.full(grid.shape_hwd, -1, dtype=np.int64)
+    for owner, indices in enumerate(source_indices):
+        result = rasterize_rigid_component(
+            indices,
+            owner + 4,
+            np.eye(4),
+            pose,
+            source_center_world=source_centers[owner],
+            target_center_world=targets[owner],
+            yaw_delta_rad=float(yaw[owner]),
+            grid=grid,
+            source_points_world=points[owner],
+            future_world_to_ego=inverse,
+        )
+        idx = result.voxel_indices
+        expected[idx[:, 0], idx[:, 1], idx[:, 2]] = owner
+
+    idx, owners = rasterize_rigid_components_batched(
+        points,
+        source_centers,
+        targets,
+        yaw,
+        inverse,
+        grid=grid,
+    )
+    actual = np.full(grid.shape_hwd, -1, dtype=np.int64)
+    actual[idx[:, 0], idx[:, 1], idx[:, 2]] = owners
+    assert np.array_equal(actual, expected)

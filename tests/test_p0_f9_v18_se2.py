@@ -127,6 +127,41 @@ def test_soft_se2_overlap_is_zero_at_exact_nonzero_transform():
     assert stats["se2_transport_soft_iou"] > 0.9999
 
 
+def test_deferred_soft_se2_statistics_preserve_training_loss():
+    footprint = torch.zeros(2, 20, 20)
+    footprint[:, 8:12, 5:15] = 1.0
+    pred_d = torch.randn(2, FUTURE_FRAMES, 2) * 0.2
+    target_d = torch.randn(2, FUTURE_FRAMES, 2) * 0.2
+    pred_yaw = torch.randn(2, FUTURE_FRAMES) * 0.1
+    target_yaw = torch.randn(2, FUTURE_FRAMES) * 0.1
+    valid = torch.ones(2, FUTURE_FRAMES, dtype=torch.bool)
+    enabled = torch.ones(2, dtype=torch.bool)
+    yaw_valid = torch.ones_like(valid)
+    regular, _ = soft_se2_transport_overlap_loss(
+        pred_d,
+        target_d,
+        pred_yaw,
+        target_yaw,
+        footprint,
+        valid,
+        enabled,
+        yaw_valid,
+    )
+    deferred, stats = soft_se2_transport_overlap_loss(
+        pred_d,
+        target_d,
+        pred_yaw,
+        target_yaw,
+        footprint,
+        valid,
+        enabled,
+        yaw_valid,
+        materialize_stats=False,
+    )
+    assert torch.allclose(deferred, regular, atol=1e-7, rtol=1e-6)
+    assert isinstance(stats["se2_transport_overlap_labels"], torch.Tensor)
+
+
 def test_soft_se2_yaw_gradient_matches_finite_difference_away_from_kinks():
     B = 1
     footprint = torch.zeros(B, 20, 20)

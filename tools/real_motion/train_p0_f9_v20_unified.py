@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 import hashlib
 import json
@@ -57,6 +58,7 @@ from tools.real_motion.v20_unified_common import (
     lattice_from_dict,
     load_stage1_rows,
     load_v18_cache,
+    move_prepared_to_device,
     prepare_unified_window,
     stage1_manifest_paths,
     training_completion_inputs_batch,
@@ -89,6 +91,34 @@ def _transport_batch(record: dict, gpu: dict, device: torch.device) -> dict:
     batch["kta_displacement_xy_m"] = gpu["kta"]
     batch["target_source_mask_tube"] = gpu["source_mask"]
     return batch
+
+
+def _materialize_scalar_stats(rows: list[dict]) -> list[dict]:
+    """Convert deferred scalar CUDA statistics after the update sync."""
+    out = []
+    for row in rows:
+        converted = {}
+        for name, value in row.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise RuntimeError(f"training statistic {name!r} is not scalar")
+                scalar = value.detach().item()
+                converted[name] = (
+                    int(scalar)
+                    if value.dtype
+                    in {
+                        torch.uint8,
+                        torch.int8,
+                        torch.int16,
+                        torch.int32,
+                        torch.int64,
+                    }
+                    else float(scalar)
+                )
+            else:
+                converted[name] = value
+        out.append(converted)
+    return out
 
 
 def _lr_scale(successful_updates: int, max_updates: int) -> float:
@@ -248,6 +278,15 @@ def main() -> None:
         action="store_true",
         help="Group selected train windows by scene for better token-cache locality.",
     )
+    parser.add_argument(
+        "--no-cpu-prefetch",
+        action="store_true",
+        help=(
+            "Disable one-microbatch-ahead CPU window preparation. Prefetching "
+            "does not alter sample order or tensors and normally hides raw-data "
+            "loading, Strong-W2Det and baseline rasterization behind GPU work."
+        ),
+    )
     args = parser.parse_args()
     if args.smoke and args.screen1024:
         raise ValueError("--smoke and --screen1024 are mutually exclusive")
@@ -386,6 +425,7 @@ def main() -> None:
         "smoke": bool(args.smoke),
         "screen1024": bool(args.screen1024),
         "io_locality_order": bool(args.io_locality_order),
+        "cpu_prefetch": not bool(args.no_cpu_prefetch),
         "train_windows": len(train_records),
         "train_order_sha256": _population_sha256(train_records, order),
         "dev_monitor_population_sha256": _population_sha256(
@@ -482,6 +522,42 @@ def main() -> None:
         ).get("frozen_v18_reference")
     started = time.perf_counter()
 
+    def prepare_cpu_batch(start_cursor: int) -> tuple[list, float]:
+        batch_started = time.perf_counter()
+        rows = []
+        for offset in range(int(args.batch_size)):
+            record = train_records[order[(start_cursor + offset) % len(order)]]
+            key = (str(record["scene_name"]), str(record["t0_token"]))
+            rows.append(
+                prepare_unified_window(
+                    record,
+                    stage1_rows[key],
+                    source=source,
+                    pcfg=pcfg,
+                    strong_cfg=strong_cfg,
+                    component_cache=component_cache,
+                    device=torch.device("cpu"),
+                )
+            )
+        return rows, time.perf_counter() - batch_started
+
+    prefetch_executor = (
+        None
+        if bool(args.no_cpu_prefetch)
+        else ThreadPoolExecutor(max_workers=1, thread_name_prefix="v20-prepare")
+    )
+    prefetch_cursor = int(window_cursor)
+    prefetched: Future | None = None
+
+    def submit_prefetch() -> None:
+        nonlocal prefetched, prefetch_cursor
+        if prefetch_executor is None:
+            return
+        prefetched = prefetch_executor.submit(prepare_cpu_batch, prefetch_cursor)
+        prefetch_cursor += int(args.batch_size)
+
+    submit_prefetch()
+
     while progress_state.successful_updates < int(args.max_updates):
         if device.type == "cuda":
             # Exclude outstanding monitor/checkpoint work from the next update and
@@ -504,31 +580,57 @@ def main() -> None:
         )
         optimizer.zero_grad(set_to_none=True)
         group_stats: list[dict] = []
+        prepare_cpu_seconds = 0.0
+        input_wait_seconds = 0.0
+        render_cpu_seconds = 0.0
+        cuda_stage_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+            "first": [],
+            "completion_loss": [],
+            "backward": [],
+            "optimizer": [],
+        }
         micro_steps = int(args.grad_accum) // int(args.batch_size)
-        for _ in range(micro_steps):
+        for micro_index in range(micro_steps):
             prepared_windows = []
             try:
-                for _ in range(int(args.batch_size)):
-                    record = train_records[order[window_cursor % len(order)]]
-                    window_cursor += 1
-                    key = (str(record["scene_name"]), str(record["t0_token"]))
-                    prepared_windows.append(
-                        prepare_unified_window(
-                            record,
-                            stage1_rows[key],
-                            source=source,
-                            pcfg=pcfg,
-                            strong_cfg=strong_cfg,
-                            component_cache=component_cache,
-                            device=device,
-                        )
+                prepare_started = time.perf_counter()
+                if prefetched is None:
+                    prepared_windows, prepared_seconds = prepare_cpu_batch(
+                        window_cursor
                     )
+                else:
+                    prepared_windows, prepared_seconds = prefetched.result()
+                    prefetched = None
+                window_cursor += int(args.batch_size)
+                if (
+                    micro_index + 1 < micro_steps
+                    or progress_state.successful_updates + 1
+                    < int(args.max_updates)
+                ):
+                    submit_prefetch()
+                prepared_windows = [
+                    move_prepared_to_device(prepared, device)
+                    for prepared in prepared_windows
+                ]
+                prepare_cpu_seconds += prepared_seconds
+                input_wait_seconds += time.perf_counter() - prepare_started
+                first_events = None
+                if device.type == "cuda":
+                    first_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+                    first_events[0].record()
                 with _autocast(device, amp):
                     first = first_stage_forward_batch(
                         model,
                         prepared_windows,
                         adapter_enabled=adapter_enabled,
                     )
+                if first_events is not None:
+                    first_events[1].record()
+                    cuda_stage_events["first"].append(first_events)
+                    # hard_render_transport immediately consumes detached CPU
+                    # transport outputs, so the synchronization is inherent;
+                    # make it explicit to keep renderer wall time unambiguous.
+                    first_events[1].synchronize()
                 source_counts = [
                     int(prepared.state["gpu"]["features"].shape[0])
                     for prepared in prepared_windows
@@ -536,6 +638,7 @@ def main() -> None:
                 transport_windows = []
                 current_windows = []
                 source_start = 0
+                render_started = time.perf_counter()
                 for prepared, source_count in zip(
                     prepared_windows, source_counts
                 ):
@@ -557,6 +660,14 @@ def main() -> None:
                     )
                     source_start = source_stop
                 current_transport = torch.cat(current_windows, dim=0)
+                render_cpu_seconds += time.perf_counter() - render_started
+                completion_events = None
+                if device.type == "cuda":
+                    completion_events = (
+                        torch.cuda.Event(True),
+                        torch.cuda.Event(True),
+                    )
+                    completion_events[0].record()
                 with _autocast(device, amp):
                     logits, targets, masks, completion_report = training_completion_inputs_batch(
                         model,
@@ -589,6 +700,7 @@ def main() -> None:
                             patch_resolution_m=float(args.patch_resolution_m),
                             completion_weight=float(args.completion_weight),
                             graph_anchor=model.completion_head.weight,
+                            materialize_stats=False,
                         )
                         stats["tiles"] = int(
                             completion_report["tiles_by_window"][window]
@@ -599,12 +711,31 @@ def main() -> None:
                         losses.append(loss)
                         group_stats.append(stats)
                     scaled_loss = torch.stack(losses).mean() / float(micro_steps)
+                if completion_events is not None:
+                    completion_events[1].record()
+                    cuda_stage_events["completion_loss"].append(
+                        completion_events
+                    )
+                backward_events = None
+                if device.type == "cuda":
+                    backward_events = (
+                        torch.cuda.Event(True),
+                        torch.cuda.Event(True),
+                    )
+                    backward_events[0].record()
                 scaler.scale(scaled_loss).backward()
+                if backward_events is not None:
+                    backward_events[1].record()
+                    cuda_stage_events["backward"].append(backward_events)
             finally:
                 for prepared in prepared_windows:
                     prepared.release()
 
         progress_state.attempted_updates += 1
+        optimizer_events = None
+        if device.type == "cuda":
+            optimizer_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+            optimizer_events[0].record()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), float(args.clip_grad)
@@ -614,6 +745,9 @@ def main() -> None:
         if not finite:
             scaler.update(float(scaler.get_scale()) / 2.0 if scaler.is_enabled() else 1.0)
         optimizer.zero_grad(set_to_none=True)
+        if optimizer_events is not None:
+            optimizer_events[1].record()
+            cuda_stage_events["optimizer"].append(optimizer_events)
         if device.type == "cuda":
             # Optimizer kernels are asynchronous; synchronize before reporting
             # wall time and the update's peak allocated memory.
@@ -622,12 +756,27 @@ def main() -> None:
         else:
             peak_memory_mib = 0.0
         update_seconds = time.perf_counter() - update_started
+        group_stats = _materialize_scalar_stats(group_stats)
+        cuda_ms = {
+            name: sum(start.elapsed_time(end) for start, end in pairs)
+            for name, pairs in cuda_stage_events.items()
+        }
+        timing_text = (
+            f"prep_cpu={prepare_cpu_seconds * 1000.0:.1f},"
+            f"input_wait={input_wait_seconds * 1000.0:.1f},"
+            f"render_cpu={render_cpu_seconds * 1000.0:.1f},"
+            f"first_gpu={cuda_ms['first']:.1f},"
+            f"completion_loss_gpu={cuda_ms['completion_loss']:.1f},"
+            f"backward_gpu={cuda_ms['backward']:.1f},"
+            f"optimizer_gpu={cuda_ms['optimizer']:.1f}"
+        )
         if not succeeded:
             reason = "amp_overflow" if finite else "nonfinite_grad_norm"
             print(
                 f"update_attempt={progress_state.attempted_updates} {reason}; "
                 f"seconds={update_seconds:.3f}; "
                 f"peak_memory_mib={peak_memory_mib:.1f}; "
+                f"timing_ms={timing_text}; "
                 "successful counter unchanged",
                 flush=True,
             )
@@ -648,7 +797,8 @@ def main() -> None:
             f"tiles={tiles} unique_tiles={unique_tiles} "
             f"grad_norm={float(grad_norm):.4f} "
             f"seconds={update_seconds:.3f} "
-            f"peak_memory_mib={peak_memory_mib:.1f}",
+            f"peak_memory_mib={peak_memory_mib:.1f} "
+            f"timing_ms={timing_text}",
             flush=True,
         )
 
@@ -746,12 +896,15 @@ def main() -> None:
         "tile_decode_batch_size": int(args.tile_decode_batch_size),
         "runtime_query_chunk": int(args.runtime_query_chunk),
         "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
+        "cpu_prefetch": not bool(args.no_cpu_prefetch),
         "real_data_run": True,
     }
     (out_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
     print(json.dumps(summary, indent=2), flush=True)
+    if prefetch_executor is not None:
+        prefetch_executor.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":

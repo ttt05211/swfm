@@ -289,6 +289,42 @@ def test_completion_decoder_batches_equal_shapes_across_horizons():
     )
 
 
+def test_completion_core_only_matches_full_halo_core_logits():
+    torch.manual_seed(14)
+    model = _model().eval()
+    history = _history(model)
+    source = _sources()
+    fusion = model.fuse_source_scene(history, source, adapter_enabled=True)
+    current = torch.full((1, 6, 4, 4, 4), FREE_LABEL)
+    queries, _ = prepare_runtime_queries(
+        current,
+        history.future_ego_to_t0,
+        coarse_lattice=model.coarse_lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        core_shape_xyz=(2, 2, 2),
+        halo=1,
+    )
+    with torch.no_grad():
+        future, _ = model.build_future_features(
+            history, source, fusion, _condition(model, history, current)
+        )
+        full = model.decode_completion_from_features(
+            history, future, queries[:5]
+        )
+        core = model.decode_completion_from_features(
+            history, future, queries[:5], core_only=True
+        )
+    expected = [
+        value[(*query.tile.core_slice_xyz, slice(None))]
+        for value, query in zip(full, queries)
+    ][:5]
+    assert all(
+        torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+        for a, b in zip(core, expected)
+    )
+
+
 def test_transport_loss_updates_adapter_after_zero_initialized_identity():
     torch.manual_seed(9)
     model = _model().train()

@@ -235,7 +235,8 @@ def prepare_runtime_queries(
     halo: int = 2,
     dense_geometry_valid: torch.Tensor | None = None,
     dense_completion_support: torch.Tensor | None = None,
-) -> tuple[list[CompletionTileQuery], UnifiedRuntimeReport]:
+    materialize_report: bool = True,
+) -> tuple[list[CompletionTileQuery], UnifiedRuntimeReport | None]:
     """Prepare future-native queries without semantic supervision."""
     if current_transport.ndim != 5 or current_transport.shape[1] != FUTURE_FRAMES:
         raise ValueError("current_transport must be [B,6,X,Y,Z]")
@@ -307,6 +308,8 @@ def prepare_runtime_queries(
         requested += int(geometry_valid.numel())
         in_bounds_counts.append(geometry_valid.sum(dtype=torch.int64))
         eligible_counts.append(support.sum(dtype=torch.int64))
+    if not bool(materialize_report):
+        return queries, None
     if in_bounds_counts:
         totals = torch.stack(
             (

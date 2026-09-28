@@ -183,6 +183,7 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         *,
         return_latents: bool = False,
         decode_outputs: bool = True,
+        validate_label_values: bool = True,
     ) -> dict[str, torch.Tensor]:
         cfg = self.config
         if features.ndim != 2 or features.shape[-1] != FEATURE_DIM:
@@ -204,11 +205,15 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             raise ValueError("decode_outputs=False requires return_latents=True")
 
         labels = local_semantic_tube.long()
-        if bool((labels < 0).any()) or bool((labels >= SEMANTIC_CLASSES).any()):
-            raise ValueError("semantic tube contains labels outside [0,17]")
+        if bool(validate_label_values):
+            if bool((labels < 0).any()) or bool(
+                (labels >= SEMANTIC_CLASSES).any()
+            ):
+                raise ValueError("semantic tube contains labels outside [0,17]")
         mask_labels = target_source_mask_tube.long()
-        if bool((mask_labels < 0).any()) or bool((mask_labels > 1).any()):
-            raise ValueError("target source mask must be binary")
+        if bool(validate_label_values):
+            if bool((mask_labels < 0).any()) or bool((mask_labels > 1).any()):
+                raise ValueError("target source mask must be binary")
 
         if B == 0:
             out = self.decode_transport_queries(
@@ -262,6 +267,8 @@ def periodic_yaw_loss(
     target_yaw_rad: torch.Tensor,
     yaw_enabled: torch.Tensor,
     yaw_label_valid: torch.Tensor,
+    *,
+    materialize_stats: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     if pred_yaw_rad.shape != target_yaw_rad.shape:
         raise ValueError("pred/target yaw shape mismatch")
@@ -273,6 +280,20 @@ def periodic_yaw_loss(
     if enabled.shape != pred_yaw_rad.shape:
         raise ValueError("yaw_enabled must be [B] or [B,H]")
     usable = enabled & yaw_label_valid.bool()
+    if not bool(materialize_stats):
+        delta = wrap_angle_tensor(
+            pred_yaw_rad - target_yaw_rad.to(pred_yaw_rad.dtype)
+        )
+        per = 1.0 - torch.cos(delta)
+        count = usable.sum(dtype=torch.int64)
+        denominator = count.clamp_min(1).to(per.dtype)
+        loss = per.masked_select(usable).sum() / denominator
+        mae = delta.abs().masked_select(usable).sum() / denominator
+        return loss, {
+            "yaw_periodic_loss": loss.detach(),
+            "yaw_mae_rad": mae.detach(),
+            "yaw_labels": count.detach(),
+        }
     if bool(usable.any()):
         delta = wrap_angle_tensor(pred_yaw_rad - target_yaw_rad.to(pred_yaw_rad.dtype))
         per = 1.0 - torch.cos(delta)
@@ -443,6 +464,7 @@ def soft_se2_transport_overlap_loss(
     *,
     patch_resolution_m: float = 0.8,
     eps: float = 1e-6,
+    materialize_stats: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Soft-IoU loss for predicted vs GT source-centred SE(2) transport."""
     iou, usable, yaw_use = _soft_se2_transport_iou_per_label(
@@ -457,6 +479,18 @@ def soft_se2_transport_overlap_loss(
         patch_resolution_m=float(patch_resolution_m),
         eps=float(eps),
     )
+    if not bool(materialize_stats):
+        count = usable.sum(dtype=torch.int64)
+        denominator = count.clamp_min(1).to(iou.dtype)
+        loss = (1.0 - iou).masked_select(usable).sum() / denominator
+        mean_iou = iou.masked_select(usable).sum() / denominator
+        return loss, {
+            "se2_transport_soft_iou": mean_iou.detach(),
+            "se2_transport_overlap_labels": count.detach(),
+            "se2_yaw_active_labels": (
+                usable & yaw_use
+            ).sum(dtype=torch.int64).detach(),
+        }
     if bool(usable.any()):
         loss = (1.0 - iou[usable]).mean()
         mean_iou = float(iou[usable].detach().mean().cpu())

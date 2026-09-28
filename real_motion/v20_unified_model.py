@@ -185,6 +185,10 @@ class V20UnifiedTransportCompletion(nn.Module):
             target_source_mask_tube,
             return_latents=True,
             decode_outputs=False,
+            # The V20 real-data adapter has already validated and frozen these
+            # cache fields.  Rechecking min/max on CUDA would add four forced
+            # device synchronizations to every optimizer update.
+            validate_label_values=False,
         )
         source = UnifiedSourceInput(
             history_source_context=out["history_source_context"],
@@ -354,7 +358,9 @@ class V20UnifiedTransportCompletion(nn.Module):
         history: HistoryEncoding,
         sources: UnifiedSourceInput,
         fusion: SourceFusionOutput,
-    ) -> tuple[torch.Tensor, torch.Tensor, SourceScatterReport]:
+        *,
+        materialize_report: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, SourceScatterReport | None]:
         B = int(history.features.shape[0])
         T = FUTURE_FRAMES
         C = int(self.config.future_dim)
@@ -428,10 +434,13 @@ class V20UnifiedTransportCompletion(nn.Module):
         field = field / weight.clamp_min(1.0e-6)
         field = field.view(B, T, *shape, C).permute(0, 1, 5, 2, 3, 4)
         density = weight.view(B, T, *shape, 1).permute(0, 1, 5, 2, 3, 4)
-        in_count = int(in_bounds_point.sum().item())
-        return field, density, SourceScatterReport(
-            requested, in_count, requested - in_count
-        )
+        report = None
+        if bool(materialize_report):
+            in_count = int(in_bounds_point.sum().item())
+            report = SourceScatterReport(
+                requested, in_count, requested - in_count
+            )
+        return field, density, report
 
     def build_future_features(
         self,
@@ -439,7 +448,9 @@ class V20UnifiedTransportCompletion(nn.Module):
         sources: UnifiedSourceInput,
         fusion: SourceFusionOutput,
         current_transport_condition: torch.Tensor,
-    ) -> tuple[torch.Tensor, SourceScatterReport]:
+        *,
+        materialize_report: bool = True,
+    ) -> tuple[torch.Tensor, SourceScatterReport | None]:
         expected_condition = (
             history.features.shape[0],
             FUTURE_FRAMES,
@@ -450,7 +461,12 @@ class V20UnifiedTransportCompletion(nn.Module):
             raise ValueError(
                 "transport condition must be [B,6,19,Xc,Yc,Zc]"
             )
-        source_field, density, report = self._scatter_source_tokens(history, sources, fusion)
+        source_field, density, report = self._scatter_source_tokens(
+            history,
+            sources,
+            fusion,
+            materialize_report=bool(materialize_report),
+        )
         B, T = int(history.features.shape[0]), FUTURE_FRAMES
         scene = history.features[:, None].expand(-1, T, -1, -1, -1, -1)
         cond_input = current_transport_condition.to(scene.dtype).reshape(
@@ -482,8 +498,16 @@ class V20UnifiedTransportCompletion(nn.Module):
         history: HistoryEncoding,
         future_features: torch.Tensor,
         queries: Sequence[CompletionTileQuery],
+        *,
+        core_only: bool = False,
     ) -> list[torch.Tensor]:
-        """Decode shape-homogeneous tiles in bounded micro-batches."""
+        """Decode shape-homogeneous tiles in bounded micro-batches.
+
+        Training supervises only the core of every halo tile.  ``core_only``
+        therefore applies the pointwise 18-class head after cropping the trunk
+        features.  The two 3x3x3 trunk convolutions still see the exact halo,
+        while the head and CE no longer materialize unused halo logits.
+        """
         if future_features.ndim != 6 or future_features.shape[1] != FUTURE_FRAMES:
             raise ValueError("future_features must be [B,6,C,Xc,Yc,Zc]")
         if not queries:
@@ -514,7 +538,8 @@ class V20UnifiedTransportCompletion(nn.Module):
         # only by tensor shape, allowing tiles from all six horizons to share a
         # much larger Conv3d batch.
         decode_groups: dict[
-            tuple[int, int, int], list[tuple[int, torch.Tensor]]
+            tuple[int, int, int],
+            list[tuple[int, CompletionTileQuery, torch.Tensor]],
         ] = {}
         for group_key, rows in sample_groups.items():
             window_index, horizon = group_key[-2:]
@@ -540,36 +565,83 @@ class V20UnifiedTransportCompletion(nn.Module):
             ).permute(0, 4, 1, 2, 3)
             shape = tuple(int(x) for x in group_key[:3])
             decode_groups.setdefault(shape, []).extend(
-                (qi, tile_inputs[bi]) for bi, (qi, _) in enumerate(rows)
+                (qi, query, tile_inputs[bi])
+                for bi, (qi, query) in enumerate(rows)
             )
 
         micro = max(int(self.config.tile_decode_batch_size), 1)
         for rows in decode_groups.values():
             for start in range(0, len(rows), micro):
                 part = rows[start : start + micro]
-                tile_input = torch.stack([value for _, value in part], dim=0)
+                tile_input = torch.stack(
+                    [value for _, _, value in part], dim=0
+                )
+                if not core_only:
+                    if (
+                        self.training
+                        and torch.is_grad_enabled()
+                        and bool(self.config.checkpoint_completion_tiles)
+                    ):
+                        decoded = activation_checkpoint(
+                            self._decode_completion_batch,
+                            tile_input,
+                            use_reentrant=False,
+                        )
+                    else:
+                        decoded = self._decode_completion_batch(tile_input)
+                    batched_logits = decoded.permute(0, 2, 3, 4, 1)
+                    for bi, (qi, _, _) in enumerate(part):
+                        outputs[qi] = batched_logits[bi]
+                    continue
+
                 if (
                     self.training
                     and torch.is_grad_enabled()
                     and bool(self.config.checkpoint_completion_tiles)
                 ):
-                    decoded = activation_checkpoint(
-                        self._decode_completion_batch,
+                    features = activation_checkpoint(
+                        self._decode_completion_features_batch,
                         tile_input,
                         use_reentrant=False,
                     )
                 else:
-                    decoded = self._decode_completion_batch(tile_input)
-                batched_logits = decoded.permute(0, 2, 3, 4, 1)
-                for bi, (qi, _) in enumerate(part):
-                    outputs[qi] = batched_logits[bi]
+                    features = self._decode_completion_features_batch(tile_input)
+
+                # Boundary tiles can have smaller cores.  Batch the pointwise
+                # head by core shape so cropping does not reintroduce one
+                # Conv3d launch per query.
+                core_groups: dict[
+                    tuple[int, int, int], list[tuple[int, torch.Tensor]]
+                ] = {}
+                for bi, (qi, query, _) in enumerate(part):
+                    core = features[(bi, slice(None), *query.tile.core_slice_xyz)]
+                    core_groups.setdefault(
+                        tuple(int(x) for x in query.tile.core_shape_xyz), []
+                    ).append((qi, core))
+                for core_rows in core_groups.values():
+                    core_features = torch.stack(
+                        [value for _, value in core_rows], dim=0
+                    )
+                    core_logits = self.completion_head(core_features).permute(
+                        0, 2, 3, 4, 1
+                    )
+                    for bi, (qi, _) in enumerate(core_rows):
+                        outputs[qi] = core_logits[bi]
         if any(x is None for x in outputs):
             raise RuntimeError("completion tile batching lost an output")
         return [x for x in outputs if x is not None]
 
     def _decode_completion_batch(self, tile_input: torch.Tensor) -> torch.Tensor:
         """Checkpointable tile trunk+head; returns [M,18,X,Y,Z]."""
-        return self.completion_head(self.completion_trunk(tile_input))
+        return self.completion_head(
+            self._decode_completion_features_batch(tile_input)
+        )
+
+    def _decode_completion_features_batch(
+        self, tile_input: torch.Tensor
+    ) -> torch.Tensor:
+        """Checkpointable two-layer halo trunk; returns [M,C,X,Y,Z]."""
+        return self.completion_trunk(tile_input)
 
     def decode_completion(
         self,
@@ -578,11 +650,20 @@ class V20UnifiedTransportCompletion(nn.Module):
         fusion: SourceFusionOutput,
         current_transport_condition: torch.Tensor,
         queries: Sequence[CompletionTileQuery],
-    ) -> tuple[list[torch.Tensor], SourceScatterReport]:
+        *,
+        core_only: bool = False,
+        materialize_report: bool = True,
+    ) -> tuple[list[torch.Tensor], SourceScatterReport | None]:
         future, report = self.build_future_features(
-            history, sources, fusion, current_transport_condition
+            history,
+            sources,
+            fusion,
+            current_transport_condition,
+            materialize_report=bool(materialize_report),
         )
-        return self.decode_completion_from_features(history, future, queries), report
+        return self.decode_completion_from_features(
+            history, future, queries, core_only=bool(core_only)
+        ), report
 
     def prepare_runtime_queries(self, *args, **kwargs):
         return _prepare_runtime_queries(*args, coarse_lattice=self.coarse_lattice, **kwargs)

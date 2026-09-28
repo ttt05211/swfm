@@ -114,6 +114,19 @@ def test_single_tile_and_aggregate_loss_statistics_are_identical():
     assert torch.equal(direct.mean, aggregate.mean)
 
 
+def test_deferred_completion_statistics_preserve_loss_and_count():
+    torch.manual_seed(5)
+    logits = torch.randn(2, 3, 1, 18)
+    target = torch.randint(0, 18, (2, 3, 1))
+    mask = torch.ones_like(target, dtype=torch.bool)
+    regular = completion_tiles_cross_entropy([logits], [target], [mask])
+    deferred = completion_tiles_cross_entropy(
+        [logits], [target], [mask], materialize_stats=False
+    )
+    assert torch.equal(deferred.mean, regular.mean)
+    assert int(deferred.count) == regular.count
+
+
 def test_transport_condition_is_spatial_proportions_plus_coverage():
     lattice = CanonicalLattice(
         (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (2, 1, 1)
