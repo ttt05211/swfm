@@ -120,6 +120,8 @@ python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
 
 热路径还会复用已生成的 dense geometry/support mask和有放回抽样产生的重复 tile 查询张量；tile 抽样、runtime 统计和 completion CE 分别按 horizon/整批合并设备同步。completion decoder 按窗口与 horizon 分组，直接采样对应的 future/history volume，不再为每个 micro-batch 扫描所有 volume 或构造逐体素 volume-index 张量。空间映射和 source scatter 的空集合由 tensor kernel 原生处理，避免 Python `any()` 强制同步。这些优化不改变 tile draw、loss denominator、support、合成或指标口径。
 
+checkpoint selection 的 population 和顺序由所传 Stage-1 cache 的冻结 shard/key 顺序唯一决定。训练 monitor 和独立 evaluator 都会先对完整 V18 cache 建立 `(scene_name, t0_token) -> record` 唯一索引，再严格按 Stage-1 key 顺序选择/重排。因此 full4369 V18 cache 可以直接与冻结 V19-split Stage-1 dev512 配对，不需要额外复制一份 V18 dev512。V18 重复 identity、Stage-1 缺行、声明数量不符、最终数量或顺序不一致都会在 GPU forward 前报错，不会退化成 full4369 的前 512 条。
+
 真正的 train-screen1024 是固定 1024 个训练窗口做 1024 successful updates（grad_accum=4，约四遍暴露）：
 
 ```bash
@@ -146,6 +148,8 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/eval_p0_f9_v20_unified.py \
 
 将 `--max-windows` 改为 `128` 或 `512` 可运行对应 dev 检查。只有 loss、semantic mIoU 和 Moving 指标显示稳定正趋势后，才去掉 `--max-windows` 运行完整正式集合。
 
+若 `--stage1-cache` 本身就是冻结 dev512 selection cache，直接省略 `--max-windows` 即精确评测全部 512 条；此时 `--val-cache` 可以仍指向 full4369 V18 cache。只有最终 full4369 验证才将 Stage-1 参数切换成完整 dev4369 cache。`--max-windows 128` 表示冻结 Stage-1 selection 顺序中的前 128 条，而不是 full4369 V18 文件的前 128 条。
+
 主方案有效后再运行 completion source-latent ablation；该开关不改变 current transport：
 
 ```bash
@@ -156,4 +160,4 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/eval_p0_f9_v20_unified.py \
 
 ## 6. 本地验证状态
 
-本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、四个 CLI 入口 import 和全量单元/回归测试（`479 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。
+本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、CLI 入口 import 和全量单元/回归测试（`481 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。

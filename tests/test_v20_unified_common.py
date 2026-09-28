@@ -10,6 +10,7 @@ import torch
 from tools.real_motion.v20_unified_common import (
     STAGE1_PROTOCOL,
     Stage1RowStore,
+    align_v18_records_to_stage1,
     stage1_manifest_paths,
 )
 from tools.real_motion.compact_p0_f9_v20_stage1_for_unified import (
@@ -69,6 +70,65 @@ def test_stage1_store_rejects_changed_shard_and_manifest_lists_every_file(tmp_pa
         "train_stage1_index": tmp_path / "index.json",
         "train_stage1_shard:shard_00000.pt": shard,
     }
+
+
+def _stage1_store_with_keys(tmp_path, keys):
+    shard = tmp_path / "ordered.pt"
+    rows = [
+        {"scene_name": scene, "t0_token": token}
+        for scene, token in keys
+    ]
+    torch.save({"protocol": STAGE1_PROTOCOL, "rows": rows}, shard)
+    index = {
+        "num_windows": len(keys),
+        "shards": [
+            {
+                "file": shard.name,
+                "count": len(keys),
+                "keys": [list(key) for key in keys],
+            }
+        ],
+    }
+    return Stage1RowStore(tmp_path, index)
+
+
+def test_v18_population_is_strictly_aligned_to_stage1_order(tmp_path):
+    store = _stage1_store_with_keys(
+        tmp_path, [("scene-b", "t2"), ("scene-a", "t1")]
+    )
+    records = [
+        {"scene_name": "scene-a", "t0_token": "t1", "value": 1},
+        {"scene_name": "unused", "t0_token": "t3", "value": 3},
+        {"scene_name": "scene-b", "t0_token": "t2", "value": 2},
+    ]
+    aligned, report = align_v18_records_to_stage1(
+        records, store, population_name="dev512"
+    )
+    assert [row["value"] for row in aligned] == [2, 1]
+    assert report == {
+        "population": "dev512",
+        "v18_source_records": 3,
+        "stage1_frozen_keys": 2,
+        "matched": 2,
+        "unique": 2,
+        "missing": 0,
+        "duplicate": 0,
+    }
+
+
+def test_v18_population_alignment_rejects_missing_and_duplicate_keys(tmp_path):
+    store = _stage1_store_with_keys(tmp_path, [("scene", "t1")])
+    with pytest.raises(RuntimeError, match="misses frozen Stage1 identities"):
+        align_v18_records_to_stage1(
+            [{"scene_name": "other", "t0_token": "t2"}],
+            store,
+            population_name="dev512",
+        )
+    duplicate = {"scene_name": "scene", "t0_token": "t1"}
+    with pytest.raises(RuntimeError, match="duplicate V18 identities"):
+        align_v18_records_to_stage1(
+            [duplicate, dict(duplicate)], store, population_name="dev512"
+        )
 
 
 def test_compactor_keeps_only_responsibility_counts_and_writes_verified_index(

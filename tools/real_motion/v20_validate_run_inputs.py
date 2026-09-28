@@ -20,6 +20,11 @@ from real_motion.v20_static_repair import (
     FACTORIZED_TRAIN_PROTOCOL as STATIC_REPAIR_FACTORIZED_PROTOCOL,
 )
 from tools.real_motion.build_p0_f9_v20_history_cache import PROTOCOL as STAGE1_PROTOCOL
+from tools.real_motion.v20_unified_common import (
+    align_v18_records_to_stage1,
+    load_stage1_rows,
+    load_v18_cache,
+)
 
 
 def _cache(path):
@@ -59,6 +64,8 @@ def main():
     p.add_argument("--v20-config", required=True)
     p.add_argument("--train-stage1-cache", required=True)
     p.add_argument("--dev-stage1-cache", required=True)
+    p.add_argument("--train-v18-cache", default="")
+    p.add_argument("--dev-v18-cache", default="")
     p.add_argument("--base-checkpoint", required=True)
     p.add_argument("--static-checkpoint", default="")
     p.add_argument("--dormant-checkpoint", default="")
@@ -80,6 +87,23 @@ def main():
 
     tr = _cache(a.train_stage1_cache)
     dv = _cache(a.dev_stage1_cache)
+    population_alignment = {}
+    if a.train_v18_cache:
+        _, train_records = load_v18_cache(a.train_v18_cache)
+        _, _, train_stage1_rows = load_stage1_rows(a.train_stage1_cache)
+        _, population_alignment["train"] = align_v18_records_to_stage1(
+            train_records,
+            train_stage1_rows,
+            population_name="validation train",
+        )
+    if a.dev_v18_cache:
+        _, dev_records = load_v18_cache(a.dev_v18_cache)
+        _, _, dev_stage1_rows = load_stage1_rows(a.dev_stage1_cache)
+        _, population_alignment["dev"] = align_v18_records_to_stage1(
+            dev_records,
+            dev_stage1_rows,
+            population_name="validation dev",
+        )
     overlap = set(tr["scene_names"]) & set(dv["scene_names"])
     if overlap:
         raise RuntimeError(f"train/dev scene overlap: {sorted(overlap)[:5]}")
@@ -159,6 +183,7 @@ def main():
         "checkpoint_chain": chain,
         "highres_lattice": tr["highres_lattice"],
         "coarse_lattice": tr["coarse_lattice"],
+        "population_alignment": population_alignment,
     }
     print(json.dumps(report, indent=2))
 

@@ -46,6 +46,7 @@ from tools.real_motion.eval_p0_f9_v20_unified import evaluate_model, load_clean_
 from tools.real_motion.v20_unified_common import (
     CachedSource,
     ComponentLRU,
+    align_v18_records_to_stage1,
     first_stage_forward,
     hard_render_transport,
     lattice_from_dict,
@@ -243,8 +244,23 @@ def main() -> None:
     pcfg = make_prepare_config(runtime_cfg)
     _, train_records = load_v18_cache(args.train_cache)
     _, dev_records = load_v18_cache(args.dev_cache)
+    stage1_index_path, stage1_index, stage1_rows = load_stage1_rows(args.stage1_cache)
+    dev_stage1_index_path, dev_stage1_index, dev_stage1_rows = load_stage1_rows(
+        args.dev_stage1_cache
+    )
+    dev_records, dev_alignment = align_v18_records_to_stage1(
+        dev_records,
+        dev_stage1_rows,
+        population_name="training dev selection",
+    )
+    print(json.dumps({"dev_population_alignment": dev_alignment}), flush=True)
     if not dev_records:
         raise RuntimeError("empty development population")
+    if int(args.monitor_windows) > len(dev_records):
+        raise RuntimeError(
+            f"monitor-windows={args.monitor_windows} exceeds aligned dev "
+            f"population={len(dev_records)}"
+        )
     overlap = sorted(
         {str(r["scene_name"]) for r in train_records}
         & {str(r["scene_name"]) for r in dev_records}
@@ -258,10 +274,6 @@ def main() -> None:
         random.Random(int(args.seed) + 1024).shuffle(select)
         selected = sorted(select[:1024])
         train_records = [train_records[i] for i in selected]
-    stage1_index_path, stage1_index, stage1_rows = load_stage1_rows(args.stage1_cache)
-    dev_stage1_index_path, dev_stage1_index, dev_stage1_rows = load_stage1_rows(
-        args.dev_stage1_cache
-    )
     if stage1_index["native_grid"] != dev_stage1_index["native_grid"]:
         raise RuntimeError("train/dev native grids differ")
     missing = [

@@ -88,6 +88,15 @@ class Stage1RowStore:
                 if pair in self.locations:
                     raise RuntimeError(f"duplicate Stage1 row: {pair}")
                 self.locations[pair] = (file, int(row_index))
+        declared_windows = index.get("num_windows")
+        if (
+            declared_windows is not None
+            and int(declared_windows) != len(self.locations)
+        ):
+            raise RuntimeError(
+                "Stage1 index window/key count mismatch: "
+                f"{declared_windows} != {len(self.locations)}"
+            )
         while len(self.cache) > self.max_cached_shards:
             self.cache.popitem(last=False)
 
@@ -96,6 +105,11 @@ class Stage1RowStore:
 
     def __len__(self) -> int:
         return len(self.locations)
+
+    @property
+    def ordered_keys(self) -> tuple[tuple[str, str], ...]:
+        """Frozen Stage-1 population in index shard/row order."""
+        return tuple(self.locations)
 
     def _rows(self, file: str) -> list[dict]:
         if file in self.cache:
@@ -259,6 +273,61 @@ def load_v18_cache(path: str | Path) -> tuple[dict, list[dict]]:
     if not records:
         raise RuntimeError("V18 cache has no records")
     return metadata, records
+
+
+def align_v18_records_to_stage1(
+    records: Sequence[dict],
+    stage1_rows: Stage1RowStore,
+    *,
+    population_name: str,
+) -> tuple[list[dict], dict[str, int | str]]:
+    """Strictly select/reorder V18 windows by the frozen Stage-1 population."""
+    by_key: dict[tuple[str, str], dict] = {}
+    duplicate_keys: list[tuple[str, str]] = []
+    for record in records:
+        try:
+            key = (str(record["scene_name"]), str(record["t0_token"]))
+        except KeyError as exc:
+            raise RuntimeError(
+                f"{population_name}: V18 record lacks identity field {exc}"
+            ) from exc
+        if key in by_key:
+            duplicate_keys.append(key)
+        else:
+            by_key[key] = record
+    if duplicate_keys:
+        raise RuntimeError(
+            f"{population_name}: duplicate V18 identities: "
+            f"count={len(duplicate_keys)} examples={duplicate_keys[:5]}"
+        )
+
+    frozen_keys = stage1_rows.ordered_keys
+    missing = [key for key in frozen_keys if key not in by_key]
+    if missing:
+        raise RuntimeError(
+            f"{population_name}: V18 cache misses frozen Stage1 identities: "
+            f"count={len(missing)} examples={missing[:5]}"
+        )
+    aligned = [by_key[key] for key in frozen_keys]
+    actual = tuple(
+        (str(record["scene_name"]), str(record["t0_token"]))
+        for record in aligned
+    )
+    if actual != frozen_keys:
+        raise RuntimeError(f"{population_name}: aligned V18/Stage1 order mismatch")
+    if len(aligned) != len(frozen_keys) or len(set(actual)) != len(frozen_keys):
+        raise RuntimeError(
+            f"{population_name}: aligned population cardinality mismatch"
+        )
+    return aligned, {
+        "population": str(population_name),
+        "v18_source_records": len(records),
+        "stage1_frozen_keys": len(frozen_keys),
+        "matched": len(aligned),
+        "unique": len(set(actual)),
+        "missing": 0,
+        "duplicate": 0,
+    }
 
 
 def _t0_xy_to_world(xy_t0, source_center_world, t0_pose):

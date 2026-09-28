@@ -25,6 +25,7 @@ from real_motion.v20_unified_training import file_sha256, load_model_checkpoint
 from tools.real_motion.v20_unified_common import (
     CachedSource,
     ComponentLRU,
+    align_v18_records_to_stage1,
     first_stage_forward,
     full_completion_prediction,
     hard_render_transport,
@@ -476,11 +477,21 @@ def main() -> None:
 
     pcfg = make_prepare_config(load_runtime_config(args.config, args.override))
     _, records = load_v18_cache(args.val_cache)
+    _, stage1_index, stage1_rows = load_stage1_rows(args.stage1_cache)
+    records, population_alignment = align_v18_records_to_stage1(
+        records,
+        stage1_rows,
+        population_name="evaluation selection",
+    )
     if int(args.max_windows) > 0:
+        if int(args.max_windows) > len(records):
+            raise RuntimeError(
+                f"max-windows={args.max_windows} exceeds aligned evaluation "
+                f"population={len(records)}"
+            )
         records = records[: int(args.max_windows)]
     if not records:
         raise RuntimeError("empty evaluation population")
-    _, stage1_index, stage1_rows = load_stage1_rows(args.stage1_cache)
     device = torch.device(
         args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu"
     )
@@ -509,6 +520,7 @@ def main() -> None:
             "checkpoint": str(Path(args.checkpoint).resolve()),
             "base_checkpoint": str(Path(args.base_checkpoint).resolve()),
             "stage1_cache": str(Path(args.stage1_cache).resolve()),
+            "population_alignment": population_alignment,
             "evaluation_population_truncated": bool(
                 int(args.max_windows) > 0
             ),
