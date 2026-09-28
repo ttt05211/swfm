@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -10,7 +11,9 @@ import torch
 
 from real_motion.local_st_world_model_v17 import LocalSTWMV17Config
 from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
-from real_motion.v20_history_world import CanonicalLattice
+from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRAMES
+from real_motion.v20_history_world import FREE_LABEL, CanonicalLattice
+from real_motion.v20_unified_data import UnifiedHistoryInput
 from real_motion.v20_unified_model import (
     V20UnifiedConfig,
     V20UnifiedTransportCompletion,
@@ -29,6 +32,11 @@ from real_motion.v20_unified_training import (
 from tools.real_motion.train_p0_f9_v20_unified import (
     _autocast,
     _load_monitor_history,
+)
+from tools.real_motion.v20_unified_common import (
+    first_stage_forward,
+    first_stage_forward_batch,
+    training_completion_inputs_batch,
 )
 
 
@@ -65,6 +73,105 @@ def test_optimizer_groups_exist_once_and_phase_switch_does_not_rebuild():
     assert enabled and optimizer.param_groups[1]["lr"] == 2e-5
     assert all(p.requires_grad for p in model.v18.parameters())
     assert id(optimizer) == identity
+
+
+def _prepared_fixture(seed: int, sources: int):
+    generator = torch.Generator().manual_seed(seed)
+    semantic = torch.randint(
+        0, 18, (1, HISTORY_FRAMES, 4, 4, 4), generator=generator
+    )
+    observed = torch.ones_like(semantic, dtype=torch.bool)
+    history = UnifiedHistoryInput(
+        semantic=semantic,
+        observed=observed,
+        observed_free=observed.clone(),
+        future_ego_to_t0=torch.eye(4)
+        .view(1, 1, 4, 4)
+        .expand(1, FUTURE_FRAMES, 4, 4)
+        .clone(),
+    )
+    tube = torch.randint(
+        0, 18, (sources, HISTORY_FRAMES, 8, 8), generator=generator
+    )
+    gpu = {
+        "features": torch.randn(sources, FEATURE_DIM, generator=generator),
+        "tube": tube,
+        "kta": torch.randn(
+            sources, FUTURE_FRAMES, 2, generator=generator
+        ),
+        "frame_motion": torch.randn(
+            sources, HISTORY_FRAMES, 5, generator=generator
+        ),
+        "source_mask": torch.randint(
+            0, 2, tube.shape, generator=generator
+        ),
+    }
+    return SimpleNamespace(
+        history=history,
+        state={"gpu": gpu},
+        source_anchor_xyz_t0_m=torch.rand(
+            sources, 3, generator=generator
+        )
+        * 3.0,
+        future_semantic=torch.full(
+            (1, FUTURE_FRAMES, 4, 4, 4), FREE_LABEL
+        ),
+        formal_valid=torch.ones(
+            (1, FUTURE_FRAMES, 4, 4, 4), dtype=torch.bool
+        ),
+    )
+
+
+def test_first_stage_window_batch_matches_independent_forwards():
+    torch.manual_seed(23)
+    model = _model().eval()
+    prepared = [_prepared_fixture(31, 2), _prepared_fixture(32, 3)]
+    with torch.no_grad():
+        separate = [
+            first_stage_forward(model, row, adapter_enabled=True)
+            for row in prepared
+        ]
+        together = first_stage_forward_batch(
+            model, prepared, adapter_enabled=True
+        )
+    assert torch.equal(
+        together["sources"].window_index,
+        torch.tensor([0, 0, 1, 1, 1]),
+    )
+    for key in ("residual_xy_m", "existence_logits", "yaw_delta_rad"):
+        expected = torch.cat([row["transport"][key] for row in separate])
+        assert torch.allclose(
+            together["transport"][key], expected, atol=1e-6, rtol=1e-6
+        )
+
+
+def test_completion_window_batch_preserves_per_window_draw_accounting():
+    torch.manual_seed(24)
+    model = _model().eval()
+    prepared = [_prepared_fixture(41, 2), _prepared_fixture(42, 1)]
+    with torch.no_grad():
+        first = first_stage_forward_batch(
+            model, prepared, adapter_enabled=True
+        )
+        current = torch.full(
+            (2, FUTURE_FRAMES, 4, 4, 4), FREE_LABEL
+        )
+        logits, targets, masks, report = training_completion_inputs_batch(
+            model,
+            prepared,
+            first,
+            current,
+            native_grid={
+                "origin_xyz_m": (0.0, 0.0, 0.0),
+                "voxel_size_xyz_m": (1.0, 1.0, 1.0),
+            },
+            generator=torch.Generator().manual_seed(7),
+        )
+    assert len(logits) == len(targets) == len(masks) == 2 * 6 * 16
+    assert report["tiles_by_window"] == [96, 96]
+    assert report["unique_tiles_by_window"] == [6, 6]
+    assert report["window_indices"].count(0) == 96
+    assert report["window_indices"].count(1) == 96
 
 
 def test_training_autocast_uses_bfloat16():
@@ -123,6 +230,7 @@ def test_checkpoint_resume_restores_counters_model_optimizer_and_rng(tmp_path):
 def test_checkpoint_roundtrip_preserves_completion_execution_config(tmp_path):
     unified_config = V20UnifiedConfig(
         tile_decode_batch_size=16,
+        runtime_query_chunk=256,
         checkpoint_completion_tiles=False,
     )
     model = _model(unified_config)
@@ -134,6 +242,7 @@ def test_checkpoint_roundtrip_preserves_completion_execution_config(tmp_path):
     manifest.write_text('{"protocol":"test"}', encoding="utf-8")
     contract = {
         "tile_decode_batch_size": 16,
+        "runtime_query_chunk": 256,
         "checkpoint_completion_tiles": False,
     }
     payload = checkpoint_payload(
@@ -153,6 +262,7 @@ def test_checkpoint_roundtrip_preserves_completion_execution_config(tmp_path):
 
     loaded_model, checkpoint = load_model_checkpoint(path)
     assert loaded_model.config.tile_decode_batch_size == 16
+    assert loaded_model.config.runtime_query_chunk == 256
     assert not loaded_model.config.checkpoint_completion_tiles
     verify_resume_inputs(
         checkpoint,

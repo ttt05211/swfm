@@ -52,14 +52,14 @@ from tools.real_motion.v20_unified_common import (
     CachedSource,
     ComponentLRU,
     align_v18_records_to_stage1,
-    first_stage_forward,
+    first_stage_forward_batch,
     hard_render_transport,
     lattice_from_dict,
     load_stage1_rows,
     load_v18_cache,
     prepare_unified_window,
     stage1_manifest_paths,
-    training_completion_inputs,
+    training_completion_inputs_batch,
 )
 
 PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v1"
@@ -176,7 +176,16 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--seed", type=int, default=20260927)
-    parser.add_argument("--batch-size", type=int, default=1, choices=[1])
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        choices=[1, 2, 4],
+        help=(
+            "Windows processed in one GPU micro-batch. --grad-accum remains "
+            "the total windows per optimizer update and must be divisible by it."
+        ),
+    )
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--warmup-updates", type=int, default=128)
     parser.add_argument("--max-updates", type=int, default=1024)
@@ -204,6 +213,15 @@ def main() -> None:
         help=(
             "Disable activation recomputation in the completion decoder. This "
             "uses more GPU memory but is faster and does not change model outputs."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-query-chunk",
+        type=int,
+        default=32,
+        help=(
+            "Maximum full-volume completion queries retained per evaluation "
+            "chunk. Larger values trade GPU memory for monitor/eval speed."
         ),
     )
     parser.add_argument(
@@ -236,7 +254,7 @@ def main() -> None:
     if args.smoke:
         args.warmup_updates = 1
         args.max_updates = 2
-        args.grad_accum = 1
+        args.grad_accum = int(args.batch_size)
         args.monitor_every = 1
         args.monitor_windows = 1
     if args.screen1024:
@@ -249,10 +267,13 @@ def main() -> None:
         int(args.monitor_every),
         int(args.monitor_windows),
         int(args.tile_decode_batch_size),
+        int(args.runtime_query_chunk),
     ) <= 0:
         raise ValueError(
             "update, accumulation, monitor and tile batch counts must be positive"
         )
+    if int(args.grad_accum) % int(args.batch_size) != 0:
+        raise ValueError("--grad-accum must be divisible by --batch-size")
 
     _seed_everything(int(args.seed))
     device = torch.device(
@@ -357,6 +378,7 @@ def main() -> None:
         "patch_resolution_m": float(args.patch_resolution_m),
         "alignment_workers": int(args.alignment_workers),
         "tile_decode_batch_size": int(args.tile_decode_batch_size),
+        "runtime_query_chunk": int(args.runtime_query_chunk),
         "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
         "amp": bool(amp),
         "amp_dtype": "bfloat16" if amp else "float32",
@@ -392,6 +414,7 @@ def main() -> None:
             coarse_lattice=lattice_from_dict(stage1_index["coarse_lattice"]),
             config=V20UnifiedConfig(
                 tile_decode_batch_size=int(args.tile_decode_batch_size),
+                runtime_query_chunk=int(args.runtime_query_chunk),
                 checkpoint_completion_tiles=not bool(
                     args.no_completion_checkpoint
                 ),
@@ -481,58 +504,105 @@ def main() -> None:
         )
         optimizer.zero_grad(set_to_none=True)
         group_stats: list[dict] = []
-        for _ in range(int(args.grad_accum)):
-            record = train_records[order[window_cursor % len(order)]]
-            window_cursor += 1
-            key = (str(record["scene_name"]), str(record["t0_token"]))
-            prepared = prepare_unified_window(
-                record,
-                stage1_rows[key],
-                source=source,
-                pcfg=pcfg,
-                strong_cfg=strong_cfg,
-                component_cache=component_cache,
-                device=device,
-            )
+        micro_steps = int(args.grad_accum) // int(args.batch_size)
+        for _ in range(micro_steps):
+            prepared_windows = []
             try:
-                with _autocast(device, amp):
-                    first = first_stage_forward(
-                        model, prepared, adapter_enabled=adapter_enabled
+                for _ in range(int(args.batch_size)):
+                    record = train_records[order[window_cursor % len(order)]]
+                    window_cursor += 1
+                    key = (str(record["scene_name"]), str(record["t0_token"]))
+                    prepared_windows.append(
+                        prepare_unified_window(
+                            record,
+                            stage1_rows[key],
+                            source=source,
+                            pcfg=pcfg,
+                            strong_cfg=strong_cfg,
+                            component_cache=component_cache,
+                            device=device,
+                        )
                     )
-                current_transport = hard_render_transport(
-                    model,
-                    prepared,
-                    first["transport"],
-                    pcfg=pcfg,
-                    strong_cfg=strong_cfg,
-                    device=device,
-                )
                 with _autocast(device, amp):
-                    logits, targets, masks, completion_report = training_completion_inputs(
+                    first = first_stage_forward_batch(
                         model,
-                        prepared,
+                        prepared_windows,
+                        adapter_enabled=adapter_enabled,
+                    )
+                source_counts = [
+                    int(prepared.state["gpu"]["features"].shape[0])
+                    for prepared in prepared_windows
+                ]
+                transport_windows = []
+                current_windows = []
+                source_start = 0
+                for prepared, source_count in zip(
+                    prepared_windows, source_counts
+                ):
+                    source_stop = source_start + source_count
+                    transport = {
+                        name: value[source_start:source_stop]
+                        for name, value in first["transport"].items()
+                    }
+                    transport_windows.append(transport)
+                    current_windows.append(
+                        hard_render_transport(
+                            model,
+                            prepared,
+                            transport,
+                            pcfg=pcfg,
+                            strong_cfg=strong_cfg,
+                            device=device,
+                        )
+                    )
+                    source_start = source_stop
+                current_transport = torch.cat(current_windows, dim=0)
+                with _autocast(device, amp):
+                    logits, targets, masks, completion_report = training_completion_inputs_batch(
+                        model,
+                        prepared_windows,
                         first,
                         current_transport,
                         native_grid=stage1_index["native_grid"],
                         generator=tile_generator,
                     )
-                    loss, stats = compute_training_loss(
-                        first["transport"],
-                        _transport_batch(record, prepared.state["gpu"], device),
-                        logits,
-                        targets,
-                        masks,
-                        patch_resolution_m=float(args.patch_resolution_m),
-                        completion_weight=float(args.completion_weight),
-                        graph_anchor=model.completion_head.weight,
-                    )
-                    scaled_loss = loss / float(args.grad_accum)
+                    losses = []
+                    window_indices = completion_report["window_indices"]
+                    for window, (prepared, transport) in enumerate(
+                        zip(prepared_windows, transport_windows)
+                    ):
+                        selected = [
+                            i
+                            for i, owner in enumerate(window_indices)
+                            if owner == window
+                        ]
+                        loss, stats = compute_training_loss(
+                            transport,
+                            _transport_batch(
+                                prepared.record,
+                                prepared.state["gpu"],
+                                device,
+                            ),
+                            [logits[i] for i in selected],
+                            [targets[i] for i in selected],
+                            [masks[i] for i in selected],
+                            patch_resolution_m=float(args.patch_resolution_m),
+                            completion_weight=float(args.completion_weight),
+                            graph_anchor=model.completion_head.weight,
+                        )
+                        stats["tiles"] = int(
+                            completion_report["tiles_by_window"][window]
+                        )
+                        stats["unique_tiles"] = int(
+                            completion_report["unique_tiles_by_window"][window]
+                        )
+                        losses.append(loss)
+                        group_stats.append(stats)
+                    scaled_loss = torch.stack(losses).mean() / float(micro_steps)
                 scaler.scale(scaled_loss).backward()
-                stats["tiles"] = int(completion_report["tiles"])
-                stats["unique_tiles"] = int(completion_report["unique_tiles"])
-                group_stats.append(stats)
             finally:
-                prepared.release()
+                for prepared in prepared_windows:
+                    prepared.release()
 
         progress_state.attempted_updates += 1
         scaler.unscale_(optimizer)
@@ -574,7 +644,8 @@ def main() -> None:
         print(
             f"update={progress_state.successful_updates}/{args.max_updates} "
             f"phase={phase} loss={mean_loss:.6f} completion={mean_comp:.6f} "
-            f"voxels={voxels} tiles={tiles} unique_tiles={unique_tiles} "
+            f"windows={len(group_stats)} voxels={voxels} "
+            f"tiles={tiles} unique_tiles={unique_tiles} "
             f"grad_norm={float(grad_norm):.4f} "
             f"seconds={update_seconds:.3f} "
             f"peak_memory_mib={peak_memory_mib:.1f}",
@@ -668,9 +739,12 @@ def main() -> None:
         "smoke": bool(args.smoke),
         "screen1024": bool(args.screen1024),
         "train_windows": len(train_records),
+        "batch_size": int(args.batch_size),
+        "windows_per_update": int(args.grad_accum),
         "keep_checkpoints": int(args.keep_checkpoints),
         "precision": "bfloat16" if amp else "float32",
         "tile_decode_batch_size": int(args.tile_decode_batch_size),
+        "runtime_query_chunk": int(args.runtime_query_chunk),
         "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
         "real_data_run": True,
     }

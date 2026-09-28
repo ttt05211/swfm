@@ -16,6 +16,7 @@ from .v20_unified_data import (
     iter_core_tiles,
     make_completion_tile,
     native_tile_points_to_t0,
+    native_voxel_center_points,
     points_in_lattice,
 )
 
@@ -84,53 +85,53 @@ def dense_geometry_and_transport_condition(
         dtype=future_ego_to_t0.dtype,
     )
 
-    for b in range(B):
-        for h in range(FUTURE_FRAMES):
-            for start, size in iter_core_tiles(native, chunk_shape_xyz):
-                tile = make_completion_tile(
-                    window_index=b,
-                    horizon=h,
-                    core_start_xyz=start,
-                    core_shape_xyz=size,
-                    native_shape_xyz=native,
-                    halo=0,
-                )
-                points = native_tile_points_to_t0(
-                    tile,
-                    future_ego_to_t0,
-                    native_origin_xyz_m=native_origin_xyz_m,
-                    native_voxel_size_xyz_m=native_voxel_size_xyz_m,
-                )
-                valid = points_in_lattice(points, coarse_lattice)
-                sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
-                valid_dense[(b, h, *sl)] = valid
-                coarse_idx = torch.floor(
-                    (points - coarse_origin) / coarse_step
-                ).long()
-                linear = (
-                    coarse_idx[..., 0] * (coarse_shape[1] * coarse_shape[2])
-                    + coarse_idx[..., 1] * coarse_shape[2]
-                    + coarse_idx[..., 2]
-                )[valid]
-                global_linear = (b * FUTURE_FRAMES + h) * coarse_voxels + linear
-                coverage_flat.index_add_(
-                    0,
-                    global_linear,
-                    torch.ones(
-                        (global_linear.numel(), 1),
-                        device=device,
-                        dtype=torch.float32,
-                    ),
-                )
-                labels = current_transport[(b, h, *sl)][valid].long()
-                occupied = labels != FREE_LABEL
-                counts_flat.index_add_(
-                    0,
-                    global_linear[occupied],
-                    F.one_hot(
-                        labels[occupied], SEMANTIC_CLASSES
-                    ).to(torch.float32),
-                )
+    # Materialize the native lattice once and transform all horizons in one
+    # batched operation.  The former chunk loop launched dozens of meshgrid,
+    # bounds and index_add kernels per window despite ample GPU memory.
+    native_points = native_voxel_center_points(
+        start_xyz=(0, 0, 0),
+        shape_xyz=native,
+        device=device,
+        dtype=future_ego_to_t0.dtype,
+        native_origin_xyz_m=native_origin_xyz_m,
+        native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+    ).reshape(-1, 3)
+    points = torch.einsum(
+        "nj,bhij->bhni", native_points, future_ego_to_t0[..., :3, :3]
+    ) + future_ego_to_t0[..., :3, 3].unsqueeze(-2)
+    coarse_idx = torch.floor((points - coarse_origin) / coarse_step).long()
+    valid = (
+        (coarse_idx[..., 0] >= 0)
+        & (coarse_idx[..., 0] < coarse_shape[0])
+        & (coarse_idx[..., 1] >= 0)
+        & (coarse_idx[..., 1] < coarse_shape[1])
+        & (coarse_idx[..., 2] >= 0)
+        & (coarse_idx[..., 2] < coarse_shape[2])
+    )
+    valid_dense.copy_(valid.reshape(B, FUTURE_FRAMES, *native))
+    linear = (
+        coarse_idx[..., 0] * (coarse_shape[1] * coarse_shape[2])
+        + coarse_idx[..., 1] * coarse_shape[2]
+        + coarse_idx[..., 2]
+    )
+    offsets = torch.arange(
+        B * FUTURE_FRAMES, device=device, dtype=linear.dtype
+    ).view(B, FUTURE_FRAMES, 1) * coarse_voxels
+    global_linear = (linear + offsets)[valid]
+    coverage_flat.index_add_(
+        0,
+        global_linear,
+        torch.ones(
+            (global_linear.numel(), 1), device=device, dtype=torch.float32
+        ),
+    )
+    labels = current_transport.reshape(B, FUTURE_FRAMES, -1)[valid].long()
+    occupied = labels != FREE_LABEL
+    counts_flat.index_add_(
+        0,
+        global_linear[occupied],
+        F.one_hot(labels[occupied], SEMANTIC_CLASSES).to(torch.float32),
+    )
 
     counts[..., FREE_LABEL] = (
         coverage_count[..., 0] - counts[..., :FREE_LABEL].sum(dim=-1)

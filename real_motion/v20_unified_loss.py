@@ -61,9 +61,23 @@ def completion_tiles_cross_entropy(
     """Combine repeated tile draws with exact multiplicity and one sync."""
     if not (len(logits) == len(targets) == len(loss_masks)):
         raise ValueError("tile loss inputs must have equal length")
+    groups: dict[
+        tuple[tuple[int, ...], tuple[int, ...]],
+        list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ] = {}
+    for a, b, c in zip(logits, targets, loss_masks):
+        key = (tuple(a.shape), tuple(b.shape))
+        groups.setdefault(key, []).append((a, b, c))
+    # Boundary tiles have a handful of shapes.  One batched CE per shape avoids
+    # launching up to 96 tiny cross-entropy kernels while retaining repeated
+    # draws in the stack, hence preserving their exact gradient multiplicity.
     pieces = [
-        _completion_cross_entropy_tensors(a, b, c)
-        for a, b, c in zip(logits, targets, loss_masks)
+        _completion_cross_entropy_tensors(
+            torch.stack([row[0] for row in rows], dim=0),
+            torch.stack([row[1] for row in rows], dim=0),
+            torch.stack([row[2] for row in rows], dim=0),
+        )
+        for rows in groups.values()
     ]
     if pieces:
         loss_sum = torch.stack([piece[0] for piece in pieces]).sum()

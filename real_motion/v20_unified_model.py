@@ -489,14 +489,14 @@ class V20UnifiedTransportCompletion(nn.Module):
         if not queries:
             return []
         outputs: list[torch.Tensor | None] = [None] * len(queries)
-        groups: dict[
+        sample_groups: dict[
             tuple[int, int, int, int, int],
             list[tuple[int, CompletionTileQuery]],
         ] = {}
         for qi, query in enumerate(queries):
             query.validate()
             tile = query.tile
-            groups.setdefault(
+            sample_groups.setdefault(
                 (
                     *tuple(tile.halo_shape_xyz),
                     int(tile.window_index),
@@ -509,31 +509,45 @@ class V20UnifiedTransportCompletion(nn.Module):
         flat_future = future_features.reshape(
             B * T, future_features.shape[2], *future_features.shape[3:]
         )
-        micro = max(int(self.config.tile_decode_batch_size), 1)
-        for group_key, rows in groups.items():
+        # Sampling still groups by source volume so grid_sample does not copy a
+        # coarse future volume once per tile.  Decoder inputs are then regrouped
+        # only by tensor shape, allowing tiles from all six horizons to share a
+        # much larger Conv3d batch.
+        decode_groups: dict[
+            tuple[int, int, int], list[tuple[int, torch.Tensor]]
+        ] = {}
+        for group_key, rows in sample_groups.items():
             window_index, horizon = group_key[-2:]
+            points = torch.stack(
+                [q.points_xyz_t0_m for _, q in rows], dim=0
+            )
+            local_future = self._sample_volume_index(
+                flat_future,
+                points,
+                int(window_index) * T + int(horizon),
+            )
+            local_history = self._sample_volume_index(
+                history.observation_summary,
+                points,
+                int(window_index),
+            )
+            xyz = self._normalized_xyz(points)
+            valid = torch.stack(
+                [q.geometry_valid for _, q in rows], dim=0
+            ).to(local_future.dtype).unsqueeze(-1)
+            tile_inputs = torch.cat(
+                (local_future, local_history, xyz, valid), dim=-1
+            ).permute(0, 4, 1, 2, 3)
+            shape = tuple(int(x) for x in group_key[:3])
+            decode_groups.setdefault(shape, []).extend(
+                (qi, tile_inputs[bi]) for bi, (qi, _) in enumerate(rows)
+            )
+
+        micro = max(int(self.config.tile_decode_batch_size), 1)
+        for rows in decode_groups.values():
             for start in range(0, len(rows), micro):
                 part = rows[start : start + micro]
-                points = torch.stack(
-                    [q.points_xyz_t0_m for _, q in part], dim=0
-                )
-                local_future = self._sample_volume_index(
-                    flat_future,
-                    points,
-                    int(window_index) * T + int(horizon),
-                )
-                local_history = self._sample_volume_index(
-                    history.observation_summary,
-                    points,
-                    int(window_index),
-                )
-                xyz = self._normalized_xyz(points)
-                valid = torch.stack(
-                    [q.geometry_valid for _, q in part], dim=0
-                ).to(local_future.dtype).unsqueeze(-1)
-                tile_input = torch.cat(
-                    (local_future, local_history, xyz, valid), dim=-1
-                ).permute(0, 4, 1, 2, 3)
+                tile_input = torch.stack([value for _, value in part], dim=0)
                 if (
                     self.training
                     and torch.is_grad_enabled()

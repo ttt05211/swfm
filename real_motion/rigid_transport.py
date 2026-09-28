@@ -81,6 +81,18 @@ def _deduplicate_indices(indices_xyz: np.ndarray, grid: OccupancyGrid) -> np.nda
     return idx[np.sort(first)]
 
 
+def rigid_source_points_world(
+    voxel_indices: np.ndarray,
+    current_ego_to_world: np.ndarray,
+    *,
+    grid: OccupancyGrid = OccupancyGrid(),
+) -> np.ndarray:
+    """Precompute the horizon-invariant world points of one source shape."""
+    return _transform_points(
+        current_ego_to_world, _indices_to_ego_xyz(voxel_indices, grid)
+    )
+
+
 def rasterize_rigid_component(
     voxel_indices: np.ndarray,
     class_id: int,
@@ -92,6 +104,8 @@ def rasterize_rigid_component(
     yaw_delta_rad: float = 0.0,
     translate_z: bool = False,
     grid: OccupancyGrid = OccupancyGrid(),
+    source_points_world: np.ndarray | None = None,
+    future_world_to_ego: np.ndarray | None = None,
 ) -> RasterizedRigidComponent:
     """Move one t0 component by an object-centric rigid transform.
 
@@ -113,8 +127,13 @@ def rasterize_rigid_component(
     if source_center.shape != (3,) or target_center.shape != (3,):
         raise ValueError("source/target center must be xyz")
 
-    pts_ego = _indices_to_ego_xyz(src_idx, grid)
-    pts_world = _transform_points(current_ego_to_world, pts_ego)
+    pts_world = (
+        rigid_source_points_world(src_idx, current_ego_to_world, grid=grid)
+        if source_points_world is None
+        else np.asarray(source_points_world, dtype=np.float64)
+    )
+    if pts_world.shape != (len(src_idx), 3):
+        raise ValueError("source_points_world must match voxel_indices")
 
     theta = float(yaw_delta_rad)
     c, s = math.cos(theta), math.sin(theta)
@@ -127,7 +146,13 @@ def rasterize_rigid_component(
     if bool(translate_z):
         moved_world[:, 2] += float(target_center[2] - source_center[2])
 
-    world_to_future = np.linalg.inv(np.asarray(future_ego_to_world, dtype=np.float64))
+    world_to_future = (
+        np.linalg.inv(np.asarray(future_ego_to_world, dtype=np.float64))
+        if future_world_to_ego is None
+        else np.asarray(future_world_to_ego, dtype=np.float64)
+    )
+    if world_to_future.shape != (4, 4):
+        raise ValueError("future_world_to_ego must be 4x4")
     moved_future = _transform_points(world_to_future, moved_world)
     dst_idx, valid = _metric_to_indices(moved_future, grid)
     dst_idx = _deduplicate_indices(dst_idx[valid], grid)

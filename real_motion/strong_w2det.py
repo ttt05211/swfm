@@ -266,8 +266,15 @@ def strong_w2det_sequence(
     frame_dt_s: float = 0.5,
     grid: OccupancyGrid = OccupancyGrid(),
     cfg: StrongW2DetConfig = StrongW2DetConfig(),
+    current_instances: Sequence[dict] | None = None,
+    previous_instances: Sequence[dict] | None = None,
 ) -> np.ndarray:
-    """Generate all future strong anchors from the final two causal history frames."""
+    """Generate all future anchors while sharing horizon-invariant analysis.
+
+    Optional precomputed components must come from :func:`extract_instances`
+    with the same semantic frames, poses, grid and config.  They let callers
+    with an identity cache avoid repeating connected-component extraction.
+    """
     hist = np.asarray(history_semantics)
     if hist.ndim != 4 or hist.shape[0] < 2:
         raise ValueError("history_semantics must be [T,X,Y,Z] with T>=2")
@@ -275,13 +282,86 @@ def strong_w2det_sequence(
         raise ValueError("history pose count mismatch")
     current_pose = np.asarray(history_ego_to_world[-1], dtype=np.float64)
     previous_pose = np.asarray(history_ego_to_world[-2], dtype=np.float64)
+    sem0 = np.asarray(hist[-1])
+    previous_semantics = np.asarray(hist[-2])
+    dyn = np.isin(sem0, np.asarray(DYNAMIC_CLASS_IDS, dtype=sem0.dtype))
+    static_src = sem0.copy()
+    static_src[dyn] = int(cfg.free_label)
+
+    dynamic_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray | None]] = []
+    if bool(dyn.any()):
+        current = (
+            list(current_instances)
+            if current_instances is not None
+            else extract_instances(sem0, current_pose, grid=grid, cfg=cfg)
+        )
+        previous = (
+            list(previous_instances)
+            if previous_instances is not None
+            else extract_instances(
+                previous_semantics, previous_pose, grid=grid, cfg=cfg
+            )
+        )
+        velocities = match_instances(
+            previous,
+            current,
+            float(frame_dt_s),
+            max_speed_mps=cfg.max_match_speed_mps,
+        )
+        origin = np.asarray(
+            [grid.x_min, grid.y_min, grid.z_min], dtype=np.float64
+        )
+        step = np.asarray(grid.voxel_size, dtype=np.float64)
+        covered = np.zeros_like(dyn, dtype=bool)
+        for j, inst in enumerate(current):
+            idx = np.asarray(inst["voxel_indices"], dtype=np.int64)
+            covered[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+            pts_ego = origin + (idx.astype(np.float64) + 0.5) * step
+            pts_world = _transform_points(current_pose, pts_ego)
+            labels = np.full(
+                len(idx), int(inst["class_id"]), dtype=sem0.dtype
+            )
+            dynamic_rows.append((pts_world, labels, velocities.get(j)))
+        rest = dyn & ~covered
+        if bool(rest.any()):
+            ridx = np.argwhere(rest)
+            pts_ego = origin + (ridx.astype(np.float64) + 0.5) * step
+            dynamic_rows.append(
+                (
+                    _transform_points(current_pose, pts_ego),
+                    sem0[ridx[:, 0], ridx[:, 1], ridx[:, 2]],
+                    None,
+                )
+            )
+
     outputs = []
     for i, future_pose in enumerate(future_ego_to_world):
-        outputs.append(w2det_predict(
-            hist[-1], hist[-2], current_pose, previous_pose, np.asarray(future_pose),
-            dt_future_s=(i + 1) * float(frame_dt_s),
-            dt_previous_s=float(frame_dt_s),
-            grid=grid,
-            cfg=cfg,
-        ))
+        future_pose = np.asarray(future_pose, dtype=np.float64)
+        static_dst, known = inverse_warp(
+            static_src,
+            relative_transform(current_pose, future_pose),
+            grid,
+            cfg.free_label,
+        )
+        out = majority_fill(
+            static_dst,
+            ~known,
+            kernel=cfg.fill_kernel,
+            min_fraction=cfg.fill_min_fraction,
+        )
+        if dynamic_rows:
+            dt = (i + 1) * float(frame_dt_s)
+            moved_points = [
+                points if velocity is None else points + velocity[None] * dt
+                for points, _, velocity in dynamic_rows
+            ]
+            labels = np.concatenate([row[1] for row in dynamic_rows], axis=0)
+            pts_future = _transform_points(
+                np.linalg.inv(future_pose), np.concatenate(moved_points, axis=0)
+            )
+            idx = _metric_to_voxel(pts_future, grid)
+            valid = _in_grid(idx, grid)
+            idx = idx[valid]
+            out[idx[:, 0], idx[:, 1], idx[:, 2]] = labels[valid]
+        outputs.append(out)
     return np.stack(outputs, axis=0)

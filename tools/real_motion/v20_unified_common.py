@@ -21,8 +21,8 @@ from real_motion.nuscenes_adapter import (
     gt_moving_support_sequence,
 )
 from real_motion.rigid_transport import (
-    compose_component_replacements_in_input_order,
     rasterize_rigid_component,
+    rigid_source_points_world,
 )
 from real_motion.strong_w2det import (
     StrongW2DetConfig,
@@ -355,12 +355,9 @@ def align_v18_records_to_stage1(
     }
 
 
-def _t0_xy_to_world(xy_t0, source_center_world, t0_pose):
-    source_t0 = world_points_to_t0(
-        np.asarray(source_center_world, dtype=np.float64)[None], t0_pose
-    )[0]
+def _t0_xy_to_world(xy_t0, source_z_t0, t0_pose):
     point = np.asarray(
-        [float(xy_t0[0]), float(xy_t0[1]), float(source_t0[2]), 1.0],
+        [float(xy_t0[0]), float(xy_t0[1]), float(source_z_t0), 1.0],
         dtype=np.float64,
     )
     return (np.asarray(t0_pose, dtype=np.float64) @ point)[:3]
@@ -444,6 +441,14 @@ def prepare_unified_window(
         grid=pcfg.grid,
         cfg=strong_cfg,
     )
+    previous = component_cache.get_or_build(
+        str(window.scene_name),
+        str(window.history_tokens[-2]),
+        np.asarray(raw["history_occ"][-2], dtype=np.uint8),
+        np.asarray(raw["history_poses"][-2], dtype=np.float64),
+        grid=pcfg.grid,
+        cfg=strong_cfg,
+    )
     expected_classes = [int(x) for x in record["source_class_id"].tolist()]
     if [int(x["class_id"]) for x in current] != expected_classes:
         raise RuntimeError(f"{record['sample_id']}: Strong/source order mismatch")
@@ -454,46 +459,59 @@ def prepare_unified_window(
         frame_dt_s=float(pcfg.frame_dt_s),
         grid=pcfg.grid,
         cfg=strong_cfg,
+        current_instances=current,
+        previous_instances=previous,
     )
-    source_z_t0 = np.asarray(
-        [
-            world_points_to_t0(
-                np.asarray(comp["centroid_world"], dtype=np.float64)[None], current_pose
-            )[0, 2]
-            for comp in current
-        ],
-        dtype=np.float64,
+    centroids_world = np.asarray(
+        [comp["centroid_world"] for comp in current], dtype=np.float64
+    ).reshape(-1, 3)
+    source_z_t0 = (
+        world_points_to_t0(centroids_world, current_pose)[:, 2]
+        if len(centroids_world)
+        else np.empty((0,), dtype=np.float64)
     )
     future_poses = np.asarray(raw["future_poses"], dtype=np.float64)
+    future_world_to_ego = [np.linalg.inv(pose) for pose in future_poses]
+    source_points_world = [
+        rigid_source_points_world(
+            comp["voxel_indices"], current_pose, grid=pcfg.grid
+        )
+        for comp in current
+    ]
     anchor_xy = record["anchors_xy_t0_m"].float().cpu().numpy()
-    baseline_components = []
+    baseline_clear_masks = []
     for horizon in range(6):
-        rows = []
+        clear = np.zeros(tuple(pcfg.grid.shape_hwd), dtype=bool)
         for source_index, comp in enumerate(current):
-            rows.append(
-                rasterize_rigid_component(
-                    comp["voxel_indices"],
-                    int(comp["class_id"]),
+            baseline = rasterize_rigid_component(
+                comp["voxel_indices"],
+                int(comp["class_id"]),
+                current_pose,
+                future_poses[horizon],
+                source_center_world=comp["centroid_world"],
+                target_center_world=_t0_xy_to_world(
+                    anchor_xy[source_index, horizon],
+                    source_z_t0[source_index],
                     current_pose,
-                    future_poses[horizon],
-                    source_center_world=comp["centroid_world"],
-                    target_center_world=_t0_xy_to_world(
-                        anchor_xy[source_index, horizon],
-                        comp["centroid_world"],
-                        current_pose,
-                    ),
-                    grid=pcfg.grid,
-                )
+                ),
+                grid=pcfg.grid,
+                source_points_world=source_points_world[source_index],
+                future_world_to_ego=future_world_to_ego[horizon],
             )
-        baseline_components.append(rows)
+            idx = np.asarray(baseline.voxel_indices, dtype=np.int64)
+            if len(idx):
+                clear[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+        baseline_clear_masks.append(clear)
     state = {
         "rec": record,
         "window": window,
         "current_pose": current_pose,
         "future_poses": future_poses,
+        "future_world_to_ego": future_world_to_ego,
         "current": current,
+        "source_points_world": source_points_world,
         "anchors": anchors,
-        "baseline_components": baseline_components,
+        "baseline_clear_masks": baseline_clear_masks,
         "source_z_t0": source_z_t0,
         "gpu": _gpu_inputs(record, device),
     }
@@ -528,20 +546,60 @@ def prepare_unified_window(
     )
 
 
-def first_stage_forward(model, prepared: PreparedUnifiedWindow, *, adapter_enabled: bool):
-    gpu = prepared.state["gpu"]
-    return model(
-        prepared.history,
-        features=gpu["features"],
-        local_semantic_tube=gpu["tube"],
-        kta_displacement_xy_m=gpu["kta"],
-        frame_motion_features=gpu["frame_motion"],
-        target_source_mask_tube=gpu["source_mask"],
-        source_anchor_xyz_t0_m=prepared.source_anchor_xyz_t0_m,
-        window_index=torch.zeros(
-            gpu["features"].shape[0], device=gpu["features"].device, dtype=torch.long
+def first_stage_forward_batch(
+    model,
+    prepared_windows: Sequence[PreparedUnifiedWindow],
+    *,
+    adapter_enabled: bool,
+):
+    if not prepared_windows:
+        raise ValueError("first-stage batch cannot be empty")
+    gpu_rows = [prepared.state["gpu"] for prepared in prepared_windows]
+    history = UnifiedHistoryInput(
+        semantic=torch.cat([p.history.semantic for p in prepared_windows], dim=0),
+        observed=torch.cat([p.history.observed for p in prepared_windows], dim=0),
+        observed_free=torch.cat(
+            [p.history.observed_free for p in prepared_windows], dim=0
         ),
+        future_ego_to_t0=torch.cat(
+            [p.history.future_ego_to_t0 for p in prepared_windows], dim=0
+        ),
+    )
+    source_counts = [int(gpu["features"].shape[0]) for gpu in gpu_rows]
+    window_index = torch.cat(
+        [
+            torch.full(
+                (count,),
+                window,
+                device=gpu_rows[window]["features"].device,
+                dtype=torch.long,
+            )
+            for window, count in enumerate(source_counts)
+        ],
+        dim=0,
+    )
+    return model(
+        history,
+        features=torch.cat([gpu["features"] for gpu in gpu_rows], dim=0),
+        local_semantic_tube=torch.cat([gpu["tube"] for gpu in gpu_rows], dim=0),
+        kta_displacement_xy_m=torch.cat([gpu["kta"] for gpu in gpu_rows], dim=0),
+        frame_motion_features=torch.cat(
+            [gpu["frame_motion"] for gpu in gpu_rows], dim=0
+        ),
+        target_source_mask_tube=torch.cat(
+            [gpu["source_mask"] for gpu in gpu_rows], dim=0
+        ),
+        source_anchor_xyz_t0_m=torch.cat(
+            [p.source_anchor_xyz_t0_m for p in prepared_windows], dim=0
+        ),
+        window_index=window_index,
         adapter_enabled=adapter_enabled,
+    )
+
+
+def first_stage_forward(model, prepared: PreparedUnifiedWindow, *, adapter_enabled: bool):
+    return first_stage_forward_batch(
+        model, [prepared], adapter_enabled=adapter_enabled
     )
 
 
@@ -572,7 +630,9 @@ def hard_render_transport(
                     state["future_poses"][horizon],
                     source_center_world=comp["centroid_world"],
                     target_center_world=_t0_xy_to_world(
-                        target_xy, comp["centroid_world"], state["current_pose"]
+                        target_xy,
+                        state["source_z_t0"][source_index],
+                        state["current_pose"],
                     ),
                     yaw_delta_rad=renderer_yaw_delta(
                         int(comp["class_id"]),
@@ -580,18 +640,22 @@ def hard_render_transport(
                         zero_two_wheel_yaw=False,
                     ),
                     grid=pcfg.grid,
+                    source_points_world=state["source_points_world"][source_index],
+                    future_world_to_ego=state["future_world_to_ego"][horizon],
                 )
             )
-        rendered.append(
-            compose_component_replacements_in_input_order(
-                state["anchors"][horizon],
-                state["baseline_components"][horizon],
-                replacements,
-                dynamic_class_ids=DYNAMIC_CLASS_IDS,
-                free_label=int(pcfg.free_label),
-                grid=pcfg.grid,
-            )
+        out = np.asarray(state["anchors"][horizon]).copy()
+        clear = state["baseline_clear_masks"][horizon]
+        out[clear & np.isin(out, np.asarray(DYNAMIC_CLASS_IDS))] = int(
+            pcfg.free_label
         )
+        for replacement in replacements:
+            idx = np.asarray(replacement.voxel_indices, dtype=np.int64)
+            if len(idx):
+                out[idx[:, 0], idx[:, 1], idx[:, 2]] = int(
+                    replacement.class_id
+                )
+        rendered.append(out)
     return torch.from_numpy(np.asarray(rendered, dtype=np.int64)).to(device).unsqueeze(0)
 
 
@@ -669,20 +733,57 @@ def training_completion_inputs(
     draws_per_horizon: int = 16,
     positive_draws: int = 8,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], dict]:
-    geometry_valid, support, condition = geometry_and_support(
-        model, prepared, current_transport, native_grid
+    return training_completion_inputs_batch(
+        model,
+        [prepared],
+        first_stage,
+        current_transport,
+        native_grid=native_grid,
+        generator=generator,
+        draws_per_horizon=draws_per_horizon,
+        positive_draws=positive_draws,
     )
+
+
+def training_completion_inputs_batch(
+    model,
+    prepared_windows: Sequence[PreparedUnifiedWindow],
+    first_stage: dict,
+    current_transport: torch.Tensor,
+    *,
+    native_grid: dict,
+    generator: torch.Generator,
+    draws_per_horizon: int = 16,
+    positive_draws: int = 8,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], dict]:
+    if not prepared_windows:
+        raise ValueError("completion batch cannot be empty")
+    future_semantic = torch.cat(
+        [prepared.future_semantic for prepared in prepared_windows], dim=0
+    )
+    formal_valid = torch.cat(
+        [prepared.formal_valid for prepared in prepared_windows], dim=0
+    )
+    future_ego_to_t0 = first_stage["history"].future_ego_to_t0
+    geometry_valid, condition = dense_geometry_and_transport_condition(
+        current_transport,
+        future_ego_to_t0,
+        coarse_lattice=model.coarse_lattice,
+        native_origin_xyz_m=native_grid["origin_xyz_m"],
+        native_voxel_size_xyz_m=native_grid["voxel_size_xyz_m"],
+    )
+    support = completion_support(current_transport, geometry_valid)
     tiles = sample_training_tiles(
         support,
-        prepared.future_semantic,
-        prepared.formal_valid,
+        future_semantic,
+        formal_valid,
         draws_per_horizon=draws_per_horizon,
         positive_draws=positive_draws,
         generator=generator,
     )
     queries, runtime_report = model.prepare_runtime_queries(
         current_transport,
-        prepared.history.future_ego_to_t0,
+        future_ego_to_t0,
         native_origin_xyz_m=native_grid["origin_xyz_m"],
         native_voxel_size_xyz_m=native_grid["voxel_size_xyz_m"],
         tiles=tiles,
@@ -706,15 +807,25 @@ def training_completion_inputs(
         core_logits.append(value[(*tile.core_slice_xyz, slice(None))])
         start, size = tile.core_start_xyz, tile.core_shape_xyz
         sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
-        targets.append(prepared.future_semantic[(tile.window_index, tile.horizon, *sl)])
+        targets.append(future_semantic[(tile.window_index, tile.horizon, *sl)])
         masks.append(
             query.support[tile.core_slice_xyz]
-            & prepared.formal_valid[(tile.window_index, tile.horizon, *sl)]
+            & formal_valid[(tile.window_index, tile.horizon, *sl)]
         )
+    batch_size = len(prepared_windows)
+    tiles_by_window = [0] * batch_size
+    unique_tiles_by_window = [0] * batch_size
+    for tile in tiles:
+        tiles_by_window[int(tile.window_index)] += 1
+    for query in unique_queries:
+        unique_tiles_by_window[int(query.tile.window_index)] += 1
     return core_logits, targets, masks, {
         "tiles": len(tiles),
         "unique_tiles": len(unique_queries),
         "duplicate_tiles_saved": len(tiles) - len(unique_queries),
+        "window_indices": [int(query.tile.window_index) for query in queries],
+        "tiles_by_window": tiles_by_window,
+        "unique_tiles_by_window": unique_tiles_by_window,
         "runtime": runtime_report,
         "scatter": scatter_report,
     }

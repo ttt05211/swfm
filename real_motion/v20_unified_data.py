@@ -6,15 +6,20 @@ the public inference-input audit below.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, fields
 from typing import Iterator, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from .motion_transport import FUTURE_FRAMES, HISTORY_FRAMES
 from .v20_history_world import FREE_LABEL, CanonicalLattice
 
 V20_UNIFIED_PROTOCOL = "p0_f9_v20_unified_transport_completion_v1"
+
+_NATIVE_POINTS_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_NATIVE_POINTS_CACHE_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -203,25 +208,48 @@ def sample_training_tiles(
         raise ValueError("positive_draws must be in [0,draws_per_horizon]")
     native = tuple(int(v) for v in support.shape[2:])
     grid = list(iter_core_tiles(native, core_shape_xyz))
+    core = tuple(int(v) for v in core_shape_xyz)
+    grid_shape = tuple((native[d] + core[d] - 1) // core[d] for d in range(3))
+    padded_shape = tuple(grid_shape[d] * core[d] for d in range(3))
+    pad = (
+        0,
+        padded_shape[2] - native[2],
+        0,
+        padded_shape[1] - native[1],
+        0,
+        padded_shape[0] - native[0],
+    )
+    valid_support = support.bool() & formal_valid.bool()
+    positive_support = valid_support & (future_semantic != FREE_LABEL)
+
+    def tile_any(mask: torch.Tensor) -> torch.Tensor:
+        padded = F.pad(mask, pad, mode="constant", value=False)
+        shaped = padded.reshape(
+            mask.shape[0],
+            mask.shape[1],
+            grid_shape[0],
+            core[0],
+            grid_shape[1],
+            core[1],
+            grid_shape[2],
+            core[2],
+        )
+        return torch.any(shaped, dim=(3, 5, 7))
+
+    # Reduce every non-overlapping core tile in two vectorized kernels instead
+    # of launching two ``any`` reductions for every tile and horizon.
+    flags = torch.stack(
+        (tile_any(valid_support), tile_any(positive_support)), dim=0
+    ).detach().cpu()
     out: list[CompletionTile] = []
     for b in range(int(support.shape[0])):
         for h in range(FUTURE_FRAMES):
-            uniform_flags: list[torch.Tensor] = []
-            positive_flags: list[torch.Tensor] = []
-            for start, size in grid:
-                sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
-                valid_support = support[(b, h, *sl)].bool() & formal_valid[(b, h, *sl)].bool()
-                targets = future_semantic[(b, h, *sl)]
-                uniform_flags.append(valid_support.any())
-                positive_flags.append(
-                    (valid_support & (targets != FREE_LABEL)).any()
-                )
-            # One synchronization per horizon instead of two per core tile.
-            flags = torch.stack(
-                (torch.stack(uniform_flags), torch.stack(positive_flags)), dim=0
-            ).detach().cpu()
-            uniform = torch.nonzero(flags[0], as_tuple=False).flatten().tolist()
-            positive = torch.nonzero(flags[1], as_tuple=False).flatten().tolist()
+            uniform = torch.nonzero(
+                flags[0, b, h].reshape(-1), as_tuple=False
+            ).flatten().tolist()
+            positive = torch.nonzero(
+                flags[1, b, h].reshape(-1), as_tuple=False
+            ).flatten().tolist()
             if not uniform:
                 continue
             n_pos = positive_draws if positive else 0
@@ -245,6 +273,38 @@ def sample_training_tiles(
     return out
 
 
+def native_voxel_center_points(
+    *,
+    start_xyz: Sequence[int],
+    shape_xyz: Sequence[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    native_origin_xyz_m: Sequence[float],
+    native_voxel_size_xyz_m: Sequence[float],
+) -> torch.Tensor:
+    """Return cached native-frame voxel centers for one rectangular region."""
+    start = tuple(int(v) for v in start_xyz)
+    shape = tuple(int(v) for v in shape_xyz)
+    origin = tuple(float(v) for v in native_origin_xyz_m)
+    step = tuple(float(v) for v in native_voxel_size_xyz_m)
+    key = (str(device), str(dtype), origin, step, start, shape)
+    cached = _NATIVE_POINTS_CACHE.get(key)
+    if cached is not None:
+        _NATIVE_POINTS_CACHE.move_to_end(key)
+        return cached
+    axes = []
+    for d in range(3):
+        idx = torch.arange(
+            start[d], start[d] + shape[d], device=device, dtype=dtype
+        )
+        axes.append(origin[d] + (idx + 0.5) * step[d])
+    value = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+    _NATIVE_POINTS_CACHE[key] = value
+    while len(_NATIVE_POINTS_CACHE) > _NATIVE_POINTS_CACHE_SIZE:
+        _NATIVE_POINTS_CACHE.popitem(last=False)
+    return value
+
+
 def native_tile_points_to_t0(
     tile: CompletionTile,
     future_ego_to_t0: torch.Tensor,
@@ -255,20 +315,14 @@ def native_tile_points_to_t0(
     """Return future-native voxel centers transformed into the t0 frame."""
     if future_ego_to_t0.ndim != 4 or tuple(future_ego_to_t0.shape[-2:]) != (4, 4):
         raise ValueError("future_ego_to_t0 must be [B,6,4,4]")
-    device, dtype = future_ego_to_t0.device, future_ego_to_t0.dtype
-    axes = []
-    for d in range(3):
-        idx = torch.arange(
-            tile.halo_start_xyz[d],
-            tile.halo_start_xyz[d] + tile.halo_shape_xyz[d],
-            device=device,
-            dtype=dtype,
-        )
-        axes.append(
-            float(native_origin_xyz_m[d])
-            + (idx + 0.5) * float(native_voxel_size_xyz_m[d])
-        )
-    xyz = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+    xyz = native_voxel_center_points(
+        start_xyz=tile.halo_start_xyz,
+        shape_xyz=tile.halo_shape_xyz,
+        device=future_ego_to_t0.device,
+        dtype=future_ego_to_t0.dtype,
+        native_origin_xyz_m=native_origin_xyz_m,
+        native_voxel_size_xyz_m=native_voxel_size_xyz_m,
+    )
     T = future_ego_to_t0[tile.window_index, tile.horizon]
     return torch.einsum("...j,ij->...i", xyz, T[:3, :3]) + T[:3, 3]
 

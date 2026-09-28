@@ -250,6 +250,45 @@ def test_completion_query_chunking_is_numerically_identical():
     assert all(torch.allclose(a, b, atol=1e-6, rtol=1e-6) for a, b in zip(together, chunked))
 
 
+def test_completion_decoder_batches_equal_shapes_across_horizons():
+    torch.manual_seed(13)
+    model = _model().eval()
+    history = _history(model)
+    source = _sources()
+    fusion = model.fuse_source_scene(history, source, adapter_enabled=True)
+    current = torch.full((1, 6, 4, 4, 4), FREE_LABEL)
+    queries, _ = prepare_runtime_queries(
+        current,
+        history.future_ego_to_t0,
+        coarse_lattice=model.coarse_lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        core_shape_xyz=(4, 4, 4),
+        halo=0,
+    )
+    with torch.no_grad():
+        future, _ = model.build_future_features(
+            history, source, fusion, _condition(model, history, current)
+        )
+        with patch.object(
+            model,
+            "_decode_completion_batch",
+            wraps=model._decode_completion_batch,
+        ) as decoder:
+            together = model.decode_completion_from_features(
+                history, future, queries
+            )
+        separate = [
+            model.decode_completion_from_features(history, future, [query])[0]
+            for query in queries
+        ]
+    assert decoder.call_count == 1
+    assert all(
+        torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+        for a, b in zip(together, separate)
+    )
+
+
 def test_transport_loss_updates_adapter_after_zero_initialized_identity():
     torch.manual_seed(9)
     model = _model().train()
