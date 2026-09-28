@@ -64,7 +64,7 @@ PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v1"
 
 def _autocast(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
 
@@ -237,6 +237,11 @@ def main() -> None:
     )
     amp = device.type == "cuda" and not bool(args.no_amp)
     if device.type == "cuda":
+        if amp and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "V20 formal AMP requires CUDA BF16 support; use --no-amp "
+                "for an explicit FP32 run"
+            )
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -329,6 +334,7 @@ def main() -> None:
         "patch_resolution_m": float(args.patch_resolution_m),
         "alignment_workers": int(args.alignment_workers),
         "amp": bool(amp),
+        "amp_dtype": "bfloat16" if amp else "float32",
         "device": str(device),
         "smoke": bool(args.smoke),
         "screen1024": bool(args.screen1024),
@@ -368,7 +374,9 @@ def main() -> None:
         v18_lr=float(args.v18_lr),
         weight_decay=float(args.weight_decay),
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    # BF16 has FP32-like exponent range and does not need dynamic loss scaling.
+    # Keep a disabled scaler object solely for a uniform checkpoint schema.
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
     progress_state = TrainerProgress()
     window_cursor = 0
     if resume_checkpoint is not None:
@@ -499,8 +507,9 @@ def main() -> None:
             scaler.update(float(scaler.get_scale()) / 2.0 if scaler.is_enabled() else 1.0)
         optimizer.zero_grad(set_to_none=True)
         if not succeeded:
+            reason = "amp_overflow" if finite else "nonfinite_grad_norm"
             print(
-                f"update_attempt={progress_state.attempted_updates} overflow/nonfinite; "
+                f"update_attempt={progress_state.attempted_updates} {reason}; "
                 "successful counter unchanged",
                 flush=True,
             )
@@ -584,7 +593,8 @@ def main() -> None:
             {
                 "successful_updates": progress_state.successful_updates,
                 "attempted_updates": progress_state.attempted_updates,
-                "phase": progress_state.phase,
+                "phase": phase,
+                "next_phase": progress_state.phase,
                 "checkpoint": str(checkpoint_path.resolve()),
             }
         )
@@ -606,6 +616,7 @@ def main() -> None:
         "screen1024": bool(args.screen1024),
         "train_windows": len(train_records),
         "keep_checkpoints": int(args.keep_checkpoints),
+        "precision": "bfloat16" if amp else "float32",
         "real_data_run": True,
     }
     (out_dir / "summary.json").write_text(

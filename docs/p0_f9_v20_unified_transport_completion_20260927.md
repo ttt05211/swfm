@@ -21,6 +21,7 @@
 - optimizer 参数组只创建一次。warmup 的 V18 LR 为 0 且 `eval/requires_grad=False`；joint 设置 V18 LR 为 `2e-5`，新模块 LR 为 `2e-4`。
 - checkpoint 保存 model、optimizer、scheduler、scaler、attempted/successful update、phase、全局 RNG、tile RNG、全部 cache/index/shard/info manifest hash、规范化 grid、精确运行合同、已有 monitor 历史和 Git SHA。resume 会拒绝 warmup、seed、screen population/order、优化器超参、AMP 或输入资产漂移；JSON list 与 checkpoint tuple 在 grid 比较前统一规范化。
 - 训练态 completion trunk+head 默认使用 non-reentrant activation checkpointing；tile micro-batch 只改变执行分块，不改变 draw multiplicity、loss denominator 或梯度路径。
+- CUDA AMP 训练和 evaluator 统一使用 BF16；BF16 不启用动态 loss scaling。GPU 不支持 BF16 时正式入口拒绝静默降为 FP16，可显式传 `--no-amp` 运行 FP32。precision dtype 属于精确 resume 合同。
 
 ## 2. 入口
 
@@ -160,4 +161,4 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/eval_p0_f9_v20_unified.py \
 
 ## 6. 本地验证状态
 
-本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、CLI 入口 import 和全量单元/回归测试（`482 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。
+本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、CLI 入口 import 和全量单元/回归测试（`483 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。

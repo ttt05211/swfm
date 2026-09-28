@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -22,7 +23,10 @@ from real_motion.v20_unified_training import (
     set_optimizer_phase_lrs,
     verify_resume_inputs,
 )
-from tools.real_motion.train_p0_f9_v20_unified import _load_monitor_history
+from tools.real_motion.train_p0_f9_v20_unified import (
+    _autocast,
+    _load_monitor_history,
+)
 
 
 def _model():
@@ -57,6 +61,16 @@ def test_optimizer_groups_exist_once_and_phase_switch_does_not_rebuild():
     assert enabled and optimizer.param_groups[1]["lr"] == 2e-5
     assert all(p.requires_grad for p in model.v18.parameters())
     assert id(optimizer) == identity
+
+
+def test_training_autocast_uses_bfloat16():
+    sentinel = object()
+    with patch(
+        "tools.real_motion.train_p0_f9_v20_unified.torch.autocast",
+        return_value=sentinel,
+    ) as autocast:
+        assert _autocast(torch.device("cuda"), True) is sentinel
+    autocast.assert_called_once_with(device_type="cuda", dtype=torch.bfloat16)
 
 
 def test_checkpoint_resume_restores_counters_model_optimizer_and_rng(tmp_path):
@@ -110,7 +124,12 @@ def test_resume_contract_normalizes_json_lattice_and_rejects_drift(tmp_path):
     manifest = tmp_path / "index.json"
     torch.save({"base": True}, base)
     manifest.write_text('{"protocol":"test"}', encoding="utf-8")
-    contract = {"seed": 7, "warmup_updates": 128, "screen1024": True}
+    contract = {
+        "seed": 7,
+        "warmup_updates": 128,
+        "screen1024": True,
+        "amp_dtype": "bfloat16",
+    }
     payload = checkpoint_payload(
         model=model,
         optimizer=optimizer,
@@ -141,6 +160,14 @@ def test_resume_contract_normalizes_json_lattice_and_rejects_drift(tmp_path):
             base_checkpoint=base,
             manifest_paths={"train": manifest},
             resume_contract={**contract, "warmup_updates": 1},
+            coarse_lattice=json_lattice,
+        )
+    with pytest.raises(RuntimeError, match="run contract differs"):
+        verify_resume_inputs(
+            payload,
+            base_checkpoint=base,
+            manifest_paths={"train": manifest},
+            resume_contract={**contract, "amp_dtype": "float16"},
             coarse_lattice=json_lattice,
         )
     with pytest.raises(RuntimeError, match="coarse lattice mismatch"):
