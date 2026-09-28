@@ -29,12 +29,18 @@ from real_motion.runtime_config import (
     make_prepare_config,
 )
 from real_motion.strong_w2det import StrongW2DetConfig
-from real_motion.v20_unified_loss import compute_training_loss
+from real_motion.v20_unified_loss import (
+    COMPLETION_OBJECTIVE_PROTOCOL,
+    DEFAULT_COMPLETION_SEMANTIC_WEIGHT,
+    DEFAULT_PRESENCE_FOCAL_GAMMA,
+    compute_training_loss,
+)
 from real_motion.v20_unified_model import (
     V20UnifiedConfig,
     V20UnifiedTransportCompletion,
 )
 from real_motion.v20_unified_training import (
+    TRAIN_PROTOCOL,
     TrainerProgress,
     build_optimizer,
     checkpoint_payload,
@@ -64,7 +70,7 @@ from tools.real_motion.v20_unified_common import (
     training_completion_inputs_batch,
 )
 
-PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v1"
+PROTOCOL = TRAIN_PROTOCOL
 
 
 def _autocast(device: torch.device, enabled: bool):
@@ -119,6 +125,20 @@ def _materialize_scalar_stats(rows: list[dict]) -> list[dict]:
                 converted[name] = value
         out.append(converted)
     return out
+
+
+def _completion_head_gradient_norms(
+    model: V20UnifiedTransportCompletion,
+) -> torch.Tensor:
+    """Per-class L2 gradient norms, retained until the update synchronization."""
+    weight = model.completion_head.weight.grad
+    bias = model.completion_head.bias.grad
+    if weight is None:
+        return model.completion_head.weight.new_zeros(18, dtype=torch.float32)
+    squared = weight.detach().float().flatten(1).square().sum(dim=1)
+    if bias is not None:
+        squared = squared + bias.detach().float().square()
+    return squared.sqrt()
 
 
 def _lr_scale(successful_updates: int, max_updates: int) -> float:
@@ -226,6 +246,24 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1.0e-4)
     parser.add_argument("--clip-grad", type=float, default=5.0)
     parser.add_argument("--completion-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--presence-focal-gamma",
+        type=float,
+        default=DEFAULT_PRESENCE_FOCAL_GAMMA,
+        help=(
+            "Focal gamma for occupied-vs-free energy derived from the coupled "
+            "18-class logits."
+        ),
+    )
+    parser.add_argument(
+        "--completion-semantic-weight",
+        type=float,
+        default=DEFAULT_COMPLETION_SEMANTIC_WEIGHT,
+        help=(
+            "Weight of positive-only 17-class semantic CE inside the coupled "
+            "completion objective."
+        ),
+    )
     parser.add_argument("--patch-resolution-m", type=float, default=0.8)
     parser.add_argument("--alignment-workers", type=int, default=6)
     parser.add_argument(
@@ -313,6 +351,16 @@ def main() -> None:
         )
     if int(args.grad_accum) % int(args.batch_size) != 0:
         raise ValueError("--grad-accum must be divisible by --batch-size")
+    if not math.isfinite(float(args.presence_focal_gamma)) or float(
+        args.presence_focal_gamma
+    ) < 0.0:
+        raise ValueError("--presence-focal-gamma must be finite and non-negative")
+    if not math.isfinite(float(args.completion_semantic_weight)) or float(
+        args.completion_semantic_weight
+    ) < 0.0:
+        raise ValueError(
+            "--completion-semantic-weight must be finite and non-negative"
+        )
 
     _seed_everything(int(args.seed))
     device = torch.device(
@@ -414,6 +462,9 @@ def main() -> None:
         "weight_decay": float(args.weight_decay),
         "clip_grad": float(args.clip_grad),
         "completion_weight": float(args.completion_weight),
+        "completion_objective_protocol": COMPLETION_OBJECTIVE_PROTOCOL,
+        "presence_focal_gamma": float(args.presence_focal_gamma),
+        "completion_semantic_weight": float(args.completion_semantic_weight),
         "patch_resolution_m": float(args.patch_resolution_m),
         "alignment_workers": int(args.alignment_workers),
         "tile_decode_batch_size": int(args.tile_decode_batch_size),
@@ -481,6 +532,21 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = out_dir / "train_diagnostics.jsonl"
+    natural_distribution_logged = bool(args.resume) or diagnostics_path.exists()
+    print(
+        json.dumps(
+            {
+                "completion_objective": COMPLETION_OBJECTIVE_PROTOCOL,
+                "presence_focal_gamma": float(args.presence_focal_gamma),
+                "completion_semantic_weight": float(
+                    args.completion_semantic_weight
+                ),
+                "diagnostics": str(diagnostics_path.resolve()),
+            }
+        ),
+        flush=True,
+    )
     if resume_checkpoint is not None:
         future_checkpoints = [
             path
@@ -580,6 +646,7 @@ def main() -> None:
         )
         optimizer.zero_grad(set_to_none=True)
         group_stats: list[dict] = []
+        natural_distribution_pieces: list[dict[str, torch.Tensor]] = []
         prepare_cpu_seconds = 0.0
         input_wait_seconds = 0.0
         render_cpu_seconds = 0.0
@@ -676,7 +743,12 @@ def main() -> None:
                         current_transport,
                         native_grid=stage1_index["native_grid"],
                         generator=tile_generator,
+                        collect_distribution_stats=not natural_distribution_logged,
                     )
+                    if completion_report.get("distribution") is not None:
+                        natural_distribution_pieces.append(
+                            completion_report["distribution"]
+                        )
                     losses = []
                     window_indices = completion_report["window_indices"]
                     for window, (prepared, transport) in enumerate(
@@ -699,6 +771,12 @@ def main() -> None:
                             [masks[i] for i in selected],
                             patch_resolution_m=float(args.patch_resolution_m),
                             completion_weight=float(args.completion_weight),
+                            presence_focal_gamma=float(
+                                args.presence_focal_gamma
+                            ),
+                            completion_semantic_weight=float(
+                                args.completion_semantic_weight
+                            ),
                             graph_anchor=model.completion_head.weight,
                             materialize_stats=False,
                         )
@@ -737,6 +815,7 @@ def main() -> None:
             optimizer_events = (torch.cuda.Event(True), torch.cuda.Event(True))
             optimizer_events[0].record()
         scaler.unscale_(optimizer)
+        completion_head_gradients = _completion_head_gradient_norms(model)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), float(args.clip_grad)
         )
@@ -757,6 +836,49 @@ def main() -> None:
             peak_memory_mib = 0.0
         update_seconds = time.perf_counter() - update_started
         group_stats = _materialize_scalar_stats(group_stats)
+        completion_head_gradients_cpu = (
+            completion_head_gradients.detach().float().cpu()
+        )
+        completion_head_gradient_by_class = [
+            float(value) for value in completion_head_gradients_cpu.tolist()
+        ]
+        completion_head_nonfree_grad = float(
+            completion_head_gradients_cpu[:17].norm()
+        )
+        completion_head_free_grad = float(completion_head_gradients_cpu[17])
+        natural_distribution = None
+        if natural_distribution_pieces:
+            natural_counts = torch.stack(
+                [row["natural_class_counts"] for row in natural_distribution_pieces]
+            ).sum(dim=0).detach().cpu()
+            natural_windows = int(
+                torch.stack(
+                    [row["natural_windows"] for row in natural_distribution_pieces]
+                ).sum().detach().cpu()
+            )
+            natural_windows_without_positive = int(
+                torch.stack(
+                    [
+                        row["natural_windows_without_positive"]
+                        for row in natural_distribution_pieces
+                    ]
+                ).sum().detach().cpu()
+            )
+            natural_count_list = [int(value) for value in natural_counts.tolist()]
+            natural_total = int(sum(natural_count_list))
+            natural_occupied = int(sum(natural_count_list[:17]))
+            natural_distribution = {
+                "natural_support_voxels": natural_total,
+                "natural_occupied_voxels": natural_occupied,
+                "natural_occupied_fraction": float(
+                    natural_occupied / max(natural_total, 1)
+                ),
+                "natural_class_counts": natural_count_list,
+                "natural_windows": natural_windows,
+                "natural_windows_without_positive": (
+                    natural_windows_without_positive
+                ),
+            }
         cuda_ms = {
             name: sum(start.elapsed_time(end) for start, end in pairs)
             for name, pairs in cuda_stage_events.items()
@@ -787,15 +909,93 @@ def main() -> None:
         )
         mean_loss = float(np.mean([row["loss"] for row in group_stats]))
         mean_comp = float(np.mean([row["completion_loss"] for row in group_stats]))
+        mean_presence = float(
+            np.mean([row["completion_presence_focal"] for row in group_stats])
+        )
+        mean_semantic = float(
+            np.mean([row["completion_semantic_ce"] for row in group_stats])
+        )
+        mean_presence_free = float(
+            np.mean(
+                [row["completion_presence_free_focal"] for row in group_stats]
+            )
+        )
+        mean_presence_occupied = float(
+            np.mean(
+                [
+                    row["completion_presence_occupied_focal"]
+                    for row in group_stats
+                ]
+            )
+        )
         voxels = int(sum(row["completion_voxels"] for row in group_stats))
+        occupied_voxels = int(
+            sum(row["completion_occupied_voxels"] for row in group_stats)
+        )
+        occupied_fraction = float(occupied_voxels / max(voxels, 1))
+        class_counts = [
+            int(
+                sum(
+                    row[f"completion_class_{class_id:02d}_voxels"]
+                    for row in group_stats
+                )
+            )
+            for class_id in range(18)
+        ]
         tiles = int(sum(row["tiles"] for row in group_stats))
         unique_tiles = int(sum(row["unique_tiles"] for row in group_stats))
+        diagnostic = {
+            "successful_update": int(progress_state.successful_updates),
+            "attempted_update": int(progress_state.attempted_updates),
+            "phase": phase,
+            "completion_objective": COMPLETION_OBJECTIVE_PROTOCOL,
+            "completion_loss": mean_comp,
+            "presence_focal_loss": mean_presence,
+            "presence_free_focal_loss": mean_presence_free,
+            "presence_occupied_focal_loss": mean_presence_occupied,
+            "positive_semantic_ce": mean_semantic,
+            "sampled_voxels": voxels,
+            "sampled_occupied_voxels": occupied_voxels,
+            "sampled_occupied_fraction": occupied_fraction,
+            "sampled_windows_without_positive": int(
+                sum(
+                    int(row["completion_occupied_voxels"] == 0)
+                    for row in group_stats
+                )
+            ),
+            "sampled_class_counts": class_counts,
+            "completion_head_gradient_norm_by_class": (
+                completion_head_gradient_by_class
+            ),
+            "completion_head_nonfree_gradient_norm": (
+                completion_head_nonfree_grad
+            ),
+            "completion_head_free_gradient_norm": completion_head_free_grad,
+            "completion_head_nonfree_to_free_gradient_ratio": float(
+                completion_head_nonfree_grad
+                / max(completion_head_free_grad, 1.0e-12)
+            ),
+        }
+        if natural_distribution is not None:
+            diagnostic.update(natural_distribution)
+            natural_distribution_logged = True
+        with diagnostics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(diagnostic, allow_nan=False) + "\n")
+        natural_text = (
+            f"natural_occ={natural_distribution['natural_occupied_fraction']:.3%} "
+            if natural_distribution is not None
+            else ""
+        )
         print(
             f"update={progress_state.successful_updates}/{args.max_updates} "
             f"phase={phase} loss={mean_loss:.6f} completion={mean_comp:.6f} "
+            f"presence={mean_presence:.6f} semantic={mean_semantic:.6f} "
+            f"sampled_occ={occupied_fraction:.3%} {natural_text}"
             f"windows={len(group_stats)} voxels={voxels} "
             f"tiles={tiles} unique_tiles={unique_tiles} "
             f"grad_norm={float(grad_norm):.4f} "
+            f"head_grad_fg={completion_head_nonfree_grad:.4f} "
+            f"head_grad_free={completion_head_free_grad:.4f} "
             f"seconds={update_seconds:.3f} "
             f"peak_memory_mib={peak_memory_mib:.1f} "
             f"timing_ms={timing_text}",
@@ -825,6 +1025,7 @@ def main() -> None:
                 **vars(args),
                 "out_dir": str(out_dir.resolve()),
                 "warmup_updates": int(args.warmup_updates),
+                "completion_objective": COMPLETION_OBJECTIVE_PROTOCOL,
                 "native_grid": stage1_index["native_grid"],
             },
             repository_root=ROOT,
@@ -897,6 +1098,10 @@ def main() -> None:
         "runtime_query_chunk": int(args.runtime_query_chunk),
         "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
         "cpu_prefetch": not bool(args.no_cpu_prefetch),
+        "completion_objective": COMPLETION_OBJECTIVE_PROTOCOL,
+        "presence_focal_gamma": float(args.presence_focal_gamma),
+        "completion_semantic_weight": float(args.completion_semantic_weight),
+        "train_diagnostics": str(diagnostics_path.resolve()),
         "real_data_run": True,
     }
     (out_dir / "summary.json").write_text(

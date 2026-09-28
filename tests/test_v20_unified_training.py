@@ -166,12 +166,18 @@ def test_completion_window_batch_preserves_per_window_draw_accounting():
                 "voxel_size_xyz_m": (1.0, 1.0, 1.0),
             },
             generator=torch.Generator().manual_seed(7),
+            collect_distribution_stats=True,
         )
     assert len(logits) == len(targets) == len(masks) == 2 * 6 * 16
     assert report["tiles_by_window"] == [96, 96]
     assert report["unique_tiles_by_window"] == [6, 6]
     assert report["window_indices"].count(0) == 96
     assert report["window_indices"].count(1) == 96
+    distribution = report["distribution"]
+    assert int(distribution["natural_class_counts"].sum()) == 2 * 6 * 4 * 4 * 4
+    assert int(distribution["natural_class_counts"][FREE_LABEL]) == 2 * 6 * 4 * 4 * 4
+    assert int(distribution["natural_windows"]) == 2
+    assert int(distribution["natural_windows_without_positive"]) == 2
 
 
 def test_training_autocast_uses_bfloat16():
@@ -279,6 +285,18 @@ def test_checkpoint_roundtrip_preserves_completion_execution_config(tmp_path):
             resume_contract={**contract, "tile_decode_batch_size": 8},
             coarse_lattice=model.coarse_lattice,
         )
+
+    # V1 checkpoints remain readable for evaluation/diagnostics, while the
+    # expanded resume contract prevents continuing them under the V2 loss.
+    legacy_payload = dict(payload)
+    legacy_payload["protocol"] = (
+        "p0_f9_v20_unified_transport_completion_train_v1"
+    )
+    legacy_path = tmp_path / "legacy.pt"
+    save_checkpoint(legacy_path, legacy_payload)
+    legacy_model, legacy_checkpoint = load_model_checkpoint(legacy_path)
+    assert legacy_checkpoint["protocol"].endswith("train_v1")
+    assert legacy_model.config == loaded_model.config
 
 
 def test_resume_contract_normalizes_json_lattice_and_rejects_drift(tmp_path):

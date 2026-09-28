@@ -803,6 +803,7 @@ def training_completion_inputs_batch(
     generator: torch.Generator,
     draws_per_horizon: int = 16,
     positive_draws: int = 8,
+    collect_distribution_stats: bool = False,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], dict]:
     if not prepared_windows:
         raise ValueError("completion batch cannot be empty")
@@ -821,6 +822,24 @@ def training_completion_inputs_batch(
         native_voxel_size_xyz_m=native_grid["voxel_size_xyz_m"],
     )
     support = completion_support(current_transport, geometry_valid)
+    distribution_stats = None
+    if bool(collect_distribution_stats):
+        natural_mask = support.bool() & formal_valid.bool()
+        natural_labels = future_semantic.masked_select(natural_mask).long()
+        natural_class_counts = torch.bincount(
+            natural_labels, minlength=18
+        )
+        natural_positive = natural_mask & (future_semantic != FREE_LABEL)
+        windows_with_positive = natural_positive.flatten(1).any(dim=1)
+        distribution_stats = {
+            "natural_class_counts": natural_class_counts,
+            "natural_windows": torch.as_tensor(
+                len(prepared_windows), device=support.device, dtype=torch.int64
+            ),
+            "natural_windows_without_positive": (~windows_with_positive).sum(
+                dtype=torch.int64
+            ),
+        }
     tiles = sample_training_tiles(
         support,
         future_semantic,
@@ -889,6 +908,7 @@ def training_completion_inputs_batch(
         "unique_tiles_by_window": unique_tiles_by_window,
         "runtime": runtime_report,
         "scatter": scatter_report,
+        "distribution": distribution_stats,
     }
 
 

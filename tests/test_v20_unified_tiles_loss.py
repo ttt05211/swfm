@@ -5,7 +5,9 @@ import torch
 from real_motion.v20_history_world import FREE_LABEL, CanonicalLattice
 from real_motion.v20_unified_data import sample_training_tiles
 from real_motion.v20_unified_loss import (
+    completion_coupled_focal_semantic,
     completion_cross_entropy,
+    completion_tiles_coupled_focal_semantic,
     completion_tiles_cross_entropy,
 )
 from real_motion.v20_unified_runtime import (
@@ -126,6 +128,121 @@ def test_deferred_completion_statistics_preserve_loss_and_count():
     )
     assert torch.equal(deferred.mean, regular.mean)
     assert int(deferred.count) == regular.count
+
+
+def test_coupled_completion_decomposes_ce_at_gamma_zero_and_original_mass():
+    torch.manual_seed(13)
+    logits = torch.randn(4, 18, requires_grad=True)
+    target = torch.tensor([FREE_LABEL, 2, FREE_LABEL, 5])
+    mask = torch.ones(4, dtype=torch.bool)
+    # With gamma=0 and semantic weight equal to the occupied mass, the
+    # factorization is exactly the original 18-way cross entropy.
+    got = completion_coupled_focal_semantic(
+        logits,
+        target,
+        mask,
+        presence_focal_gamma=0.0,
+        semantic_weight=0.5,
+    )
+    expected = torch.nn.functional.cross_entropy(logits, target)
+    assert torch.allclose(got.mean, expected, atol=1.0e-6, rtol=1.0e-6)
+    assert got.count == 4
+    assert got.free_count == 2
+    assert got.occupied_count == 2
+    assert got.class_counts[FREE_LABEL] == 2
+    assert got.class_counts[2] == 1
+    assert got.class_counts[5] == 1
+    got.mean.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert float(logits.grad[:, FREE_LABEL].abs().sum()) > 0.0
+    assert float(logits.grad[:, :FREE_LABEL].abs().sum()) > 0.0
+
+
+def test_coupled_completion_separately_normalizes_positive_semantics():
+    logits = torch.zeros(3, 18, requires_grad=True)
+    target = torch.tensor([FREE_LABEL, FREE_LABEL, 4])
+    mask = torch.ones(3, dtype=torch.bool)
+    got = completion_coupled_focal_semantic(
+        logits,
+        target,
+        mask,
+        presence_focal_gamma=2.0,
+        semantic_weight=1.0,
+    )
+    presence_logit = torch.log(torch.tensor(17.0))
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        presence_logit.expand(3),
+        torch.tensor([0.0, 0.0, 1.0]),
+        reduction="none",
+    )
+    expected_presence = ((1.0 - torch.exp(-bce)).square() * bce).mean()
+    expected_semantic = torch.log(torch.tensor(17.0))
+    assert torch.allclose(got.presence_mean, expected_presence)
+    assert torch.allclose(got.semantic_mean, expected_semantic)
+    assert torch.allclose(got.mean, expected_presence + expected_semantic)
+
+
+def test_coupled_tile_loss_preserves_draw_multiplicity_and_class_counts():
+    torch.manual_seed(14)
+    occupied_logits = torch.randn(1, 2, 1, 18, requires_grad=True)
+    free_logits = torch.randn(1, 2, 1, 18, requires_grad=True)
+    occupied_target = torch.tensor([[[3], [7]]])
+    free_target = torch.full((1, 2, 1), FREE_LABEL)
+    mask = torch.ones_like(occupied_target, dtype=torch.bool)
+    aggregate = completion_tiles_coupled_focal_semantic(
+        [occupied_logits, occupied_logits, free_logits],
+        [occupied_target, occupied_target, free_target],
+        [mask, mask, mask],
+    )
+    direct = completion_coupled_focal_semantic(
+        torch.cat([occupied_logits, occupied_logits, free_logits], dim=0),
+        torch.cat([occupied_target, occupied_target, free_target], dim=0),
+        torch.cat([mask, mask, mask], dim=0),
+    )
+    assert torch.allclose(aggregate.mean, direct.mean)
+    assert torch.allclose(aggregate.presence_mean, direct.presence_mean)
+    assert torch.allclose(aggregate.semantic_mean, direct.semantic_mean)
+    assert aggregate.count == direct.count == 6
+    assert aggregate.occupied_count == direct.occupied_count == 4
+    assert aggregate.free_count == direct.free_count == 2
+    assert aggregate.class_counts == direct.class_counts
+
+
+def test_coupled_completion_empty_mask_is_graph_connected_zero():
+    logits = torch.randn(2, 18, requires_grad=True)
+    result = completion_coupled_focal_semantic(
+        logits,
+        torch.zeros(2, dtype=torch.long),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    assert result.count == 0
+    assert result.occupied_count == 0
+    assert float(result.mean) == 0.0
+    result.mean.backward()
+    assert logits.grad is not None
+    assert torch.equal(logits.grad, torch.zeros_like(logits))
+
+
+def test_coupled_completion_deferred_statistics_match_materialized():
+    torch.manual_seed(15)
+    logits = torch.randn(2, 3, 1, 18)
+    target = torch.tensor([[[FREE_LABEL], [2], [4]], [[7], [FREE_LABEL], [9]]])
+    mask = torch.tensor(
+        [[[True], [True], [False]], [[True], [True], [True]]]
+    )
+    regular = completion_tiles_coupled_focal_semantic(
+        [logits], [target], [mask]
+    )
+    deferred = completion_tiles_coupled_focal_semantic(
+        [logits], [target], [mask], materialize_stats=False
+    )
+    assert torch.equal(deferred.mean, regular.mean)
+    assert torch.equal(deferred.presence_mean, regular.presence_mean)
+    assert torch.equal(deferred.semantic_mean, regular.semantic_mean)
+    assert int(deferred.count) == regular.count
+    assert int(deferred.free_count) == regular.free_count
+    assert int(deferred.occupied_count) == regular.occupied_count
+    assert tuple(int(value) for value in deferred.class_counts) == regular.class_counts
 
 
 def test_transport_condition_is_spatial_proportions_plus_coverage():

@@ -22,7 +22,10 @@ from .v20_unified_model import (
     V20UnifiedTransportCompletion,
 )
 
-TRAIN_PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v1"
+TRAIN_PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v2"
+LEGACY_TRAIN_PROTOCOLS = {
+    "p0_f9_v20_unified_transport_completion_train_v1",
+}
 
 
 @dataclass
@@ -280,7 +283,7 @@ def load_model_checkpoint(
     map_location: str | torch.device = "cpu",
 ) -> tuple[V20UnifiedTransportCompletion, dict]:
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
-    if checkpoint.get("protocol") != TRAIN_PROTOCOL:
+    if checkpoint.get("protocol") not in {TRAIN_PROTOCOL, *LEGACY_TRAIN_PROTOCOLS}:
         raise RuntimeError(f"unexpected unified checkpoint: {checkpoint.get('protocol')}")
     v18_cfg = config_from_mapping_v17(checkpoint["v18_model_config"])
     unified_cfg = V20UnifiedConfig(**checkpoint["unified_model_config"])
