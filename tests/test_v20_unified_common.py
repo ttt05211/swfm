@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -20,6 +23,32 @@ from tools.real_motion.compact_p0_f9_v20_stage1_for_unified import (
 
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_v20_entrypoint_forces_repository_tools_ahead_of_shadow_package(tmp_path):
+    shadow = tmp_path / "tools"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("# conflicting tools package\n")
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    pythonpath = [str(tmp_path), str(root)]
+    if env.get("PYTHONPATH"):
+        pythonpath.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "tools/real_motion/v20_validate_run_inputs.py"),
+            "--help",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--dev-v18-cache" in result.stdout
 
 
 def test_stage1_store_rejects_index_shard_row_identity_mismatch(tmp_path):

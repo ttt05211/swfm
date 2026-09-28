@@ -160,4 +160,4 @@ CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/eval_p0_f9_v20_unified.py \
 
 ## 6. 本地验证状态
 
-本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、CLI 入口 import 和全量单元/回归测试（`481 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。
+本提交在 Windows Anaconda base（PyTorch `2.3.1+cu118`）完成了语法、CLI 入口 import 和全量单元/回归测试（`482 passed, 1 skipped`）。真实 nuScenes cache、Clean-E14 checkpoint 与数据根目录不在当前工作区，因此未伪造 smoke、screen 或正式实验结果。
