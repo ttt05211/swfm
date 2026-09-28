@@ -429,6 +429,7 @@ def main() -> None:
     started = time.perf_counter()
 
     while progress_state.successful_updates < int(args.max_updates):
+        update_started = time.perf_counter()
         phase = training_phase(
             progress_state.successful_updates, int(args.warmup_updates)
         )
@@ -492,6 +493,7 @@ def main() -> None:
                     scaled_loss = loss / float(args.grad_accum)
                 scaler.scale(scaled_loss).backward()
                 stats["tiles"] = int(completion_report["tiles"])
+                stats["unique_tiles"] = int(completion_report["unique_tiles"])
                 group_stats.append(stats)
             finally:
                 prepared.release()
@@ -510,6 +512,7 @@ def main() -> None:
             reason = "amp_overflow" if finite else "nonfinite_grad_norm"
             print(
                 f"update_attempt={progress_state.attempted_updates} {reason}; "
+                f"seconds={time.perf_counter() - update_started:.3f}; "
                 "successful counter unchanged",
                 flush=True,
             )
@@ -521,10 +524,14 @@ def main() -> None:
         mean_loss = float(np.mean([row["loss"] for row in group_stats]))
         mean_comp = float(np.mean([row["completion_loss"] for row in group_stats]))
         voxels = int(sum(row["completion_voxels"] for row in group_stats))
+        tiles = int(sum(row["tiles"] for row in group_stats))
+        unique_tiles = int(sum(row["unique_tiles"] for row in group_stats))
         print(
             f"update={progress_state.successful_updates}/{args.max_updates} "
             f"phase={phase} loss={mean_loss:.6f} completion={mean_comp:.6f} "
-            f"voxels={voxels} grad_norm={float(grad_norm):.4f}",
+            f"voxels={voxels} tiles={tiles} unique_tiles={unique_tiles} "
+            f"grad_norm={float(grad_norm):.4f} "
+            f"seconds={time.perf_counter() - update_started:.3f}",
             flush=True,
         )
 

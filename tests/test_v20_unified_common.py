@@ -14,8 +14,10 @@ from tools.real_motion.v20_unified_common import (
     STAGE1_PROTOCOL,
     Stage1RowStore,
     align_v18_records_to_stage1,
+    deduplicate_completion_queries,
     stage1_manifest_paths,
 )
+from real_motion.v20_unified_data import CompletionTileQuery, make_completion_tile
 from tools.real_motion.compact_p0_f9_v20_stage1_for_unified import (
     main as compact_stage1_main,
 )
@@ -23,6 +25,32 @@ from tools.real_motion.compact_p0_f9_v20_stage1_for_unified import (
 
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_repeated_completion_query_is_decoded_once_but_keeps_inverse_draws():
+    tile = make_completion_tile(
+        window_index=0,
+        horizon=2,
+        core_start_xyz=(0, 0, 0),
+        core_shape_xyz=(2, 2, 1),
+        native_shape_xyz=(2, 2, 1),
+        halo=2,
+    )
+    points = torch.zeros(*tile.halo_shape_xyz, 3)
+    valid = torch.ones(tile.halo_shape_xyz, dtype=torch.bool)
+    support = torch.ones_like(valid)
+    query = CompletionTileQuery(tile, points, valid, support)
+    unique, inverse = deduplicate_completion_queries([query, query, query])
+    assert len(unique) == 1 and unique[0] is query
+    assert inverse == [0, 0, 0]
+
+    # Equal values with distinct tensor identities are deliberately not merged.
+    distinct = CompletionTileQuery(
+        tile, points.clone(), valid.clone(), support.clone()
+    )
+    unique, inverse = deduplicate_completion_queries([query, distinct])
+    assert len(unique) == 2
+    assert inverse == [0, 1]
 
 
 def test_v20_entrypoint_forces_repository_tools_ahead_of_shadow_package(tmp_path):

@@ -34,6 +34,7 @@ from real_motion.v20_history_world import CanonicalLattice, FREE_LABEL
 from real_motion.v20_stage1_codec import unpack_bool, unpack_history_semantic
 from real_motion.v20_unified_data import (
     CompletionTile,
+    CompletionTileQuery,
     UnifiedHistoryInput,
     sample_training_tiles,
 )
@@ -627,6 +628,36 @@ def geometry_and_support(
     )
 
 
+def deduplicate_completion_queries(
+    queries: Sequence[CompletionTileQuery],
+) -> tuple[list[CompletionTileQuery], list[int]]:
+    """Reuse exact repeated draws while preserving their loss multiplicity."""
+    unique: list[CompletionTileQuery] = []
+    inverse: list[int] = []
+    lookup: dict[tuple, int] = {}
+    for query in queries:
+        tile = query.tile
+        key = (
+            int(tile.window_index),
+            int(tile.horizon),
+            tuple(tile.core_start_xyz),
+            tuple(tile.core_shape_xyz),
+            tuple(tile.halo_start_xyz),
+            tuple(tile.halo_shape_xyz),
+            tuple((sl.start, sl.stop, sl.step) for sl in tile.core_slice_xyz),
+            id(query.points_xyz_t0_m),
+            id(query.geometry_valid),
+            id(query.support),
+        )
+        unique_index = lookup.get(key)
+        if unique_index is None:
+            unique_index = len(unique)
+            lookup[key] = unique_index
+            unique.append(query)
+        inverse.append(unique_index)
+    return unique, inverse
+
+
 def training_completion_inputs(
     model,
     prepared: PreparedUnifiedWindow,
@@ -658,13 +689,15 @@ def training_completion_inputs(
         dense_geometry_valid=geometry_valid,
         dense_completion_support=support,
     )
-    logits, scatter_report = model.decode_completion(
+    unique_queries, inverse = deduplicate_completion_queries(queries)
+    unique_logits, scatter_report = model.decode_completion(
         first_stage["history"],
         first_stage["sources"],
         first_stage["fusion"],
         condition,
-        queries,
+        unique_queries,
     )
+    logits = [unique_logits[index] for index in inverse]
     core_logits: list[torch.Tensor] = []
     targets: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
@@ -680,6 +713,8 @@ def training_completion_inputs(
         )
     return core_logits, targets, masks, {
         "tiles": len(tiles),
+        "unique_tiles": len(unique_queries),
+        "duplicate_tiles_saved": len(tiles) - len(unique_queries),
         "runtime": runtime_report,
         "scatter": scatter_report,
     }
