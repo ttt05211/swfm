@@ -30,6 +30,7 @@ from tools.real_motion.v20_unified_common import (
     align_v18_records_to_stage1,
     first_stage_forward,
     full_completion_prediction,
+    full_completion_predictions_at_free_logit_offsets,
     hard_render_transport,
     load_stage1_rows,
     load_v18_cache,
@@ -162,6 +163,95 @@ def _delta(left, right):
     }
 
 
+def _new_addition_raw():
+    return {
+        "support_valid_voxels": np.zeros(6, dtype=np.int64),
+        "target_positive_voxels": np.zeros(6, dtype=np.int64),
+        "predicted_add_voxels": np.zeros(6, dtype=np.int64),
+        "added_occ_tp": np.zeros(6, dtype=np.int64),
+        "added_occ_fp": np.zeros(6, dtype=np.int64),
+        "added_semantic_correct": np.zeros(6, dtype=np.int64),
+        "added_semantic_wrong_occupied": np.zeros(6, dtype=np.int64),
+        "missed_positive_voxels": np.zeros(6, dtype=np.int64),
+        "full_confusion_matrix": np.zeros((18, 18), dtype=np.int64),
+    }
+
+
+def _update_addition_raw(addition, horizon, *, current, final, target, support, free):
+    target_positive = support & (target != free)
+    written = support & (current == free) & (final != free)
+    addition["support_valid_voxels"][horizon] += int(support.sum())
+    addition["target_positive_voxels"][horizon] += int(target_positive.sum())
+    addition["predicted_add_voxels"][horizon] += int(written.sum())
+    addition["added_occ_tp"][horizon] += int((written & (target != free)).sum())
+    addition["added_occ_fp"][horizon] += int((written & (target == free)).sum())
+    addition["added_semantic_correct"][horizon] += int(
+        (written & (final == target)).sum()
+    )
+    addition["added_semantic_wrong_occupied"][horizon] += int(
+        (written & (target != free) & (final != target)).sum()
+    )
+    addition["missed_positive_voxels"][horizon] += int(
+        (target_positive & (final == free)).sum()
+    )
+    pair = target.reshape(-1).astype(np.int64) * 18 + final.reshape(-1).astype(
+        np.int64
+    )
+    addition["full_confusion_matrix"] += np.bincount(
+        pair, minlength=18 * 18
+    ).reshape(18, 18)
+
+
+def _addition_json(addition):
+    result = {
+        key: value.tolist() if isinstance(value, np.ndarray) else value
+        for key, value in addition.items()
+    }
+    result["totals"] = {
+        key: int(value.sum())
+        for key, value in addition.items()
+        if isinstance(value, np.ndarray) and value.ndim == 1
+    }
+    return result
+
+
+def _margin_variant_name(offset: float) -> str:
+    return f"diagnostic_free_logit_offset_{format(float(offset), '.12g')}"
+
+
+def _scene_delta_summary(raw_by_scene, *, left_name: str, right_name: str):
+    values = np.asarray(
+        [
+            _finalize(raw[left_name])["mIoU"]
+            - _finalize(raw[right_name])["mIoU"]
+            for raw in raw_by_scene.values()
+        ],
+        dtype=np.float64,
+    )
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return {
+            "scenes": 0,
+            "positive": 0,
+            "zero": 0,
+            "negative": 0,
+            "mean": None,
+            "median": None,
+            "minimum": None,
+            "maximum": None,
+        }
+    return {
+        "scenes": int(values.size),
+        "positive": int((values > 0.0).sum()),
+        "zero": int((values == 0.0).sum()),
+        "negative": int((values < 0.0).sum()),
+        "mean": float(values.mean()),
+        "median": float(np.median(values)),
+        "minimum": float(values.min()),
+        "maximum": float(values.max()),
+    }
+
+
 def _autocast(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -206,13 +296,30 @@ def evaluate_model(
     ablate_source_latents: bool = False,
     include_per_scene: bool = False,
     frozen_reference_raw: dict | None = None,
+    diagnostic_free_logit_offsets: tuple[float, ...] = (),
 ) -> dict:
     model.eval()
     if frozen_v18 is not None:
         frozen_v18.eval()
     strong_cfg = StrongW2DetConfig(free_label=int(pcfg.free_label))
     component_cache = ComponentLRU(maxsize=1024)
-    raw_by_variant = {name: _new_raw() for name in VARIANTS}
+    diagnostic_offsets = tuple(
+        dict.fromkeys(float(value) for value in diagnostic_free_logit_offsets)
+    )
+    if any(
+        not np.isfinite(value) or value <= 0.0 for value in diagnostic_offsets
+    ):
+        raise ValueError(
+            "diagnostic_free_logit_offsets must be finite and strictly positive"
+        )
+    diagnostic_names = {
+        offset: _margin_variant_name(offset) for offset in diagnostic_offsets
+    }
+    all_variants = VARIANTS + tuple(diagnostic_names.values())
+    completion_variants = ("transport_plus_completion",) + tuple(
+        diagnostic_names.values()
+    )
+    raw_by_variant = {name: _new_raw() for name in all_variants}
     if frozen_reference_raw is not None:
         cached = raw_by_variant["frozen_v18_reference"]
         for key in cached:
@@ -227,16 +334,8 @@ def evaluate_model(
         "IGNORE_instances": 0,
     }
     dynamic_diagnostic_windows = 0
-    addition = {
-        "support_valid_voxels": np.zeros(6, dtype=np.int64),
-        "target_positive_voxels": np.zeros(6, dtype=np.int64),
-        "predicted_add_voxels": np.zeros(6, dtype=np.int64),
-        "added_occ_tp": np.zeros(6, dtype=np.int64),
-        "added_occ_fp": np.zeros(6, dtype=np.int64),
-        "added_semantic_correct": np.zeros(6, dtype=np.int64),
-        "added_semantic_wrong_occupied": np.zeros(6, dtype=np.int64),
-        "missed_positive_voxels": np.zeros(6, dtype=np.int64),
-        "full_confusion_matrix": np.zeros((18, 18), dtype=np.int64),
+    addition_by_variant = {
+        name: _new_addition_raw() for name in completion_variants
     }
     started = time.perf_counter()
     for wi, record in enumerate(records, start=1):
@@ -288,16 +387,41 @@ def evaluate_model(
                 device=device,
             )
             with torch.inference_mode(), _autocast(device, amp):
-                final_t, reports = full_completion_prediction(
-                    model,
-                    prepared,
-                    first,
-                    current_t,
-                    native_grid=native_grid,
-                    ablate_source_latents=bool(ablate_source_latents),
-                )
+                if diagnostic_offsets:
+                    final_by_offset_t, reports = (
+                        full_completion_predictions_at_free_logit_offsets(
+                            model,
+                            prepared,
+                            first,
+                            current_t,
+                            native_grid=native_grid,
+                            free_logit_offsets=(0.0, *diagnostic_offsets),
+                            ablate_source_latents=bool(ablate_source_latents),
+                        )
+                    )
+                    final_t = final_by_offset_t[0.0]
+                else:
+                    final_t, reports = full_completion_prediction(
+                        model,
+                        prepared,
+                        first,
+                        current_t,
+                        native_grid=native_grid,
+                        ablate_source_latents=bool(ablate_source_latents),
+                    )
             current = current_t[0].cpu().numpy().astype(np.uint8)
             final = final_t[0].cpu().numpy().astype(np.uint8)
+            diagnostic_finals = (
+                {
+                    diagnostic_names[offset]: final_by_offset_t[offset][0]
+                    .cpu()
+                    .numpy()
+                    .astype(np.uint8)
+                    for offset in diagnostic_offsets
+                }
+                if diagnostic_offsets
+                else {}
+            )
             total_runtime_oob += int(reports["runtime"].out_of_bounds_voxels)
             total_completion_support += int(reports["runtime"].eligible_voxels)
             total_scatter_oob += int(reports["scatter"].out_of_bounds_points)
@@ -309,7 +433,7 @@ def evaluate_model(
             scene_name = str(record["scene_name"])
             if include_per_scene and scene_name not in raw_by_scene:
                 raw_by_scene[scene_name] = {
-                    name: _new_raw() for name in VARIANTS
+                    name: _new_raw() for name in all_variants
                 }
             dynamic_ids = np.asarray(DYNAMIC_CLASS_IDS, dtype=gt_all.dtype)
             diagnostic_groups["STATIC_target_voxels"] += int(
@@ -326,6 +450,10 @@ def evaluate_model(
                 pred_by_name = {
                     "current_transport_only": current[hi],
                     "transport_plus_completion": final[hi],
+                    **{
+                        name: prediction[hi]
+                        for name, prediction in diagnostic_finals.items()
+                    },
                 }
                 if reference is not None:
                     pred_by_name["frozen_v18_reference"] = reference[hi]
@@ -348,55 +476,33 @@ def evaluate_model(
                     )
 
                 free = int(pcfg.free_label)
-                support = support_all[hi]
-                target_positive = support & (gt_all[hi] != free)
-                written = support & (current[hi] == free) & (final[hi] != free)
-                addition["support_valid_voxels"][hi] += int(support.sum())
-                addition["target_positive_voxels"][hi] += int(
-                    target_positive.sum()
-                )
-                addition["predicted_add_voxels"][hi] += int(written.sum())
-                addition["added_occ_tp"][hi] += int(
-                    (written & (gt_all[hi] != free)).sum()
-                )
-                addition["added_occ_fp"][hi] += int(
-                    (written & (gt_all[hi] == free)).sum()
-                )
-                addition["added_semantic_correct"][hi] += int(
-                    (written & (final[hi] == gt_all[hi])).sum()
-                )
-                addition["added_semantic_wrong_occupied"][hi] += int(
-                    (
-                        written
-                        & (gt_all[hi] != free)
-                        & (final[hi] != gt_all[hi])
-                    ).sum()
-                )
-                addition["missed_positive_voxels"][hi] += int(
-                    (target_positive & (final[hi] == free)).sum()
-                )
-                pair = (
-                    gt_all[hi].reshape(-1).astype(np.int64) * 18
-                    + final[hi].reshape(-1).astype(np.int64)
-                )
-                addition["full_confusion_matrix"] += np.bincount(
-                    pair, minlength=18 * 18
-                ).reshape(18, 18)
+                completion_predictions = {
+                    "transport_plus_completion": final[hi],
+                    **{
+                        name: prediction[hi]
+                        for name, prediction in diagnostic_finals.items()
+                    },
+                }
+                for name, prediction in completion_predictions.items():
+                    _update_addition_raw(
+                        addition_by_variant[name],
+                        hi,
+                        current=current[hi],
+                        final=prediction,
+                        target=gt_all[hi],
+                        support=support_all[hi],
+                        free=free,
+                    )
         finally:
             prepared.release()
         if progress and (wi == 1 or wi % 25 == 0 or wi == len(records)):
             print(f"v20_unified_eval {wi}/{len(records)}", flush=True)
 
-    metrics = {name: _finalize(raw_by_variant[name]) for name in VARIANTS}
-    addition_json = {
-        key: value.tolist() if isinstance(value, np.ndarray) else value
-        for key, value in addition.items()
-    }
-    addition_json["totals"] = {
-        key: int(value.sum())
-        for key, value in addition.items()
-        if isinstance(value, np.ndarray) and value.ndim == 1
-    }
+    all_metrics = {name: _finalize(raw_by_variant[name]) for name in all_variants}
+    metrics = {name: all_metrics[name] for name in VARIANTS}
+    addition_json = _addition_json(
+        addition_by_variant["transport_plus_completion"]
+    )
     per_scene = (
         {
             scene: {
@@ -413,7 +519,42 @@ def evaluate_model(
             for key, value in raw.items()
         }
         for name, raw in raw_by_variant.items()
+        if name in VARIANTS
     }
+    margin_diagnostic = None
+    if diagnostic_offsets:
+        margin_diagnostic = {
+            "diagnostic_only": True,
+            "selection_eligible": False,
+            "shared_completion_forward": True,
+            "offset_semantics": (
+                "positive value subtracted from free-class logit before argmax"
+            ),
+            "formal_protocol_offset": 0.0,
+            "candidates": [
+                {
+                    "free_logit_offset": offset,
+                    "metrics": all_metrics[diagnostic_names[offset]],
+                    "delta_vs_current_transport": _delta(
+                        all_metrics[diagnostic_names[offset]],
+                        metrics["current_transport_only"],
+                    ),
+                    "addition_quality": _addition_json(
+                        addition_by_variant[diagnostic_names[offset]]
+                    ),
+                    "scene_miou_delta_vs_current": (
+                        _scene_delta_summary(
+                            raw_by_scene,
+                            left_name=diagnostic_names[offset],
+                            right_name="current_transport_only",
+                        )
+                        if include_per_scene
+                        else None
+                    ),
+                }
+                for offset in diagnostic_offsets
+            ],
+        }
     dynamic_diagnostics_available = dynamic_diagnostic_windows == len(records)
     if not dynamic_diagnostics_available:
         for key in (
@@ -423,7 +564,7 @@ def evaluate_model(
             "IGNORE_instances",
         ):
             diagnostic_groups[key] = None
-    return {
+    result = {
         "protocol": PROTOCOL,
         "windows": len(records),
         "variants": metrics,
@@ -454,6 +595,9 @@ def evaluate_model(
         "completion_source_latents_ablated": bool(ablate_source_latents),
         "frozen_reference_reused": frozen_reference_raw is not None,
     }
+    if margin_diagnostic is not None:
+        result["completion_free_logit_margin_diagnostic"] = margin_diagnostic
+    return result
 
 
 def main() -> None:
@@ -474,6 +618,16 @@ def main() -> None:
         "--ablate-completion-source-latents",
         action="store_true",
         help="Ablate only completion scatter latents; keep current transport unchanged.",
+    )
+    parser.add_argument(
+        "--diagnostic-free-logit-offsets",
+        nargs="*",
+        type=float,
+        default=(),
+        help=(
+            "Diagnostic only: subtract each positive offset from the free-class "
+            "logit and evaluate all candidates from one shared completion forward."
+        ),
     )
     args = parser.parse_args()
 
@@ -516,6 +670,7 @@ def main() -> None:
         alignment_workers=int(args.alignment_workers),
         ablate_source_latents=bool(args.ablate_completion_source_latents),
         include_per_scene=True,
+        diagnostic_free_logit_offsets=tuple(args.diagnostic_free_logit_offsets),
     )
     result.update(
         {

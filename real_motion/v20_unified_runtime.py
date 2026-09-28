@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+import math
+from typing import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -183,29 +184,76 @@ def compose_completion_tiles(
     current_transport: torch.Tensor,
     tile_logits: Sequence[torch.Tensor],
     tile_queries: Sequence[CompletionTileQuery],
+    *,
+    free_logit_offset: float = 0.0,
 ) -> torch.Tensor:
-    """Compose tile predictions directly without dense 18-way logits."""
+    """Compose tile predictions directly without dense 18-way logits.
+
+    ``free_logit_offset`` is a diagnostic-only calibration control.  A positive
+    value is subtracted from the free-class logit before argmax.  The default
+    zero path deliberately keeps the original argmax implementation exact.
+    """
+    free_logit_offset = float(free_logit_offset)
+    return compose_completion_tiles_at_free_logit_offsets(
+        {free_logit_offset: current_transport}, tile_logits, tile_queries
+    )[free_logit_offset]
+
+
+def compose_completion_tiles_at_free_logit_offsets(
+    current_transport_by_offset: Mapping[float, torch.Tensor],
+    tile_logits: Sequence[torch.Tensor],
+    tile_queries: Sequence[CompletionTileQuery],
+) -> dict[float, torch.Tensor]:
+    """Compose several diagnostic margins while sharing per-tile reductions."""
     if len(tile_logits) != len(tile_queries):
         raise ValueError("tile logit/query count mismatch")
-    out = current_transport.clone()
+    if not current_transport_by_offset:
+        raise ValueError("current_transport_by_offset cannot be empty")
+    offsets = tuple(float(value) for value in current_transport_by_offset)
+    if len(set(offsets)) != len(offsets):
+        raise ValueError("free-logit offsets must be unique after float conversion")
+    if any(not math.isfinite(value) or value < 0.0 for value in offsets):
+        raise ValueError("free_logit_offset must be finite and non-negative")
+    out_by_offset = {
+        float(offset): current.clone()
+        for offset, current in current_transport_by_offset.items()
+    }
+    nonzero_offsets = tuple(offset for offset in offsets if offset != 0.0)
     for logits, query in zip(tile_logits, tile_queries):
         tile = query.tile
         if tuple(logits.shape) != (*tile.halo_shape_xyz, SEMANTIC_CLASSES):
             raise ValueError("tile logits must cover the full halo tile")
-        proposal = logits[(*tile.core_slice_xyz, slice(None))].argmax(dim=-1)
+        core_logits = logits[(*tile.core_slice_xyz, slice(None))]
+        proposal_by_offset = {}
+        if 0.0 in out_by_offset:
+            proposal_by_offset[0.0] = core_logits.argmax(dim=-1)
+        if nonzero_offsets:
+            best_nonfree_logit, best_nonfree_class = core_logits[
+                ..., :FREE_LABEL
+            ].max(dim=-1)
+            free_logit = core_logits[..., FREE_LABEL]
+            free_class = torch.full_like(best_nonfree_class, FREE_LABEL)
+            for offset in nonzero_offsets:
+                proposal_by_offset[offset] = torch.where(
+                    best_nonfree_logit >= free_logit - offset,
+                    best_nonfree_class,
+                    free_class,
+                )
         support = query.support[tile.core_slice_xyz]
         start, size = tile.core_start_xyz, tile.core_shape_xyz
         sl = tuple(slice(start[d], start[d] + size[d]) for d in range(3))
-        current_core = out[(tile.window_index, tile.horizon, *sl)]
-        write = (
-            support.bool()
-            & (current_core.long() == FREE_LABEL)
-            & (proposal != FREE_LABEL)
-        )
-        out[(tile.window_index, tile.horizon, *sl)] = torch.where(
-            write, proposal.to(current_core.dtype), current_core
-        )
-    return out
+        for offset, out in out_by_offset.items():
+            proposal = proposal_by_offset[offset]
+            current_core = out[(tile.window_index, tile.horizon, *sl)]
+            write = (
+                support.bool()
+                & (current_core.long() == FREE_LABEL)
+                & (proposal != FREE_LABEL)
+            )
+            out[(tile.window_index, tile.horizon, *sl)] = torch.where(
+                write, proposal.to(current_core.dtype), current_core
+            )
+    return out_by_offset
 
 
 def compose(

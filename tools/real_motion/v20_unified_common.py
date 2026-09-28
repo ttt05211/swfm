@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 from typing import Sequence
@@ -40,7 +41,7 @@ from real_motion.v20_unified_data import (
 )
 from real_motion.v20_unified_runtime import (
     completion_support,
-    compose_completion_tiles,
+    compose_completion_tiles_at_free_logit_offsets,
     dense_geometry_and_transport_condition,
 )
 STAGE1_PROTOCOL = "p0_f9_v20_stage1_history_cache_v2"
@@ -891,15 +892,21 @@ def training_completion_inputs_batch(
     }
 
 
-def full_completion_prediction(
+def full_completion_predictions_at_free_logit_offsets(
     model,
     prepared: PreparedUnifiedWindow,
     first_stage: dict,
     current_transport: torch.Tensor,
     *,
     native_grid: dict,
+    free_logit_offsets: Sequence[float],
     ablate_source_latents: bool = False,
-) -> tuple[torch.Tensor, dict]:
+) -> tuple[dict[float, torch.Tensor], dict]:
+    offsets = tuple(dict.fromkeys(float(value) for value in free_logit_offsets))
+    if not offsets:
+        raise ValueError("free_logit_offsets cannot be empty")
+    if any(not math.isfinite(value) or value < 0.0 for value in offsets):
+        raise ValueError("free_logit_offsets must be finite and non-negative")
     geometry_valid, support, condition = geometry_and_support(
         model, prepared, current_transport, native_grid
     )
@@ -931,16 +938,40 @@ def full_completion_prediction(
         completion_fusion,
         condition,
     )
-    final = current_transport.clone()
+    final_by_offset = {offset: current_transport.clone() for offset in offsets}
     chunk = max(int(model.config.runtime_query_chunk), 1)
     for start in range(0, len(queries), chunk):
         q = queries[start : start + chunk]
         logits = model.decode_completion_from_features(
             first_stage["history"], future_features, q
         )
-        final = compose_completion_tiles(final, logits, q)
-    return final, {
+        final_by_offset = compose_completion_tiles_at_free_logit_offsets(
+            final_by_offset, logits, q
+        )
+    return final_by_offset, {
         "runtime": runtime_report,
         "scatter": scatter_report,
         "support": support,
     }
+
+
+def full_completion_prediction(
+    model,
+    prepared: PreparedUnifiedWindow,
+    first_stage: dict,
+    current_transport: torch.Tensor,
+    *,
+    native_grid: dict,
+    ablate_source_latents: bool = False,
+) -> tuple[torch.Tensor, dict]:
+    """Run the protocol completion path with its frozen zero-margin argmax."""
+    final_by_offset, reports = full_completion_predictions_at_free_logit_offsets(
+        model,
+        prepared,
+        first_stage,
+        current_transport,
+        native_grid=native_grid,
+        free_logit_offsets=(0.0,),
+        ablate_source_latents=ablate_source_latents,
+    )
+    return final_by_offset[0.0], reports

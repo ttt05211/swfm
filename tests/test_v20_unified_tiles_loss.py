@@ -11,6 +11,7 @@ from real_motion.v20_unified_loss import (
 from real_motion.v20_unified_runtime import (
     assemble_completion_logits,
     completion_support,
+    compose_completion_tiles,
     dense_geometry_and_transport_condition,
     prepare_runtime_queries,
 )
@@ -177,6 +178,39 @@ def test_halo_queries_write_core_only():
     dense = assemble_completion_logits(logits, queries, output_shape=current.shape)
     assert dense.shape == (*current.shape, 18)
     assert torch.isfinite(dense).all()
+
+
+def test_free_logit_offset_changes_only_diagnostic_argmax_threshold():
+    lattice = CanonicalLattice((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (2, 2, 1))
+    current = torch.full((1, 6, 2, 2, 1), FREE_LABEL)
+    pose = torch.eye(4).view(1, 1, 4, 4).expand(1, 6, 4, 4).clone()
+    queries, _ = prepare_runtime_queries(
+        current,
+        pose,
+        coarse_lattice=lattice,
+        native_origin_xyz_m=(0.0, 0.0, 0.0),
+        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
+        core_shape_xyz=(2, 2, 1),
+        halo=0,
+    )
+    logits = []
+    for query in queries:
+        value = torch.zeros(*query.tile.halo_shape_xyz, 18)
+        value[..., 4] = 1.0
+        value[..., FREE_LABEL] = 2.0
+        logits.append(value)
+
+    unchanged = compose_completion_tiles(current, logits, queries)
+    below_threshold = compose_completion_tiles(
+        current, logits, queries, free_logit_offset=0.5
+    )
+    above_threshold = compose_completion_tiles(
+        current, logits, queries, free_logit_offset=1.0
+    )
+
+    assert torch.equal(unchanged, current)
+    assert torch.equal(below_threshold, current)
+    assert torch.all(above_threshold == 4)
 
 
 def test_runtime_queries_reuse_dense_masks_without_changing_contract():
