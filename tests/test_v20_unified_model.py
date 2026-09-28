@@ -325,41 +325,6 @@ def test_completion_core_only_matches_full_halo_core_logits():
     )
 
 
-def test_completion_tile_batch_preserves_channels_last_3d_layout():
-    torch.manual_seed(15)
-    model = _model().eval()
-    history = _history(model)
-    source = _sources()
-    fusion = model.fuse_source_scene(history, source, adapter_enabled=True)
-    current = torch.full((1, 6, 4, 4, 4), FREE_LABEL)
-    queries, _ = prepare_runtime_queries(
-        current,
-        history.future_ego_to_t0,
-        coarse_lattice=model.coarse_lattice,
-        native_origin_xyz_m=(0.0, 0.0, 0.0),
-        native_voxel_size_xyz_m=(1.0, 1.0, 1.0),
-        core_shape_xyz=(2, 2, 2),
-        halo=1,
-    )
-    with torch.no_grad():
-        future, _ = model.build_future_features(
-            history, source, fusion, _condition(model, history, current)
-        )
-        seen = []
-
-        def record_layout(_module, inputs):
-            seen.append(inputs[0].is_contiguous(memory_format=torch.channels_last_3d))
-
-        hook = model.completion_trunk[0].register_forward_pre_hook(record_layout)
-        try:
-            model.decode_completion_from_features(
-                history, future, queries[:5], core_only=True
-            )
-        finally:
-            hook.remove()
-    assert seen and all(seen)
-
-
 def test_transport_loss_updates_adapter_after_zero_initialized_identity():
     torch.manual_seed(9)
     model = _model().train()

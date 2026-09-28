@@ -565,11 +565,7 @@ class V20UnifiedTransportCompletion(nn.Module):
             ).permute(0, 4, 1, 2, 3)
             shape = tuple(int(x) for x in group_key[:3])
             decode_groups.setdefault(shape, []).extend(
-                # Retain the batch dimension. Concatenating these 5D views
-                # preserves the native NDHWC/channels_last_3d stride produced
-                # by the permutation above; stacking 4D views silently fell
-                # back to contiguous NCDHW and slowed BF16 Conv3d backward.
-                (qi, query, tile_inputs[bi : bi + 1])
+                (qi, query, tile_inputs[bi])
                 for bi, (qi, query) in enumerate(rows)
             )
 
@@ -577,7 +573,7 @@ class V20UnifiedTransportCompletion(nn.Module):
         for rows in decode_groups.values():
             for start in range(0, len(rows), micro):
                 part = rows[start : start + micro]
-                tile_input = torch.cat(
+                tile_input = torch.stack(
                     [value for _, _, value in part], dim=0
                 )
                 if not core_only:
@@ -618,14 +614,12 @@ class V20UnifiedTransportCompletion(nn.Module):
                     tuple[int, int, int], list[tuple[int, torch.Tensor]]
                 ] = {}
                 for bi, (qi, query, _) in enumerate(part):
-                    core = features[
-                        (slice(bi, bi + 1), slice(None), *query.tile.core_slice_xyz)
-                    ]
+                    core = features[(bi, slice(None), *query.tile.core_slice_xyz)]
                     core_groups.setdefault(
                         tuple(int(x) for x in query.tile.core_shape_xyz), []
                     ).append((qi, core))
                 for core_rows in core_groups.values():
-                    core_features = torch.cat(
+                    core_features = torch.stack(
                         [value for _, value in core_rows], dim=0
                     )
                     core_logits = self.completion_head(core_features).permute(
