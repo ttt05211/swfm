@@ -29,7 +29,10 @@ from real_motion.runtime_config import (
 )
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v20_unified_loss import compute_training_loss
-from real_motion.v20_unified_model import V20UnifiedTransportCompletion
+from real_motion.v20_unified_model import (
+    V20UnifiedConfig,
+    V20UnifiedTransportCompletion,
+)
 from real_motion.v20_unified_training import (
     TrainerProgress,
     build_optimizer,
@@ -187,6 +190,23 @@ def main() -> None:
     parser.add_argument("--patch-resolution-m", type=float, default=0.8)
     parser.add_argument("--alignment-workers", type=int, default=6)
     parser.add_argument(
+        "--tile-decode-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Number of unique completion tiles decoded together. Larger values "
+            "trade GPU memory for speed without changing sampled tiles or loss."
+        ),
+    )
+    parser.add_argument(
+        "--no-completion-checkpoint",
+        action="store_true",
+        help=(
+            "Disable activation recomputation in the completion decoder. This "
+            "uses more GPU memory but is faster and does not change model outputs."
+        ),
+    )
+    parser.add_argument(
         "--keep-checkpoints",
         type=int,
         default=3,
@@ -228,8 +248,11 @@ def main() -> None:
         int(args.max_updates),
         int(args.monitor_every),
         int(args.monitor_windows),
+        int(args.tile_decode_batch_size),
     ) <= 0:
-        raise ValueError("update, accumulation and monitor counts must be positive")
+        raise ValueError(
+            "update, accumulation, monitor and tile batch counts must be positive"
+        )
 
     _seed_everything(int(args.seed))
     device = torch.device(
@@ -333,6 +356,8 @@ def main() -> None:
         "completion_weight": float(args.completion_weight),
         "patch_resolution_m": float(args.patch_resolution_m),
         "alignment_workers": int(args.alignment_workers),
+        "tile_decode_batch_size": int(args.tile_decode_batch_size),
+        "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
         "amp": bool(amp),
         "amp_dtype": "bfloat16" if amp else "float32",
         "device": str(device),
@@ -365,6 +390,12 @@ def main() -> None:
         model = V20UnifiedTransportCompletion(
             v18,
             coarse_lattice=lattice_from_dict(stage1_index["coarse_lattice"]),
+            config=V20UnifiedConfig(
+                tile_decode_batch_size=int(args.tile_decode_batch_size),
+                checkpoint_completion_tiles=not bool(
+                    args.no_completion_checkpoint
+                ),
+            ),
         )
         resume_checkpoint = None
     model.to(device)
@@ -429,6 +460,11 @@ def main() -> None:
     started = time.perf_counter()
 
     while progress_state.successful_updates < int(args.max_updates):
+        if device.type == "cuda":
+            # Exclude outstanding monitor/checkpoint work from the next update and
+            # report the true per-update allocated-memory high-water mark.
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
         update_started = time.perf_counter()
         phase = training_phase(
             progress_state.successful_updates, int(args.warmup_updates)
@@ -508,11 +544,20 @@ def main() -> None:
         if not finite:
             scaler.update(float(scaler.get_scale()) / 2.0 if scaler.is_enabled() else 1.0)
         optimizer.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            # Optimizer kernels are asynchronous; synchronize before reporting
+            # wall time and the update's peak allocated memory.
+            torch.cuda.synchronize(device)
+            peak_memory_mib = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        else:
+            peak_memory_mib = 0.0
+        update_seconds = time.perf_counter() - update_started
         if not succeeded:
             reason = "amp_overflow" if finite else "nonfinite_grad_norm"
             print(
                 f"update_attempt={progress_state.attempted_updates} {reason}; "
-                f"seconds={time.perf_counter() - update_started:.3f}; "
+                f"seconds={update_seconds:.3f}; "
+                f"peak_memory_mib={peak_memory_mib:.1f}; "
                 "successful counter unchanged",
                 flush=True,
             )
@@ -531,7 +576,8 @@ def main() -> None:
             f"phase={phase} loss={mean_loss:.6f} completion={mean_comp:.6f} "
             f"voxels={voxels} tiles={tiles} unique_tiles={unique_tiles} "
             f"grad_norm={float(grad_norm):.4f} "
-            f"seconds={time.perf_counter() - update_started:.3f}",
+            f"seconds={update_seconds:.3f} "
+            f"peak_memory_mib={peak_memory_mib:.1f}",
             flush=True,
         )
 
@@ -624,6 +670,8 @@ def main() -> None:
         "train_windows": len(train_records),
         "keep_checkpoints": int(args.keep_checkpoints),
         "precision": "bfloat16" if amp else "float32",
+        "tile_decode_batch_size": int(args.tile_decode_batch_size),
+        "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
         "real_data_run": True,
     }
     (out_dir / "summary.json").write_text(

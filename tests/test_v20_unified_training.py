@@ -11,7 +11,10 @@ import torch
 from real_motion.local_st_world_model_v17 import LocalSTWMV17Config
 from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
 from real_motion.v20_history_world import CanonicalLattice
-from real_motion.v20_unified_model import V20UnifiedTransportCompletion
+from real_motion.v20_unified_model import (
+    V20UnifiedConfig,
+    V20UnifiedTransportCompletion,
+)
 from real_motion.v20_unified_training import (
     TrainerProgress,
     build_optimizer,
@@ -29,7 +32,7 @@ from tools.real_motion.train_p0_f9_v20_unified import (
 )
 
 
-def _model():
+def _model(unified_config: V20UnifiedConfig = V20UnifiedConfig()):
     cfg = LocalSTWMV17Config(
         d_model=16,
         semantic_dim=4,
@@ -42,6 +45,7 @@ def _model():
     return V20UnifiedTransportCompletion(
         LocalSpatialTemporalWorldModelV18SE2(cfg),
         coarse_lattice=CanonicalLattice((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (4, 4, 4)),
+        config=unified_config,
     )
 
 
@@ -114,6 +118,57 @@ def test_checkpoint_resume_restores_counters_model_optimizer_and_rng(tmp_path):
     assert got_progress == progress
     for a, b in zip(model.parameters(), loaded_model.parameters()):
         assert torch.equal(a, b)
+
+
+def test_checkpoint_roundtrip_preserves_completion_execution_config(tmp_path):
+    unified_config = V20UnifiedConfig(
+        tile_decode_batch_size=16,
+        checkpoint_completion_tiles=False,
+    )
+    model = _model(unified_config)
+    optimizer = build_optimizer(model)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    base = tmp_path / "base.pt"
+    manifest = tmp_path / "index.json"
+    torch.save({"base": True}, base)
+    manifest.write_text('{"protocol":"test"}', encoding="utf-8")
+    contract = {
+        "tile_decode_batch_size": 16,
+        "checkpoint_completion_tiles": False,
+    }
+    payload = checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        scheduler_state={"successful_updates": 0},
+        scaler=scaler,
+        progress=TrainerProgress(),
+        base_checkpoint=base,
+        manifest_paths={"train": manifest},
+        config={},
+        repository_root=tmp_path,
+        resume_contract=contract,
+    )
+    path = tmp_path / "fast.pt"
+    save_checkpoint(path, payload)
+
+    loaded_model, checkpoint = load_model_checkpoint(path)
+    assert loaded_model.config.tile_decode_batch_size == 16
+    assert not loaded_model.config.checkpoint_completion_tiles
+    verify_resume_inputs(
+        checkpoint,
+        base_checkpoint=base,
+        manifest_paths={"train": manifest},
+        resume_contract=contract,
+        coarse_lattice=model.coarse_lattice,
+    )
+    with pytest.raises(RuntimeError, match="run contract differs"):
+        verify_resume_inputs(
+            checkpoint,
+            base_checkpoint=base,
+            manifest_paths={"train": manifest},
+            resume_contract={**contract, "tile_decode_batch_size": 8},
+            coarse_lattice=model.coarse_lattice,
+        )
 
 
 def test_resume_contract_normalizes_json_lattice_and_rejects_drift(tmp_path):

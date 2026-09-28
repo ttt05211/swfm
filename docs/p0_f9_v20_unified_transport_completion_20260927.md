@@ -20,7 +20,7 @@
 - 原始 V18 Clean-E14 loss 保持为 `L_trans + L_exist + 19*L_yaw + 0.25*L_shape_SE2`；completion 使用单一 18-way CE。
 - optimizer 参数组只创建一次。warmup 的 V18 LR 为 0 且 `eval/requires_grad=False`；joint 设置 V18 LR 为 `2e-5`，新模块 LR 为 `2e-4`。
 - checkpoint 保存 model、optimizer、scheduler、scaler、attempted/successful update、phase、全局 RNG、tile RNG、全部 cache/index/shard/info manifest hash、规范化 grid、精确运行合同、已有 monitor 历史和 Git SHA。resume 会拒绝 warmup、seed、screen population/order、优化器超参、AMP 或输入资产漂移；JSON list 与 checkpoint tuple 在 grid 比较前统一规范化。
-- 训练态 completion trunk+head 默认使用 non-reentrant activation checkpointing；tile micro-batch 只改变执行分块，不改变 draw multiplicity、loss denominator 或梯度路径。
+- 训练态 completion trunk+head 默认使用 non-reentrant activation checkpointing；tile micro-batch 只改变执行分块，不改变 draw multiplicity、loss denominator 或梯度路径。显存充足时可用 `--tile-decode-batch-size N --no-completion-checkpoint` 以显存换吞吐；两项都写入精确 resume 合同和模型 checkpoint。
 - CUDA AMP 训练和 evaluator 统一使用 BF16；BF16 不启用动态 loss scaling。GPU 不支持 BF16 时正式入口拒绝静默降为 FP16，可显式传 `--no-amp` 运行 FP32。precision dtype 属于精确 resume 合同。
 
 ## 2. 入口
@@ -119,7 +119,18 @@ python tools/real_motion/compact_p0_f9_v20_stage1_for_unified.py \
 
 确认 compact cache 后再删除旧 cache，避免长期保留两份。新 cache 的 shard metadata 带 row keys、字节数和 SHA-256；unified loader 使用小型 shard LRU，并在首次读取时核对文件、row count、顺序与实际 row identity，不再把全部 Stage-1 row 常驻 RAM。由旧完整 cache 转换时只保留 dynamic responsibility 计数供评测使用，移除重复名称、identity/trajectory/box；直接 `--unified-compact` 构建无法提供该诊断时，evaluator 明确报告 `dynamic_responsibility=false` 和 `null`，不会把“不可用”伪报为零实例。默认 spatial transport mapping 使用更大的 64×64×32 chunk 降低小 kernel 数；completion tile 仍保持 32×32×16，不改变训练口径。训练默认只保留最近 3 个 update checkpoint，可用 `--keep-checkpoints 0` 关闭轮转。训练内的固定 dev monitor 第一次计算 frozen V18 reference 后只复用其 raw intersection/union counts，monitor 历史在 resume 时保留；后续 checkpoint 不再重复跑冻结 V18 forward/render。这不改变任何指标口径，也不生成额外的大型预测 cache。
 
-热路径还会复用已生成的 dense geometry/support mask和有放回抽样产生的重复 tile 查询张量；完全相同的重复 draw 只执行一次 completion 3D forward，再按原 draw 次数进入 CE，保持 loss denominator 与梯度 multiplicity。tile 抽样、runtime 统计和 completion CE 分别按 horizon/整批合并设备同步。completion decoder 按窗口与 horizon 分组，直接采样对应的 future/history volume，不再为每个 micro-batch 扫描所有 volume 或构造逐体素 volume-index 张量。空间映射和 source scatter 的空集合由 tensor kernel 原生处理，避免 Python `any()` 强制同步。这些优化不改变 tile draw、loss denominator、support、合成或指标口径。训练日志同时报告 `tiles`、`unique_tiles` 和不含 monitor 的 update 秒数，便于用真实去重率评估吞吐。
+热路径还会复用已生成的 dense geometry/support mask和有放回抽样产生的重复 tile 查询张量；完全相同的重复 draw 只执行一次 completion 3D forward，再按原 draw 次数进入 CE，保持 loss denominator 与梯度 multiplicity。tile 抽样、runtime 统计和 completion CE 分别按 horizon/整批合并设备同步。completion decoder 按窗口与 horizon 分组，直接采样对应的 future/history volume，不再为每个 micro-batch 扫描所有 volume 或构造逐体素 volume-index 张量。空间映射和 source scatter 的空集合由 tensor kernel 原生处理，避免 Python `any()` 强制同步。这些优化不改变 tile draw、loss denominator、support、合成或指标口径。训练日志同时报告 `tiles`、`unique_tiles`、同步后的 update 秒数和该 update 的 CUDA `peak_memory_mib`，便于用真实去重率、耗时和显存余量选择执行参数。
+
+例如 40 GB 以上显存的 GPU 可先用独立 smoke 输出目录测试以下吞吐配置；只有无 OOM 且峰值显存留有余量后，才把同样参数用于 screen：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$PY" -u tools/real_motion/train_p0_f9_v20_unified.py \
+  ...同一组数据与基础 checkpoint 参数... \
+  --out-dir outputs/v20_unified_smoke_fast \
+  --tile-decode-batch-size 16 \
+  --no-completion-checkpoint \
+  --smoke
+```
 
 checkpoint selection 的 population 和顺序由所传 Stage-1 cache 的冻结 shard/key 顺序唯一决定。训练 monitor 和独立 evaluator 都会先对完整 V18 cache 建立 `(scene_name, t0_token) -> record` 唯一索引，再严格按 Stage-1 key 顺序选择/重排。因此 full4369 V18 cache 可以直接与冻结 V19-split Stage-1 dev512 配对，不需要额外复制一份 V18 dev512。V18 重复 identity、Stage-1 缺行、声明数量不符、最终数量或顺序不一致都会在 GPU forward 前报错，不会退化成 full4369 的前 512 条。
 
