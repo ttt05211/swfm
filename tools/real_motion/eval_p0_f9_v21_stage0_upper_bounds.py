@@ -32,7 +32,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 from tools.real_motion.v20_unified_common import STAGE1_PROTOCOL
 
-EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v2"
+EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v3"
 REPORT_H=(1.0,2.0,3.0)
 VARIANTS=("UB0_EXACT","UB1_CAUSAL_EXACT","UB2_DORMANT_CAUSAL_SHAPE",
           "UB2_BIRTH_PROTOTYPE","UB2_DEPLOYABLE_REPRESENTATION")
@@ -258,6 +258,49 @@ def quality(x):
             "addition_semantic_precision":x["semantic_tp"]/x["added"] if x["added"] else float("nan"),
             "v21_target_semantic_recall":x["target_recovered"]/x["target_addable"] if x["target_addable"] else float("nan"),**x}
 
+def annotation_center_inside_grid(center_world,ego_to_world,grid):
+    center=np.asarray(center_world,dtype=np.float64)
+    ego=(np.linalg.inv(np.asarray(ego_to_world,dtype=np.float64))@np.r_[center,1.0])[:3]
+    lower=np.asarray([grid.x_min,grid.y_min,grid.z_min],dtype=np.float64)
+    upper=lower+np.asarray(grid.voxel_size,dtype=np.float64)*np.asarray(grid.shape_hwd,dtype=np.float64)
+    return bool(((ego>=lower)&(ego<upper)).all())
+
+def accumulate_coverage_stratum(store,distances,name,subset,all_match_tokens,
+                                historical,frontier,t0_pose,radius):
+    subset=list(subset); tokens={t.instance_token for t in subset}; row=store[name]
+    matches,report=assign_causal_coverage(
+        subset,historical,frontier,t0_pose=t0_pose,coverage_radius_m=radius)
+    if report["duplicate_target_assignment"] or report["duplicate_anchor_assignment"]:
+        raise RuntimeError(f"V21 stratum assignment violated one-to-one contract: {name}")
+    eligible=int(report["eligible_targets"]); row["eligible"]+=eligible
+    row["covered_under_all_target_assignment"]+=len(tokens&all_match_tokens)
+    row["reassigned_covered"]+=int(report["covered_targets"])
+    row["candidate_sum"]+=float(report["mean_legal_candidates_per_positive"])*eligible
+    row["historical_matches"]+=int(report["historical_matches"])
+    row["frontier_matches"]+=int(report["frontier_matches"])
+    row["max_candidates"]=max(row["max_candidates"],int(report["max_legal_candidates_per_positive"]))
+    distances[name].extend(float(x.distance_m) for x in matches)
+
+def coverage_strata_report(store,distances):
+    out={}
+    for name,row in store.items():
+        eligible=int(row["eligible"]); d=np.asarray(distances[name],dtype=np.float64)
+        out[name]={
+            "eligible_targets":eligible,
+            "covered_under_all_target_assignment":int(row["covered_under_all_target_assignment"]),
+            "coverage_under_all_target_assignment":row["covered_under_all_target_assignment"]/max(eligible,1),
+            "reassigned_covered_targets":int(row["reassigned_covered"]),
+            "reassigned_geometric_coverage":row["reassigned_covered"]/max(eligible,1),
+            "historical_matches":int(row["historical_matches"]),
+            "frontier_matches":int(row["frontier_matches"]),
+            "mean_legal_candidates_per_positive":row["candidate_sum"]/max(eligible,1),
+            "max_legal_candidates_per_positive":int(row["max_candidates"]),
+            "matched_distance_m":({"p50":float(np.quantile(d,0.50)),"p90":float(np.quantile(d,0.90)),
+                                    "p99":float(np.quantile(d,0.99)),"max":float(d.max())}
+                                   if len(d) else None),
+        }
+    return out
+
 def main():
     p=argparse.ArgumentParser(); add_config_args(p)
     for name in ("val-cache","population-manifest","checkpoint","prototype-bank","dataroot","info-pkl","output"):
@@ -280,6 +323,7 @@ def main():
     ages={str(x):Metrics() for x in (0.5,1.0,1.5,2.0,2.5)}
     q={v:defaultdict(int,{"added":0,"occ_tp":0,"semantic_tp":0,"target_addable":0,"target_recovered":0}) for v in VARIANTS}
     audit=defaultdict(int); aa=defaultdict(int); sa=defaultdict(int); ca={v:defaultdict(int) for v in VARIANTS}; cov=defaultdict(float)
+    cov_strata=defaultdict(lambda:defaultdict(float)); cov_distances=defaultdict(list)
     perclass=defaultdict(int); perh=defaultdict(int); totalvox=coveredvox=alltargets=movingtargets=allvox=movingvox=0
     scene=defaultdict(lambda:{"V18_BASE":Metrics(),**{v:Metrics() for v in VARIANTS}})
     checked=0; started=time.perf_counter()
@@ -330,6 +374,36 @@ def main():
 
         future_attrs,future_ann_maps=future_shape_cache(source,w,raw,targets,pcfg,a.match_max_distance_m)
         masks=target_masks_from_attributions(future_attrs,pcfg.grid.shape_hwd)
+        onset_resolved=set(); any_resolved=set(); report_component=set()
+        for t in targets:
+            tok=t.instance_token
+            resolved=[hi for hi,row in enumerate(future_attrs)
+                      if (row.get(tok) is not None and row[tok].shape is not None)]
+            if resolved:
+                any_resolved.add(tok); first=resolved[0]
+                sa[f"first_resolved_horizon/{ALL_HORIZONS_S[first]:.1f}s"]+=1
+                if first>t.onset_index:sa["resolved_only_after_annotation_onset"]+=1
+            else:sa["no_future_shape_resolved"]+=1
+            if t.onset_index in resolved:onset_resolved.add(tok)
+            if any(tok in masks[hi] for hi in REPORT_INDICES):report_component.add(tok)
+            ann=future_ann_maps[t.onset_index].get(tok)
+            if ann is not None:
+                inside=annotation_center_inside_grid(
+                    ann["center_world"],raw["future_poses"][t.onset_index],pcfg.grid)
+                sa["annotation_onset_center_inside_grid" if inside else "annotation_onset_center_outside_grid"]+=1
+                if inside and tok not in onset_resolved:sa["onset_inside_grid_but_shape_unresolved"]+=1
+        sa["onset_shape_resolved"]+=len(onset_resolved)
+        sa["any_future_shape_resolved"]+=len(any_resolved)
+        sa["report_horizon_component_resolved"]+=len(report_component)
+        all_match_tokens=set(mb)
+        strata={"onset_shape_resolved":onset_resolved,
+                "any_future_shape_resolved":any_resolved,
+                "report_horizon_component_resolved":report_component}
+        for name,tokens in strata.items():
+            accumulate_coverage_stratum(
+                cov_strata,cov_distances,name,
+                (t for t in targets if t.instance_token in tokens),all_match_tokens,
+                hist,front,raw["history_poses"][-1],a.coverage_radius_m)
         onset={}; hshape={}; proto={}; hage={}; rank={t.instance_token:i for i,t in enumerate(targets)}
         for t in targets:
             tok=t.instance_token; oi=t.onset_index; at=future_attrs[oi].get(tok)
@@ -441,6 +515,7 @@ def main():
             "historical_matches":int(cov["hist"]),"frontier_matches":int(cov["front"]),"uncovered_targets":eligible-covered,
             "mean_legal_candidates_per_positive":meanc,"max_legal_candidates_per_positive":int(cov["maxcand"]),
             "duplicate_target_assignment":int(cov["dup_t"]),"duplicate_anchor_assignment":int(cov["dup_a"])},
+        "coverage_strata_diagnostic":coverage_strata_report(cov_strata,cov_distances),
         "target_mass":{"all_v21_targets":alltargets,"moving_eligible_v21_targets":movingtargets,
             "all_v21_target_voxels_report_horizons":allvox,"moving_eligible_target_voxels_inside_frozen_support":movingvox,
             "per_class_targets":dict(perclass),"per_report_horizon_target_components":dict(perh)},
@@ -455,7 +530,9 @@ def main():
         "stage0b_gate":gate,
         "contracts":{"report_horizons_s":list(REPORT_H),"all_state_horizons_s":list(ALL_HORIZONS_S),
             "target":"DORMANT_ANCESTRAL + BIRTH, report-horizon eligible","compositor":COMPOSITOR_PROTOCOL,
-            "moving_metric":"frozen Moving-mIoU v2; unchanged","v20_completion_used":False,"transformer_used":False},
+            "moving_metric":"frozen Moving-mIoU v2; unchanged",
+            "coverage_strata":"diagnostic only; formal all-target assignment and gate are unchanged",
+            "v20_completion_used":False,"transformer_used":False},
         "elapsed_seconds":time.perf_counter()-started}
     Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(result,indent=2),encoding="utf-8")
     print(json.dumps({"output":str(Path(a.output).resolve()),"windows":len(records),"UB0_dmIoU":reports["UB0_EXACT"]["delta_vs_v18_pp"]["mIoU"],

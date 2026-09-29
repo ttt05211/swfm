@@ -95,7 +95,7 @@ UB0→UB1 只测 candidate coverage；两个 UB2 diagnostic 分别隔离 histori
 
 ## 输出审计
 
-报告包括：IoU/mIoU/Moving Macro/Moving Micro、per-horizon/per-class delta、all V21 / Moving-eligible target mass、component/voxel coverage、history/frontier/uncovered、candidate budget、non-report-horizon-only、last-seen age source/voxel histogram、age-stratum UB、shape unresolved/ambiguous、addition precision/target recall、collision、blocked-by-V18、OOB 和 scene delta。
+报告包括：IoU/mIoU/Moving Macro/Moving Micro、per-horizon/per-class delta、all V21 / Moving-eligible target mass、component/voxel coverage、history/frontier/uncovered、candidate budget、non-report-horizon-only、last-seen age source/voxel histogram、age-stratum UB、shape unresolved/ambiguous、addition precision/target recall、collision、blocked-by-V18、OOB 和 scene delta。额外的 `coverage_strata_diagnostic` 分别统计 annotation-onset shape、任意 future shape 和 report-horizon component：既报告它们在正式 all-target assignment 下的覆盖，也报告只在该 stratum 内重新一对一匹配的几何覆盖上限；该诊断不会修改正式 UB、compositor 或 Stage-0B gate。
 
 ## V18 exactness
 
