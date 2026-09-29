@@ -89,15 +89,16 @@ done
 
 硬门槛：deployable UB2 `ΔmIoU >= +0.50 pp`；保留 UB1 mIoU headroom >=70%；causal component coverage >=70%；mean legal candidates/positive <=10。Moving-Micro 按冻结协议报告，但不是对所有 target 的无条件否决门槛。
 
-## 五条 oracle
+## 六条 oracle
 
-1. `UB0_EXACT`：所有 report-horizon component target + query-entry exact shape + GT state。
-2. `UB1_CAUSAL_EXACT`：只保留一对一 causal-covered target，shape/state 与 UB0 相同。
-3. `UB2_DORMANT_CAUSAL_SHAPE`：DORMANT → last-observed real shape；BIRTH 仍 exact。
-4. `UB2_BIRTH_PROTOTYPE`：BIRTH → oracle-best train prototype；DORMANT 仍 exact。
-5. `UB2_DEPLOYABLE_REPRESENTATION`：DORMANT last-observed shape + BIRTH prototype。
+1. `UB_V21_SCOPE_PER_HORIZON_GT`：所有正式 V21 component target 在每个 report horizon 直接使用该帧无歧义 GT component voxel indices；仍走 V18-free add-only compositor，不覆盖 V18 occupied voxel。它是 V21 职责范围与 compositor 下的诊断上限，不是整场景 perfect-GT。
+2. `UB0_EXACT`：所有 report-horizon component target + query-entry exact canonical shape + GT state；同一 query-entry shape 随 GT state 刚体搬运，不能解释为逐 horizon GT。为保持旧报告兼容保留该 key，其语义为 query-entry rigid exact。
+3. `UB1_CAUSAL_EXACT`：只保留一对一 causal-covered target，shape/state 与 UB0 相同。
+4. `UB2_DORMANT_CAUSAL_SHAPE`：DORMANT → last-observed real shape；BIRTH 仍 exact。
+5. `UB2_BIRTH_PROTOTYPE`：BIRTH → oracle-best train prototype；DORMANT 仍 exact。
+6. `UB2_DEPLOYABLE_REPRESENTATION`：DORMANT last-observed shape + BIRTH prototype。
 
-UB0→UB1 只测 candidate coverage；两个 UB2 diagnostic 分别隔离 historical shape aging 与 prototype quantization；deployable UB2 用于最终 Stage-0B gate。全局 annotation 首次存在时间不等于 query-entry onset：例如物体 0.5s 已在 Ωmax 外存在、2.0s 才进入 occupancy/query domain，则保留完整 existence/state，但以 2.0s 的中心、frontier eligibility 和 exact shape 做 source activation。域外且所有 report horizon 都没有 occupancy component 的 annotation 不进入 component coverage 分母，仍单独报告 identity coverage。
+`UB_V21_SCOPE_PER_HORIZON_GT`→UB0 隔离“逐 horizon component → 单一 query-entry 刚体 shape”的损失；UB0→UB1 只测 candidate coverage；两个 UB2 diagnostic 分别隔离 historical shape aging 与 prototype quantization；deployable UB2 用于最终 Stage-0B gate。结果额外报告 `v21_scope_ceiling`，包含逐 horizon GT 上限、query-entry rigid retention 和对应 mIoU gap。全局 annotation 首次存在时间不等于 query-entry onset：例如物体 0.5s 已在 Ωmax 外存在、2.0s 才进入 occupancy/query domain，则保留完整 existence/state，但以 2.0s 的中心、frontier eligibility 和 exact shape 做 source activation。域外且所有 report horizon 都没有 occupancy component 的 annotation 不进入 component coverage 分母，仍单独报告 identity coverage。
 
 ## 输出审计
 

@@ -1,12 +1,12 @@
 import numpy as np
 from real_motion.geometry import OccupancyGrid
 from real_motion.v21_source_induction import (
-    AnchorLattice,CanonicalShape,FrontierAnchor,V21Target,assign_causal_coverage,
+    AnchorLattice,CanonicalShape,FrontierAnchor,ShapeAttribution,V21Target,assign_causal_coverage,
     attribute_instance_shapes,build_frontier_anchors,build_prototype_bank,
     compose_v21_add_only,oracle_best_extent_scaled_prototype,oracle_best_prototype,rasterize_canonical_shape,
     scale_prototype_to_target_extent,select_scene_balanced_round_robin,shape_iou,
 )
-from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics
+from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics,per_horizon_gt_component_indices
 
 def birth(token,xy,onset=1):
     centers=[None]*6; yaws=[None]*6; ex=[False]*6
@@ -89,6 +89,19 @@ def test_exact_shape_round_trip_preserves_subvoxel_phase():
     assert attr.shape is not None and not attr.ambiguous
     idx,oob=rasterize_canonical_shape(attr.shape,anns["a"]["center_world"],anns["a"]["yaw_world"],np.eye(4),grid=grid)
     assert oob==0 and np.array_equal(idx,np.asarray([[2,2,0]]))
+
+def test_per_horizon_gt_component_ceiling_uses_native_component_and_fails_closed():
+    shape=CanonicalShape(4,np.asarray([[0,0,0]],np.int32),("s","i"))
+    attr=ShapeAttribution(
+        shape,False,False,1,
+        np.asarray([[2,1,0],[1,1,0],[2,1,0]],np.int64))
+    assert np.array_equal(
+        per_horizon_gt_component_indices(attr),
+        np.asarray([[1,1,0],[2,1,0]],np.int64))
+    assert per_horizon_gt_component_indices(
+        ShapeAttribution(None,True,False,2,None)) is None
+    assert per_horizon_gt_component_indices(
+        ShapeAttribution(None,False,True,0,None)) is None
 
 def test_shape_attribution_fails_closed_without_target_box_overlap():
     grid=OccupancyGrid(x_min=-2,y_min=-2,z_min=-0.2,voxel_size=(0.4,0.4,0.4),shape_hwd=(10,10,1))

@@ -33,9 +33,9 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 from tools.real_motion.v20_unified_common import STAGE1_PROTOCOL
 
-EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v5_factorized_extent"
+EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v6_per_horizon_gt_ceiling"
 REPORT_H=(1.0,2.0,3.0)
-VARIANTS=("UB0_EXACT","UB1_CAUSAL_EXACT","UB2_DORMANT_CAUSAL_SHAPE",
+VARIANTS=("UB_V21_SCOPE_PER_HORIZON_GT","UB0_EXACT","UB1_CAUSAL_EXACT","UB2_DORMANT_CAUSAL_SHAPE",
           "UB2_BIRTH_PROTOTYPE","UB2_DEPLOYABLE_REPRESENTATION",
           "UB2_FACTORIZED_ORACLE_EXTENT")
 SEM=tuple(range(17)); DYN=tuple(int(x) for x in DYNAMIC_CLASS_IDS)
@@ -298,6 +298,22 @@ def target_masks_from_attributions(attrs,shape):
             masks[tok]=m
         out.append(masks)
     return out
+
+def per_horizon_gt_component_indices(attribution):
+    """Return an exact attributed GT component in its native future grid.
+
+    This deliberately bypasses canonical-shape transport.  It is used only by
+    the V21-scope ceiling: target population, semantics and add-only composition
+    stay frozen, while each report horizon receives its own attributed GT
+    component.  Ambiguous or unresolved attribution fails closed.
+    """
+    if (attribution is None or bool(attribution.ambiguous) or
+            bool(attribution.unresolved) or attribution.voxel_indices is None):
+        return None
+    indices=np.asarray(attribution.voxel_indices,dtype=np.int64)
+    if indices.ndim!=2 or indices.shape[1]!=3:
+        raise ValueError("per-horizon GT component indices must be [N,3]")
+    return np.unique(indices,axis=0)
 
 def proposal_key(t,m,rank):
     if m is not None:return m.anchor_kind,m.anchor_id
@@ -577,6 +593,13 @@ def main():
                 ann=future_ann_maps[hi].get(tok)
                 if ann is None:continue
                 cm=mb.get(tok); kind,aid=proposal_key(t,cm,rank[tok])
+                gt_component=per_horizon_gt_component_indices(future_attrs[hi].get(tok))
+                if gt_component is None:
+                    sa["report_horizon_gt_component_missing_target_frames"]+=1
+                else:
+                    props["UB_V21_SCOPE_PER_HORIZON_GT"].append(
+                        (kind,aid,t.class_id,gt_component))
+                    sa["report_horizon_gt_component_target_frames"]+=1
                 reps={"UB0_EXACT":onset.get(tok),
                       "UB1_CAUSAL_EXACT":onset.get(tok) if cm else None,
                       "UB2_DORMANT_CAUSAL_SHAPE":(hshape.get(tok) if t.responsibility=="DORMANT_ANCESTRAL" else onset.get(tok)) if cm else None,
@@ -621,6 +644,19 @@ def main():
     br=states["V18_BASE"].compute(); reports={"V18_BASE":br}
     for v in VARIANTS:
         rr=states[v].compute(); reports[v]={"metrics":rr,"delta_vs_v18_pp":delta(rr,br),"addition_quality":quality(q[v])}
+    scope_counts=q["UB_V21_SCOPE_PER_HORIZON_GT"]
+    scope_exactness={
+        "all_added_voxels_are_occupied_gt":scope_counts["occ_tp"]==scope_counts["added"],
+        "all_added_voxels_match_gt_semantics":scope_counts["semantic_tp"]==scope_counts["added"],
+        "all_addable_target_voxels_recovered":scope_counts["target_recovered"]==scope_counts["target_addable"],
+    }
+    if not all(scope_exactness.values()):
+        raise RuntimeError(
+            "per-horizon GT scope ceiling violated exact add-only recovery: "
+            f"{scope_exactness}; counts={dict(scope_counts)}")
+    scope_gt=reports["UB_V21_SCOPE_PER_HORIZON_GT"]["delta_vs_v18_pp"]["mIoU"]
+    query_entry_rigid=reports["UB0_EXACT"]["delta_vs_v18_pp"]["mIoU"]
+    rigid_retention=query_entry_rigid/scope_gt if scope_gt>0 else float("nan")
     ub1=reports["UB1_CAUSAL_EXACT"]["delta_vs_v18_pp"]["mIoU"]; ub2=reports["UB2_DEPLOYABLE_REPRESENTATION"]["delta_vs_v18_pp"]["mIoU"]
     retention=ub2/ub1 if ub1>0 else float("nan"); eligible=int(cov["eligible"]); covered=int(cov["covered"])
     factorized_ub2=reports["UB2_FACTORIZED_ORACLE_EXTENT"]["delta_vs_v18_pp"]["mIoU"]
@@ -653,6 +689,11 @@ def main():
             "algorithm":bank.algorithm,"algorithm_config":dict(bank.algorithm_config),
             "source_provenance":dict(bank.source_provenance)},
         "coverage_radius_m":a.coverage_radius_m,"metrics":reports,
+        "v21_scope_ceiling":{"per_horizon_gt_component_delta_mIoU_pp":scope_gt,
+            "query_entry_rigid_exact_delta_mIoU_pp":query_entry_rigid,
+            "query_entry_rigid_retention_of_per_horizon_gt":rigid_retention,
+            "rigid_shape_gap_mIoU_pp":scope_gt-query_entry_rigid,
+            "exactness":scope_exactness},
         "headroom":{"ub1_exact_delta_mIoU_pp":ub1,"ub2_deployable_delta_mIoU_pp":ub2,"ub2_retention_of_ub1_mIoU":retention},
         "factorized_oracle_extent_headroom":{"ub1_exact_delta_mIoU_pp":ub1,
             "ub2_factorized_delta_mIoU_pp":factorized_ub2,
@@ -693,6 +734,8 @@ def main():
         "contracts":{"report_horizons_s":list(REPORT_H),"all_state_horizons_s":list(ALL_HORIZONS_S),
             "target":"DORMANT_ANCESTRAL + BIRTH with report-horizon occupancy component",
             "query_entry_onset":"first unambiguous future occupancy component in frozen Omega_max; annotation existence remains six-frame",
+            "per_horizon_gt_scope_ceiling":"each report horizon uses its own unambiguous attributed GT component; V21 target scope and V18-free add-only compositor remain frozen; diagnostic only",
+            "ub0_exact_semantics":"query-entry exact canonical shape rigidly transported with GT state; not a per-horizon or whole-scene GT oracle",
             "compositor":COMPOSITOR_PROTOCOL,
             "moving_metric":"frozen Moving-mIoU v2; unchanged",
             "coverage_strata":"annotation-onset strata are diagnostic; formal gate uses report-component query-entry assignment",
@@ -700,7 +743,10 @@ def main():
             "v20_completion_used":False,"transformer_used":False},
         "elapsed_seconds":time.perf_counter()-started}
     Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(result,indent=2),encoding="utf-8")
-    print(json.dumps({"output":str(Path(a.output).resolve()),"windows":len(records),"UB0_dmIoU":reports["UB0_EXACT"]["delta_vs_v18_pp"]["mIoU"],
+    print(json.dumps({"output":str(Path(a.output).resolve()),"windows":len(records),
+                      "V21_scope_per_horizon_GT_dmIoU":scope_gt,
+                      "query_entry_rigid_exact_dmIoU":query_entry_rigid,
+                      "query_entry_rigid_retention":rigid_retention,
                       "UB1_dmIoU":ub1,"UB2_dmIoU":ub2,
                       "factorized_oracle_extent_dmIoU":factorized_ub2,
                       "coverage":compcov,"mean_candidates":meanc,
