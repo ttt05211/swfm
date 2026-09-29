@@ -245,7 +245,14 @@ class NuScenesWindowSource:
         return sem,obs
 
     def load_semantics(self,scene_name,token):
-        return self.load_occ3d(scene_name,token,require_lidar_mask=False)[0]
+        # Future-GT/metric callers need only semantics.  Reading through
+        # load_occ3d also decompresses the equally large mask_lidar member of
+        # every NPZ even though it is immediately discarded.
+        path=self._label_path(scene_name,token)
+        if not path.exists():raise FileNotFoundError(path)
+        with np.load(path) as data:
+            if "semantics" not in data:raise KeyError(f"{path} lacks semantics")
+            return np.asarray(data["semantics"])
 
     def load_lidar_observation(self,scene_name,token):
         return self.load_occ3d(scene_name,token,require_lidar_mask=True)[1]
