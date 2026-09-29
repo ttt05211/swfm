@@ -1,0 +1,108 @@
+# V21 Stage 0：Causal Source Induction and Transport
+
+状态：**只实现 Stage-0 upper-bound audit**。没有 Transformer、loss、训练脚本，也不加载或调用任何 V20 completion checkpoint/logit。
+
+## 冻结合同
+
+- 科学基线：Clean-E14 / V18 source-centred SE(2)
+- frozen commit：`ccf7d77e65e9773f441b35083d625b06791bfeaa`
+- V21 工程分支基于：`feature/v20-unified-transport-completion@22b07d0`
+- target：`DORMANT_ANCESTRAL + BIRTH`
+- 正式 horizon：1 / 2 / 3 s；完整 state/onset：0.5 / 1 / 1.5 / 2 / 2.5 / 3 s
+- Historical memory：完整过去 2.5 s，25 m/s causal association
+- Frontier：0.4m canonical BEV boundary → fixed 1.6m anchor lattice
+- compositor：V18 occupied 永远保护；Historical > Frontier；同类型 anchor ID 升序，first-writer wins
+- frozen Moving-mIoU v2 不修改
+
+## 代码入口
+
+- `real_motion/v21_source_induction.py`：target、anchors、一对一 coverage、shape/prototype、add-only compositor、dev64 selector。
+- `tools/real_motion/build_p0_f9_v21_dev_manifest.py`：冻结 dev64/dev512 identity/order。
+- `tools/real_motion/build_p0_f9_v21_prototype_bank.py`：构建 K=1/4/8/16 train-only prototype。
+- `tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py`：运行 UB-0/UB-1/UB-2 和 Stage-0B gate。
+
+## 1. 冻结 population
+
+```bash
+python tools/real_motion/build_p0_f9_v21_dev_manifest.py \
+  --stage1-cache "$V20_STAGE1_DEV512" \
+  --output data/p0_f9_v21_dev64_manifest.json --count 64
+
+python tools/real_motion/build_p0_f9_v21_dev_manifest.py \
+  --stage1-cache "$V20_STAGE1_DEV512" \
+  --output data/p0_f9_v21_dev512_manifest.json --count 0
+```
+
+dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin，不使用 GT positive 选样；manifest 保存 parent/selected fingerprint。
+
+## 2. 构建 train-only prototype
+
+```bash
+python tools/real_motion/build_p0_f9_v21_prototype_bank.py \
+  --config "$RUNTIME_CONFIG" --train-cache "$TRAIN_V18" \
+  --dataroot "$DATAROOT" --info-pkl "$TRAIN_INFO" \
+  --output-dir outputs/p0_f9_v21_prototypes --k 1 4 8 16
+```
+
+唯一 observation key 为 `(sample_token, instance_token)`；overlapping windows 先按真实 sample 去重。同一 instance 在不同 sample 可各计一次。shape 只做 GT center/yaw 的 offline canonicalization，不做 box-size scaling，保留真实尺度；距离为 `1-binary IoU`。某类样本少于 K 时不复制 medoid。
+
+## 3. dev64 Stage-0 smoke
+
+```bash
+for K in 1 4 8 16; do
+  for R in 0.8 1.6 3.2; do
+    python tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py \
+      --config "$RUNTIME_CONFIG" --val-cache "$DEV_V18" \
+      --population-manifest data/p0_f9_v21_dev64_manifest.json \
+      --checkpoint "$V18_CLEAN_E14" \
+      --prototype-bank "outputs/p0_f9_v21_prototypes/prototype_bank_k$K.pt" \
+      --dataroot "$DATAROOT" --info-pkl "$VAL_INFO" \
+      --coverage-radius-m "$R" \
+      --output "outputs/v21_stage0_dev64_k$K_r$R.json"
+  done
+done
+```
+
+只允许用 dev64 选择一次最小可用 K 和 coverage radius，随后冻结。
+
+## 4. dev512 Stage-0B
+
+```bash
+python tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py \
+  --config "$RUNTIME_CONFIG" --val-cache "$DEV_V18" \
+  --population-manifest data/p0_f9_v21_dev512_manifest.json \
+  --checkpoint "$V18_CLEAN_E14" --prototype-bank "$SELECTED_PROTOTYPE_BANK" \
+  --dataroot "$DATAROOT" --info-pkl "$VAL_INFO" \
+  --coverage-radius-m "$SELECTED_RADIUS" \
+  --output outputs/v21_stage0b_dev512.json --enforce-stage0b-gate
+```
+
+硬门槛：deployable UB2 `ΔmIoU >= +0.50 pp`；保留 UB1 mIoU headroom >=70%；causal component coverage >=70%；mean legal candidates/positive <=10。Moving-Micro 按冻结协议报告，但不是对所有 target 的无条件否决门槛。
+
+## 五条 oracle
+
+1. `UB0_EXACT`：所有 eligible target + future-onset exact shape + GT state。
+2. `UB1_CAUSAL_EXACT`：只保留一对一 causal-covered target，shape/state 与 UB0 相同。
+3. `UB2_DORMANT_CAUSAL_SHAPE`：DORMANT → last-observed real shape；BIRTH 仍 exact。
+4. `UB2_BIRTH_PROTOTYPE`：BIRTH → oracle-best train prototype；DORMANT 仍 exact。
+5. `UB2_DEPLOYABLE_REPRESENTATION`：DORMANT last-observed shape + BIRTH prototype。
+
+UB0→UB1 只测 candidate coverage；两个 UB2 diagnostic 分别隔离 historical shape aging 与 prototype quantization；deployable UB2 用于最终 Stage-0B gate。
+
+## 输出审计
+
+报告包括：IoU/mIoU/Moving Macro/Moving Micro、per-horizon/per-class delta、all V21 / Moving-eligible target mass、component/voxel coverage、history/frontier/uncovered、candidate budget、non-report-horizon-only、last-seen age source/voxel histogram、age-stratum UB、shape unresolved/ambiguous、addition precision/target recall、collision、blocked-by-V18、OOB 和 scene delta。
+
+## V18 exactness
+
+Evaluator 默认至少检查第一个窗口：
+
+1. 当前 V18 default forward 与逐行复刻 frozen `ccf7d77` forward elementwise 比较；
+2. 复用 `benchmark_p0_f9_v18_runtime._exactness_check` 验证 Strong、SE(2) raster 和 A1 compositor；
+3. 每个窗口验证空 V21 proposals 与 V18 逐 voxel 相等。
+
+任一失败立即停止。
+
+## 明确未实现
+
+Source Induction Transformer、Event/State/Render loss、Positive32、Train1024/4096/full、learned V21 checkpoint、dense completion、global Null query、Autoencoder、4–6s rollout均未实现。只有 dev64 和 dev512 Stage-0B 支持这条表示路线后才进入 learned stage。
