@@ -10,6 +10,7 @@ from real_motion.v21_source_induction import (
 )
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import (
     Metrics,per_horizon_gt_component_indices,serialized_shape_population_fingerprint,
+    verify_prototype_medoids_in_shape_pool,
 )
 
 def birth(token,xy,onset=1):
@@ -99,6 +100,14 @@ def test_legacy_float32_shape_pool_is_fingerprinted_before_normalization():
                     "local_xyz_m":shape.local_xyz_m.astype(np.float32),
                     "observation_key":["s","i"]}]}
     assert serialized_shape_population_fingerprint(payload)==canonical_shape_population_fingerprint({4:[shape]})
+
+def test_cross_artifact_contract_verifies_every_prototype_medoid():
+    a=CanonicalShape(4,np.asarray([[0,0,0]],np.int32),("s0","i0"))
+    b=CanonicalShape(4,np.asarray([[0,0,0],[1,0,0]],np.int32),("s1","i1"))
+    bank=build_prototype_bank(
+        {4:[a,b]},requested_k=2,
+        population_manifest=[a.observation_key,b.observation_key])
+    assert verify_prototype_medoids_in_shape_pool(bank,{4:[b,a]})==2
 
 def test_frontier_keeps_type_and_time_bits():
     grid=OccupancyGrid(x_min=-0.8,y_min=-0.8,z_min=-0.2,voxel_size=(0.4,0.4,0.4),shape_hwd=(4,4,1))

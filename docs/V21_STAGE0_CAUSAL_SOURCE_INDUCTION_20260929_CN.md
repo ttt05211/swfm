@@ -52,6 +52,8 @@ dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin
 
 同一目录还会生成 `canonical_shape_pool.pt`。它与 prototype bank 共享完全相同的 train-only population、provenance 和 shape fingerprint，不进行第二次数据扫描。Evaluator 使用 canonical-cell 倒排索引计算 exact train-NN，避免 target × pool 的全量两两比较。diagnostic bank 需同时传入 `--allow-incomplete-prototype-bank --allow-incomplete-shape-pool`；正式完整 train bank 默认 fail-closed。
 
+旧版 float32 pool 与 bank 可能因 canonical local-row 重排产生不同的全体 shape fingerprint。兼容加载仍分别验证两个文件自身 fingerprint，并强制 observation population、source provenance 和每一个 K medoid 的 class/key/cells/geometry 完全一致；全体指纹是否相同保留在审计字段中，不再把纯序列化顺序差异误判为 population 不同。新版构建器保存 float64 local coordinates，后续新 artifact 不再产生该兼容问题。
+
 ## 3. dev64 Stage-0 smoke
 
 Stage-0 evaluator 的 `--cpu-workers 0` 默认选择至多 8 个线程，并行加载同一窗口的帧、提取六帧历史/未来 component 和计算 Moving support。global/scene 指标共用一次 confusion-matrix 计数，替代对每个类别重复扫描全体素；输出 `performance.seconds_by_stage` 便于继续定位瓶颈。这里 GPU 只负责冻结 V18 forward/warp，Stage-0 的 GT attribution、component、renderer 与 metric 仍主要是 CPU 工作，因此低显存和间歇性 GPU utilization 本身不是停滞。

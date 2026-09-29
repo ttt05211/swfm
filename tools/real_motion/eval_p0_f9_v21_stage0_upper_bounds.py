@@ -222,6 +222,36 @@ def serialized_shape_population_fingerprint(rows_by_class):
                 class_id,cells,key,local)])
     return stable_json_fingerprint(out)
 
+def verify_prototype_medoids_in_shape_pool(bank,shapes_by_class):
+    """Require every persisted medoid to be the same train observation/shape.
+
+    This is the operative cross-artifact contract.  A legacy bank and a newly
+    serialized full pool can have different all-shape fingerprints because of
+    float32 canonical-row ordering, while still sharing the exact population
+    and all K medoids.
+    """
+    pool={}
+    for cid,rows in shapes_by_class.items():
+        for shape in rows:
+            key=(int(cid),tuple(shape.observation_key or ("","")))
+            if key in pool:raise RuntimeError("duplicate class/observation in shape pool")
+            pool[key]=shape
+    verified=0
+    for cid,rows in bank.medoids_by_class.items():
+        for medoid in rows:
+            key=(int(cid),tuple(medoid.observation_key or ("","")))
+            candidate=pool.get(key)
+            if candidate is None:
+                raise RuntimeError(f"prototype medoid missing from shape pool: {key}")
+            if not np.array_equal(medoid.cells_ijk,candidate.cells_ijk):
+                raise RuntimeError(f"prototype medoid cells differ from shape pool: {key}")
+            left=np.unique(np.asarray(medoid.local_xyz_m,dtype=np.float32),axis=0)
+            right=np.unique(np.asarray(candidate.local_xyz_m,dtype=np.float32),axis=0)
+            if not np.array_equal(left,right):
+                raise RuntimeError(f"prototype medoid geometry differs from shape pool: {key}")
+            verified+=1
+    return verified
+
 def load_bank(path,*,allow_incomplete=False):
     x=torch.load(path,map_location="cpu",weights_only=False)
     if x.get("protocol")!=PROTOTYPE_PROTOCOL: raise RuntimeError("bad prototype bank")
@@ -304,13 +334,17 @@ def load_shape_pool(path,bank,*,allow_incomplete=False):
     fingerprint=shape_pool_metadata_fingerprint(population,shape_fp,provenance)
     if fingerprint!=x.get("fingerprint"):
         raise RuntimeError("shape-pool metadata fingerprint mismatch")
-    if shape_fp!=bank.population_shape_fingerprint:
-        raise RuntimeError("shape pool and prototype bank use different shape populations")
     if dict(bank.source_provenance)!=provenance:
         raise RuntimeError("shape pool and prototype bank provenance differ")
+    if tuple(bank.population_manifest)!=population:
+        raise RuntimeError("shape pool and prototype bank observation populations differ")
+    verified_medoids=verify_prototype_medoids_in_shape_pool(bank,shapes)
     meta={"path":str(Path(path).resolve()),"fingerprint":fingerprint,
           "population_shape_fingerprint":shape_fp,"population_observations":len(population),
           "runtime_normalized_shape_fingerprint":canonical_shape_population_fingerprint(shapes),
+          "prototype_population_shape_fingerprint":bank.population_shape_fingerprint,
+          "cross_artifact_population_shape_fingerprint_match":shape_fp==bank.population_shape_fingerprint,
+          "prototype_medoids_verified_against_shape_pool":verified_medoids,
           "class_observations":{str(k):len(v) for k,v in sorted(shapes.items())},
           "source_provenance":provenance}
     return shapes,index_shape_pool(shapes),meta
