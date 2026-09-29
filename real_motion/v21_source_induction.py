@@ -126,10 +126,12 @@ def annotation_map(nusc,token):
         a=nusc.get("sample_annotation",at)
         cid=category_to_dynamic_class(a["category_name"])
         if cid is None: continue
+        w_m,l_m,h_m=(float(x) for x in a["size"])
         out[str(a["instance_token"])]={
             "instance_token":str(a["instance_token"]),"class_id":int(cid),
             "center_world":np.asarray(a["translation"],dtype=np.float64),
             "yaw_world":float(quaternion_yaw(a["rotation"])),
+            "size_lwh":np.asarray([l_m,w_m,h_m],dtype=np.float64),
         }
     return out
 
@@ -339,6 +341,14 @@ def _canon(points,center,yaw):
     q=np.stack((c*r[:,0]+s*r[:,1],-s*r[:,0]+c*r[:,1],r[:,2]),-1)
     return np.unique(np.rint(q/SHAPE_RES).astype(np.int32),axis=0)
 
+def _points_inside_oriented_box(points_world,ann,margin_m=0.2):
+    pts=np.asarray(points_world,dtype=np.float64)
+    rel=pts-np.asarray(ann["center_world"],dtype=np.float64)[None]
+    yaw=float(ann["yaw_world"]); c,s=math.cos(yaw),math.sin(yaw)
+    local=np.stack((c*rel[:,0]+s*rel[:,1],-s*rel[:,0]+c*rel[:,1],rel[:,2]),axis=-1)
+    half=0.5*np.asarray(ann["size_lwh"],dtype=np.float64)+float(margin_m)
+    return (np.abs(local)<=half[None]).all(axis=1)
+
 def attribute_instance_shape(semantic,pose,anns,token,*,grid,free_label=17,match_max_distance_m=4.0,observation_key=None):
     token=str(token); ann=anns.get(token)
     if ann is None:return ShapeAttribution(None,False,True,0)
@@ -348,12 +358,16 @@ def attribute_instance_shape(semantic,pose,anns,token,*,grid,free_label=17,match
     chosen=[c for c,(t,_) in zip(comps,mm) if t==token]
     if not chosen:return ShapeAttribution(None,False,True,0)
     same=[a for a in anns.values() if int(a["class_id"])==int(ann["class_id"])]
+    worlds=[]
     for comp in chosen:
-        cc=np.asarray(comp["centroid_world"])
-        ds=sorted(float(np.linalg.norm(cc[:2]-np.asarray(a["center_world"])[:2])) for a in same)
-        if len(ds)>1 and ds[0]<=match_max_distance_m and ds[1]-ds[0]<=0.2:
+        points=_component_world_points(comp,pose,grid); worlds.append(points)
+        overlaps=[
+            str(a["instance_token"]) for a in same
+            if bool(_points_inside_oriented_box(points,a).any())
+        ]
+        if len(set(overlaps))>1:
             return ShapeAttribution(None,True,False,len(chosen))
-    points=np.concatenate([_component_world_points(c,pose,grid) for c in chosen])
+    points=np.concatenate(worlds,axis=0)
     return ShapeAttribution(CanonicalShape(int(ann["class_id"]),_canon(points,ann["center_world"],ann["yaw_world"]),observation_key),False,False,len(chosen))
 
 def shape_iou(a,b):
