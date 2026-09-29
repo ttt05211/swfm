@@ -32,7 +32,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 from tools.real_motion.v20_unified_common import STAGE1_PROTOCOL
 
-EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v3"
+EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v4_query_entry"
 REPORT_H=(1.0,2.0,3.0)
 VARIANTS=("UB0_EXACT","UB1_CAUSAL_EXACT","UB2_DORMANT_CAUSAL_SHAPE",
           "UB2_BIRTH_PROTOTYPE","UB2_DEPLOYABLE_REPRESENTATION")
@@ -266,10 +266,11 @@ def annotation_center_inside_grid(center_world,ego_to_world,grid):
     return bool(((ego>=lower)&(ego<upper)).all())
 
 def accumulate_coverage_stratum(store,distances,name,subset,all_match_tokens,
-                                historical,frontier,t0_pose,radius):
+                                historical,frontier,t0_pose,radius,onset_index_by_token=None):
     subset=list(subset); tokens={t.instance_token for t in subset}; row=store[name]
     matches,report=assign_causal_coverage(
-        subset,historical,frontier,t0_pose=t0_pose,coverage_radius_m=radius)
+        subset,historical,frontier,t0_pose=t0_pose,coverage_radius_m=radius,
+        onset_index_by_token=onset_index_by_token)
     if report["duplicate_target_assignment"] or report["duplicate_anchor_assignment"]:
         raise RuntimeError(f"V21 stratum assignment violated one-to-one contract: {name}")
     eligible=int(report["eligible_targets"]); row["eligible"]+=eligible
@@ -323,8 +324,10 @@ def main():
     ages={str(x):Metrics() for x in (0.5,1.0,1.5,2.0,2.5)}
     q={v:defaultdict(int,{"added":0,"occ_tp":0,"semantic_tp":0,"target_addable":0,"target_recovered":0}) for v in VARIANTS}
     audit=defaultdict(int); aa=defaultdict(int); sa=defaultdict(int); ca={v:defaultdict(int) for v in VARIANTS}; cov=defaultdict(float)
+    identity_cov=defaultdict(float)
     cov_strata=defaultdict(lambda:defaultdict(float)); cov_distances=defaultdict(list)
-    perclass=defaultdict(int); perh=defaultdict(int); totalvox=coveredvox=alltargets=movingtargets=allvox=movingvox=0
+    perclass=defaultdict(int); queryperclass=defaultdict(int); perh=defaultdict(int)
+    totalvox=coveredvox=alltargets=querytargets=movingtargets=querymovingtargets=allvox=movingvox=0
     scene=defaultdict(lambda:{"V18_BASE":Metrics(),**{v:Metrics() for v in VARIANTS}})
     checked=0; started=time.perf_counter()
 
@@ -363,29 +366,34 @@ def main():
                 for kk,vv in v.items():aa[f"{k}/{kk}"]+=int(vv)
             else:aa[k]+=int(v)
         aa["frontier_anchor_count"]+=fa["frontier_anchor_count"]
-        matches,cr=assign_causal_coverage(targets,hist,front,t0_pose=raw["history_poses"][-1],coverage_radius_m=a.coverage_radius_m)
-        if cr["duplicate_target_assignment"] or cr["duplicate_anchor_assignment"]:
-            raise RuntimeError("V21 causal assignment violated one-to-one contract")
-        mb={m.target_token:m for m in matches}; cov["eligible"]+=cr["eligible_targets"]; cov["covered"]+=cr["covered_targets"]
-        cov["candidate_sum"]+=cr["mean_legal_candidates_per_positive"]*cr["eligible_targets"]
-        cov["hist"]+=cr["historical_matches"]; cov["front"]+=cr["frontier_matches"]
-        cov["dup_t"]+=cr["duplicate_target_assignment"]; cov["dup_a"]+=cr["duplicate_anchor_assignment"]
-        cov["maxcand"]=max(cov["maxcand"],cr["max_legal_candidates_per_positive"])
+        identity_matches,identity_report=assign_causal_coverage(
+            targets,hist,front,t0_pose=raw["history_poses"][-1],coverage_radius_m=a.coverage_radius_m)
+        if identity_report["duplicate_target_assignment"] or identity_report["duplicate_anchor_assignment"]:
+            raise RuntimeError("V21 annotation-identity assignment violated one-to-one contract")
+        identity_cov["eligible"]+=identity_report["eligible_targets"]
+        identity_cov["covered"]+=identity_report["covered_targets"]
+        identity_cov["candidate_sum"]+=identity_report["mean_legal_candidates_per_positive"]*identity_report["eligible_targets"]
+        identity_cov["hist"]+=identity_report["historical_matches"]
+        identity_cov["front"]+=identity_report["frontier_matches"]
+        identity_cov["maxcand"]=max(identity_cov["maxcand"],identity_report["max_legal_candidates_per_positive"])
 
         future_attrs,future_ann_maps=future_shape_cache(source,w,raw,targets,pcfg,a.match_max_distance_m)
         masks=target_masks_from_attributions(future_attrs,pcfg.grid.shape_hwd)
-        onset_resolved=set(); any_resolved=set(); report_component=set()
+        onset_resolved=set(); any_resolved=set(); report_component=set(); first_resolved={}
         for t in targets:
             tok=t.instance_token
             resolved=[hi for hi,row in enumerate(future_attrs)
                       if (row.get(tok) is not None and row[tok].shape is not None)]
             if resolved:
-                any_resolved.add(tok); first=resolved[0]
+                any_resolved.add(tok); first=resolved[0]; first_resolved[tok]=first
                 sa[f"first_resolved_horizon/{ALL_HORIZONS_S[first]:.1f}s"]+=1
                 if first>t.onset_index:sa["resolved_only_after_annotation_onset"]+=1
             else:sa["no_future_shape_resolved"]+=1
             if t.onset_index in resolved:onset_resolved.add(tok)
             if any(tok in masks[hi] for hi in REPORT_INDICES):report_component.add(tok)
+            onset_attr=future_attrs[t.onset_index].get(tok)
+            if onset_attr is not None and onset_attr.ambiguous:
+                sa["annotation_onset_shape_ambiguous"]+=1
             ann=future_ann_maps[t.onset_index].get(tok)
             if ann is not None:
                 inside=annotation_center_inside_grid(
@@ -395,7 +403,21 @@ def main():
         sa["onset_shape_resolved"]+=len(onset_resolved)
         sa["any_future_shape_resolved"]+=len(any_resolved)
         sa["report_horizon_component_resolved"]+=len(report_component)
-        all_match_tokens=set(mb)
+        eval_targets=[t for t in targets if t.instance_token in report_component]
+        query_onset={t.instance_token:first_resolved[t.instance_token] for t in eval_targets}
+        querytargets+=len(eval_targets)
+        for t in eval_targets:queryperclass[str(t.class_id)]+=1
+        matches,cr=assign_causal_coverage(
+            eval_targets,hist,front,t0_pose=raw["history_poses"][-1],
+            coverage_radius_m=a.coverage_radius_m,onset_index_by_token=query_onset)
+        if cr["duplicate_target_assignment"] or cr["duplicate_anchor_assignment"]:
+            raise RuntimeError("V21 query-entry assignment violated one-to-one contract")
+        mb={m.target_token:m for m in matches}; cov["eligible"]+=cr["eligible_targets"]; cov["covered"]+=cr["covered_targets"]
+        cov["candidate_sum"]+=cr["mean_legal_candidates_per_positive"]*cr["eligible_targets"]
+        cov["hist"]+=cr["historical_matches"]; cov["front"]+=cr["frontier_matches"]
+        cov["dup_t"]+=cr["duplicate_target_assignment"]; cov["dup_a"]+=cr["duplicate_anchor_assignment"]
+        cov["maxcand"]=max(cov["maxcand"],cr["max_legal_candidates_per_positive"])
+        all_match_tokens={m.target_token for m in identity_matches}
         strata={"onset_shape_resolved":onset_resolved,
                 "any_future_shape_resolved":any_resolved,
                 "report_horizon_component_resolved":report_component}
@@ -404,20 +426,23 @@ def main():
                 cov_strata,cov_distances,name,
                 (t for t in targets if t.instance_token in tokens),all_match_tokens,
                 hist,front,raw["history_poses"][-1],a.coverage_radius_m)
-        onset={}; hshape={}; proto={}; hage={}; rank={t.instance_token:i for i,t in enumerate(targets)}
-        for t in targets:
-            tok=t.instance_token; oi=t.onset_index; at=future_attrs[oi].get(tok)
+        accumulate_coverage_stratum(
+            cov_strata,cov_distances,"report_component_query_entry",eval_targets,set(mb),
+            hist,front,raw["history_poses"][-1],a.coverage_radius_m,query_onset)
+        onset={}; hshape={}; proto={}; hage={}; rank={t.instance_token:i for i,t in enumerate(eval_targets)}
+        for t in eval_targets:
+            tok=t.instance_token; oi=query_onset[tok]; at=future_attrs[oi].get(tok)
             if at is None or at.shape is None:
                 if at is not None and at.ambiguous:sa["shape_ambiguous"]+=1
-                sa["shape_unresolved"]+=1
+                sa["query_entry_shape_unresolved"]+=1
             else:
                 ann=future_ann_maps[oi][tok]
                 roundtrip,_=rasterize_canonical_shape(
                     at.shape,ann["center_world"],ann["yaw_world"],raw["future_poses"][oi],grid=pcfg.grid)
                 expected=np.unique(np.asarray(at.voxel_indices,dtype=np.int64),axis=0)
                 if not np.array_equal(roundtrip,expected):
-                    raise RuntimeError(f"future-onset exact-shape round-trip failed: {w.scene_name}/{w.t0_token}/{tok}")
-                sa["onset_roundtrip_exact"]+=1
+                    raise RuntimeError(f"query-entry exact-shape round-trip failed: {w.scene_name}/{w.t0_token}/{tok}")
+                sa["query_entry_roundtrip_exact"]+=1
                 onset[tok]=at.shape; pp=oracle_best_prototype(at.shape,bank)
                 if pp is not None:proto[tok]=pp
                 elif t.responsibility=="BIRTH":sa["prototype_missing_class"]+=1
@@ -435,9 +460,10 @@ def main():
         moving=np.stack([x[0] for x in moving_rows]); mt=set()
         for hi in REPORT_INDICES:mt.update(str(r["instance_token"]) for r in moving_rows[hi][1])
         movingtargets+=sum(t.instance_token in mt for t in targets)
+        querymovingtargets+=sum(t.instance_token in mt for t in eval_targets)
         covered=set(mb)
         for hi in REPORT_INDICES:
-            for t in targets:
+            for t in eval_targets:
                 m=masks[hi].get(t.instance_token)
                 if m is None:continue
                 n=int(m.sum()); allvox+=n; totalvox+=n
@@ -448,12 +474,12 @@ def main():
             gt=np.asarray(raw["future_gt_occ"][hi],np.uint8); bh=np.asarray(basepred[hi],np.uint8)
             states["V18_BASE"].update(pos,bh,gt,moving[hi],pcfg.free_label); scene[w.scene_name]["V18_BASE"].update(pos,bh,gt,moving[hi],pcfg.free_label)
             tmask=np.zeros(pcfg.grid.shape_hwd,bool)
-            for t in targets:
+            for t in eval_targets:
                 if t.instance_token in masks[hi]:tmask|=masks[hi][t.instance_token]
             props={v:[] for v in VARIANTS}; ageprops={k:[] for k in ages}; oob=defaultdict(int)
-            for t in targets:
+            for t in eval_targets:
                 tok=t.instance_token
-                if not t.existence[hi]:continue
+                if hi<query_onset[tok] or not t.existence[hi]:continue
                 ann=future_ann_maps[hi].get(tok)
                 if ann is None:continue
                 cm=mb.get(tok); kind,aid=proposal_key(t,cm,rank[tok])
@@ -511,14 +537,24 @@ def main():
             "source_provenance":dict(bank.source_provenance)},
         "coverage_radius_m":a.coverage_radius_m,"metrics":reports,
         "headroom":{"ub1_exact_delta_mIoU_pp":ub1,"ub2_deployable_delta_mIoU_pp":ub2,"ub2_retention_of_ub1_mIoU":retention},
-        "coverage":{"eligible_targets":eligible,"covered_targets":covered,"component_coverage":compcov,"voxel_coverage":voxcov,
+        "coverage":{"population":"report_horizon_component_resolved at query-entry onset",
+            "eligible_targets":eligible,"covered_targets":covered,"component_coverage":compcov,"voxel_coverage":voxcov,
             "historical_matches":int(cov["hist"]),"frontier_matches":int(cov["front"]),"uncovered_targets":eligible-covered,
             "mean_legal_candidates_per_positive":meanc,"max_legal_candidates_per_positive":int(cov["maxcand"]),
             "duplicate_target_assignment":int(cov["dup_t"]),"duplicate_anchor_assignment":int(cov["dup_a"])},
+        "annotation_identity_coverage_diagnostic":{
+            "eligible_targets":int(identity_cov["eligible"]),"covered_targets":int(identity_cov["covered"]),
+            "coverage":identity_cov["covered"]/max(identity_cov["eligible"],1),
+            "historical_matches":int(identity_cov["hist"]),"frontier_matches":int(identity_cov["front"]),
+            "mean_legal_candidates_per_positive":identity_cov["candidate_sum"]/max(identity_cov["eligible"],1),
+            "max_legal_candidates_per_positive":int(identity_cov["maxcand"])},
         "coverage_strata_diagnostic":coverage_strata_report(cov_strata,cov_distances),
-        "target_mass":{"all_v21_targets":alltargets,"moving_eligible_v21_targets":movingtargets,
-            "all_v21_target_voxels_report_horizons":allvox,"moving_eligible_target_voxels_inside_frozen_support":movingvox,
-            "per_class_targets":dict(perclass),"per_report_horizon_target_components":dict(perh)},
+        "target_mass":{"all_annotation_v21_targets":alltargets,"query_entry_component_targets":querytargets,
+            "moving_eligible_annotation_targets":movingtargets,"moving_eligible_query_entry_targets":querymovingtargets,
+            "query_entry_target_voxels_report_horizons":allvox,
+            "moving_eligible_query_entry_voxels_inside_frozen_support":movingvox,
+            "per_class_annotation_targets":dict(perclass),"per_class_query_entry_targets":dict(queryperclass),
+            "per_report_horizon_annotation_targets":dict(perh)},
         "target_audit":dict(audit),"anchor_audit":dict(aa),"shape_audit":dict(sa),
         "collision_audit":{k:dict(v) for k,v in ca.items()},
         "dormant_age_stratum_ub1_exact":{age:{"metrics":m.compute(),"delta_vs_v18_pp":delta(m.compute(),br)} for age,m in ages.items()},
@@ -529,9 +565,11 @@ def main():
             "by_scene":scene_rows},
         "stage0b_gate":gate,
         "contracts":{"report_horizons_s":list(REPORT_H),"all_state_horizons_s":list(ALL_HORIZONS_S),
-            "target":"DORMANT_ANCESTRAL + BIRTH, report-horizon eligible","compositor":COMPOSITOR_PROTOCOL,
+            "target":"DORMANT_ANCESTRAL + BIRTH with report-horizon occupancy component",
+            "query_entry_onset":"first unambiguous future occupancy component in frozen Omega_max; annotation existence remains six-frame",
+            "compositor":COMPOSITOR_PROTOCOL,
             "moving_metric":"frozen Moving-mIoU v2; unchanged",
-            "coverage_strata":"diagnostic only; formal all-target assignment and gate are unchanged",
+            "coverage_strata":"annotation-onset strata are diagnostic; formal gate uses report-component query-entry assignment",
             "v20_completion_used":False,"transformer_used":False},
         "elapsed_seconds":time.perf_counter()-started}
     Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(result,indent=2),encoding="utf-8")

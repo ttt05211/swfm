@@ -31,6 +31,18 @@ def test_onset_cannot_precede_frontier():
     m,_=assign_causal_coverage([t],[],[a],t0_pose=np.eye(4),coverage_radius_m=3.2)
     assert m==[]
 
+def test_query_entry_onset_can_match_later_frontier():
+    centers=[(10.0,0.0,0.0),None,None,(0.0,0.0,0.0),None,None]
+    yaws=[0.0,None,None,0.0,None,None]
+    t=V21Target("a",4,"BIRTH",(True,False,False,True,False,False),tuple(centers),tuple(yaws),0,True,False)
+    a=FrontierAnchor(1,(0.0,0.0,0.0),1,0b001000,3)
+    old,_=assign_causal_coverage([t],[],[a],t0_pose=np.eye(4),coverage_radius_m=0.8)
+    new,_=assign_causal_coverage(
+        [t],[],[a],t0_pose=np.eye(4),coverage_radius_m=0.8,
+        onset_index_by_token={"a":3})
+    assert old==[]
+    assert len(new)==1 and new[0].target_token=="a" and new[0].distance_m==0.0
+
 def test_add_only_priority_and_collision():
     base=np.full((3,3,1),17,np.uint8); base[0,0,0]=1
     hist=np.asarray([[1,1,0],[0,0,0]]); front=np.asarray([[1,1,0],[2,2,0]])

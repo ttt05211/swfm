@@ -7,7 +7,7 @@
 - 科学基线：Clean-E14 / V18 source-centred SE(2)
 - frozen commit：`ccf7d77e65e9773f441b35083d625b06791bfeaa`
 - V21 工程分支基于：`feature/v20-unified-transport-completion@22b07d0`
-- target：`DORMANT_ANCESTRAL + BIRTH`
+- target：`DORMANT_ANCESTRAL + BIRTH`；保留六帧 annotation existence，但正式 source activation 使用第一次进入冻结 Ωmax 且存在无歧义 occupancy component 的 query-entry onset
 - 正式 horizon：1 / 2 / 3 s；完整 state/onset：0.5 / 1 / 1.5 / 2 / 2.5 / 3 s
 - Historical memory：完整过去 2.5 s，25 m/s causal association
 - Frontier：从 Stage-1 index 继承冻结 Ωmax（0.4m canonical BEV boundary）→ 同 origin 的 1.6m anchor lattice；禁止使用 tracked placeholder extent
@@ -85,13 +85,13 @@ done
 
 ## 五条 oracle
 
-1. `UB0_EXACT`：所有 eligible target + future-onset exact shape + GT state。
+1. `UB0_EXACT`：所有 report-horizon component target + query-entry exact shape + GT state。
 2. `UB1_CAUSAL_EXACT`：只保留一对一 causal-covered target，shape/state 与 UB0 相同。
 3. `UB2_DORMANT_CAUSAL_SHAPE`：DORMANT → last-observed real shape；BIRTH 仍 exact。
 4. `UB2_BIRTH_PROTOTYPE`：BIRTH → oracle-best train prototype；DORMANT 仍 exact。
 5. `UB2_DEPLOYABLE_REPRESENTATION`：DORMANT last-observed shape + BIRTH prototype。
 
-UB0→UB1 只测 candidate coverage；两个 UB2 diagnostic 分别隔离 historical shape aging 与 prototype quantization；deployable UB2 用于最终 Stage-0B gate。
+UB0→UB1 只测 candidate coverage；两个 UB2 diagnostic 分别隔离 historical shape aging 与 prototype quantization；deployable UB2 用于最终 Stage-0B gate。全局 annotation 首次存在时间不等于 query-entry onset：例如物体 0.5s 已在 Ωmax 外存在、2.0s 才进入 occupancy/query domain，则保留完整 existence/state，但以 2.0s 的中心、frontier eligibility 和 exact shape 做 source activation。域外且所有 report horizon 都没有 occupancy component 的 annotation 不进入 component coverage 分母，仍单独报告 identity coverage。
 
 ## 输出审计
 

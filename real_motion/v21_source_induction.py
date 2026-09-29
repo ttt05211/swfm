@@ -391,21 +391,29 @@ def build_frontier_anchors(history_observed,history_poses,future_poses,*,grid,la
                 "frontier_anchor_count":len(out),"deduplicated_anchor_cells":len(out),
                 "lattice":lattice.to_dict()}
 
-def assign_causal_coverage(targets,historical,frontier,*,t0_pose,coverage_radius_m):
+def assign_causal_coverage(targets,historical,frontier,*,t0_pose,coverage_radius_m,
+                           onset_index_by_token=None):
     radius=float(coverage_radius_m); matches=[]; used=set(); by={t.instance_token:t for t in targets}
+    onset_index_by_token={} if onset_index_by_token is None else {
+        str(k):int(v) for k,v in onset_index_by_token.items()}
+    def onset(t):
+        idx=onset_index_by_token.get(t.instance_token,int(t.onset_index))
+        if idx<0 or idx>=len(t.center_world) or t.center_world[idx] is None:
+            raise ValueError(f"invalid coverage onset for {t.instance_token}: {idx}")
+        return idx
     for a in sorted(historical,key=lambda x:(x.canonical_anchor_id,x.track_id)):
         tok=a.target_token; t=by.get(tok)
         if tok is None or a.ambiguous or tok in used or t is None or t.responsibility!="DORMANT_ANCESTRAL":continue
-        p=_world_to_t0(t.center_world[t.onset_index],t0_pose); d=float(np.linalg.norm(p[:2]-np.asarray(a.anchor_xyz_t0)[:2]))
+        oi=onset(t); p=_world_to_t0(t.center_world[oi],t0_pose); d=float(np.linalg.norm(p[:2]-np.asarray(a.anchor_xyz_t0)[:2]))
         matches.append(CoverageMatch(tok,t.responsibility,"historical",a.canonical_anchor_id,d)); used.add(tok)
     births=sorted([t for t in targets if t.responsibility=="BIRTH" and t.instance_token not in used],key=lambda x:x.key)
     front=sorted(frontier,key=lambda x:x.canonical_anchor_id); legal={t.instance_token:0 for t in births}
     if births and front:
         big=1e9; cost=np.full((len(births),len(front)),big)
         for i,t in enumerate(births):
-            p=_world_to_t0(t.center_world[t.onset_index],t0_pose)
+            oi=onset(t); p=_world_to_t0(t.center_world[oi],t0_pose)
             for j,a in enumerate(front):
-                if a.first_eligible_horizon>t.onset_index:continue
+                if a.first_eligible_horizon>oi:continue
                 d=float(np.linalg.norm(p[:2]-np.asarray(a.anchor_xyz_t0)[:2]))
                 if d<=radius+1e-9: legal[t.instance_token]+=1; cost[i,j]=d+(i+1)*(j+1)*1e-12
         ri,ci=linear_sum_assignment(cost)
