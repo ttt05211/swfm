@@ -15,9 +15,10 @@ from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v21_source_induction import (
     KMEDOIDS_CLARA_SAMPLE_SIZE,KMEDOIDS_CLARA_TRIALS,KMEDOIDS_EXACT_MAX_N,
-    PROTOTYPE_PROTOCOL,annotation_map,attribute_instance_shapes,
-    build_prototype_bank,reliable_components_and_tokens,
+    PROTOTYPE_PROTOCOL,SHAPE_POOL_PROTOCOL,SHAPE_RES,annotation_map,attribute_instance_shapes,
+    build_prototype_bank,canonical_shape_population_fingerprint,reliable_components_and_tokens,
     select_scene_balanced_round_robin,stable_json_fingerprint,
+    shape_pool_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
@@ -149,6 +150,31 @@ def main():
               "algorithm_config":{"exact_max_n":KMEDOIDS_EXACT_MAX_N,
                   "clara_sample_size":KMEDOIDS_CLARA_SAMPLE_SIZE,"clara_trials":KMEDOIDS_CLARA_TRIALS},
               "source_provenance":provenance}
+    sorted_shapes={int(cid):tuple(sorted(rows,key=lambda x:tuple(x.observation_key or ("",""))))
+                   for cid,rows in sorted(by_class.items())}
+    sorted_population=tuple(sorted((str(a),str(b)) for a,b in population))
+    population_shape_fp=canonical_shape_population_fingerprint(sorted_shapes)
+    pool_fingerprint=shape_pool_fingerprint(sorted_shapes,sorted_population,provenance)
+    pool_payload={
+        "protocol":SHAPE_POOL_PROTOCOL,
+        "resolution_m":SHAPE_RES,
+        "fingerprint":pool_fingerprint,
+        "population_fingerprint":popfp,
+        "population_shape_fingerprint":population_shape_fp,
+        "population_manifest":[list(x) for x in sorted_population],
+        "source_provenance":provenance,
+        "shapes_by_class":{str(cid):[_serialize(s) for s in rows]
+                           for cid,rows in sorted_shapes.items()},
+        "class_observations":{str(cid):len(rows) for cid,rows in sorted_shapes.items()},
+    }
+    shape_pool_path=out/"canonical_shape_pool.pt"
+    torch.save(pool_payload,shape_pool_path)
+    summary["shape_pool"]={
+        "path":str(shape_pool_path.resolve()),
+        "fingerprint":pool_fingerprint,
+        "population_shape_fingerprint":population_shape_fp,
+        "bytes":shape_pool_path.stat().st_size,
+    }
     cluster_started=time.perf_counter()
     for k in sorted(set(a.k)):
         if k<=0: raise ValueError("K must be positive")

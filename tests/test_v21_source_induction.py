@@ -3,8 +3,10 @@ from real_motion.geometry import OccupancyGrid
 from real_motion.v21_source_induction import (
     AnchorLattice,CanonicalShape,FrontierAnchor,ShapeAttribution,V21Target,assign_causal_coverage,
     attribute_instance_shapes,build_frontier_anchors,build_prototype_bank,
-    compose_v21_add_only,oracle_best_extent_scaled_prototype,oracle_best_prototype,rasterize_canonical_shape,
-    scale_prototype_to_target_extent,select_scene_balanced_round_robin,shape_iou,
+    canonical_shape_population_fingerprint,compose_v21_add_only,index_shape_pool,
+    oracle_best_extent_scaled_prototype,oracle_best_indexed_shape,oracle_best_prototype,
+    rasterize_canonical_shape,scale_prototype_to_target_extent,
+    select_scene_balanced_round_robin,shape_iou,shape_pool_fingerprint,
 )
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics,per_horizon_gt_component_indices
 
@@ -68,6 +70,22 @@ def test_kmedoids_deterministic_and_oracle_best():
     assert x.fingerprint==y.fingerprint
     best=oracle_best_prototype(a,x)
     assert shape_iou(a,best)==max(shape_iou(a,z) for z in x.medoids_by_class[4])
+
+def test_shape_pool_fingerprint_and_sparse_exact_nn_are_deterministic():
+    a=CanonicalShape(4,np.asarray([[0,0,0],[1,0,0]],np.int32),("s0","i0"))
+    b=CanonicalShape(4,np.asarray([[0,0,0],[0,1,0]],np.int32),("s1","i1"))
+    c=CanonicalShape(4,np.asarray([[8,8,0]],np.int32),("s2","i2"))
+    target=CanonicalShape(4,np.asarray([[0,0,0],[0,1,0],[0,2,0]],np.int32),("t","i"))
+    provenance={"split":"train"}; population=[a.observation_key,b.observation_key,c.observation_key]
+    left={4:[a,b,c]}; right={4:[c,a,b]}
+    assert canonical_shape_population_fingerprint(left)==canonical_shape_population_fingerprint(right)
+    assert shape_pool_fingerprint(left,population,provenance)==shape_pool_fingerprint(
+        right,list(reversed(population)),provenance)
+    assert oracle_best_indexed_shape(target,index_shape_pool(left)).observation_key==b.observation_key
+    no_overlap=CanonicalShape(4,np.asarray([[99,99,0]],np.int32),("t2","i2"))
+    assert oracle_best_indexed_shape(no_overlap,index_shape_pool(right)).observation_key==a.observation_key
+    missing=CanonicalShape(7,np.asarray([[0,0,0]],np.int32),("t3","i3"))
+    assert oracle_best_indexed_shape(missing,index_shape_pool(left)) is None
 
 def test_frontier_keeps_type_and_time_bits():
     grid=OccupancyGrid(x_min=-0.8,y_min=-0.8,z_min=-0.2,voxel_size=(0.4,0.4,0.4),shape_hwd=(4,4,1))

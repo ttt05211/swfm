@@ -24,6 +24,7 @@ from .v19_scene_memory import build_dynamic_source_memory
 PROTOCOL="p0_f9_v21_stage0_causal_source_induction_v2"
 POPULATION_PROTOCOL="p0_f9_v21_population_manifest_v2"
 PROTOTYPE_PROTOCOL="v21_train_only_binary_iou_kmedoids_v2"
+SHAPE_POOL_PROTOCOL="v21_train_only_canonical_shape_pool_v1"
 COMPOSITOR_PROTOCOL="v21_v18_free_first_writer_v1"
 FREE_LABEL=17
 REPORT_INDICES=(1,3,5)
@@ -526,6 +527,62 @@ def canonical_shape_fingerprint(shape):
     h.update(np.asarray(shape.cells_ijk,dtype="<i4").tobytes(order="C"))
     h.update(np.asarray(shape.local_xyz_m,dtype="<f4").tobytes(order="C"))
     return h.hexdigest()
+
+def canonical_shape_population_fingerprint(shapes_by_class):
+    rows=[]
+    for cid in sorted(shapes_by_class):
+        for shape in sorted(shapes_by_class[cid],key=lambda x:tuple(x.observation_key or ("",""))):
+            if int(shape.class_id)!=int(cid):
+                raise RuntimeError("shape-pool class key/shape mismatch")
+            rows.append([list(shape.observation_key or ("","")),canonical_shape_fingerprint(shape)])
+    return stable_json_fingerprint(rows)
+
+def shape_pool_fingerprint(shapes_by_class,population_manifest,source_provenance):
+    population=tuple(sorted((str(a),str(b)) for a,b in population_manifest))
+    keys=[tuple(x.observation_key or ("",""))
+          for cid in sorted(shapes_by_class) for x in shapes_by_class[cid]]
+    if len(keys)!=len(set(keys)) or set(keys)!=set(population):
+        raise RuntimeError("shape pool and population manifest differ")
+    payload={
+        "protocol":SHAPE_POOL_PROTOCOL,
+        "resolution_m":SHAPE_RES,
+        "population_manifest":[list(x) for x in population],
+        "population_shape_fingerprint":canonical_shape_population_fingerprint(shapes_by_class),
+        "source_provenance":dict(source_provenance),
+    }
+    return stable_json_fingerprint(payload)
+
+def index_shape_pool(shapes_by_class):
+    """Build a sparse inverted index for exact repeated binary-IoU lookup.
+
+    Only candidates sharing at least one occupied canonical cell can beat IoU
+    zero, so the postings avoid a full target x train-pool scan.
+    """
+    out={}
+    for cid,rows in shapes_by_class.items():
+        parsed=tuple(sorted(rows,key=lambda x:tuple(x.observation_key or ("",""))))
+        if any(int(x.class_id)!=int(cid) for x in parsed):
+            raise RuntimeError("shape-pool class key/shape mismatch")
+        postings={}; sizes=[]
+        for i,shape in enumerate(parsed):
+            cells=frozenset(tuple(v) for v in shape.cells_ijk.tolist()); sizes.append(len(cells))
+            for cell in cells:postings.setdefault(cell,[]).append(i)
+        out[int(cid)]={"shapes":parsed,"sizes":tuple(sizes),
+                       "postings":{k:tuple(v) for k,v in postings.items()}}
+    return out
+
+def oracle_best_indexed_shape(shape,index):
+    row=index.get(int(shape.class_id))
+    if not row or not row["shapes"]:return None
+    target=frozenset(tuple(v) for v in shape.cells_ijk.tolist())
+    overlaps={}
+    for cell in target:
+        for i in row["postings"].get(cell,()):overlaps[i]=overlaps.get(i,0)+1
+    if not overlaps:return row["shapes"][0]
+    def _score(item):
+        i,inter=item; union=len(target)+row["sizes"][i]-inter
+        return (-(inter/max(union,1)),tuple(row["shapes"][i].observation_key or ("","")))
+    return row["shapes"][min(overlaps.items(),key=_score)[0]]
 
 def _set_iou(A,B):return len(A&B)/max(len(A|B),1)
 
