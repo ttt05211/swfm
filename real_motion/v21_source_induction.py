@@ -409,17 +409,21 @@ def assign_causal_coverage(targets,historical,frontier,*,t0_pose,coverage_radius
     births=sorted([t for t in targets if t.responsibility=="BIRTH" and t.instance_token not in used],key=lambda x:x.key)
     front=sorted(frontier,key=lambda x:x.canonical_anchor_id); legal={t.instance_token:0 for t in births}
     if births and front:
-        big=1e9; cost=np.full((len(births),len(front)),big)
+        big=1e9; cost=np.full((len(births),len(front)),big); distance=np.full_like(cost,np.inf)
         for i,t in enumerate(births):
             oi=onset(t); p=_world_to_t0(t.center_world[oi],t0_pose)
             for j,a in enumerate(front):
                 if a.first_eligible_horizon>oi:continue
                 d=float(np.linalg.norm(p[:2]-np.asarray(a.anchor_xyz_t0)[:2]))
-                if d<=radius+1e-9: legal[t.instance_token]+=1; cost[i,j]=d+(i+1)*(j+1)*1e-12
+                if d<=radius+1e-9:
+                    legal[t.instance_token]+=1; distance[i,j]=d
+                    cost[i,j]=d+(i+1)*(j+1)*1e-12
         ri,ci=linear_sum_assignment(cost)
         for i,j in zip(ri,ci):
             if cost[i,j]>=big/2:continue
-            t,a=births[i],front[j]; matches.append(CoverageMatch(t.instance_token,t.responsibility,"frontier",a.canonical_anchor_id,float(cost[i,j])))
+            t,a=births[i],front[j]
+            matches.append(CoverageMatch(
+                t.instance_token,t.responsibility,"frontier",a.canonical_anchor_id,float(distance[i,j])))
     histcand=[int(any(a.target_token==t.instance_token and not a.ambiguous for a in historical))
               for t in targets if t.responsibility=="DORMANT_ANCESTRAL"]
     cc=histcand+list(legal.values()); n=len(targets)
