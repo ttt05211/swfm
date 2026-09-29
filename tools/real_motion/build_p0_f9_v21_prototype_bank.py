@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build deterministic train-only V21 source-shape prototype banks."""
 from __future__ import annotations
-import argparse, hashlib, json, os, time
-from concurrent.futures import ThreadPoolExecutor
+import argparse, hashlib, json, multiprocessing, os, time
+from concurrent.futures import ProcessPoolExecutor,ThreadPoolExecutor
 from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[2]
@@ -34,6 +34,34 @@ def _sha256(path):
     with Path(path).open("rb") as f:
         for chunk in iter(lambda:f.read(1<<20),b""):h.update(chunk)
     return h.hexdigest()
+
+_WORKER_CONTEXT={}
+
+def _process_sample(item):
+    """Process one unique train sample using inherited read-only metadata."""
+    source=_WORKER_CONTEXT["source"]; pcfg=_WORKER_CONTEXT["pcfg"]
+    strong=_WORKER_CONTEXT["strong"]; match_max_distance_m=_WORKER_CONTEXT["match_max_distance_m"]
+    scene,tok=item
+    sem,obs=source.load_occ3d(scene,tok,require_lidar_mask=True); pose=np.asarray(source.pose(tok))
+    components,matched,amb=reliable_components_and_tokens(
+        source,scene,tok,sem,obs,pose,grid=pcfg.grid,strong_cfg=strong,
+        match_max_distance_m=match_max_distance_m)
+    anns=annotation_map(source.nusc,tok)
+    masked=np.where(np.asarray(obs,bool),np.asarray(sem),int(pcfg.free_label)).astype(np.uint8)
+    tokens=sorted({str(x) for x in matched if x is not None})
+    keys={inst:(tok,inst) for inst in tokens}
+    attrs=attribute_instance_shapes(
+        masked,pose,anns,grid=pcfg.grid,free_label=int(pcfg.free_label),
+        match_max_distance_m=match_max_distance_m,tokens=tokens,observation_keys=keys,
+        components=components,component_matches=matched)
+    rows=[]; sample_unresolved=sample_ambiguous=0
+    for inst in tokens:
+        if inst in amb: sample_ambiguous+=1; continue
+        key=keys[inst]; attr=attrs[inst]
+        if attr.ambiguous: sample_ambiguous+=1; continue
+        if attr.shape is None: sample_unresolved+=1; continue
+        rows.append((int(attr.shape.class_id),attr.shape,key))
+    return rows,sample_unresolved,sample_ambiguous
 
 def main():
     p=argparse.ArgumentParser(); add_config_args(p)
@@ -78,36 +106,24 @@ def main():
     strong=StrongW2DetConfig(free_label=int(pcfg.free_label))
     by_class={}; population=[]; unresolved=ambiguous=0
 
-    def _process_sample(item):
-        scene,tok=item
-        sem,obs=source.load_occ3d(scene,tok,require_lidar_mask=True); pose=np.asarray(source.pose(tok))
-        components,matched,amb=reliable_components_and_tokens(
-            source,scene,tok,sem,obs,pose,grid=pcfg.grid,strong_cfg=strong,
-            match_max_distance_m=a.match_max_distance_m)
-        anns=annotation_map(source.nusc,tok)
-        masked=np.where(np.asarray(obs,bool),np.asarray(sem),int(pcfg.free_label)).astype(np.uint8)
-        tokens=sorted({str(x) for x in matched if x is not None})
-        keys={inst:(tok,inst) for inst in tokens}
-        attrs=attribute_instance_shapes(
-            masked,pose,anns,grid=pcfg.grid,free_label=int(pcfg.free_label),
-            match_max_distance_m=a.match_max_distance_m,tokens=tokens,observation_keys=keys,
-            components=components,component_matches=matched)
-        rows=[]; sample_unresolved=sample_ambiguous=0
-        for inst in tokens:
-            if inst in amb: sample_ambiguous+=1; continue
-            key=keys[inst]; attr=attrs[inst]
-            if attr.ambiguous: sample_ambiguous+=1; continue
-            if attr.shape is None: sample_unresolved+=1; continue
-            rows.append((int(attr.shape.class_id),attr.shape,key))
-        return rows,sample_unresolved,sample_ambiguous
-
+    global _WORKER_CONTEXT
+    _WORKER_CONTEXT={"source":source,"pcfg":pcfg,"strong":strong,
+                     "match_max_distance_m":a.match_max_distance_m}
     scan_started=time.perf_counter()
     if workers==1:
         results=map(_process_sample,ordered)
-        pool=None
+        pool=None; executor_kind="serial"
+    elif os.name=="posix":
+        # Linux fork shares the large read-only nuScenes metadata through CoW
+        # while bypassing the GIL-bound component/attribution path.
+        pool=ProcessPoolExecutor(max_workers=workers,
+                                 mp_context=multiprocessing.get_context("fork"))
+        results=pool.map(_process_sample,ordered,chunksize=4)
+        executor_kind="fork_process_pool"
     else:
         pool=ThreadPoolExecutor(max_workers=workers)
-        results=pool.map(_process_sample,ordered)
+        results=pool.map(_process_sample,ordered,chunksize=4)
+        executor_kind="thread_pool_fallback"
     try:
         for si,(rows,sample_unresolved,sample_ambiguous) in enumerate(results,1):
             unresolved+=sample_unresolved; ambiguous+=sample_ambiguous
@@ -139,7 +155,7 @@ def main():
              "record_selection_rule":selection_rule,
              "selected_windows":len(records),
              "selected_scenes":len({x[0] for x in selected_record_keys}),
-             "workers":workers,"sample_scan_seconds":scan_seconds,
+             "workers":workers,"executor_kind":executor_kind,"sample_scan_seconds":scan_seconds,
              "sample_scan_samples_per_second":len(ordered)/max(scan_seconds,1e-9),
              "class_histogram":{str(k):len(v) for k,v in sorted(by_class.items())},
              "shape_unresolved":unresolved,"shape_ambiguous":ambiguous,

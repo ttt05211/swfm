@@ -48,7 +48,7 @@ dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin
 
 每类 observation 数 `<=512` 时运行 exact PAM；更大 population 使用冻结的 deterministic CLARA（sample size 256，5 trials），避免全量 `N×N` 距离矩阵。bank 保存 train-cache/info SHA256、完整 population 标志、shape fingerprint、算法参数和 medoid 内容 fingerprint。`--max-windows` 生成的只是 diagnostic bank，且窗口按训练缓存中的 scene first-appearance order 做 deterministic scene-balanced round-robin，不再取有顺序偏差的前 N 条；正式 evaluator 默认拒绝不完整 bank，只有显式 `--allow-incomplete-prototype-bank` 才能用于调试。evaluator 另报告 causal-covered BIRTH 的 prototype/exact canonical shape IoU 与体素量比，用于区分训练 population 不充分和 prototype 表示本身不足。
 
-构建器默认使用至多 8 个线程并发完成独立 sample 的 Occ3D 读取、Strong component extraction 和 shape attribution（`--workers 0` 自动选择，服务器可显式使用 `--workers 8`）。unique sample 只访问一次，因此不再使用会保留数 GB 三维数组但没有复用收益的 occupancy LRU。结果仍由主线程按冻结 sample order 汇总，所以 worker 完成顺序不会改变 population、medoid 或 fingerprint。
+构建器默认使用至多 8 个 worker 并发完成独立 sample 的 Occ3D 读取、Strong component extraction 和 shape attribution（`--workers 0` 自动选择，服务器可显式使用 `--workers 8`）。Linux 服务器使用 fork process pool，共享只读 nuScenes metadata 的 copy-on-write 页面并绕过 Python GIL；非 POSIX 平台才回退线程。unique sample 只访问一次，因此不再使用会保留数 GB 三维数组但没有复用收益的 occupancy LRU。结果仍由主进程按冻结 sample order 汇总，所以 worker 完成顺序不会改变 population、medoid 或 fingerprint。
 
 同一目录还会生成 `canonical_shape_pool.pt`。它与 prototype bank 共享完全相同的 train-only population、provenance 和 shape fingerprint，不进行第二次数据扫描。Evaluator 使用 canonical-cell 倒排索引计算 exact train-NN，避免 target × pool 的全量两两比较。diagnostic bank 需同时传入 `--allow-incomplete-prototype-bank --allow-incomplete-shape-pool`；正式完整 train bank 默认 fail-closed。
 
