@@ -10,7 +10,7 @@
 - target：`DORMANT_ANCESTRAL + BIRTH`
 - 正式 horizon：1 / 2 / 3 s；完整 state/onset：0.5 / 1 / 1.5 / 2 / 2.5 / 3 s
 - Historical memory：完整过去 2.5 s，25 m/s causal association
-- Frontier：0.4m canonical BEV boundary → fixed 1.6m anchor lattice
+- Frontier：从 Stage-1 index 继承冻结 Ωmax（0.4m canonical BEV boundary）→ 同 origin 的 1.6m anchor lattice；禁止使用 tracked placeholder extent
 - compositor：V18 occupied 永远保护；Historical > Frontier；同类型 anchor ID 升序，first-writer wins
 - frozen Moving-mIoU v2 不修改
 
@@ -24,39 +24,42 @@
 ## 1. 冻结 population
 
 ```bash
-python tools/real_motion/build_p0_f9_v21_dev_manifest.py \
+"$PY" -u tools/real_motion/build_p0_f9_v21_dev_manifest.py \
   --stage1-cache "$V20_STAGE1_DEV512" \
   --output data/p0_f9_v21_dev64_manifest.json --count 64
 
-python tools/real_motion/build_p0_f9_v21_dev_manifest.py \
+"$PY" -u tools/real_motion/build_p0_f9_v21_dev_manifest.py \
   --stage1-cache "$V20_STAGE1_DEV512" \
   --output data/p0_f9_v21_dev512_manifest.json --count 0
 ```
 
-dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin，不使用 GT positive 选样；manifest 保存 parent/selected fingerprint。
+dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin，不使用 GT positive 选样；manifest 保存 parent/selected fingerprint、Stage-1 index SHA256、冻结 highres/coarse lattice 和整份 manifest fingerprint。Evaluator 会重新验证所有字段。
 
 ## 2. 构建 train-only prototype
 
 ```bash
-python tools/real_motion/build_p0_f9_v21_prototype_bank.py \
+"$PY" -u tools/real_motion/build_p0_f9_v21_prototype_bank.py \
   --config "$RUNTIME_CONFIG" --train-cache "$TRAIN_V18" \
   --dataroot "$DATAROOT" --info-pkl "$TRAIN_INFO" \
   --output-dir outputs/p0_f9_v21_prototypes --k 1 4 8 16
 ```
 
-唯一 observation key 为 `(sample_token, instance_token)`；overlapping windows 先按真实 sample 去重。同一 instance 在不同 sample 可各计一次。shape 只做 GT center/yaw 的 offline canonicalization，不做 box-size scaling，保留真实尺度；距离为 `1-binary IoU`。某类样本少于 K 时不复制 medoid。
+唯一 observation key 为 `(sample_token, instance_token)`；对 train windows 的 history/future sample union 去重，不按 overlapping window 重复加权。同一 instance 在不同 sample 可各计一次。每个 sample 只运行一次 frozen Strong component extraction，归因和 shape 构建直接复用同一组 component/match，不再重复做 connected-component。shape 只做 GT center/yaw 的 offline canonicalization，不做 box-size scaling，保留真实尺度；距离为 `1-binary IoU`。某类样本少于 K 时不复制 medoid。
+
+每类 observation 数 `<=512` 时运行 exact PAM；更大 population 使用冻结的 deterministic CLARA（sample size 256，5 trials），避免全量 `N×N` 距离矩阵。bank 保存 train-cache/info SHA256、完整 population 标志、shape fingerprint、算法参数和 medoid 内容 fingerprint。`--max-windows` 生成的只是 diagnostic bank，正式 evaluator 默认拒绝；只有显式 `--allow-incomplete-prototype-bank` 才能用于调试。
 
 ## 3. dev64 Stage-0 smoke
 
 ```bash
 for K in 1 4 8 16; do
   for R in 0.8 1.6 3.2; do
-    python tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py \
+    "$PY" -u tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py \
       --config "$RUNTIME_CONFIG" --val-cache "$DEV_V18" \
       --population-manifest data/p0_f9_v21_dev64_manifest.json \
       --checkpoint "$V18_CLEAN_E14" \
+      --expected-checkpoint-sha256 "$BASE_CKPT_SHA256" \
       --prototype-bank "outputs/p0_f9_v21_prototypes/prototype_bank_k$K.pt" \
-      --dataroot "$DATAROOT" --info-pkl "$VAL_INFO" \
+      --dataroot "$DATAROOT" --info-pkl "$DEV_INFO" \
       --coverage-radius-m "$R" \
       --output "outputs/v21_stage0_dev64_k$K_r$R.json"
   done
@@ -68,11 +71,12 @@ done
 ## 4. dev512 Stage-0B
 
 ```bash
-python tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py \
+"$PY" -u tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py \
   --config "$RUNTIME_CONFIG" --val-cache "$DEV_V18" \
   --population-manifest data/p0_f9_v21_dev512_manifest.json \
   --checkpoint "$V18_CLEAN_E14" --prototype-bank "$SELECTED_PROTOTYPE_BANK" \
-  --dataroot "$DATAROOT" --info-pkl "$VAL_INFO" \
+  --expected-checkpoint-sha256 "$BASE_CKPT_SHA256" \
+  --dataroot "$DATAROOT" --info-pkl "$DEV_INFO" \
   --coverage-radius-m "$SELECTED_RADIUS" \
   --output outputs/v21_stage0b_dev512.json --enforce-stage0b-gate
 ```
@@ -100,8 +104,18 @@ Evaluator 默认至少检查第一个窗口：
 1. 当前 V18 default forward 与逐行复刻 frozen `ccf7d77` forward elementwise 比较；
 2. 复用 `benchmark_p0_f9_v18_runtime._exactness_check` 验证 Strong、SE(2) raster 和 A1 compositor；
 3. 每个窗口验证空 V21 proposals 与 V18 逐 voxel 相等。
+4. 每个 resolved future-onset exact shape 在原 horizon/pose 下 round-trip 后必须与 attributed Occ3D component 逐 voxel 完全一致。
 
 任一失败立即停止。
+
+正式运行前冻结 checkpoint 内容指纹：
+
+```bash
+export V18_CLEAN_E14="$BASE_CKPT"
+export BASE_CKPT_SHA256="$(sha256sum "$V18_CLEAN_E14" | awk '{print $1}')"
+```
+
+Evaluator 同时强制 `training_mode=clean_one_stage_from_scratch_v1_tail_continuation`、`epoch=14` 和 SHA256 完全一致，不再只凭通用 protocol 接受任意 Clean epoch。
 
 ## 明确未实现
 
