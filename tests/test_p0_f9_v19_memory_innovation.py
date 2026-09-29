@@ -11,6 +11,7 @@ from real_motion.local_st_world_model_v18_se2 import (
 )
 from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRAMES
 from real_motion.strong_w2det import StrongW2DetConfig
+from real_motion.runtime_fastpath import component_lists_equal
 from real_motion.v19_innovation import (
     ResidualInnovationHead,
     ResidualInnovationIntervalHead,
@@ -145,6 +146,12 @@ def test_source_memory_keeps_current_order_and_appends_dormant():
         frame_dt_s=0.5,
         max_missing_s=1.5,
     )
+    parallel_tracks,parallel_comps=build_dynamic_source_memory(
+        hist,poses,grid=grid,strong_cfg=cfg,frame_dt_s=0.5,
+        max_missing_s=1.5,workers=3)
+    assert all(component_lists_equal(a,b) for a,b in zip(comps,parallel_comps))
+    assert [(x.track_id,x.class_id,x.last_observed_frame) for x in tracks]==[
+        (x.track_id,x.class_id,x.last_observed_frame) for x in parallel_tracks]
     assert len(comps[-1]) == 1
     assert tracks[0].observed_at_anchor
     assert tracks[0].class_id == 4

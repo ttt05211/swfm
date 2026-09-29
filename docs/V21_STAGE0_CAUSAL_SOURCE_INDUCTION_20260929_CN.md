@@ -48,7 +48,13 @@ dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin
 
 每类 observation 数 `<=512` 时运行 exact PAM；更大 population 使用冻结的 deterministic CLARA（sample size 256，5 trials），避免全量 `N×N` 距离矩阵。bank 保存 train-cache/info SHA256、完整 population 标志、shape fingerprint、算法参数和 medoid 内容 fingerprint。`--max-windows` 生成的只是 diagnostic bank，且窗口按训练缓存中的 scene first-appearance order 做 deterministic scene-balanced round-robin，不再取有顺序偏差的前 N 条；正式 evaluator 默认拒绝不完整 bank，只有显式 `--allow-incomplete-prototype-bank` 才能用于调试。evaluator 另报告 causal-covered BIRTH 的 prototype/exact canonical shape IoU 与体素量比，用于区分训练 population 不充分和 prototype 表示本身不足。
 
+构建器默认使用至多 8 个线程并发完成独立 sample 的 Occ3D 读取、Strong component extraction 和 shape attribution（`--workers 0` 自动选择，服务器可显式使用 `--workers 8`）。unique sample 只访问一次，因此不再使用会保留数 GB 三维数组但没有复用收益的 occupancy LRU。结果仍由主线程按冻结 sample order 汇总，所以 worker 完成顺序不会改变 population、medoid 或 fingerprint。
+
 ## 3. dev64 Stage-0 smoke
+
+Stage-0 evaluator 的 `--cpu-workers 0` 默认选择至多 8 个线程，并行加载同一窗口的帧、提取六帧历史/未来 component 和计算 Moving support。global/scene 指标共用一次 confusion-matrix 计数，替代对每个类别重复扫描全体素；输出 `performance.seconds_by_stage` 便于继续定位瓶颈。这里 GPU 只负责冻结 V18 forward/warp，Stage-0 的 GT attribution、component、renderer 与 metric 仍主要是 CPU 工作，因此低显存和间歇性 GPU utilization 本身不是停滞。
+
+若普通 prototype 的 UB2/UB1 retention 不足，evaluator 同次额外报告 `UB2_FACTORIZED_ORACLE_EXTENT`：保持同一个 train-only prototype 形状码，只把 query-entry GT occupancy 的三轴 extent 作为 oracle 连续尺度施加到 prototype。它只回答“shape code × continuous extent”是否有表示上限，不复制目标 voxel pattern，不进入原 `stage0b_gate`，也不得作为 deployable 结果；其独立门槛位于 `factorized_oracle_extent_gate`。若该门槛仍失败，停止 prototype 路线；若通过，后续模型才增加一个 causal extent prediction head。
 
 ```bash
 for K in 1 4 8 16; do

@@ -267,11 +267,11 @@ def build_v21_targets(source,window,history_occ,history_observed,history_poses,*
 def _world_to_t0(p,T):
     return (np.linalg.inv(np.asarray(T))@np.r_[np.asarray(p,dtype=np.float64),1.0])[:3]
 
-def build_historical_anchors(source,window,history_occ,history_observed,history_poses,*,grid,strong_cfg,frame_dt_s=0.5,match_max_distance_m=4.0):
+def build_historical_anchors(source,window,history_occ,history_observed,history_poses,*,grid,strong_cfg,frame_dt_s=0.5,match_max_distance_m=4.0,workers=1):
     masked=np.where(np.asarray(history_observed,bool),np.asarray(history_occ),int(strong_cfg.free_label)).astype(np.uint8)
     tracks,cbf=build_dynamic_source_memory(
         list(masked),list(np.asarray(history_poses)),grid=grid,strong_cfg=strong_cfg,
-        frame_dt_s=float(frame_dt_s),max_missing_s=2.5)
+        frame_dt_s=float(frame_dt_s),max_missing_s=2.5,workers=int(workers))
     matched=[]; matched_sets=[]; ambiguous=set(); ambiguous_sets=[]
     for i,tok in enumerate(window.history_tokens):
         anns=dynamic_annotations(source.nusc,str(tok))
@@ -611,6 +611,24 @@ def build_prototype_bank(shapes_by_class,*,requested_k,population_manifest,sourc
 def oracle_best_prototype(shape,bank):
     rows=bank.medoids_by_class.get(int(shape.class_id),())
     return min(rows,key=lambda x:(-shape_iou(shape,x),tuple(x.observation_key or ("","")))) if rows else None
+
+def scale_prototype_to_target_extent(prototype,target):
+    """Oracle diagnostic for factorized shape-code x continuous extent.
+
+    Both shapes are already canonicalized by GT center/yaw.  Only the three
+    occupied extents are transferred; no target voxel pattern is copied.
+    A future deployable model would predict these three scale factors.
+    """
+    if int(prototype.class_id)!=int(target.class_id):
+        raise ValueError("prototype/target classes differ")
+    p=np.asarray(prototype.local_xyz_m,dtype=np.float64)
+    t=np.asarray(target.local_xyz_m,dtype=np.float64)
+    if not len(p) or not len(t):return prototype
+    pext=np.ptp(p,axis=0)+SHAPE_RES; text=np.ptp(t,axis=0)+SHAPE_RES
+    scale=np.divide(text,pext,out=np.ones(3,dtype=np.float64),where=pext>1e-12)
+    local=p*scale[None]
+    cells=np.unique(np.rint(local/SHAPE_RES).astype(np.int32),axis=0)
+    return CanonicalShape(int(prototype.class_id),cells,prototype.observation_key,local)
 
 def rasterize_canonical_shape(shape,center,yaw,future_pose,*,grid):
     local=np.asarray(shape.local_xyz_m,float); c,s=math.cos(yaw),math.sin(yaw)

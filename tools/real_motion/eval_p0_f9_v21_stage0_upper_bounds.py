@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """V21 Stage-0 upper-bound audit. No V21 network or V20 completion is used."""
 from __future__ import annotations
-import argparse,hashlib,json,time
+import argparse,hashlib,json,os,time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[2]
@@ -11,7 +12,7 @@ import numpy as np
 import torch
 
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
-from real_motion.nuscenes_adapter import gt_moving_support_sequence
+from real_motion.nuscenes_adapter import NuScenesWindowSource,gt_moving_support_sequence
 from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args,load_runtime_config,make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig
@@ -22,20 +23,21 @@ from real_motion.v21_source_induction import (
     attribute_instance_shapes,build_frontier_anchors,build_historical_anchors,
     build_v21_targets,compose_v21_add_only,oracle_best_prototype,
     prototype_bank_fingerprint,rasterize_canonical_shape,
-    select_scene_balanced_round_robin,shape_iou,stable_json_fingerprint,
+    scale_prototype_to_target_extent,select_scene_balanced_round_robin,
+    shape_iou,stable_json_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
-from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import CachedSource
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.train_p0_f9_v18_se2_clean import PROTOCOL as CLEAN_PROTOCOL
 from tools.real_motion.v20_unified_common import STAGE1_PROTOCOL
 
-EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v4_query_entry"
+EVAL_PROTOCOL="p0_f9_v21_stage0_upper_bound_audit_v5_factorized_extent"
 REPORT_H=(1.0,2.0,3.0)
 VARIANTS=("UB0_EXACT","UB1_CAUSAL_EXACT","UB2_DORMANT_CAUSAL_SHAPE",
-          "UB2_BIRTH_PROTOTYPE","UB2_DEPLOYABLE_REPRESENTATION")
+          "UB2_BIRTH_PROTOTYPE","UB2_DEPLOYABLE_REPRESENTATION",
+          "UB2_FACTORIZED_ORACLE_EXTENT")
 SEM=tuple(range(17)); DYN=tuple(int(x) for x in DYNAMIC_CLASS_IDS)
 
 class Metrics:
@@ -43,13 +45,31 @@ class Metrics:
         self.oi=np.zeros(3,np.int64); self.ou=np.zeros(3,np.int64)
         self.si=np.zeros((3,17),np.int64); self.su=np.zeros((3,17),np.int64)
         self.mi=np.zeros((3,len(DYN)),np.int64); self.mu=np.zeros((3,len(DYN)),np.int64)
-    def update(self,i,p,g,m,free):
+    @staticmethod
+    def counts(p,g,m,free):
         p=np.asarray(p); g=np.asarray(g); m=np.asarray(m,bool)
-        po=p!=free; go=g!=free; self.oi[i]+=int((po&go).sum()); self.ou[i]+=int((po|go).sum())
-        for j,c in enumerate(SEM):
-            pp=p==c; gg=g==c; self.si[i,j]+=int((pp&gg).sum()); self.su[i,j]+=int((pp|gg).sum())
-        for j,c in enumerate(DYN):
-            pp=(p==c)&m; gg=(g==c)&m; self.mi[i,j]+=int((pp&gg).sum()); self.mu[i,j]+=int((pp|gg).sum())
+        if p.shape!=g.shape or p.shape!=m.shape:
+            raise ValueError("prediction/GT/moving-support shapes differ")
+        n=int(free)+1
+        if n!=18 or p.size and (int(p.min())<0 or int(g.min())<0 or
+                                int(p.max())>=n or int(g.max())>=n):
+            raise ValueError("V21 metric labels violate frozen 0..17 contract")
+        code=g.reshape(-1).astype(np.int16,copy=False)*n+p.reshape(-1).astype(np.int16,copy=False)
+        conf=np.bincount(code,minlength=n*n).reshape(n,n)
+        diag=np.diag(conf); rows=conf.sum(1); cols=conf.sum(0)
+        si=diag[:17]; su=rows[:17]+cols[:17]-si
+        oi=int(conf[:free,:free].sum()); ou=int(conf.sum()-conf[free,free])
+        moving_code=code[m.reshape(-1)]
+        moving_conf=np.bincount(moving_code,minlength=n*n).reshape(n,n)
+        mdiag=np.diag(moving_conf); mrows=moving_conf.sum(1); mcols=moving_conf.sum(0)
+        ids=np.asarray(DYN,dtype=np.int64); mi=mdiag[ids]; mu=mrows[ids]+mcols[ids]-mi
+        return oi,ou,si,su,mi,mu
+    def update(self,i,p=None,g=None,m=None,free=17,*,counts=None):
+        row=self.counts(p,g,m,free) if counts is None else counts
+        oi,ou,si,su,mi,mu=row
+        self.oi[i]+=oi; self.ou[i]+=ou; self.si[i]+=si; self.su[i]+=su
+        self.mi[i]+=mi; self.mu[i]+=mu
+        return row
     @staticmethod
     def iou(a,b):
         a=np.asarray(a,float); b=np.asarray(b,float); o=np.full(np.broadcast_shapes(a.shape,b.shape),np.nan)
@@ -84,6 +104,8 @@ def summarize_prototype_fit(rows):
     def one(items):
         iou=np.asarray([x[0] for x in items],dtype=np.float64)
         ratio=np.asarray([x[1] for x in items],dtype=np.float64)
+        scaled_iou=np.asarray([x[2] for x in items],dtype=np.float64)
+        scaled_ratio=np.asarray([x[3] for x in items],dtype=np.float64)
         if not len(iou):
             return {"targets":0}
         return {
@@ -98,6 +120,10 @@ def summarize_prototype_fit(rows):
             "prototype_to_exact_voxel_ratio_p90":float(np.percentile(ratio,90)),
             "oversized_targets":int((ratio>1.0).sum()),
             "undersized_targets":int((ratio<1.0).sum()),
+            "oracle_extent_shape_iou_mean":float(scaled_iou.mean()),
+            "oracle_extent_shape_iou_p50":float(np.percentile(scaled_iou,50)),
+            "oracle_extent_prototype_to_exact_voxel_ratio_mean":float(scaled_ratio.mean()),
+            "oracle_extent_prototype_to_exact_voxel_ratio_p50":float(np.percentile(scaled_ratio,50)),
         }
     all_rows=[x for values in rows.values() for x in values]
     return {"population":"causally-covered BIRTH targets at query-entry onset",
@@ -243,16 +269,23 @@ def history_shape_cache(source,w,raw,pcfg,gate,matched_sets,ambiguous_sets,
             components=components_by_frame[i],component_matches=component_matches_by_frame[i]))
     return attrs
 
-def future_shape_cache(source,w,raw,targets,pcfg,gate):
-    wanted={t.instance_token for t in targets}; out=[]; maps=[]
-    for hi,tok in enumerate(w.future_tokens):
+def future_shape_cache(source,w,raw,targets,pcfg,gate,workers=1):
+    wanted={t.instance_token for t in targets}
+    def _one(item):
+        hi,tok=item
         anns=annotation_map(source.nusc,tok); tokens=sorted(wanted&set(anns))
-        maps.append(anns)
-        out.append(attribute_instance_shapes(
+        attrs=attribute_instance_shapes(
             raw["future_gt_occ"][hi],raw["future_poses"][hi],anns,grid=pcfg.grid,
             free_label=pcfg.free_label,match_max_distance_m=gate,tokens=tokens,
-            observation_keys={x:(str(tok),x) for x in tokens}))
-    return out,maps
+            observation_keys={x:(str(tok),x) for x in tokens})
+        return attrs,anns
+    items=list(enumerate(w.future_tokens)); nworkers=max(1,min(int(workers),len(items)))
+    if nworkers==1:
+        rows=[_one(x) for x in items]
+    else:
+        with ThreadPoolExecutor(max_workers=nworkers) as pool:
+            rows=list(pool.map(_one,items))
+    return [x[0] for x in rows],[x[1] for x in rows]
 
 def target_masks_from_attributions(attrs,shape):
     out=[]
@@ -334,12 +367,21 @@ def main():
     p.add_argument("--coverage-radius-m",type=float,choices=(0.8,1.6,3.2),required=True)
     p.add_argument("--match-max-distance-m",type=float,default=4.0); p.add_argument("--device",default="cuda")
     p.add_argument("--exactness-windows",type=int,default=1); p.add_argument("--moving-workers",type=int,default=1)
+    p.add_argument("--cpu-workers",type=int,default=0,
+                   help="parallel frame I/O/component workers; 0 uses min(8, cpu_count-1)")
     p.add_argument("--allow-incomplete-prototype-bank",action="store_true")
     p.add_argument("--enforce-stage0b-gate",action="store_true"); a=p.parse_args()
+    if a.cpu_workers<0 or a.moving_workers<1:
+        raise ValueError("worker counts are invalid")
+    cpu_workers=(max(1,min(8,(os.cpu_count() or 2)-1))
+                 if a.cpu_workers==0 else max(1,a.cpu_workers))
     pcfg=make_prepare_config(load_runtime_config(a.config,a.override)); manifest,keys,lattice=load_manifest(a.population_manifest)
     _,records0=base.load_cache(a.val_cache); records=align_records(records0,keys)
     bank=load_bank(a.prototype_bank,allow_incomplete=a.allow_incomplete_prototype_bank)
-    source=CachedSource(a.dataroot,info_pkl=a.info_pkl,verbose=False); strong=StrongW2DetConfig(free_label=int(pcfg.free_label))
+    # dev64/dev512 are scene-balanced and offer almost no large-array cache
+    # reuse.  Retaining every 3-D occupancy volume creates memory pressure;
+    # bounded frame-level concurrency is both faster and much smaller.
+    source=NuScenesWindowSource(a.dataroot,info_pkl=a.info_pkl,verbose=False); strong=StrongW2DetConfig(free_label=int(pcfg.free_label))
     device=torch.device(a.device if a.device!="cuda" or torch.cuda.is_available() else "cpu")
     ck,model,_=full._load_model(a.checkpoint,CLEAN_PROTOCOL,device)
     checkpoint_sha=validate_clean_e14_checkpoint(ck,a.checkpoint,a.expected_checkpoint_sha256)
@@ -354,23 +396,30 @@ def main():
     perclass=defaultdict(int); queryperclass=defaultdict(int); perh=defaultdict(int)
     totalvox=coveredvox=alltargets=querytargets=movingtargets=querymovingtargets=allvox=movingvox=0
     scene=defaultdict(lambda:{"V18_BASE":Metrics(),**{v:Metrics() for v in VARIANTS}})
-    checked=0; started=time.perf_counter()
+    checked=0; started=time.perf_counter(); timings=defaultdict(float)
 
     for wi,rec in enumerate(records,1):
-        w=window_from_record(rec); raw=load_nuscenes_window_raw(source,w,pcfg,include_gt=True)
+        window_started=time.perf_counter(); w=window_from_record(rec)
+        stage_started=time.perf_counter()
+        raw=load_nuscenes_window_raw(
+            source,w,pcfg,include_gt=True,io_workers=cpu_workers)
+        timings["raw_load"]+=time.perf_counter()-stage_started
+        stage_started=time.perf_counter()
         st=runtime._prepare_record(rec,source,pcfg,strong,device,raw_window=raw); runtime._stage_gpu_inputs(st,device)
         try:
             if checked<a.exactness_windows: assert_forward_exact(model,st,device); runtime._exactness_check(model,st,pcfg,strong,device); checked+=1
             basepred=runtime._forecast_once(model,st,pcfg,strong,device)
         finally: runtime._release_gpu_inputs(st)
+        timings["v18_prepare_forecast"]+=time.perf_counter()-stage_started
         for h in range(6):
             noop,_=compose_v21_add_only(basepred[h],[],free_label=pcfg.free_label)
             if not np.array_equal(noop,basepred[h]):raise RuntimeError("zero-contribution identity failed")
 
+        stage_started=time.perf_counter()
         hist,_,ha,history_evidence=build_historical_anchors(
             source,w,raw["history_occ"],raw["history_observed"],raw["history_poses"],
             grid=pcfg.grid,strong_cfg=strong,frame_dt_s=pcfg.frame_dt_s,
-            match_max_distance_m=a.match_max_distance_m)
+            match_max_distance_m=a.match_max_distance_m,workers=cpu_workers)
         hmatches=history_evidence["matched_sets"]
         hambiguous=history_evidence["ambiguous_sets"]
         hattrs=history_shape_cache(
@@ -401,8 +450,11 @@ def main():
         identity_cov["hist"]+=identity_report["historical_matches"]
         identity_cov["front"]+=identity_report["frontier_matches"]
         identity_cov["maxcand"]=max(identity_cov["maxcand"],identity_report["max_legal_candidates_per_positive"])
+        timings["history_frontier"]+=time.perf_counter()-stage_started
 
-        future_attrs,future_ann_maps=future_shape_cache(source,w,raw,targets,pcfg,a.match_max_distance_m)
+        stage_started=time.perf_counter()
+        future_attrs,future_ann_maps=future_shape_cache(
+            source,w,raw,targets,pcfg,a.match_max_distance_m,workers=cpu_workers)
         masks=target_masks_from_attributions(future_attrs,pcfg.grid.shape_hwd)
         onset_resolved=set(); any_resolved=set(); report_component=set(); first_resolved={}
         for t in targets:
@@ -454,7 +506,9 @@ def main():
         accumulate_coverage_stratum(
             cov_strata,cov_distances,"report_component_query_entry",eval_targets,set(mb),
             hist,front,raw["history_poses"][-1],a.coverage_radius_m,query_onset)
-        onset={}; hshape={}; proto={}; hage={}; rank={t.instance_token:i for i,t in enumerate(eval_targets)}
+        timings["future_attribution_assignment"]+=time.perf_counter()-stage_started
+        representation_started=time.perf_counter()
+        onset={}; hshape={}; proto={}; scaled_proto={}; hage={}; rank={t.instance_token:i for i,t in enumerate(eval_targets)}
         for t in eval_targets:
             tok=t.instance_token; oi=query_onset[tok]; at=future_attrs[oi].get(tok)
             if at is None or at.shape is None:
@@ -471,10 +525,13 @@ def main():
                 onset[tok]=at.shape; pp=oracle_best_prototype(at.shape,bank)
                 if pp is not None:
                     proto[tok]=pp
+                    scaled_proto[tok]=scale_prototype_to_target_extent(pp,at.shape)
                     if t.responsibility=="BIRTH" and tok in mb:
                         exact_n=max(len(at.shape.cells_ijk),1)
+                        scaled=scaled_proto[tok]
                         prototype_fit[int(t.class_id)].append(
-                            (shape_iou(at.shape,pp),len(pp.cells_ijk)/exact_n))
+                            (shape_iou(at.shape,pp),len(pp.cells_ijk)/exact_n,
+                             shape_iou(at.shape,scaled),len(scaled.cells_ijk)/exact_n))
                 elif t.responsibility=="BIRTH":sa["prototype_missing_class"]+=1
             if t.responsibility=="DORMANT_ANCESTRAL":
                 found=None
@@ -485,8 +542,13 @@ def main():
                             found=(hh.shape,idx); break
                 if found is None:sa["dormant_history_shape_unresolved"]+=1
                 else:hshape[tok]=found[0]; hage[tok]=(5-found[1])*pcfg.frame_dt_s
+        timings["representation_prepare"]+=time.perf_counter()-representation_started
 
-        moving_rows=gt_moving_support_sequence(source.nusc,str(w.t0_token),w.future_tokens,ALL_HORIZONS_S,grid=pcfg.grid,workers=a.moving_workers)
+        stage_started=time.perf_counter()
+        moving_rows=gt_moving_support_sequence(
+            source.nusc,str(w.t0_token),w.future_tokens,ALL_HORIZONS_S,
+            grid=pcfg.grid,workers=max(a.moving_workers,cpu_workers))
+        timings["moving_support"]+=time.perf_counter()-stage_started
         moving=np.stack([x[0] for x in moving_rows]); mt=set()
         for hi in REPORT_INDICES:mt.update(str(r["instance_token"]) for r in moving_rows[hi][1])
         movingtargets+=sum(t.instance_token in mt for t in targets)
@@ -500,9 +562,11 @@ def main():
                 if t.instance_token in covered:coveredvox+=n
                 if t.instance_token in mt:movingvox+=int((m&moving[hi]).sum())
 
+        stage_started=time.perf_counter()
         for pos,hi in enumerate(REPORT_INDICES):
             gt=np.asarray(raw["future_gt_occ"][hi],np.uint8); bh=np.asarray(basepred[hi],np.uint8)
-            states["V18_BASE"].update(pos,bh,gt,moving[hi],pcfg.free_label); scene[w.scene_name]["V18_BASE"].update(pos,bh,gt,moving[hi],pcfg.free_label)
+            metric_counts=states["V18_BASE"].update(pos,bh,gt,moving[hi],pcfg.free_label)
+            scene[w.scene_name]["V18_BASE"].update(pos,counts=metric_counts)
             tmask=np.zeros(pcfg.grid.shape_hwd,bool)
             for t in eval_targets:
                 if t.instance_token in masks[hi]:tmask|=masks[hi][t.instance_token]
@@ -517,7 +581,8 @@ def main():
                       "UB1_CAUSAL_EXACT":onset.get(tok) if cm else None,
                       "UB2_DORMANT_CAUSAL_SHAPE":(hshape.get(tok) if t.responsibility=="DORMANT_ANCESTRAL" else onset.get(tok)) if cm else None,
                       "UB2_BIRTH_PROTOTYPE":(proto.get(tok) if t.responsibility=="BIRTH" else onset.get(tok)) if cm else None,
-                      "UB2_DEPLOYABLE_REPRESENTATION":(hshape.get(tok) if t.responsibility=="DORMANT_ANCESTRAL" else proto.get(tok)) if cm else None}
+                      "UB2_DEPLOYABLE_REPRESENTATION":(hshape.get(tok) if t.responsibility=="DORMANT_ANCESTRAL" else proto.get(tok)) if cm else None,
+                      "UB2_FACTORIZED_ORACLE_EXTENT":(hshape.get(tok) if t.responsibility=="DORMANT_ANCESTRAL" else scaled_proto.get(tok)) if cm else None}
                 for v,s in reps.items():
                     if s is None:continue
                     idx,oo=rasterize_canonical_shape(s,ann["center_world"],ann["yaw_world"],raw["future_poses"][hi],grid=pcfg.grid)
@@ -527,21 +592,39 @@ def main():
                     if age in ageprops:
                         idx,_=rasterize_canonical_shape(onset[tok],ann["center_world"],ann["yaw_world"],raw["future_poses"][hi],grid=pcfg.grid)
                         ageprops[age].append((kind,aid,t.class_id,idx))
-            for v in VARIANTS:
-                pred,r=compose_v21_add_only(bh,props[v],free_label=pcfg.free_label); states[v].update(pos,pred,gt,moving[hi],pcfg.free_label)
-                scene[w.scene_name][v].update(pos,pred,gt,moving[hi],pcfg.free_label); merge_counts(q[v],add_counts(bh,pred,gt,tmask,pcfg.free_label))
+            def _evaluate_variant(v):
+                pred,r=compose_v21_add_only(bh,props[v],free_label=pcfg.free_label)
+                counts=Metrics.counts(pred,gt,moving[hi],pcfg.free_label)
+                return v,r,counts,add_counts(bh,pred,gt,tmask,pcfg.free_label)
+            variant_workers=max(1,min(cpu_workers,len(VARIANTS)))
+            if variant_workers==1:
+                variant_rows=[_evaluate_variant(v) for v in VARIANTS]
+            else:
+                with ThreadPoolExecutor(max_workers=variant_workers) as pool:
+                    variant_rows=list(pool.map(_evaluate_variant,VARIANTS))
+            for v,r,metric_counts,addition_counts in variant_rows:
+                states[v].update(pos,counts=metric_counts)
+                scene[w.scene_name][v].update(pos,counts=metric_counts); merge_counts(q[v],addition_counts)
                 ca[v]["v21_collision_voxels"]+=r.v21_collision_voxels; ca[v]["historical_frontier_collision_voxels"]+=r.historical_frontier_collision_voxels
                 ca[v]["blocked_by_v18_voxels"]+=r.blocked_by_v18_voxels
                 ca[v]["out_of_bounds_voxels"]+=oob[v]+r.out_of_bounds_voxels
             for age,pp in ageprops.items():
                 pred,_=compose_v21_add_only(bh,pp,free_label=pcfg.free_label); ages[age].update(pos,pred,gt,moving[hi],pcfg.free_label)
-        if wi==1 or wi%16==0 or wi==len(records):print(f"v21_stage0 {wi}/{len(records)}",flush=True)
+        timings["render_metrics"]+=time.perf_counter()-stage_started
+        timings["total_window"]+=time.perf_counter()-window_started
+        if wi==1 or wi%16==0 or wi==len(records):
+            elapsed=time.perf_counter()-started
+            print(f"v21_stage0 {wi}/{len(records)} workers={cpu_workers} "
+                  f"seconds_per_window={timings['total_window']/wi:.2f} "
+                  f"elapsed_seconds={elapsed:.1f}",flush=True)
 
     br=states["V18_BASE"].compute(); reports={"V18_BASE":br}
     for v in VARIANTS:
         rr=states[v].compute(); reports[v]={"metrics":rr,"delta_vs_v18_pp":delta(rr,br),"addition_quality":quality(q[v])}
     ub1=reports["UB1_CAUSAL_EXACT"]["delta_vs_v18_pp"]["mIoU"]; ub2=reports["UB2_DEPLOYABLE_REPRESENTATION"]["delta_vs_v18_pp"]["mIoU"]
     retention=ub2/ub1 if ub1>0 else float("nan"); eligible=int(cov["eligible"]); covered=int(cov["covered"])
+    factorized_ub2=reports["UB2_FACTORIZED_ORACLE_EXTENT"]["delta_vs_v18_pp"]["mIoU"]
+    factorized_retention=factorized_ub2/ub1 if ub1>0 else float("nan")
     compcov=covered/max(eligible,1); voxcov=coveredvox/max(totalvox,1); meanc=cov["candidate_sum"]/max(eligible,1)
     sd=[]; scene_rows={}
     for s,x in scene.items():
@@ -551,6 +634,10 @@ def main():
     gate={"delta_mIoU_ge_0_50":ub2>=0.50,"retain_ub1_mIoU_headroom_ge_0_70":np.isfinite(retention) and retention>=0.70,
           "causal_component_coverage_ge_0_70":compcov>=0.70,"mean_candidates_le_10":meanc<=10.0}
     gate["pass"]=all(gate.values())
+    factorized_gate={"delta_mIoU_ge_0_50":factorized_ub2>=0.50,
+        "retain_ub1_mIoU_headroom_ge_0_70":np.isfinite(factorized_retention) and factorized_retention>=0.70,
+        "causal_component_coverage_ge_0_70":compcov>=0.70,"mean_candidates_le_10":meanc<=10.0}
+    factorized_gate["pass"]=all(factorized_gate.values())
     result={"protocol":EVAL_PROTOCOL,"v21_protocol":PROTOCOL,
         "scientific_baseline":{"branch":"freeze/v18-main-final-20260918","commit":"ccf7d77e65e9773f441b35083d625b06791bfeaa",
             "checkpoint":str(Path(a.checkpoint).resolve()),"checkpoint_sha256":checkpoint_sha,
@@ -567,6 +654,9 @@ def main():
             "source_provenance":dict(bank.source_provenance)},
         "coverage_radius_m":a.coverage_radius_m,"metrics":reports,
         "headroom":{"ub1_exact_delta_mIoU_pp":ub1,"ub2_deployable_delta_mIoU_pp":ub2,"ub2_retention_of_ub1_mIoU":retention},
+        "factorized_oracle_extent_headroom":{"ub1_exact_delta_mIoU_pp":ub1,
+            "ub2_factorized_delta_mIoU_pp":factorized_ub2,
+            "ub2_factorized_retention_of_ub1_mIoU":factorized_retention},
         "coverage":{"population":"report_horizon_component_resolved at query-entry onset",
             "eligible_targets":eligible,"covered_targets":covered,"component_coverage":compcov,"voxel_coverage":voxcov,
             "historical_matches":int(cov["hist"]),"frontier_matches":int(cov["front"]),"uncovered_targets":eligible-covered,
@@ -595,17 +685,27 @@ def main():
             "min":float(np.min(sd)) if sd else float("nan"),"max":float(np.max(sd)) if sd else float("nan"),
             "by_scene":scene_rows},
         "stage0b_gate":gate,
+        "factorized_oracle_extent_gate":factorized_gate,
+        "performance":{"cpu_workers":cpu_workers,"moving_workers":max(a.moving_workers,cpu_workers),
+            "seconds_total":time.perf_counter()-started,
+            "seconds_by_stage":{k:float(v) for k,v in timings.items()},
+            "mean_seconds_per_window":timings["total_window"]/max(len(records),1)},
         "contracts":{"report_horizons_s":list(REPORT_H),"all_state_horizons_s":list(ALL_HORIZONS_S),
             "target":"DORMANT_ANCESTRAL + BIRTH with report-horizon occupancy component",
             "query_entry_onset":"first unambiguous future occupancy component in frozen Omega_max; annotation existence remains six-frame",
             "compositor":COMPOSITOR_PROTOCOL,
             "moving_metric":"frozen Moving-mIoU v2; unchanged",
             "coverage_strata":"annotation-onset strata are diagnostic; formal gate uses report-component query-entry assignment",
+            "oracle_extent_diagnostic":"GT query-entry occupied extent only; diagnostic representation ceiling, not a deployable prediction",
             "v20_completion_used":False,"transformer_used":False},
         "elapsed_seconds":time.perf_counter()-started}
     Path(a.output).parent.mkdir(parents=True,exist_ok=True); Path(a.output).write_text(json.dumps(result,indent=2),encoding="utf-8")
     print(json.dumps({"output":str(Path(a.output).resolve()),"windows":len(records),"UB0_dmIoU":reports["UB0_EXACT"]["delta_vs_v18_pp"]["mIoU"],
-                      "UB1_dmIoU":ub1,"UB2_dmIoU":ub2,"coverage":compcov,"mean_candidates":meanc,"gate_pass":gate["pass"]},indent=2))
+                      "UB1_dmIoU":ub1,"UB2_dmIoU":ub2,
+                      "factorized_oracle_extent_dmIoU":factorized_ub2,
+                      "coverage":compcov,"mean_candidates":meanc,
+                      "gate_pass":gate["pass"],
+                      "factorized_oracle_extent_gate_pass":factorized_gate["pass"]},indent=2))
     if a.enforce_stage0b_gate and not gate["pass"]:raise SystemExit(2)
 
 if __name__=="__main__":main()

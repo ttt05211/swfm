@@ -4,8 +4,9 @@ from real_motion.v21_source_induction import (
     AnchorLattice,CanonicalShape,FrontierAnchor,V21Target,assign_causal_coverage,
     attribute_instance_shapes,build_frontier_anchors,build_prototype_bank,
     compose_v21_add_only,oracle_best_prototype,rasterize_canonical_shape,
-    select_scene_balanced_round_robin,shape_iou,
+    scale_prototype_to_target_extent,select_scene_balanced_round_robin,shape_iou,
 )
+from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics
 
 def birth(token,xy,onset=1):
     centers=[None]*6; yaws=[None]*6; ex=[False]*6
@@ -133,3 +134,38 @@ def test_large_kmedoids_path_is_deterministic():
     b=build_prototype_bank({4:list(reversed(rows))},requested_k=4,population_manifest=list(reversed(pop)))
     assert a.fingerprint==b.fingerprint
     assert a.algorithm=="exact_pam_le_512_else_deterministic_clara_v1"
+
+def test_fast_metric_confusion_counts_match_boolean_reference():
+    rng=np.random.default_rng(21)
+    p=rng.integers(0,18,size=(7,6,3),dtype=np.uint8)
+    g=rng.integers(0,18,size=(7,6,3),dtype=np.uint8)
+    moving=rng.random(p.shape)>0.4
+    fast=Metrics(); counts=fast.update(0,p,g,moving,17)
+    ref=Metrics(); po=p!=17; go=g!=17
+    ref.oi[0]=int((po&go).sum()); ref.ou[0]=int((po|go).sum())
+    for j,c in enumerate(range(17)):
+        pp=p==c; gg=g==c
+        ref.si[0,j]=int((pp&gg).sum()); ref.su[0,j]=int((pp|gg).sum())
+    for j,c in enumerate((2,3,4,5,6,7,9,10)):
+        pp=(p==c)&moving; gg=(g==c)&moving
+        ref.mi[0,j]=int((pp&gg).sum()); ref.mu[0,j]=int((pp|gg).sum())
+    assert np.array_equal(fast.oi,ref.oi)
+    assert np.array_equal(fast.ou,ref.ou)
+    assert np.array_equal(fast.si,ref.si)
+    assert np.array_equal(fast.su,ref.su)
+    assert np.array_equal(fast.mi,ref.mi)
+    assert np.array_equal(fast.mu,ref.mu)
+    reused=Metrics(); reused.update(0,counts=counts)
+    assert np.array_equal(reused.si,fast.si)
+
+def test_oracle_extent_scaling_changes_extent_without_copying_target_pattern():
+    proto=CanonicalShape(
+        4,np.asarray([[-1,0,0],[0,0,0],[1,0,0]],np.int32),("p","i"),
+        np.asarray([[-0.4,0,0],[0,0,0],[0.4,0,0]],np.float64))
+    target=CanonicalShape(
+        4,np.asarray([[-2,0,0],[-1,0,0],[0,0,0],[1,0,0],[2,0,0]],np.int32),
+        ("t","i"),np.asarray([[-0.8,0,0],[-0.4,0,0],[0,0,0],[0.4,0,0],[0.8,0,0]]))
+    scaled=scale_prototype_to_target_extent(proto,target)
+    assert scaled.observation_key==proto.observation_key
+    assert np.isclose(np.ptp(scaled.local_xyz_m[:,0]),np.ptp(target.local_xyz_m[:,0]))
+    assert len(scaled.cells_ijk)==len(proto.cells_ijk)

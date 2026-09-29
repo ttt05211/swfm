@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build deterministic train-only V21 source-shape prototype banks."""
 from __future__ import annotations
-import argparse, hashlib, json
+import argparse, hashlib, json, os, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[2]
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 
 from real_motion.runtime_config import add_config_args,load_runtime_config,make_prepare_config
+from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v21_source_induction import (
     KMEDOIDS_CLARA_SAMPLE_SIZE,KMEDOIDS_CLARA_TRIALS,KMEDOIDS_EXACT_MAX_N,
@@ -18,7 +20,6 @@ from real_motion.v21_source_induction import (
     select_scene_balanced_round_robin,stable_json_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
-from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import CachedSource
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 
 def _serialize(s):
@@ -41,7 +42,11 @@ def main():
     p.add_argument("--k",type=int,nargs="+",default=[1,4,8,16])
     p.add_argument("--match-max-distance-m",type=float,default=4.0)
     p.add_argument("--max-windows",type=int,default=0)
+    p.add_argument("--workers",type=int,default=0,
+                   help="sample load/component workers; 0 uses min(8, cpu_count-1)")
     a=p.parse_args()
+    if a.workers<0:raise ValueError("--workers must be non-negative")
+    workers=(max(1,min(8,(os.cpu_count() or 2)-1)) if a.workers==0 else max(1,a.workers))
     pcfg=make_prepare_config(load_runtime_config(a.config,a.override))
     cache_meta,records_all=base.load_cache(a.train_cache)
     total_records=len(records_all)
@@ -65,10 +70,15 @@ def main():
         for tok in (*w.history_tokens,*w.future_tokens):
             samples.setdefault(str(tok),(str(w.scene_name),str(tok)))
     ordered=[samples[k] for k in sorted(samples)]
-    source=CachedSource(a.dataroot,info_pkl=a.info_pkl,verbose=False)
+    # Every unique sample is visited once, so caching full occupancy arrays only
+    # retains gigabytes without producing cache hits.  NuScenes metadata is
+    # read-only and safe for the bounded worker pool below.
+    source=NuScenesWindowSource(a.dataroot,info_pkl=a.info_pkl,verbose=False)
     strong=StrongW2DetConfig(free_label=int(pcfg.free_label))
     by_class={}; population=[]; unresolved=ambiguous=0
-    for si,(scene,tok) in enumerate(ordered,1):
+
+    def _process_sample(item):
+        scene,tok=item
         sem,obs=source.load_occ3d(scene,tok,require_lidar_mask=True); pose=np.asarray(source.pose(tok))
         components,matched,amb=reliable_components_and_tokens(
             source,scene,tok,sem,obs,pose,grid=pcfg.grid,strong_cfg=strong,
@@ -81,14 +91,34 @@ def main():
             masked,pose,anns,grid=pcfg.grid,free_label=int(pcfg.free_label),
             match_max_distance_m=a.match_max_distance_m,tokens=tokens,observation_keys=keys,
             components=components,component_matches=matched)
+        rows=[]; sample_unresolved=sample_ambiguous=0
         for inst in tokens:
-            if inst in amb: ambiguous+=1; continue
+            if inst in amb: sample_ambiguous+=1; continue
             key=keys[inst]; attr=attrs[inst]
-            if attr.ambiguous: ambiguous+=1; continue
-            if attr.shape is None: unresolved+=1; continue
-            by_class.setdefault(int(attr.shape.class_id),[]).append(attr.shape); population.append(key)
-        if si==1 or si%500==0 or si==len(ordered):
-            print(f"v21_prototypes samples {si}/{len(ordered)}",flush=True)
+            if attr.ambiguous: sample_ambiguous+=1; continue
+            if attr.shape is None: sample_unresolved+=1; continue
+            rows.append((int(attr.shape.class_id),attr.shape,key))
+        return rows,sample_unresolved,sample_ambiguous
+
+    scan_started=time.perf_counter()
+    if workers==1:
+        results=map(_process_sample,ordered)
+        pool=None
+    else:
+        pool=ThreadPoolExecutor(max_workers=workers)
+        results=pool.map(_process_sample,ordered)
+    try:
+        for si,(rows,sample_unresolved,sample_ambiguous) in enumerate(results,1):
+            unresolved+=sample_unresolved; ambiguous+=sample_ambiguous
+            for cid,shape,key in rows:
+                by_class.setdefault(cid,[]).append(shape); population.append(key)
+            if si==1 or si%250==0 or si==len(ordered):
+                elapsed=time.perf_counter()-scan_started
+                print(f"v21_prototypes samples {si}/{len(ordered)} workers={workers} "
+                      f"samples_per_s={si/max(elapsed,1e-9):.2f}",flush=True)
+    finally:
+        if pool is not None:pool.shutdown(wait=True)
+    scan_seconds=time.perf_counter()-scan_started
     if len(population)!=len(set(population)):
         raise RuntimeError("duplicate (sample_token, instance_token) observations")
 
@@ -108,6 +138,8 @@ def main():
              "record_selection_rule":selection_rule,
              "selected_windows":len(records),
              "selected_scenes":len({x[0] for x in selected_record_keys}),
+             "workers":workers,"sample_scan_seconds":scan_seconds,
+             "sample_scan_samples_per_second":len(ordered)/max(scan_seconds,1e-9),
              "class_histogram":{str(k):len(v) for k,v in sorted(by_class.items())},
              "shape_unresolved":unresolved,"shape_ambiguous":ambiguous,
              "resolution_m":0.4,
@@ -117,6 +149,7 @@ def main():
               "algorithm_config":{"exact_max_n":KMEDOIDS_EXACT_MAX_N,
                   "clara_sample_size":KMEDOIDS_CLARA_SAMPLE_SIZE,"clara_trials":KMEDOIDS_CLARA_TRIALS},
               "source_provenance":provenance}
+    cluster_started=time.perf_counter()
     for k in sorted(set(a.k)):
         if k<=0: raise ValueError("K must be positive")
         bank=build_prototype_bank(by_class,requested_k=k,population_manifest=population,
@@ -139,6 +172,9 @@ def main():
              "algorithm":payload["algorithm"],"source_provenance":payload["source_provenance"],
             "medoid_observation_keys":{cid:[r["observation_key"] for r in rows]
                                        for cid,rows in payload["medoids_by_class"].items()}},indent=2),encoding="utf-8")
+        print(f"v21_prototypes clustered k={k} elapsed_seconds={time.perf_counter()-cluster_started:.1f}",flush=True)
+    summary["clustering_seconds"]=time.perf_counter()-cluster_started
+    summary["elapsed_seconds"]=time.perf_counter()-scan_started
     (out/"prototype_population_summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
     print(json.dumps(summary,indent=2))
 

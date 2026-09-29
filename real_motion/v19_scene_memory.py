@@ -21,6 +21,7 @@ diagnostics.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 from typing import Mapping, Sequence
@@ -267,6 +268,7 @@ def build_dynamic_source_memory(
     frame_dt_s: float = 0.5,
     max_missing_s: float = 1.5,
     confidence_tau_s: float = 1.0,
+    workers: int = 1,
 ) -> tuple[list[SourceTrack], list[list[dict]]]:
     """Build six-frame causal source tracks.
 
@@ -283,15 +285,21 @@ def build_dynamic_source_memory(
         math.floor(max_missing_s / float(frame_dt_s) + 1e-8)
     )
 
-    comps_by_frame = [
-        extract_instances_cropped_exact(
+    def _extract(item):
+        sem,pose=item
+        return extract_instances_cropped_exact(
             np.asarray(sem, dtype=np.uint8),
             np.asarray(pose, dtype=np.float64),
             grid=grid,
             cfg=strong_cfg,
         )
-        for sem, pose in zip(history_semantics, history_poses)
-    ]
+    items=list(zip(history_semantics,history_poses))
+    nworkers=max(1,min(int(workers),len(items)))
+    if nworkers==1:
+        comps_by_frame=[_extract(x) for x in items]
+    else:
+        with ThreadPoolExecutor(max_workers=nworkers) as pool:
+            comps_by_frame=list(pool.map(_extract,items))
 
     tracks: list[SourceTrack] = []
     next_id = 0

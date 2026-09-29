@@ -1,4 +1,5 @@
 """Raw occupancy-window preparation: geometry -> motion -> SE(3) -> KTA -> GT targets."""
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -103,9 +104,8 @@ def causal_history_split(history_native, history_poses, history_observed, cfg: P
     return np.stack(static_frames), np.stack(moving_frames), np.stack(candidate_support)
 
 
-def _load_history_semantics_and_observation(source, scene_name, tokens, free_label):
-    semantics, observed = [], []
-    for token in tokens:
+def _load_history_semantics_and_observation(source, scene_name, tokens, free_label, workers=1):
+    def _one(token):
         if hasattr(source, "load_occ3d"):
             sem, obs = source.load_occ3d(scene_name, token, require_lidar_mask=True)
         else:
@@ -113,18 +113,35 @@ def _load_history_semantics_and_observation(source, scene_name, tokens, free_lab
             # always exposes load_occ3d and requires Occ3D mask_lidar.
             sem = source.load_semantics(scene_name, token)
             obs = np.asarray(sem) != free_label
-        semantics.append(np.asarray(sem))
-        observed.append(np.asarray(obs, dtype=bool))
+        return np.asarray(sem),np.asarray(obs,dtype=bool)
+    tokens=tuple(tokens); nworkers=max(1,min(int(workers),len(tokens))) if tokens else 1
+    if nworkers==1:
+        rows=[_one(token) for token in tokens]
+    else:
+        with ThreadPoolExecutor(max_workers=nworkers) as pool:
+            rows=list(pool.map(_one,tokens))
+    semantics=[x[0] for x in rows]; observed=[x[1] for x in rows]
     return np.stack(semantics), np.stack(observed)
 
 
-def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(), include_gt=True):
+def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(), include_gt=True,
+                              io_workers=1):
     """Load raw arrays/poses once; trajectory matches official OccFM-fut exactly."""
+    io_workers=max(1,int(io_workers))
     hist, hist_obs = _load_history_semantics_and_observation(
-        source, window.scene_name, window.history_tokens, cfg.free_label
+        source, window.scene_name, window.history_tokens, cfg.free_label,io_workers
     )
-    fut_gt = (np.stack([source.load_semantics(window.scene_name, t) for t in window.future_tokens])
-              if include_gt else None)
+    if include_gt:
+        nworkers=max(1,min(io_workers,len(window.future_tokens)))
+        if nworkers==1:
+            future=[source.load_semantics(window.scene_name,t) for t in window.future_tokens]
+        else:
+            with ThreadPoolExecutor(max_workers=nworkers) as pool:
+                future=list(pool.map(
+                    lambda t:source.load_semantics(window.scene_name,t),window.future_tokens))
+        fut_gt=np.stack(future)
+    else:
+        fut_gt=None
     trajectory = source.official_trajectory(
         window.history_tokens, window.future_tokens,
         hist_last=cfg.trajectory_hist_last,
@@ -140,12 +157,19 @@ def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(
         np.zeros((cfg.trajectory_zero_prefix,2),dtype=np.float32),
     ):
         raise ValueError("OccFM-fut trajectory prefix masking does not match HIST_LAST contract")
+    all_tokens=tuple(window.history_tokens)+tuple(window.future_tokens)
+    nworkers=max(1,min(io_workers,len(all_tokens)))
+    if nworkers==1:
+        poses=[source.pose(t) for t in all_tokens]
+    else:
+        with ThreadPoolExecutor(max_workers=nworkers) as pool:
+            poses=list(pool.map(source.pose,all_tokens))
     return {
         "history_occ": hist,
         "history_observed": hist_obs,
         "future_gt_occ": fut_gt,
-        "history_poses": [source.pose(t) for t in window.history_tokens],
-        "future_poses": [source.pose(t) for t in window.future_tokens],
+        "history_poses": poses[:len(window.history_tokens)],
+        "future_poses": poses[len(window.history_tokens):],
         "trajectory": trajectory,
     }
 
