@@ -22,11 +22,13 @@ from real_motion.v21_source_induction import (
     KMEDOIDS_CLARA_SAMPLE_SIZE,KMEDOIDS_CLARA_TRIALS,KMEDOIDS_EXACT_MAX_N,
     AnchorLattice,CanonicalShape,PrototypeBank,annotation_map,assign_causal_coverage,
     attribute_instance_shapes,build_frontier_anchors,build_historical_anchors,
-    build_v21_targets,canonical_shape_population_fingerprint,compose_v21_add_only,
+    build_v21_targets,canonical_shape_arrays_fingerprint,canonical_shape_population_fingerprint,
+    compose_v21_add_only,
     index_shape_pool,oracle_best_indexed_shape,oracle_best_prototype,
     oracle_best_extent_scaled_prototype,
     prototype_bank_fingerprint,rasterize_canonical_shape,
-    select_scene_balanced_round_robin,shape_iou,shape_pool_fingerprint,stable_json_fingerprint,
+    select_scene_balanced_round_robin,shape_iou,shape_pool_metadata_fingerprint,
+    stable_json_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -204,6 +206,22 @@ def _parse_shape(row):
         (str(row["observation_key"][0]),str(row["observation_key"][1])),
         row["local_xyz_m"].numpy().astype(np.float64))
 
+def serialized_shape_population_fingerprint(rows_by_class):
+    """Verify the on-disk payload before CanonicalShape normalization."""
+    out=[]
+    for cid,rows in sorted(rows_by_class.items(),key=lambda x:int(x[0])):
+        class_id=int(cid)
+        ordered=sorted(rows,key=lambda r:tuple(str(x) for x in r["observation_key"]))
+        for row in ordered:
+            if int(row["class_id"])!=class_id:
+                raise RuntimeError("shape-pool serialized class key/payload mismatch")
+            key=(str(row["observation_key"][0]),str(row["observation_key"][1]))
+            cells=row["cells_ijk"].numpy() if hasattr(row["cells_ijk"],"numpy") else row["cells_ijk"]
+            local=row["local_xyz_m"].numpy() if hasattr(row["local_xyz_m"],"numpy") else row["local_xyz_m"]
+            out.append([list(key),canonical_shape_arrays_fingerprint(
+                class_id,cells,key,local)])
+    return stable_json_fingerprint(out)
+
 def load_bank(path,*,allow_incomplete=False):
     x=torch.load(path,map_location="cpu",weights_only=False)
     if x.get("protocol")!=PROTOTYPE_PROTOCOL: raise RuntimeError("bad prototype bank")
@@ -263,8 +281,12 @@ def load_shape_pool(path,bank,*,allow_incomplete=False):
         raise RuntimeError("shape-pool V18 cache version mismatch")
     if provenance.get("se2_target_contract")!=base.SE2_TARGET_CONTRACT:
         raise RuntimeError("shape-pool SE2 target contract mismatch")
+    serialized_rows=x.get("shapes_by_class",{})
+    serialized_shape_fp=serialized_shape_population_fingerprint(serialized_rows)
+    if serialized_shape_fp!=x.get("population_shape_fingerprint"):
+        raise RuntimeError("shape-pool serialized content fingerprint mismatch")
     shapes={}
-    for cid,rows in x.get("shapes_by_class",{}).items():
+    for cid,rows in serialized_rows.items():
         class_id=int(cid); parsed=tuple(_parse_shape(r) for r in rows)
         if any(s.class_id!=class_id for s in parsed):
             raise RuntimeError("shape-pool class key/payload mismatch")
@@ -274,10 +296,8 @@ def load_shape_pool(path,bank,*,allow_incomplete=False):
         raise RuntimeError("shape pool contains duplicate observations")
     if stable_json_fingerprint([list(z) for z in population])!=x.get("population_fingerprint"):
         raise RuntimeError("shape-pool population fingerprint mismatch")
-    shape_fp=canonical_shape_population_fingerprint(shapes)
-    if shape_fp!=x.get("population_shape_fingerprint"):
-        raise RuntimeError("shape-pool content fingerprint mismatch")
-    fingerprint=shape_pool_fingerprint(shapes,population,provenance)
+    shape_fp=str(x["population_shape_fingerprint"])
+    fingerprint=shape_pool_metadata_fingerprint(population,shape_fp,provenance)
     if fingerprint!=x.get("fingerprint"):
         raise RuntimeError("shape-pool metadata fingerprint mismatch")
     if shape_fp!=bank.population_shape_fingerprint:
@@ -286,6 +306,7 @@ def load_shape_pool(path,bank,*,allow_incomplete=False):
         raise RuntimeError("shape pool and prototype bank provenance differ")
     meta={"path":str(Path(path).resolve()),"fingerprint":fingerprint,
           "population_shape_fingerprint":shape_fp,"population_observations":len(population),
+          "runtime_normalized_shape_fingerprint":canonical_shape_population_fingerprint(shapes),
           "class_observations":{str(k):len(v) for k,v in sorted(shapes.items())},
           "source_provenance":provenance}
     return shapes,index_shape_pool(shapes),meta

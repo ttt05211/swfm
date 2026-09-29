@@ -26,7 +26,9 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 def _serialize(s):
     return {"class_id":int(s.class_id),
             "cells_ijk":torch.from_numpy(np.asarray(s.cells_ijk,dtype=np.int32)),
-            "local_xyz_m":torch.from_numpy(np.asarray(s.local_xyz_m,dtype=np.float32)),
+            # Preserve sub-float32 distinctions so reconstruction cannot change
+            # the canonical row set before integrity verification.
+            "local_xyz_m":torch.from_numpy(np.asarray(s.local_xyz_m,dtype=np.float64)),
             "observation_key":list(s.observation_key or ("",""))}
 
 def _sha256(path):

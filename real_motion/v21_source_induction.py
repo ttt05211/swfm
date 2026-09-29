@@ -521,12 +521,23 @@ def shape_iou(a,b):
     A={tuple(x) for x in a.cells_ijk.tolist()}; B={tuple(x) for x in b.cells_ijk.tolist()}
     return len(A&B)/max(len(A|B),1)
 
-def canonical_shape_fingerprint(shape):
-    h=hashlib.sha256(); h.update(str(int(shape.class_id)).encode()); h.update(b"\0")
-    h.update(json.dumps(list(shape.observation_key or ("","")),separators=(",",":")).encode())
-    h.update(np.asarray(shape.cells_ijk,dtype="<i4").tobytes(order="C"))
-    h.update(np.asarray(shape.local_xyz_m,dtype="<f4").tobytes(order="C"))
+def canonical_shape_arrays_fingerprint(class_id,cells_ijk,observation_key,local_xyz_m):
+    """Fingerprint serialized shape arrays without reconstructing the shape.
+
+    This is intentionally separate from ``CanonicalShape`` construction:
+    legacy v1 pools stored local coordinates as float32, and running those
+    arrays through float64 ``np.unique`` can collapse/reorder equal float32
+    rows before integrity verification.
+    """
+    h=hashlib.sha256(); h.update(str(int(class_id)).encode()); h.update(b"\0")
+    h.update(json.dumps(list(observation_key or ("","")),separators=(",",":")).encode())
+    h.update(np.asarray(cells_ijk,dtype="<i4").tobytes(order="C"))
+    h.update(np.asarray(local_xyz_m,dtype="<f4").tobytes(order="C"))
     return h.hexdigest()
+
+def canonical_shape_fingerprint(shape):
+    return canonical_shape_arrays_fingerprint(
+        shape.class_id,shape.cells_ijk,shape.observation_key,shape.local_xyz_m)
 
 def canonical_shape_population_fingerprint(shapes_by_class):
     rows=[]
@@ -537,20 +548,25 @@ def canonical_shape_population_fingerprint(shapes_by_class):
             rows.append([list(shape.observation_key or ("","")),canonical_shape_fingerprint(shape)])
     return stable_json_fingerprint(rows)
 
+def shape_pool_metadata_fingerprint(population_manifest,population_shape_fingerprint,source_provenance):
+    population=tuple(sorted((str(a),str(b)) for a,b in population_manifest))
+    payload={
+        "protocol":SHAPE_POOL_PROTOCOL,
+        "resolution_m":SHAPE_RES,
+        "population_manifest":[list(x) for x in population],
+        "population_shape_fingerprint":str(population_shape_fingerprint),
+        "source_provenance":dict(source_provenance),
+    }
+    return stable_json_fingerprint(payload)
+
 def shape_pool_fingerprint(shapes_by_class,population_manifest,source_provenance):
     population=tuple(sorted((str(a),str(b)) for a,b in population_manifest))
     keys=[tuple(x.observation_key or ("",""))
           for cid in sorted(shapes_by_class) for x in shapes_by_class[cid]]
     if len(keys)!=len(set(keys)) or set(keys)!=set(population):
         raise RuntimeError("shape pool and population manifest differ")
-    payload={
-        "protocol":SHAPE_POOL_PROTOCOL,
-        "resolution_m":SHAPE_RES,
-        "population_manifest":[list(x) for x in population],
-        "population_shape_fingerprint":canonical_shape_population_fingerprint(shapes_by_class),
-        "source_provenance":dict(source_provenance),
-    }
-    return stable_json_fingerprint(payload)
+    return shape_pool_metadata_fingerprint(
+        population,canonical_shape_population_fingerprint(shapes_by_class),source_provenance)
 
 def index_shape_pool(shapes_by_class):
     """Build a sparse inverted index for exact repeated binary-IoU lookup.

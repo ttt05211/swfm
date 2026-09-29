@@ -8,7 +8,9 @@ from real_motion.v21_source_induction import (
     rasterize_canonical_shape,scale_prototype_to_target_extent,
     select_scene_balanced_round_robin,shape_iou,shape_pool_fingerprint,
 )
-from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics,per_horizon_gt_component_indices
+from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import (
+    Metrics,per_horizon_gt_component_indices,serialized_shape_population_fingerprint,
+)
 
 def birth(token,xy,onset=1):
     centers=[None]*6; yaws=[None]*6; ex=[False]*6
@@ -86,6 +88,17 @@ def test_shape_pool_fingerprint_and_sparse_exact_nn_are_deterministic():
     assert oracle_best_indexed_shape(no_overlap,index_shape_pool(right)).observation_key==a.observation_key
     missing=CanonicalShape(7,np.asarray([[0,0,0]],np.int32),("t3","i3"))
     assert oracle_best_indexed_shape(missing,index_shape_pool(left)) is None
+
+def test_legacy_float32_shape_pool_is_fingerprinted_before_normalization():
+    # These distinct float64 rows collapse after legacy float32 serialization.
+    # Integrity must cover the serialized two-row payload, not a reconstructed
+    # CanonicalShape whose np.unique normalization reduces it to one row.
+    local=np.asarray([[0.1,0.0,0.0],[0.1+1e-10,0.0,0.0]],np.float64)
+    shape=CanonicalShape(4,np.asarray([[0,0,0],[1,0,0]],np.int32),("s","i"),local)
+    payload={"4":[{"class_id":4,"cells_ijk":shape.cells_ijk.copy(),
+                    "local_xyz_m":shape.local_xyz_m.astype(np.float32),
+                    "observation_key":["s","i"]}]}
+    assert serialized_shape_population_fingerprint(payload)==canonical_shape_population_fingerprint({4:[shape]})
 
 def test_frontier_keeps_type_and_time_bits():
     grid=OccupancyGrid(x_min=-0.8,y_min=-0.8,z_min=-0.2,voxel_size=(0.4,0.4,0.4),shape_hwd=(4,4,1))
