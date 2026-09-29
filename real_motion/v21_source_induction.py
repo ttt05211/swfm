@@ -624,8 +624,8 @@ def scale_prototype_to_target_extent(prototype,target):
     p=np.asarray(prototype.local_xyz_m,dtype=np.float64)
     t=np.asarray(target.local_xyz_m,dtype=np.float64)
     if not len(p) or not len(t):return prototype
-    pext=np.ptp(p,axis=0)+SHAPE_RES; text=np.ptp(t,axis=0)+SHAPE_RES
-    scale=np.divide(text,pext,out=np.ones(3,dtype=np.float64),where=pext>1e-12)
+    pspan=np.ptp(p,axis=0); tspan=np.ptp(t,axis=0)
+    scale=np.divide(tspan,pspan,out=np.ones(3,dtype=np.float64),where=pspan>1e-12)
     local=p*scale[None]
     cells=np.unique(np.rint(local/SHAPE_RES).astype(np.int32),axis=0)
     return CanonicalShape(int(prototype.class_id),cells,prototype.observation_key,local)
