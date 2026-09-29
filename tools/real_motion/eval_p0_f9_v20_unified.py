@@ -306,11 +306,10 @@ def evaluate_model(
     diagnostic_offsets = tuple(
         dict.fromkeys(float(value) for value in diagnostic_free_logit_offsets)
     )
-    if any(
-        not np.isfinite(value) or value <= 0.0 for value in diagnostic_offsets
-    ):
+    if any(not np.isfinite(value) or value == 0.0 for value in diagnostic_offsets):
         raise ValueError(
-            "diagnostic_free_logit_offsets must be finite and strictly positive"
+            "diagnostic_free_logit_offsets must be finite and nonzero; "
+            "zero is already the formal protocol"
         )
     diagnostic_names = {
         offset: _margin_variant_name(offset) for offset in diagnostic_offsets
@@ -528,7 +527,8 @@ def evaluate_model(
             "selection_eligible": False,
             "shared_completion_forward": True,
             "offset_semantics": (
-                "positive value subtracted from free-class logit before argmax"
+                "value subtracted from free-class logit before argmax; positive "
+                "is looser and negative is a stricter free margin"
             ),
             "formal_protocol_offset": 0.0,
             "candidates": [
@@ -625,8 +625,9 @@ def main() -> None:
         type=float,
         default=(),
         help=(
-            "Diagnostic only: subtract each positive offset from the free-class "
-            "logit and evaluate all candidates from one shared completion forward."
+            "Diagnostic only: subtract each signed nonzero offset from the "
+            "free-class logit and evaluate all candidates from one shared "
+            "completion forward. Negative values impose a stricter free margin."
         ),
     )
     args = parser.parse_args()

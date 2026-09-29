@@ -16,9 +16,9 @@ from .v20_history_world import FREE_LABEL
 
 
 COMPLETION_OBJECTIVE_PROTOCOL = (
-    "coupled_energy_focal_presence_positive_semantic_v1"
+    "argmax_aligned_bce_presence_positive_semantic_v2"
 )
-DEFAULT_PRESENCE_FOCAL_GAMMA = 2.0
+DEFAULT_PRESENCE_FOCAL_GAMMA = 0.0
 DEFAULT_COMPLETION_SEMANTIC_WEIGHT = 1.0
 
 
@@ -159,16 +159,17 @@ def _coupled_completion_terms(
     *,
     presence_focal_gamma: float,
 ) -> dict[str, torch.Tensor]:
-    """Return additive terms for the coupled 18-way completion objective.
+    """Return additive terms for the inference-aligned completion objective.
 
-    ``presence_logit`` is derived from the same semantic logits used at
-    inference.  This is deliberately not an independent binary head:
+    ``presence_logit`` is exactly the margin used by formal 18-way argmax:
 
-        logsumexp(non-free logits) - free logit
+        max(non-free logits) - free logit
 
-    The positive-only semantic term then trains the conditional class
-    distribution without letting the overwhelmingly frequent free label
-    dilute its normalization.
+    V3 model logits are structured so this margin is produced only by the
+    scalar presence head, while relative non-free logits are produced only by
+    the conditional semantic head.  The two objectives therefore do not leak
+    directly into each other's output projection, although both still train
+    the shared completion representation.
     """
     if logits.shape[:-1] != target.shape or target.shape != loss_mask.shape:
         raise ValueError("completion logits/target/mask shape mismatch")
@@ -188,7 +189,7 @@ def _coupled_completion_terms(
     occupied = labels != FREE_LABEL
     occupied_float = occupied.to(dtype=torch.float32)
     free_float = (~occupied).to(dtype=torch.float32)
-    presence_logit = torch.logsumexp(rows[:, :FREE_LABEL], dim=-1) - rows[:, FREE_LABEL]
+    presence_logit = rows[:, :FREE_LABEL].amax(dim=-1) - rows[:, FREE_LABEL]
     presence_bce = F.binary_cross_entropy_with_logits(
         presence_logit, occupied_float, reduction="none"
     )

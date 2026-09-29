@@ -17,14 +17,16 @@ from .local_st_world_model_v17 import config_from_mapping_v17
 from .local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
 from .v20_history_world import CanonicalLattice
 from .v20_unified_model import (
+    LEGACY_COMPLETION_HEAD_PROTOCOL,
     V20_UNIFIED_MODEL_PROTOCOL,
     V20UnifiedConfig,
     V20UnifiedTransportCompletion,
 )
 
-TRAIN_PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v2"
+TRAIN_PROTOCOL = "p0_f9_v20_unified_transport_completion_train_v3"
 LEGACY_TRAIN_PROTOCOLS = {
     "p0_f9_v20_unified_transport_completion_train_v1",
+    "p0_f9_v20_unified_transport_completion_train_v2",
 }
 
 
@@ -286,7 +288,14 @@ def load_model_checkpoint(
     if checkpoint.get("protocol") not in {TRAIN_PROTOCOL, *LEGACY_TRAIN_PROTOCOLS}:
         raise RuntimeError(f"unexpected unified checkpoint: {checkpoint.get('protocol')}")
     v18_cfg = config_from_mapping_v17(checkpoint["v18_model_config"])
-    unified_cfg = V20UnifiedConfig(**checkpoint["unified_model_config"])
+    unified_mapping = dict(checkpoint["unified_model_config"])
+    # V1/V2 checkpoints predate the structured presence/semantic head.  Make
+    # that implicit architecture explicit so they remain readable for
+    # evaluation and signed-margin diagnostics without weakening V3 resume.
+    unified_mapping.setdefault(
+        "completion_head_protocol", LEGACY_COMPLETION_HEAD_PROTOCOL
+    )
+    unified_cfg = V20UnifiedConfig(**unified_mapping)
     lattice = CanonicalLattice(**checkpoint["coarse_lattice"])
     model = V20UnifiedTransportCompletion(
         LocalSpatialTemporalWorldModelV18SE2(v18_cfg),

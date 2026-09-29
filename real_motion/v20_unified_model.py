@@ -1,11 +1,12 @@
 """V20 unified transport-completion model.
 
-The model has one V18 source path and one 18-class completion path.  Static,
+The model has one V18 source path and one structured completion path.  Static,
 Dormant and Birth are evaluation groups only; there is no routing head here.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Mapping, Sequence
 
 import torch
@@ -27,7 +28,9 @@ from .v20_unified_data import (
 from .v20_unified_loss import compute_training_loss as _compute_training_loss
 from .v20_unified_runtime import prepare_runtime_queries as _prepare_runtime_queries
 
-V20_UNIFIED_MODEL_PROTOCOL = "p0_f9_v20_unified_transport_completion_v1"
+V20_UNIFIED_MODEL_PROTOCOL = "p0_f9_v20_unified_transport_completion_v2"
+LEGACY_COMPLETION_HEAD_PROTOCOL = "legacy_shared_18way_v1"
+STRUCTURED_COMPLETION_HEAD_PROTOCOL = "factorized_presence_semantic_v1"
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,8 @@ class V20UnifiedConfig:
     future_dim: int = 64
     tile_dim: int = 48
     completion_classes: int = SEMANTIC_CLASSES
+    completion_head_protocol: str = STRUCTURED_COMPLETION_HEAD_PROTOCOL
+    presence_prior: float = 0.02
     free_logit_bias: float = 2.0
     completion_last_std: float = 1.0e-3
     tile_decode_batch_size: int = 8
@@ -132,19 +137,82 @@ class V20UnifiedTransportCompletion(nn.Module):
             nn.GroupNorm(_group_count(td), td),
             nn.GELU(),
         )
-        self.completion_head = nn.Conv3d(td, SEMANTIC_CLASSES, 1)
-        nn.init.normal_(
-            self.completion_head.weight,
-            mean=0.0,
-            std=float(config.completion_last_std),
-        )
-        nn.init.zeros_(self.completion_head.bias)
-        with torch.no_grad():
-            self.completion_head.bias[FREE_LABEL] = float(config.free_logit_bias)
+        head_protocol = str(config.completion_head_protocol)
+        if head_protocol == LEGACY_COMPLETION_HEAD_PROTOCOL:
+            # Kept only so V1/V2 checkpoints remain evaluable.  New training
+            # always uses the factorized head below.
+            self.completion_head = nn.Conv3d(td, SEMANTIC_CLASSES, 1)
+            self.completion_presence_head = None
+            nn.init.normal_(
+                self.completion_head.weight,
+                mean=0.0,
+                std=float(config.completion_last_std),
+            )
+            nn.init.zeros_(self.completion_head.bias)
+            with torch.no_grad():
+                self.completion_head.bias[FREE_LABEL] = float(config.free_logit_bias)
+        elif head_protocol == STRUCTURED_COMPLETION_HEAD_PROTOCOL:
+            prior = float(config.presence_prior)
+            if not math.isfinite(prior) or not 0.0 < prior < 1.0:
+                raise ValueError("presence_prior must be finite and strictly in (0,1)")
+            # The semantic head is conditional on occupancy.  The scalar
+            # presence head alone controls whether formal 18-way argmax writes
+            # a voxel, so relative semantic logits cannot silently move it.
+            self.completion_head = nn.Conv3d(td, FREE_LABEL, 1)
+            self.completion_presence_head = nn.Conv3d(td, 1, 1)
+            nn.init.normal_(
+                self.completion_head.weight,
+                mean=0.0,
+                std=float(config.completion_last_std),
+            )
+            nn.init.zeros_(self.completion_head.bias)
+            nn.init.normal_(
+                self.completion_presence_head.weight,
+                mean=0.0,
+                std=float(config.completion_last_std),
+            )
+            nn.init.constant_(
+                self.completion_presence_head.bias,
+                math.log(prior / (1.0 - prior)),
+            )
+        else:
+            raise ValueError(f"unknown completion head protocol: {head_protocol!r}")
 
     @property
     def d_model(self) -> int:
         return int(self.v18.config.d_model)
+
+    @property
+    def structured_completion_head(self) -> bool:
+        return (
+            str(self.config.completion_head_protocol)
+            == STRUCTURED_COMPLETION_HEAD_PROTOCOL
+        )
+
+    def _completion_logits_from_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Return formal 18-way logits with an argmax-exact presence gate.
+
+        For the structured head, the largest non-free logit is exactly the
+        scalar presence logit and the free logit is zero.  Therefore formal
+        argmax writes a non-free class exactly when the learned presence score
+        crosses zero, while the relative semantic logits choose its class.
+        """
+        semantic = self.completion_head(features)
+        if not self.structured_completion_head:
+            return semantic
+        if self.completion_presence_head is None:
+            raise RuntimeError("structured completion head lacks presence projection")
+        presence = self.completion_presence_head(features)
+        relative_semantic = semantic - semantic.amax(dim=1, keepdim=True)
+        free = torch.zeros_like(presence)
+        return torch.cat((relative_semantic + presence, free), dim=1)
+
+    def completion_graph_anchor(self) -> torch.Tensor:
+        """Connect empty completion batches to every trainable output head."""
+        anchor = self.completion_head.weight.sum()
+        if self.completion_presence_head is not None:
+            anchor = anchor + self.completion_presence_head.weight.sum()
+        return anchor
 
     def encode_history(self, history: UnifiedHistoryInput) -> HistoryEncoding:
         audit_inference_input_names(history)
@@ -622,7 +690,9 @@ class V20UnifiedTransportCompletion(nn.Module):
                     core_features = torch.stack(
                         [value for _, value in core_rows], dim=0
                     )
-                    core_logits = self.completion_head(core_features).permute(
+                    core_logits = self._completion_logits_from_features(
+                        core_features
+                    ).permute(
                         0, 2, 3, 4, 1
                     )
                     for bi, (qi, _) in enumerate(core_rows):
@@ -633,7 +703,7 @@ class V20UnifiedTransportCompletion(nn.Module):
 
     def _decode_completion_batch(self, tile_input: torch.Tensor) -> torch.Tensor:
         """Checkpointable tile trunk+head; returns [M,18,X,Y,Z]."""
-        return self.completion_head(
+        return self._completion_logits_from_features(
             self._decode_completion_features_batch(tile_input)
         )
 

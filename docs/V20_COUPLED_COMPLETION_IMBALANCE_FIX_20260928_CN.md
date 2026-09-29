@@ -1,5 +1,9 @@
 # V20 耦合 Completion 类别不均衡修复
 
+> 状态：V2 screen1024 已证明该方案会过度补全，正式指标不通过。本文仅保留失败实验的
+> 复现记录；后续实现与验收以
+> `V20_FACTORISED_COMPLETION_GATE_V3_20260929_CN.md` 为准。
+
 ## 诊断
 
 dev512 的 completion support 中约 97.93% 是 free。旧训练目标对所有采样体素执行无权重

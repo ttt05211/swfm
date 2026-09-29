@@ -121,11 +121,44 @@ def test_empty_source_path_still_decodes_completion():
     assert report.requested_points == 0
 
 
-def test_initial_completion_prefers_free_but_is_not_an_exact_zero_head():
+def test_initial_structured_completion_uses_declared_presence_prior():
     model = _model().eval()
-    assert float(model.completion_head.bias[FREE_LABEL]) == 2.0
+    assert model.completion_head.out_channels == FREE_LABEL
+    assert model.completion_presence_head is not None
+    expected = torch.log(torch.tensor(0.02 / 0.98))
+    assert torch.allclose(model.completion_presence_head.bias[0], expected)
     assert float(model.completion_head.weight.abs().sum()) > 0.0
     assert float(model.completion_head.weight.std()) < 0.01
+
+
+def test_structured_completion_separates_presence_and_semantic_gradients():
+    torch.manual_seed(29)
+    model = _model()
+    features = torch.randn(2, model.config.tile_dim, 2, 1, 1)
+    logits = model._completion_logits_from_features(features)
+    presence = model.completion_presence_head(features).squeeze(1)
+    formal_margin = logits[:, :FREE_LABEL].amax(dim=1) - logits[:, FREE_LABEL]
+    assert torch.allclose(formal_margin, presence, atol=1.0e-6, rtol=1.0e-6)
+
+    torch.nn.functional.binary_cross_entropy_with_logits(
+        formal_margin, torch.ones_like(formal_margin)
+    ).backward()
+    assert model.completion_presence_head.weight.grad is not None
+    semantic_grad = model.completion_head.weight.grad
+    assert semantic_grad is not None
+    assert float(semantic_grad.abs().max()) < 1.0e-6
+
+    model.zero_grad(set_to_none=True)
+    logits = model._completion_logits_from_features(features)
+    target = torch.zeros(logits.shape[0], *logits.shape[2:], dtype=torch.long)
+    torch.nn.functional.cross_entropy(
+        logits[:, :FREE_LABEL].movedim(1, -1).reshape(-1, FREE_LABEL),
+        target.reshape(-1),
+    ).backward()
+    assert model.completion_head.weight.grad is not None
+    presence_grad = model.completion_presence_head.weight.grad
+    assert presence_grad is not None
+    assert float(presence_grad.abs().max()) < 1.0e-6
 
 
 def test_grid_sample_uses_voxel_centers_and_explicit_xyz_order():

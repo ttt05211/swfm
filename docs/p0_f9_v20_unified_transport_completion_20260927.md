@@ -1,5 +1,10 @@
 # V20 统一运输补全实现与运行交接（2026-09-27）
 
+> 2026-09-29 更新：原始 18-way CE 和后续 V2 coupled focal 均未通过真实 screen。
+> 当前 completion head/loss 协议已升级为 V3；差异和止损流程见
+> `V20_FACTORISED_COMPLETION_GATE_V3_20260929_CN.md`。本文其余部分保留数据、运行和评测
+> 合同；涉及旧 completion loss/protocol 的描述不得用于新的结果声明。
+
 协议：`p0_f9_v20_unified_transport_completion_v1`
 
 本文只记录已实现的代码合同与可复现实验命令。代码或测试存在不等于真实数据实验已经完成；在得到 smoke/screen 日志以前，不报告方法收益。

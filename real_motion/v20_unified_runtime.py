@@ -189,9 +189,11 @@ def compose_completion_tiles(
 ) -> torch.Tensor:
     """Compose tile predictions directly without dense 18-way logits.
 
-    ``free_logit_offset`` is a diagnostic-only calibration control.  A positive
-    value is subtracted from the free-class logit before argmax.  The default
-    zero path deliberately keeps the original argmax implementation exact.
+    ``free_logit_offset`` is a diagnostic-only calibration control.  It is
+    subtracted from the free-class logit before argmax: positive values loosen
+    the completion gate, while negative values raise the free-class margin and
+    make it stricter.  The default zero path deliberately keeps the original
+    argmax implementation exact.
     """
     free_logit_offset = float(free_logit_offset)
     return compose_completion_tiles_at_free_logit_offsets(
@@ -212,8 +214,8 @@ def compose_completion_tiles_at_free_logit_offsets(
     offsets = tuple(float(value) for value in current_transport_by_offset)
     if len(set(offsets)) != len(offsets):
         raise ValueError("free-logit offsets must be unique after float conversion")
-    if any(not math.isfinite(value) or value < 0.0 for value in offsets):
-        raise ValueError("free_logit_offset must be finite and non-negative")
+    if any(not math.isfinite(value) for value in offsets):
+        raise ValueError("free_logit_offset must be finite")
     out_by_offset = {
         float(offset): current.clone()
         for offset, current in current_transport_by_offset.items()

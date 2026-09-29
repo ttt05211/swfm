@@ -130,21 +130,22 @@ def test_deferred_completion_statistics_preserve_loss_and_count():
     assert int(deferred.count) == regular.count
 
 
-def test_coupled_completion_decomposes_ce_at_gamma_zero_and_original_mass():
+def test_completion_presence_uses_formal_argmax_margin():
     torch.manual_seed(13)
     logits = torch.randn(4, 18, requires_grad=True)
     target = torch.tensor([FREE_LABEL, 2, FREE_LABEL, 5])
     mask = torch.ones(4, dtype=torch.bool)
-    # With gamma=0 and semantic weight equal to the occupied mass, the
-    # factorization is exactly the original 18-way cross entropy.
     got = completion_coupled_focal_semantic(
         logits,
         target,
         mask,
         presence_focal_gamma=0.0,
-        semantic_weight=0.5,
+        semantic_weight=0.0,
     )
-    expected = torch.nn.functional.cross_entropy(logits, target)
+    presence_logit = logits[:, :FREE_LABEL].amax(dim=-1) - logits[:, FREE_LABEL]
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        presence_logit, (target != FREE_LABEL).float()
+    )
     assert torch.allclose(got.mean, expected, atol=1.0e-6, rtol=1.0e-6)
     assert got.count == 4
     assert got.free_count == 2
@@ -169,7 +170,7 @@ def test_coupled_completion_separately_normalizes_positive_semantics():
         presence_focal_gamma=2.0,
         semantic_weight=1.0,
     )
-    presence_logit = torch.log(torch.tensor(17.0))
+    presence_logit = torch.tensor(0.0)
     bce = torch.nn.functional.binary_cross_entropy_with_logits(
         presence_logit.expand(3),
         torch.tensor([0.0, 0.0, 1.0]),
@@ -328,6 +329,15 @@ def test_free_logit_offset_changes_only_diagnostic_argmax_threshold():
     assert torch.equal(unchanged, current)
     assert torch.equal(below_threshold, current)
     assert torch.all(above_threshold == 4)
+
+    occupied_logits = [value.clone() for value in logits]
+    for value in occupied_logits:
+        value[..., 4] = 3.0
+    assert torch.all(compose_completion_tiles(current, occupied_logits, queries) == 4)
+    stricter = compose_completion_tiles(
+        current, occupied_logits, queries, free_logit_offset=-1.5
+    )
+    assert torch.equal(stricter, current)
 
 
 def test_runtime_queries_reuse_dense_masks_without_changing_contract():

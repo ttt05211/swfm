@@ -925,8 +925,8 @@ def full_completion_predictions_at_free_logit_offsets(
     offsets = tuple(dict.fromkeys(float(value) for value in free_logit_offsets))
     if not offsets:
         raise ValueError("free_logit_offsets cannot be empty")
-    if any(not math.isfinite(value) or value < 0.0 for value in offsets):
-        raise ValueError("free_logit_offsets must be finite and non-negative")
+    if any(not math.isfinite(value) for value in offsets):
+        raise ValueError("free_logit_offsets must be finite")
     geometry_valid, support, condition = geometry_and_support(
         model, prepared, current_transport, native_grid
     )

@@ -15,6 +15,7 @@ from real_motion.motion_transport import FEATURE_DIM, FUTURE_FRAMES, HISTORY_FRA
 from real_motion.v20_history_world import FREE_LABEL, CanonicalLattice
 from real_motion.v20_unified_data import UnifiedHistoryInput
 from real_motion.v20_unified_model import (
+    LEGACY_COMPLETION_HEAD_PROTOCOL,
     V20UnifiedConfig,
     V20UnifiedTransportCompletion,
 )
@@ -297,6 +298,44 @@ def test_checkpoint_roundtrip_preserves_completion_execution_config(tmp_path):
     legacy_model, legacy_checkpoint = load_model_checkpoint(legacy_path)
     assert legacy_checkpoint["protocol"].endswith("train_v1")
     assert legacy_model.config == loaded_model.config
+
+
+def test_actual_v2_shared_head_checkpoint_remains_evaluable(tmp_path):
+    legacy_config = V20UnifiedConfig(
+        completion_head_protocol=LEGACY_COMPLETION_HEAD_PROTOCOL
+    )
+    model = _model(legacy_config)
+    optimizer = build_optimizer(model)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    base = tmp_path / "base.pt"
+    manifest = tmp_path / "index.json"
+    torch.save({"base": True}, base)
+    manifest.write_text('{"protocol":"test"}', encoding="utf-8")
+    payload = checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        scheduler_state={"successful_updates": 0},
+        scaler=scaler,
+        progress=TrainerProgress(),
+        base_checkpoint=base,
+        manifest_paths={"train": manifest},
+        config={},
+        repository_root=tmp_path,
+    )
+    payload["protocol"] = "p0_f9_v20_unified_transport_completion_train_v2"
+    payload["model_protocol"] = "p0_f9_v20_unified_transport_completion_v1"
+    payload["unified_model_config"].pop("completion_head_protocol")
+    payload["unified_model_config"].pop("presence_prior")
+    path = tmp_path / "actual_v2.pt"
+    save_checkpoint(path, payload)
+
+    loaded, checkpoint = load_model_checkpoint(path)
+    assert checkpoint["protocol"].endswith("train_v2")
+    assert loaded.config.completion_head_protocol == LEGACY_COMPLETION_HEAD_PROTOCOL
+    assert loaded.completion_head.out_channels == 18
+    assert loaded.completion_presence_head is None
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, loaded.state_dict()[name])
 
 
 def test_resume_contract_normalizes_json_lattice_and_rejects_drift(tmp_path):

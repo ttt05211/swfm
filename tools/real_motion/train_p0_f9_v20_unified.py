@@ -130,15 +130,37 @@ def _materialize_scalar_stats(rows: list[dict]) -> list[dict]:
 def _completion_head_gradient_norms(
     model: V20UnifiedTransportCompletion,
 ) -> torch.Tensor:
-    """Per-class L2 gradient norms, retained until the update synchronization."""
+    """Return 17 semantic norms followed by the scalar presence-head norm."""
     weight = model.completion_head.weight.grad
     bias = model.completion_head.bias.grad
     if weight is None:
-        return model.completion_head.weight.new_zeros(18, dtype=torch.float32)
-    squared = weight.detach().float().flatten(1).square().sum(dim=1)
-    if bias is not None:
-        squared = squared + bias.detach().float().square()
-    return squared.sqrt()
+        semantic = model.completion_head.weight.new_zeros(
+            model.completion_head.out_channels, dtype=torch.float32
+        )
+    else:
+        squared = weight.detach().float().flatten(1).square().sum(dim=1)
+        if bias is not None:
+            squared = squared + bias.detach().float().square()
+        semantic = squared.sqrt()
+    if model.completion_presence_head is None:
+        if semantic.numel() != 18:
+            raise RuntimeError("legacy completion head must expose 18 classes")
+        return semantic
+    presence_weight = model.completion_presence_head.weight.grad
+    presence_bias = model.completion_presence_head.bias.grad
+    if presence_weight is None:
+        presence = semantic.new_zeros(1)
+    else:
+        presence_squared = presence_weight.detach().float().square().sum()
+        if presence_bias is not None:
+            presence_squared = (
+                presence_squared
+                + presence_bias.detach().float().square().sum()
+            )
+        presence = presence_squared.sqrt().reshape(1)
+    if semantic.numel() != 17:
+        raise RuntimeError("structured semantic head must expose 17 classes")
+    return torch.cat((semantic, presence))
 
 
 def _lr_scale(successful_updates: int, max_updates: int) -> float:
@@ -239,6 +261,16 @@ def main() -> None:
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--warmup-updates", type=int, default=128)
     parser.add_argument("--max-updates", type=int, default=1024)
+    parser.add_argument(
+        "--stop-after-updates",
+        type=int,
+        default=0,
+        help=(
+            "Operational early-stop boundary without changing the configured "
+            "schedule or exact resume contract. A stopped run can resume toward "
+            "--max-updates from its final checkpoint. Zero disables it."
+        ),
+    )
     parser.add_argument("--monitor-every", type=int, default=128)
     parser.add_argument("--monitor-windows", type=int, default=128)
     parser.add_argument("--new-lr", type=float, default=2.0e-4)
@@ -251,8 +283,8 @@ def main() -> None:
         type=float,
         default=DEFAULT_PRESENCE_FOCAL_GAMMA,
         help=(
-            "Focal gamma for occupied-vs-free energy derived from the coupled "
-            "18-class logits."
+            "Focal gamma for the argmax-aligned scalar occupied/free gate. "
+            "The formal V3 default is zero (ordinary calibrated BCE)."
         ),
     )
     parser.add_argument(
@@ -338,6 +370,15 @@ def main() -> None:
         args.max_updates = 1024
         args.grad_accum = 4
         args.io_locality_order = True
+    execution_target = (
+        int(args.stop_after_updates)
+        if int(args.stop_after_updates) > 0
+        else int(args.max_updates)
+    )
+    if int(args.stop_after_updates) < 0 or execution_target > int(args.max_updates):
+        raise ValueError(
+            "--stop-after-updates must be zero or in [1, --max-updates]"
+        )
     if min(
         int(args.grad_accum),
         int(args.max_updates),
@@ -463,6 +504,8 @@ def main() -> None:
         "clip_grad": float(args.clip_grad),
         "completion_weight": float(args.completion_weight),
         "completion_objective_protocol": COMPLETION_OBJECTIVE_PROTOCOL,
+        "completion_head_protocol": V20UnifiedConfig().completion_head_protocol,
+        "presence_prior": float(V20UnifiedConfig().presence_prior),
         "presence_focal_gamma": float(args.presence_focal_gamma),
         "completion_semantic_weight": float(args.completion_semantic_weight),
         "patch_resolution_m": float(args.patch_resolution_m),
@@ -529,6 +572,11 @@ def main() -> None:
             resume_checkpoint, model=model, optimizer=optimizer, scaler=scaler
         )
         window_cursor = int(resume_checkpoint.get("scheduler", {}).get("window_cursor", 0))
+    if progress_state.successful_updates >= execution_target:
+        raise RuntimeError(
+            f"checkpoint already reached execution target {execution_target}; "
+            "raise --stop-after-updates or disable it"
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -624,7 +672,7 @@ def main() -> None:
 
     submit_prefetch()
 
-    while progress_state.successful_updates < int(args.max_updates):
+    while progress_state.successful_updates < execution_target:
         if device.type == "cuda":
             # Exclude outstanding monitor/checkpoint work from the next update and
             # report the true per-update allocated-memory high-water mark.
@@ -777,7 +825,7 @@ def main() -> None:
                             completion_semantic_weight=float(
                                 args.completion_semantic_weight
                             ),
-                            graph_anchor=model.completion_head.weight,
+                            graph_anchor=model.completion_graph_anchor(),
                             materialize_stats=False,
                         )
                         stats["tiles"] = int(
@@ -839,13 +887,13 @@ def main() -> None:
         completion_head_gradients_cpu = (
             completion_head_gradients.detach().float().cpu()
         )
-        completion_head_gradient_by_class = [
+        completion_semantic_gradient_by_class = [
             float(value) for value in completion_head_gradients_cpu.tolist()
-        ]
-        completion_head_nonfree_grad = float(
+        ][:17]
+        completion_semantic_grad = float(
             completion_head_gradients_cpu[:17].norm()
         )
-        completion_head_free_grad = float(completion_head_gradients_cpu[17])
+        completion_presence_grad = float(completion_head_gradients_cpu[17])
         natural_distribution = None
         if natural_distribution_pieces:
             natural_counts = torch.stack(
@@ -964,16 +1012,16 @@ def main() -> None:
                 )
             ),
             "sampled_class_counts": class_counts,
-            "completion_head_gradient_norm_by_class": (
-                completion_head_gradient_by_class
+            "completion_semantic_head_gradient_norm_by_class": (
+                completion_semantic_gradient_by_class
             ),
-            "completion_head_nonfree_gradient_norm": (
-                completion_head_nonfree_grad
+            "completion_semantic_head_gradient_norm": (
+                completion_semantic_grad
             ),
-            "completion_head_free_gradient_norm": completion_head_free_grad,
-            "completion_head_nonfree_to_free_gradient_ratio": float(
-                completion_head_nonfree_grad
-                / max(completion_head_free_grad, 1.0e-12)
+            "completion_presence_head_gradient_norm": completion_presence_grad,
+            "completion_semantic_to_presence_gradient_ratio": float(
+                completion_semantic_grad
+                / max(completion_presence_grad, 1.0e-12)
             ),
         }
         if natural_distribution is not None:
@@ -994,8 +1042,8 @@ def main() -> None:
             f"windows={len(group_stats)} voxels={voxels} "
             f"tiles={tiles} unique_tiles={unique_tiles} "
             f"grad_norm={float(grad_norm):.4f} "
-            f"head_grad_fg={completion_head_nonfree_grad:.4f} "
-            f"head_grad_free={completion_head_free_grad:.4f} "
+            f"semantic_grad={completion_semantic_grad:.4f} "
+            f"presence_grad={completion_presence_grad:.4f} "
             f"seconds={update_seconds:.3f} "
             f"peak_memory_mib={peak_memory_mib:.1f} "
             f"timing_ms={timing_text}",
@@ -1004,7 +1052,7 @@ def main() -> None:
 
         should_monitor = (
             progress_state.successful_updates % int(args.monitor_every) == 0
-            or progress_state.successful_updates == int(args.max_updates)
+            or progress_state.successful_updates == execution_target
         )
         if not should_monitor:
             continue
@@ -1083,6 +1131,9 @@ def main() -> None:
         "protocol": PROTOCOL,
         "successful_updates": progress_state.successful_updates,
         "attempted_updates": progress_state.attempted_updates,
+        "configured_max_updates": int(args.max_updates),
+        "execution_target_updates": execution_target,
+        "early_stopped": execution_target < int(args.max_updates),
         "elapsed_seconds": time.perf_counter() - started,
         "final_checkpoint": str(
             (out_dir / f"update_{progress_state.successful_updates:04d}.pt").resolve()
@@ -1099,6 +1150,8 @@ def main() -> None:
         "checkpoint_completion_tiles": not bool(args.no_completion_checkpoint),
         "cpu_prefetch": not bool(args.no_cpu_prefetch),
         "completion_objective": COMPLETION_OBJECTIVE_PROTOCOL,
+        "completion_head_protocol": model.config.completion_head_protocol,
+        "presence_prior": float(model.config.presence_prior),
         "presence_focal_gamma": float(args.presence_focal_gamma),
         "completion_semantic_weight": float(args.completion_semantic_weight),
         "train_diagnostics": str(diagnostics_path.resolve()),
