@@ -3,7 +3,7 @@ from real_motion.geometry import OccupancyGrid
 from real_motion.v21_source_induction import (
     AnchorLattice,CanonicalShape,FrontierAnchor,V21Target,assign_causal_coverage,
     attribute_instance_shapes,build_frontier_anchors,build_prototype_bank,
-    compose_v21_add_only,oracle_best_prototype,rasterize_canonical_shape,
+    compose_v21_add_only,oracle_best_extent_scaled_prototype,oracle_best_prototype,rasterize_canonical_shape,
     scale_prototype_to_target_extent,select_scene_balanced_round_robin,shape_iou,
 )
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics
@@ -169,3 +169,14 @@ def test_oracle_extent_scaling_changes_extent_without_copying_target_pattern():
     assert scaled.observation_key==proto.observation_key
     assert np.isclose(np.ptp(scaled.local_xyz_m[:,0]),np.ptp(target.local_xyz_m[:,0]))
     assert len(scaled.cells_ijk)==len(proto.cells_ijk)
+
+def test_oracle_extent_selection_scores_candidates_after_scaling():
+    narrow=CanonicalShape(4,np.asarray([[-1,0,0],[0,0,0],[1,0,0]]),("a","i"))
+    l_shape=CanonicalShape(4,np.asarray([[-1,0,0],[0,0,0],[1,0,0],[0,1,0]]),("b","i"))
+    target=CanonicalShape(4,np.asarray([[-2,0,0],[0,0,0],[2,0,0],[0,2,0]]),("t","i"))
+    bank=build_prototype_bank(
+        {4:[narrow,l_shape]},requested_k=2,
+        population_manifest=[narrow.observation_key,l_shape.observation_key])
+    best=oracle_best_extent_scaled_prototype(target,bank)
+    assert best.observation_key==l_shape.observation_key
+    assert shape_iou(target,best)>shape_iou(target,scale_prototype_to_target_extent(narrow,target))

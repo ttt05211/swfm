@@ -54,7 +54,7 @@ dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin
 
 Stage-0 evaluator 的 `--cpu-workers 0` 默认选择至多 8 个线程，并行加载同一窗口的帧、提取六帧历史/未来 component 和计算 Moving support。global/scene 指标共用一次 confusion-matrix 计数，替代对每个类别重复扫描全体素；输出 `performance.seconds_by_stage` 便于继续定位瓶颈。这里 GPU 只负责冻结 V18 forward/warp，Stage-0 的 GT attribution、component、renderer 与 metric 仍主要是 CPU 工作，因此低显存和间歇性 GPU utilization 本身不是停滞。
 
-若普通 prototype 的 UB2/UB1 retention 不足，evaluator 同次额外报告 `UB2_FACTORIZED_ORACLE_EXTENT`：保持同一个 train-only prototype 形状码，只把 query-entry GT occupancy 的三轴 extent 作为 oracle 连续尺度施加到 prototype。它只回答“shape code × continuous extent”是否有表示上限，不复制目标 voxel pattern，不进入原 `stage0b_gate`，也不得作为 deployable 结果；其独立门槛位于 `factorized_oracle_extent_gate`。若该门槛仍失败，停止 prototype 路线；若通过，后续模型才增加一个 causal extent prediction head。
+若普通 prototype 的 UB2/UB1 retention 不足，evaluator 同次额外报告 `UB2_FACTORIZED_ORACLE_EXTENT`：保持同一个 train-only prototype 形状码，对每个候选先施加 query-entry GT occupancy 的三轴 oracle 连续尺度，再按缩放后的 shape IoU 选择最佳形状码。它只回答“shape code × continuous extent”是否有表示上限，不复制目标 voxel pattern，不进入原 `stage0b_gate`，也不得作为 deployable 结果；其独立门槛位于 `factorized_oracle_extent_gate`。若该门槛仍失败，停止 prototype 路线；若通过，后续模型才增加一个 causal extent prediction head。
 
 ```bash
 for K in 1 4 8 16; do

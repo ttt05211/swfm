@@ -630,6 +630,11 @@ def scale_prototype_to_target_extent(prototype,target):
     cells=np.unique(np.rint(local/SHAPE_RES).astype(np.int32),axis=0)
     return CanonicalShape(int(prototype.class_id),cells,prototype.observation_key,local)
 
+def oracle_best_extent_scaled_prototype(target,bank):
+    rows=bank.medoids_by_class.get(int(target.class_id),())
+    candidates=[scale_prototype_to_target_extent(x,target) for x in rows]
+    return min(candidates,key=lambda x:(-shape_iou(target,x),tuple(x.observation_key or ("","")))) if candidates else None
+
 def rasterize_canonical_shape(shape,center,yaw,future_pose,*,grid):
     local=np.asarray(shape.local_xyz_m,float); c,s=math.cos(yaw),math.sin(yaw)
     rel=np.stack((c*local[:,0]-s*local[:,1],s*local[:,0]+c*local[:,1],local[:,2]),-1)

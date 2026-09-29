@@ -22,9 +22,9 @@ from real_motion.v21_source_induction import (
     AnchorLattice,CanonicalShape,PrototypeBank,annotation_map,assign_causal_coverage,
     attribute_instance_shapes,build_frontier_anchors,build_historical_anchors,
     build_v21_targets,compose_v21_add_only,oracle_best_prototype,
+    oracle_best_extent_scaled_prototype,
     prototype_bank_fingerprint,rasterize_canonical_shape,
-    scale_prototype_to_target_extent,select_scene_balanced_round_robin,
-    shape_iou,stable_json_fingerprint,
+    select_scene_balanced_round_robin,shape_iou,stable_json_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -525,7 +525,7 @@ def main():
                 onset[tok]=at.shape; pp=oracle_best_prototype(at.shape,bank)
                 if pp is not None:
                     proto[tok]=pp
-                    scaled_proto[tok]=scale_prototype_to_target_extent(pp,at.shape)
+                    scaled_proto[tok]=oracle_best_extent_scaled_prototype(at.shape,bank)
                     if t.responsibility=="BIRTH" and tok in mb:
                         exact_n=max(len(at.shape.cells_ijk),1)
                         scaled=scaled_proto[tok]
