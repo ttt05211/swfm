@@ -22,7 +22,7 @@ from real_motion.v21_source_induction import (
     attribute_instance_shapes,build_frontier_anchors,build_historical_anchors,
     build_v21_targets,compose_v21_add_only,oracle_best_prototype,
     prototype_bank_fingerprint,rasterize_canonical_shape,
-    select_scene_balanced_round_robin,stable_json_fingerprint,
+    select_scene_balanced_round_robin,shape_iou,stable_json_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion import eval_p0_f9_v18_full_validation as full
@@ -79,6 +79,30 @@ def delta(c,b):
                 bv=b["per_horizon"][hs][name][cid]
                 out["per_horizon"][hs][name][cid]=float(v)-float(bv) if np.isfinite(v) and np.isfinite(bv) else float("nan")
     return out
+
+def summarize_prototype_fit(rows):
+    def one(items):
+        iou=np.asarray([x[0] for x in items],dtype=np.float64)
+        ratio=np.asarray([x[1] for x in items],dtype=np.float64)
+        if not len(iou):
+            return {"targets":0}
+        return {
+            "targets":int(len(iou)),
+            "shape_iou_mean":float(iou.mean()),
+            "shape_iou_p10":float(np.percentile(iou,10)),
+            "shape_iou_p50":float(np.percentile(iou,50)),
+            "shape_iou_p90":float(np.percentile(iou,90)),
+            "prototype_to_exact_voxel_ratio_mean":float(ratio.mean()),
+            "prototype_to_exact_voxel_ratio_p10":float(np.percentile(ratio,10)),
+            "prototype_to_exact_voxel_ratio_p50":float(np.percentile(ratio,50)),
+            "prototype_to_exact_voxel_ratio_p90":float(np.percentile(ratio,90)),
+            "oversized_targets":int((ratio>1.0).sum()),
+            "undersized_targets":int((ratio<1.0).sum()),
+        }
+    all_rows=[x for values in rows.values() for x in values]
+    return {"population":"causally-covered BIRTH targets at query-entry onset",
+            "all":one(all_rows),
+            "per_class":{str(cid):one(values) for cid,values in sorted(rows.items())}}
 
 def sha256(path):
     h=hashlib.sha256()
@@ -326,6 +350,7 @@ def main():
     audit=defaultdict(int); aa=defaultdict(int); sa=defaultdict(int); ca={v:defaultdict(int) for v in VARIANTS}; cov=defaultdict(float)
     identity_cov=defaultdict(float)
     cov_strata=defaultdict(lambda:defaultdict(float)); cov_distances=defaultdict(list)
+    prototype_fit=defaultdict(list)
     perclass=defaultdict(int); queryperclass=defaultdict(int); perh=defaultdict(int)
     totalvox=coveredvox=alltargets=querytargets=movingtargets=querymovingtargets=allvox=movingvox=0
     scene=defaultdict(lambda:{"V18_BASE":Metrics(),**{v:Metrics() for v in VARIANTS}})
@@ -444,7 +469,12 @@ def main():
                     raise RuntimeError(f"query-entry exact-shape round-trip failed: {w.scene_name}/{w.t0_token}/{tok}")
                 sa["query_entry_roundtrip_exact"]+=1
                 onset[tok]=at.shape; pp=oracle_best_prototype(at.shape,bank)
-                if pp is not None:proto[tok]=pp
+                if pp is not None:
+                    proto[tok]=pp
+                    if t.responsibility=="BIRTH" and tok in mb:
+                        exact_n=max(len(at.shape.cells_ijk),1)
+                        prototype_fit[int(t.class_id)].append(
+                            (shape_iou(at.shape,pp),len(pp.cells_ijk)/exact_n))
                 elif t.responsibility=="BIRTH":sa["prototype_missing_class"]+=1
             if t.responsibility=="DORMANT_ANCESTRAL":
                 found=None
@@ -556,6 +586,7 @@ def main():
             "per_class_annotation_targets":dict(perclass),"per_class_query_entry_targets":dict(queryperclass),
             "per_report_horizon_annotation_targets":dict(perh)},
         "target_audit":dict(audit),"anchor_audit":dict(aa),"shape_audit":dict(sa),
+        "prototype_fit_diagnostic":summarize_prototype_fit(prototype_fit),
         "collision_audit":{k:dict(v) for k,v in ca.items()},
         "dormant_age_stratum_ub1_exact":{age:{"metrics":m.compute(),"delta_vs_v18_pp":delta(m.compute(),br)} for age,m in ages.items()},
         "scene_delta_mIoU_pp":{"scenes":len(sd),"positive":sum(x>eps for x in sd),

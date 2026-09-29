@@ -14,7 +14,8 @@ from real_motion.strong_w2det import StrongW2DetConfig
 from real_motion.v21_source_induction import (
     KMEDOIDS_CLARA_SAMPLE_SIZE,KMEDOIDS_CLARA_TRIALS,KMEDOIDS_EXACT_MAX_N,
     PROTOTYPE_PROTOCOL,annotation_map,attribute_instance_shapes,
-    build_prototype_bank,reliable_components_and_tokens,stable_json_fingerprint,
+    build_prototype_bank,reliable_components_and_tokens,
+    select_scene_balanced_round_robin,stable_json_fingerprint,
 )
 from tools.real_motion import eval_p0_f9_v18_se2 as base
 from tools.real_motion.diagnose_p0_f9_v19_innovation_decomposition import CachedSource
@@ -43,8 +44,19 @@ def main():
     a=p.parse_args()
     pcfg=make_prepare_config(load_runtime_config(a.config,a.override))
     cache_meta,records_all=base.load_cache(a.train_cache)
-    total_records=len(records_all); records=records_all
-    if a.max_windows>0: records=records[:min(len(records),a.max_windows)]
+    total_records=len(records_all)
+    all_record_keys=[(str(r["scene_name"]),str(r["t0_token"])) for r in records_all]
+    if len(all_record_keys)!=len(set(all_record_keys)):
+        raise RuntimeError("train cache contains duplicate (scene_name, t0_token) identities")
+    by_record_key=dict(zip(all_record_keys,records_all))
+    if a.max_windows>0 and a.max_windows<total_records:
+        selected_record_keys=select_scene_balanced_round_robin(all_record_keys,int(a.max_windows))
+        records=[by_record_key[k] for k in selected_record_keys]
+        selection_rule="scene_balanced_round_robin_v1"
+    else:
+        records=records_all
+        selected_record_keys=tuple(all_record_keys)
+        selection_rule="complete_train_cache_order_v1"
     if not records: raise RuntimeError("empty train cache")
 
     samples={}
@@ -82,18 +94,20 @@ def main():
 
     out=Path(a.output_dir); out.mkdir(parents=True,exist_ok=True)
     popfp=stable_json_fingerprint([list(x) for x in sorted(population)])
-    record_keys=[(str(r["scene_name"]),str(r["t0_token"])) for r in records]
-    if len(record_keys)!=len(set(record_keys)):
-        raise RuntimeError("train cache contains duplicate (scene_name, t0_token) identities")
     provenance={"train_cache":str(Path(a.train_cache).resolve()),"train_cache_sha256":_sha256(a.train_cache),
                 "info_pkl":str(Path(a.info_pkl).resolve()),"info_pkl_sha256":_sha256(a.info_pkl),
                 "cache_records_total":total_records,"cache_records_used":len(records),
                 "complete_train_population":len(records)==total_records and int(a.max_windows)==0,
-                "record_key_fingerprint":stable_json_fingerprint([list(x) for x in record_keys]),
+                "record_selection_rule":selection_rule,
+                "selected_scene_count":len({x[0] for x in selected_record_keys}),
+                "record_key_fingerprint":stable_json_fingerprint([list(x) for x in selected_record_keys]),
                 "cache_version":base.SE2_CACHE_VERSION,
                 "se2_target_contract":cache_meta.get("se2_target_contract")}
     summary={"protocol":PROTOTYPE_PROTOCOL,"unique_sample_tokens":len(ordered),
              "valid_observations":len(population),"population_fingerprint":popfp,
+             "record_selection_rule":selection_rule,
+             "selected_windows":len(records),
+             "selected_scenes":len({x[0] for x in selected_record_keys}),
              "class_histogram":{str(k):len(v) for k,v in sorted(by_class.items())},
              "shape_unresolved":unresolved,"shape_ambiguous":ambiguous,
              "resolution_m":0.4,

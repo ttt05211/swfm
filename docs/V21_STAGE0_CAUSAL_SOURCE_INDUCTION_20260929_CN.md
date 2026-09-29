@@ -46,7 +46,7 @@ dev64 严格采用 parent dev512 原始 key/order 的 scene-balanced round-robin
 
 唯一 observation key 为 `(sample_token, instance_token)`；对 train windows 的 history/future sample union 去重，不按 overlapping window 重复加权。同一 instance 在不同 sample 可各计一次。每个 sample 只运行一次 frozen Strong component extraction，归因和 shape 构建直接复用同一组 component/match，不再重复做 connected-component。shape 只做 GT center/yaw 的 offline canonicalization，不做 box-size scaling，保留真实尺度；距离为 `1-binary IoU`。某类样本少于 K 时不复制 medoid。
 
-每类 observation 数 `<=512` 时运行 exact PAM；更大 population 使用冻结的 deterministic CLARA（sample size 256，5 trials），避免全量 `N×N` 距离矩阵。bank 保存 train-cache/info SHA256、完整 population 标志、shape fingerprint、算法参数和 medoid 内容 fingerprint。`--max-windows` 生成的只是 diagnostic bank，正式 evaluator 默认拒绝；只有显式 `--allow-incomplete-prototype-bank` 才能用于调试。
+每类 observation 数 `<=512` 时运行 exact PAM；更大 population 使用冻结的 deterministic CLARA（sample size 256，5 trials），避免全量 `N×N` 距离矩阵。bank 保存 train-cache/info SHA256、完整 population 标志、shape fingerprint、算法参数和 medoid 内容 fingerprint。`--max-windows` 生成的只是 diagnostic bank，且窗口按训练缓存中的 scene first-appearance order 做 deterministic scene-balanced round-robin，不再取有顺序偏差的前 N 条；正式 evaluator 默认拒绝不完整 bank，只有显式 `--allow-incomplete-prototype-bank` 才能用于调试。evaluator 另报告 causal-covered BIRTH 的 prototype/exact canonical shape IoU 与体素量比，用于区分训练 population 不充分和 prototype 表示本身不足。
 
 ## 3. dev64 Stage-0 smoke
 
