@@ -294,6 +294,10 @@ def load_shape_pool(path,bank,*,allow_incomplete=False):
     population=tuple((str(a),str(b)) for a,b in x.get("population_manifest",()))
     if len(population)!=len(set(population)):
         raise RuntimeError("shape pool contains duplicate observations")
+    shape_keys=[tuple(s.observation_key or ("",""))
+                for cid in sorted(shapes) for s in shapes[cid]]
+    if len(shape_keys)!=len(set(shape_keys)) or set(shape_keys)!=set(population):
+        raise RuntimeError("shape pool and population manifest differ")
     if stable_json_fingerprint([list(z) for z in population])!=x.get("population_fingerprint"):
         raise RuntimeError("shape-pool population fingerprint mismatch")
     shape_fp=str(x["population_shape_fingerprint"])
