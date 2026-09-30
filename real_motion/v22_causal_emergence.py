@@ -280,6 +280,7 @@ def tangent_plane_proposal(
     copied from that real historical column; only the vertical offset changes.
     Therefore this baseline uses history and ego geometry only.
     """
+    class_ids = tuple(int(x) for x in class_ids)
     sem = _masked_surface(static_render, class_ids, free_label)
     support = np.asarray(support_bev, dtype=bool)
     ax = np.asarray(nearest_x, dtype=np.int64)
@@ -300,12 +301,25 @@ def tangent_plane_proposal(
         where=count > 0,
     )
     anchor = count > 0
+    surface_ids = np.asarray(class_ids, dtype=np.uint8)
+    class_counts = np.stack(
+        [(sem == int(class_id)).sum(axis=2) for class_id in surface_ids],
+        axis=2,
+    )
+    dominant_class = surface_ids[class_counts.argmax(axis=2)]
 
     def _axis_slope(axis: int) -> np.ndarray:
         previous_height = np.roll(height, 1, axis=axis)
         next_height = np.roll(height, -1, axis=axis)
         previous_valid = np.roll(anchor, 1, axis=axis)
         next_valid = np.roll(anchor, -1, axis=axis)
+        previous_class = np.roll(dominant_class, 1, axis=axis)
+        next_class = np.roll(dominant_class, -1, axis=axis)
+        # A curb/semantic transition is a discontinuity, not evidence for a
+        # steep ground plane.  Estimate tangents only from same-class surface
+        # neighbours and fall back to zero slope at class boundaries.
+        previous_valid &= previous_class == dominant_class
+        next_valid &= next_class == dominant_class
         if axis == 0:
             previous_valid[0] = False
             next_valid[-1] = False
