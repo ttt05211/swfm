@@ -20,6 +20,8 @@ PROTOCOL = "p0_f9_v22_cet_surface_stage0_v1"
 CORE_SURFACE_IDS = (11, 13)
 EXTENDED_SURFACE_IDS = (11, 12, 13, 14)
 DEFAULT_WIDTHS_M = (0.8, 1.6, 3.2)
+COMPREHENSIVE_WIDTHS_M = (0.8, 1.6, 3.2, 6.4)
+FRONTIER_TYPES = ("GRID_ENTRY", "VISIBILITY_FRONTIER", "UNION")
 
 
 def build_future_static_memory_only(
@@ -32,7 +34,8 @@ def build_future_static_memory_only(
     dynamic_class_ids,
     free_label: int = 17,
     workers: int = 1,
-) -> np.ndarray:
+    return_observed_bev: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Exact V19 Static-Memory mosaic without unused network BEV features.
 
     The collision/clearing primitives are shared with the formal V19 builder;
@@ -73,6 +76,7 @@ def build_future_static_memory_only(
     def _one(future_pose):
         out = np.full(shape, int(free_label), dtype=np.uint8)
         flat_out = out.reshape(-1)
+        observed_bev = np.zeros(shape[:2], dtype=bool)
         for hpose, xyz, labels, usable_static in prepared:
             if not len(xyz):
                 continue
@@ -86,6 +90,8 @@ def build_future_static_memory_only(
             iy = np.asarray(iy, dtype=np.int64)
             iz = np.asarray(iz, dtype=np.int64)
             valid = np.asarray(valid, dtype=bool)
+            if bool(valid.any()):
+                observed_bev[ix[valid], iy[valid]] = True
             static_valid = valid & np.asarray(usable_static, dtype=bool)
             if bool(static_valid.any()):
                 clear_flat = (
@@ -108,7 +114,7 @@ def build_future_static_memory_only(
                 flat_out[np.asarray(write_flat, dtype=np.int64)] = np.asarray(
                     values, dtype=np.uint8
                 )
-        return out
+        return out, observed_bev
 
     nworkers = max(1, min(int(workers), len(future_poses)))
     if nworkers == 1:
@@ -116,7 +122,15 @@ def build_future_static_memory_only(
     else:
         with ThreadPoolExecutor(max_workers=nworkers) as pool:
             rows = list(pool.map(_one, future_poses))
-    return np.stack(rows, axis=0).astype(np.uint8, copy=False)
+    memory = np.stack([row[0] for row in rows], axis=0).astype(
+        np.uint8, copy=False
+    )
+    if not bool(return_observed_bev):
+        return memory
+    observed = np.stack([row[1] for row in rows], axis=0).astype(
+        bool, copy=False
+    )
+    return memory, observed
 
 
 @dataclass(frozen=True)
@@ -222,6 +236,97 @@ def build_surface_frontier(
     )
 
 
+def build_surface_frontier_family(
+    static_render: np.ndarray,
+    history_footprint_bev: np.ndarray,
+    history_observed_union_bev: np.ndarray,
+    *,
+    class_ids: Iterable[int],
+    widths_m: Iterable[float] = COMPREHENSIVE_WIDTHS_M,
+    free_label: int = 17,
+    voxel_size_xy_m: float = 0.4,
+) -> dict[str, SurfaceFrontier]:
+    """Build grid-entry, visibility, and union surface frontiers together.
+
+    Visibility candidates are inside a historical grid footprint but on the
+    unknown side of the aligned historical ``mask_lidar`` BEV union.  They are
+    limited to a metric strip around observed cells, so this is not dense
+    unknown-volume completion.  The union is exactly the OR of the two frozen
+    supports rather than a separately enlarged region.
+    """
+    widths = _validate_widths(widths_m)
+    footprint = np.asarray(history_footprint_bev, dtype=bool)
+    observed = np.asarray(history_observed_union_bev, dtype=bool)
+    if footprint.shape != observed.shape:
+        raise ValueError("history footprint/observed-union shape mismatch")
+    grid = build_surface_frontier(
+        static_render,
+        footprint,
+        class_ids=class_ids,
+        widths_m=widths,
+        free_label=free_label,
+        voxel_size_xy_m=voxel_size_xy_m,
+    )
+
+    visibility_region = footprint & ~observed
+    dummy = np.full((*observed.shape, 1), int(free_label), dtype=np.uint8)
+    dummy[..., 0][observed] = 0
+    distance_cells, _, _, valid = nearest_static_anchor_map(
+        dummy, observed, free_label=int(free_label)
+    )
+    distance_m = np.asarray(distance_cells, dtype=np.float32) * float(
+        voxel_size_xy_m
+    )
+    visibility_scope = {}
+    visibility_causal = {}
+    for width in widths:
+        scope = visibility_region & valid & (distance_m <= width + 1e-6)
+        causal = scope & (
+            grid.nearest_distance_m <= width + 1e-6
+        )
+        visibility_scope[width] = scope
+        visibility_causal[width] = causal
+
+    visibility = SurfaceFrontier(
+        new_query_bev=visibility_region,
+        scope_by_width=visibility_scope,
+        causal_by_width=visibility_causal,
+        nearest_x=grid.nearest_x,
+        nearest_y=grid.nearest_y,
+        nearest_distance_m=grid.nearest_distance_m,
+        anchor_bev=grid.anchor_bev,
+    )
+    union = SurfaceFrontier(
+        new_query_bev=grid.new_query_bev | visibility_region,
+        scope_by_width={
+            width: grid.scope_by_width[width] | visibility_scope[width]
+            for width in widths
+        },
+        causal_by_width={
+            width: grid.causal_by_width[width] | visibility_causal[width]
+            for width in widths
+        },
+        nearest_x=grid.nearest_x,
+        nearest_y=grid.nearest_y,
+        nearest_distance_m=grid.nearest_distance_m,
+        anchor_bev=grid.anchor_bev,
+    )
+    for frontier in (visibility, union):
+        for width in widths:
+            if bool(
+                (
+                    frontier.causal_by_width[width]
+                    & ~frontier.scope_by_width[width]
+                ).any()
+            ):
+                raise RuntimeError("causal support escaped its frozen scope")
+    return {
+        "GRID_ENTRY": grid,
+        "VISIBILITY_FRONTIER": visibility,
+        "UNION": union,
+    }
+
+
 def oracle_surface_proposal(
     future_gt: np.ndarray,
     support_bev: np.ndarray,
@@ -263,6 +368,132 @@ def nearest_column_proposal(
     return out
 
 
+def _dominant_surface_class(
+    sem: np.ndarray,
+    class_ids: tuple[int, ...],
+) -> np.ndarray:
+    ids = np.asarray(class_ids, dtype=np.uint8)
+    counts = np.stack(
+        [(sem == int(class_id)).sum(axis=2) for class_id in ids], axis=2
+    )
+    return ids[counts.argmax(axis=2)]
+
+
+def oracle_geometry_history_semantic_proposal(
+    future_gt: np.ndarray,
+    support_bev: np.ndarray,
+    static_render: np.ndarray,
+    nearest_x: np.ndarray,
+    nearest_y: np.ndarray,
+    *,
+    class_ids: Iterable[int],
+    free_label: int = 17,
+) -> np.ndarray:
+    """Use exact GT surface geometry but causal nearest-history semantics."""
+    class_ids = tuple(int(x) for x in class_ids)
+    gt = np.asarray(future_gt, dtype=np.uint8)
+    support = np.asarray(support_bev, dtype=bool)
+    sem = _masked_surface(static_render, class_ids, free_label)
+    ax = np.asarray(nearest_x, dtype=np.int64)
+    ay = np.asarray(nearest_y, dtype=np.int64)
+    if not (support.shape == ax.shape == ay.shape == gt.shape[:2] == sem.shape[:2]):
+        raise ValueError("GT/history/support shape mismatch")
+    nearest_class = _dominant_surface_class(sem, class_ids)[ax, ay]
+    target = support[..., None] & np.isin(
+        gt, np.asarray(class_ids, dtype=np.uint8)
+    )
+    out = np.full_like(gt, int(free_label))
+    broadcast_class = np.broadcast_to(nearest_class[..., None], gt.shape)
+    out[target] = broadcast_class[target]
+    return out
+
+
+def nearest_geometry_gt_semantic_proposal(
+    future_gt: np.ndarray,
+    nearest_proposal: np.ndarray,
+    *,
+    class_ids: Iterable[int],
+    free_label: int = 17,
+) -> np.ndarray:
+    """Keep causal nearest-column geometry and oracle-correct hit semantics."""
+    gt = np.asarray(future_gt, dtype=np.uint8)
+    out = np.asarray(nearest_proposal, dtype=np.uint8).copy()
+    if gt.shape != out.shape:
+        raise ValueError("future GT/nearest proposal shape mismatch")
+    correctable = (out != int(free_label)) & np.isin(
+        gt, np.asarray(tuple(int(x) for x in class_ids), dtype=np.uint8)
+    )
+    out[correctable] = gt[correctable]
+    return out
+
+
+def oracle_vertical_shift_proposal(
+    future_gt: np.ndarray,
+    static_render: np.ndarray,
+    support_bev: np.ndarray,
+    nearest_x: np.ndarray,
+    nearest_y: np.ndarray,
+    *,
+    class_ids: Iterable[int],
+    free_label: int = 17,
+    max_abs_shift_bins: int = 4,
+) -> np.ndarray:
+    """Oracle-select one vertical shift per causal historical surface column.
+
+    Column semantics and thickness remain historical.  Future GT is used only
+    to select a shift in ``[-max_abs_shift_bins,+max_abs_shift_bins]``.  This
+    diagnostic isolates the amount of error explainable by vertical alignment.
+    """
+    class_ids = tuple(int(x) for x in class_ids)
+    gt = np.asarray(future_gt, dtype=np.uint8)
+    support = np.asarray(support_bev, dtype=bool)
+    sem = _masked_surface(static_render, class_ids, free_label)
+    ax = np.asarray(nearest_x, dtype=np.int64)
+    ay = np.asarray(nearest_y, dtype=np.int64)
+    if not (support.shape == ax.shape == ay.shape == gt.shape[:2] == sem.shape[:2]):
+        raise ValueError("GT/history/support shape mismatch")
+    limit = int(max_abs_shift_bins)
+    if limit < 0:
+        raise ValueError("max_abs_shift_bins must be non-negative")
+    source = sem[ax, ay]
+    source_occupied = source != int(free_label)
+    target = np.isin(gt, np.asarray(class_ids, dtype=np.uint8))
+    best_score = np.full(support.shape, -1, dtype=np.int16)
+    best_shift = np.zeros(support.shape, dtype=np.int8)
+    shifts = [0]
+    for value in range(1, limit + 1):
+        shifts.extend((-value, value))
+    Z = sem.shape[2]
+    for shift in shifts:
+        overlap = np.zeros(support.shape, dtype=np.int16)
+        source_start = max(0, -shift)
+        source_stop = min(Z, Z - shift)
+        if source_start < source_stop:
+            target_start = source_start + shift
+            target_stop = source_stop + shift
+            overlap = (
+                source_occupied[..., source_start:source_stop]
+                & target[..., target_start:target_stop]
+            ).sum(axis=2, dtype=np.int16)
+        improve = support & (overlap > best_score)
+        best_score[improve] = overlap[improve]
+        best_shift[improve] = int(shift)
+
+    out = np.full_like(sem, int(free_label))
+    qx, qy = np.nonzero(support)
+    if not len(qx):
+        return out
+    shifts_for_query = best_shift[qx, qy].astype(np.int64)
+    source_columns = source[qx, qy]
+    for source_z in range(Z):
+        values = source_columns[:, source_z]
+        target_z = source_z + shifts_for_query
+        valid = (values != int(free_label)) & (target_z >= 0) & (target_z < Z)
+        if bool(valid.any()):
+            out[qx[valid], qy[valid], target_z[valid]] = values[valid]
+    return out
+
+
 def tangent_plane_proposal(
     static_render: np.ndarray,
     support_bev: np.ndarray,
@@ -301,12 +532,7 @@ def tangent_plane_proposal(
         where=count > 0,
     )
     anchor = count > 0
-    surface_ids = np.asarray(class_ids, dtype=np.uint8)
-    class_counts = np.stack(
-        [(sem == int(class_id)).sum(axis=2) for class_id in surface_ids],
-        axis=2,
-    )
-    dominant_class = surface_ids[class_counts.argmax(axis=2)]
+    dominant_class = _dominant_surface_class(sem, class_ids)
 
     def _axis_slope(axis: int) -> np.ndarray:
         previous_height = np.roll(height, 1, axis=axis)

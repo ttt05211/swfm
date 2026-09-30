@@ -1,15 +1,23 @@
 import numpy as np
 
 from real_motion.v22_causal_emergence import (
+    build_surface_frontier_family,
     build_future_static_memory_only,
     build_surface_frontier,
     nearest_column_proposal,
+    nearest_geometry_gt_semantic_proposal,
+    oracle_geometry_history_semantic_proposal,
     oracle_surface_proposal,
+    oracle_vertical_shift_proposal,
     protected_surface_add,
     tangent_plane_proposal,
 )
 from real_motion.geometry import OccupancyGrid
 from real_motion.v19_innovation import build_future_aligned_history_and_static_memory
+from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics
+from tools.real_motion.eval_p0_f9_v22_cet_surface_stage0 import (
+    _add_only_metric_counts,
+)
 
 
 FREE = 17
@@ -157,3 +165,118 @@ def test_static_only_fast_path_is_exactly_the_formal_v19_mosaic():
         workers=2,
     )
     assert np.array_equal(actual, expected)
+
+    actual_memory, actual_observed = build_future_static_memory_only(
+        history,
+        observed,
+        history_poses,
+        future_poses,
+        grid=grid,
+        free_label=FREE,
+        dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10),
+        workers=2,
+        return_observed_bev=True,
+    )
+    assert np.array_equal(actual_memory, expected)
+    assert actual_observed.shape == (6, *grid.shape_hwd[:2])
+    assert actual_observed.all()
+
+
+def test_frontier_family_keeps_visibility_narrow_and_union_exact():
+    static = np.full((7, 3, 4), FREE, dtype=np.uint8)
+    static[:2, :, 1] = 11
+    footprint = np.zeros((7, 3), dtype=bool)
+    footprint[:4] = True
+    observed = np.zeros((7, 3), dtype=bool)
+    observed[:2] = True
+    family = build_surface_frontier_family(
+        static,
+        footprint,
+        observed,
+        class_ids=(11,),
+        widths_m=(1.0, 3.0),
+        voxel_size_xy_m=1.0,
+        free_label=FREE,
+    )
+    grid = family["GRID_ENTRY"]
+    visibility = family["VISIBILITY_FRONTIER"]
+    union = family["UNION"]
+    assert grid.scope_by_width[1.0][4].all()
+    assert visibility.scope_by_width[1.0][2].all()
+    assert not visibility.scope_by_width[1.0][3].any()
+    assert np.array_equal(
+        union.scope_by_width[width := 3.0],
+        grid.scope_by_width[width] | visibility.scope_by_width[width],
+    )
+    assert np.array_equal(
+        union.causal_by_width[width],
+        grid.causal_by_width[width] | visibility.causal_by_width[width],
+    )
+
+
+def test_factorized_oracles_isolate_semantic_and_vertical_errors():
+    static = np.full((4, 2, 6), FREE, dtype=np.uint8)
+    static[1, :, 1] = 11
+    support = np.zeros((4, 2), dtype=bool)
+    support[2] = True
+    ax = np.ones((4, 2), dtype=np.int32)
+    ay = np.broadcast_to(np.arange(2, dtype=np.int32)[None], (4, 2))
+    gt = np.full_like(static, FREE)
+    gt[2, :, 3] = 13
+
+    exact_geometry = oracle_geometry_history_semantic_proposal(
+        gt,
+        support,
+        static,
+        ax,
+        ay,
+        class_ids=(11, 13),
+        free_label=FREE,
+    )
+    assert (exact_geometry[2, :, 3] == 11).all()
+
+    nearest = nearest_column_proposal(
+        static,
+        support,
+        ax,
+        ay,
+        class_ids=(11, 13),
+        free_label=FREE,
+    )
+    gt_semantic = nearest_geometry_gt_semantic_proposal(
+        gt, nearest, class_ids=(11, 13), free_label=FREE
+    )
+    # The nearest geometry misses the GT height, so semantic supervision alone
+    # cannot create a correct voxel.
+    assert (gt_semantic[2, :, 1] == 11).all()
+
+    shifted = oracle_vertical_shift_proposal(
+        gt,
+        static,
+        support,
+        ax,
+        ay,
+        class_ids=(11, 13),
+        free_label=FREE,
+        max_abs_shift_bins=4,
+    )
+    assert (shifted[2, :, 3] == 11).all()
+
+
+def test_add_only_metric_fast_path_matches_full_frozen_confusion():
+    rng = np.random.default_rng(7)
+    gt = rng.integers(0, 18, size=(7, 6, 4), dtype=np.uint8)
+    baseline = rng.integers(0, 18, size=gt.shape, dtype=np.uint8)
+    moving = rng.random(gt.shape) < 0.3
+    prediction = baseline.copy()
+    candidates = (baseline == FREE) & (rng.random(gt.shape) < 0.5)
+    prediction[candidates] = rng.integers(
+        0, 17, size=int(candidates.sum()), dtype=np.uint8
+    )
+    base_counts = Metrics.counts(baseline, gt, moving, FREE)
+    expected = Metrics.counts(prediction, gt, moving, FREE)
+    actual = _add_only_metric_counts(
+        base_counts, baseline, prediction, gt, moving, FREE
+    )
+    for got, wanted in zip(actual, expected):
+        assert np.array_equal(got, wanted)

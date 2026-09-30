@@ -20,21 +20,43 @@ def main() -> None:
     print("protocol:", obj["protocol"])
     print("windows:", obj["population"]["windows"])
     print("\n===== ALL CONFIGURATIONS =====")
+    grouped = {}
     for row in obj["comparison_table"]:
-        q = row["addition_quality"]
-        support = row["support"]
+        grouped.setdefault(row["configuration"], {})[row["method"]] = row
+    for configuration, methods in grouped.items():
+        nearest = methods["NEAREST_COLUMN"]
+        tangent = methods["TANGENT_PLANE"]
+        support = nearest["support"]
         print(
-            f"{row['configuration']:31s} {row['method']:14s} "
-            f"scope={row['scope_gt_delta_mIoU_pp']:+.6f} "
-            f"causal={row['causal_gt_delta_mIoU_pp']:+.6f} "
-            f"retain={_percent(row['causal_gt_retention_of_scope']):>8s} "
-            f"actual={row['deterministic_delta_mIoU_pp']:+.6f} "
-            f"precision={_percent(q['addition_occupancy_precision']):>8s} "
-            f"target_recall={_percent(q['scope_target_semantic_recall']):>8s} "
-            f"positive_bev={_percent(support['causal_positive_bev_fraction']):>8s}"
+            f"{configuration:52s} "
+            f"scope={nearest['scope_gt_delta_mIoU_pp']:+.5f} "
+            f"causal={nearest['causal_gt_delta_mIoU_pp']:+.5f} "
+            f"retain={_percent(nearest['causal_gt_retention_of_scope']):>7s} "
+            f"GTgeo+HistSem={nearest['gt_geometry_history_semantic_delta_mIoU_pp']:+.5f} "
+            f"Zoracle={nearest['oracle_z_shift_history_semantic_delta_mIoU_pp']:+.5f} "
+            f"Near+GTsem={nearest['nearest_geometry_gt_semantic_delta_mIoU_pp']:+.5f} "
+            f"nearest={nearest['deterministic_delta_mIoU_pp']:+.5f} "
+            f"tangent={tangent['deterministic_delta_mIoU_pp']:+.5f}"
         )
+    maximum = obj["maximum_scope_headroom"]
+    z_shift = obj["best_oracle_vertical_shift"]
     best = obj["best_deterministic"]
     scene = obj["best_deterministic_scene_delta_mIoU_pp"]
+    print("\n===== MAXIMUM STATIC SCOPE =====")
+    print("configuration:", maximum["configuration"])
+    print("scope_gt_delta_mIoU_pp:", maximum["scope_gt_delta_mIoU_pp"])
+    print("causal_gt_delta_mIoU_pp:", maximum["causal_gt_delta_mIoU_pp"])
+    print("causal_gt_retention:", maximum["causal_gt_retention_of_scope"])
+    print(
+        "gt_geometry_history_semantic_delta_mIoU_pp:",
+        maximum["gt_geometry_history_semantic_delta_mIoU_pp"],
+    )
+    print("\n===== BEST ORACLE Z SHIFT =====")
+    print("configuration:", z_shift["configuration"])
+    print(
+        "oracle_z_shift_history_semantic_delta_mIoU_pp:",
+        z_shift["oracle_z_shift_history_semantic_delta_mIoU_pp"],
+    )
     print("\n===== BEST DETERMINISTIC =====")
     print("variant:", best["variant"])
     print("scope_gt_delta_mIoU_pp:", best["scope_gt_delta_mIoU_pp"])
