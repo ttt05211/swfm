@@ -1,2 +1,3 @@
 tools/real_motion/run_p0_f9_source_evidence_dev64.sh text eol=lf
 tools/real_motion/run_p0_f9_static_evidence_selector.sh text eol=lf
+tools/real_motion/run_p0_f9_v18_motion_gap_dev64.sh text eol=lf
