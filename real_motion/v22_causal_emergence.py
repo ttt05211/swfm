@@ -7,6 +7,7 @@ accepted only by :func:`oracle_surface_proposal`.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -19,6 +20,103 @@ PROTOCOL = "p0_f9_v22_cet_surface_stage0_v1"
 CORE_SURFACE_IDS = (11, 13)
 EXTENDED_SURFACE_IDS = (11, 12, 13, 14)
 DEFAULT_WIDTHS_M = (0.8, 1.6, 3.2)
+
+
+def build_future_static_memory_only(
+    history_semantics,
+    history_observed,
+    history_poses,
+    future_poses,
+    *,
+    grid,
+    dynamic_class_ids,
+    free_label: int = 17,
+    workers: int = 1,
+) -> np.ndarray:
+    """Exact V19 Static-Memory mosaic without unused network BEV features.
+
+    The collision/clearing primitives are shared with the formal V19 builder;
+    this wrapper only avoids constructing 36 semantic/geometry feature maps
+    that Stage-0 never consumes.
+    """
+    from .geometry import relative_transform
+    from .v19_innovation import (
+        _semantic_choices_from_pretransformed,
+        _xyz_to_indices,
+        prepare_history_alignment_frame,
+    )
+
+    if not (
+        len(history_semantics)
+        == len(history_observed)
+        == len(history_poses)
+        == 6
+    ):
+        raise ValueError("expected six history frames")
+    if len(future_poses) != 6:
+        raise ValueError("expected six future frames")
+    shape = tuple(int(x) for x in grid.shape_hwd)
+    _, Y, Z = shape
+    prepared = [
+        prepare_history_alignment_frame(
+            sem,
+            obs,
+            pose,
+            grid=grid,
+            dynamic_class_ids=dynamic_class_ids,
+        )
+        for sem, obs, pose in zip(
+            history_semantics, history_observed, history_poses
+        )
+    ]
+
+    def _one(future_pose):
+        out = np.full(shape, int(free_label), dtype=np.uint8)
+        flat_out = out.reshape(-1)
+        for hpose, xyz, labels, usable_static in prepared:
+            if not len(xyz):
+                continue
+            transform = relative_transform(
+                np.asarray(hpose, dtype=np.float64),
+                np.asarray(future_pose, dtype=np.float64),
+            )
+            dst_xyz = xyz @ transform[:3, :3].T + transform[:3, 3]
+            ix, iy, iz, valid = _xyz_to_indices(dst_xyz, grid)
+            ix = np.asarray(ix, dtype=np.int64)
+            iy = np.asarray(iy, dtype=np.int64)
+            iz = np.asarray(iz, dtype=np.int64)
+            valid = np.asarray(valid, dtype=bool)
+            static_valid = valid & np.asarray(usable_static, dtype=bool)
+            if bool(static_valid.any()):
+                clear_flat = (
+                    (ix[static_valid] * Y + iy[static_valid]) * Z
+                    + iz[static_valid]
+                ).astype(np.int64, copy=False)
+                flat_out[clear_flat] = int(free_label)
+            _, _, _, values, write_flat = _semantic_choices_from_pretransformed(
+                labels,
+                ix,
+                iy,
+                iz,
+                dst_xyz,
+                valid,
+                usable_static,
+                grid=grid,
+                free_label=int(free_label),
+            )
+            if len(write_flat):
+                flat_out[np.asarray(write_flat, dtype=np.int64)] = np.asarray(
+                    values, dtype=np.uint8
+                )
+        return out
+
+    nworkers = max(1, min(int(workers), len(future_poses)))
+    if nworkers == 1:
+        rows = [_one(pose) for pose in future_poses]
+    else:
+        with ThreadPoolExecutor(max_workers=nworkers) as pool:
+            rows = list(pool.map(_one, future_poses))
+    return np.stack(rows, axis=0).astype(np.uint8, copy=False)
 
 
 @dataclass(frozen=True)

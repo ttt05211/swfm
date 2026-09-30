@@ -1,12 +1,15 @@
 import numpy as np
 
 from real_motion.v22_causal_emergence import (
+    build_future_static_memory_only,
     build_surface_frontier,
     nearest_column_proposal,
     oracle_surface_proposal,
     protected_surface_add,
     tangent_plane_proposal,
 )
+from real_motion.geometry import OccupancyGrid
+from real_motion.v19_innovation import build_future_aligned_history_and_static_memory
 
 
 FREE = 17
@@ -115,3 +118,42 @@ def test_tangent_plane_continues_simple_ramp():
     )
     assert (nearest[4, :, 3] == 11).all()
     assert (tangent[4, :, 4] == 11).all()
+
+
+def test_static_only_fast_path_is_exactly_the_formal_v19_mosaic():
+    grid = OccupancyGrid(
+        x_min=0.0,
+        y_min=0.0,
+        z_min=0.0,
+        voxel_size=(1.0, 1.0, 1.0),
+        shape_hwd=(6, 5, 4),
+    )
+    history = np.full((6, *grid.shape_hwd), FREE, dtype=np.uint8)
+    observed = np.ones_like(history, dtype=bool)
+    for frame in range(6):
+        history[frame, 1:5, :, 1] = 11
+        history[frame, 2, 2, 2] = 4  # dynamic and therefore never in Static Memory
+    history_poses = np.repeat(np.eye(4, dtype=np.float64)[None], 6, axis=0)
+    future_poses = history_poses.copy()
+    _, _, _, expected = build_future_aligned_history_and_static_memory(
+        history,
+        observed,
+        history_poses,
+        future_poses,
+        grid=grid,
+        free_label=FREE,
+        dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10),
+        workers=1,
+        return_coverage=False,
+    )
+    actual = build_future_static_memory_only(
+        history,
+        observed,
+        history_poses,
+        future_poses,
+        grid=grid,
+        free_label=FREE,
+        dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10),
+        workers=2,
+    )
+    assert np.array_equal(actual, expected)

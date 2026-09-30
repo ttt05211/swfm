@@ -27,13 +27,13 @@ from real_motion.nuscenes_adapter import NuScenesWindowSource, gt_moving_support
 from real_motion.prepared import load_nuscenes_window_raw
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.strong_w2det import StrongW2DetConfig
-from real_motion.v19_innovation import build_future_aligned_history_and_static_memory
 from real_motion.v19_static_novelty import history_grid_footprint_bev_all
 from real_motion.v22_causal_emergence import (
     CORE_SURFACE_IDS,
     DEFAULT_WIDTHS_M,
     EXTENDED_SURFACE_IDS,
     PROTOCOL,
+    build_future_static_memory_only,
     build_surface_frontier,
     nearest_column_proposal,
     oracle_surface_proposal,
@@ -278,7 +278,7 @@ def main() -> None:
         timings["v18_prepare_forecast"] += time.perf_counter() - stage
 
         stage = time.perf_counter()
-        _, _, _, static_memory = build_future_aligned_history_and_static_memory(
+        static_memory = build_future_static_memory_only(
             np.asarray(raw["history_occ"], dtype=np.uint8),
             np.asarray(raw["history_observed"], dtype=bool),
             np.asarray(raw["history_poses"], dtype=np.float64),
@@ -287,7 +287,6 @@ def main() -> None:
             free_label=int(pcfg.free_label),
             dynamic_class_ids=tuple(int(x) for x in DYNAMIC_CLASS_IDS),
             workers=cpu_workers,
-            return_coverage=False,
         )
         footprints = history_grid_footprint_bev_all(
             np.asarray(raw["history_poses"], dtype=np.float64),
