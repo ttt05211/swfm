@@ -9,3 +9,4 @@ outputs/
 *.ckpt
 *.pkl
 wandb/
+.venv-selector-check/
