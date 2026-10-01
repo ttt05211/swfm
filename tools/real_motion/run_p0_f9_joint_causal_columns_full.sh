@@ -31,7 +31,11 @@ export PYTHONPATH="$FULL_ROOT:$FULL_ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPAT
 "$PY" -c 'import torch,sys; print(sys.executable,torch.__version__); assert torch.cuda.is_available() and torch.cuda.is_bf16_supported(), "CUDA/BF16 unavailable"'
 "$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_column_runtime_pipeline.py
 mkdir -p "$RUN_DIR"
-echo "随机初始化一阶段：每轮全部20430窗口，共$EPOCHS轮；整个周期统一余弦下降，无tail阶段。"
+if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
+  echo "断点恢复一阶段：$FULL_JOINT_RESUME；原总轮数$EPOCHS，恢复optimizer/RNG/整段余弦，跳过prior。"
+else
+  echo "随机初始化一阶段：每轮全部20430窗口，共$EPOCHS轮；整个周期统一余弦下降，无tail阶段。"
+fi
 echo "window batch<=$WINDOWS / source budget=$SOURCES；每轮dev64，最后dev512；不跑full4369。"
 echo "默认不同时训练V18-only对照；E14只作评估参考；不会覆盖旧实验。输出：$RUN_DIR"
 "$PY" -u tools/real_motion/train_p0_f9_joint_causal_columns_full.py \

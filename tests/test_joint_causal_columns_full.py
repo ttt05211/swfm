@@ -175,13 +175,26 @@ def test_nonempty_prefetch_preserves_registration_features_labels_and_live_geome
     rec['anchors_xy_t0_m'] = center[:, None, :].repeat(1, 6, 1)+rec['kta_displacement_xy_m']
     provider = columns.FrozenColumns.__new__(columns.FrozenColumns)
     provider.pcfg, provider.device, provider.workers, provider.strong = pcfg, torch.device('cpu'), 1, strong
-    provider.columns_checked = True
-    joint.eval(); output = joint.motion(rec, torch.device('cpu'))
+    provider.model = joint.transport; provider.columns_checked = False
+    torch.nn.init.normal_(joint.columns.refinement.weight, std=.01)
+    joint.train(); output = joint.motion(rec, torch.device('cpu'))
+    assert output['residual_xy_m'].requires_grad and output['yaw_delta_rad'].requires_grad
     # Only the record-to-window adapter is mocked: extraction, Strong renderer,
     # registration, candidate generation, feature sampling and GT labels are real.
     with patch.object(columns, 'window_from_record', return_value=prep.window), \
          patch.object(columns.runtime, 'window_from_record', return_value=prep.window):
         a = provider.prepare_columns(None, rec, include_gt=True, raw_window=raw, outputs=output)
+        assert provider.columns_checked and a.outputs is output
+        assert a.outputs['future_transport_queries'].requires_grad
+        # The REAL first-call exactness/forecast NumPy path must not sever the
+        # joint graph. Backpropagate after it, without any mocked renderer/check.
+        batch = common.online_columns(a, joint.columns, grid, np.random.default_rng(91), torch.device('cpu'))
+        g, r = joint.columns(**{k: batch[k] for k in (*common.FEATURE_KEYS, 'source_features')})
+        loss, _ = full.column_loss(joint.columns, g, r, batch['kind'], batch['legal'], batch['target'], batch['weight'])
+        grad = torch.autograd.grad(loss, output['future_transport_queries'], retain_graph=True)[0]
+        assert grad.norm() > 0
+        loss.backward(retain_graph=True)
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in joint.transport.parameters())
         cached = {**raw, '_column_causal_preparation': evidence}
         b = provider.prepare_columns(None, rec, include_gt=True, raw_window=cached, outputs=output)
         for key in ('baseline', 'owners', 'fallbacks', 'targets', 'yaws', 'footprints', 'memory'):

@@ -121,7 +121,13 @@ class FrozenColumns(FrozenXYV18):
             runtime._stage_gpu_inputs(state, self.device)
             try:
                 runtime._exactness_check(self.model, state, self.pcfg, self.strong, self.device)
-                reference = runtime._forecast_once(self.model, state, self.pcfg, self.strong, self.device, precomputed_out=outputs)
+                # A resumed joint run reaches this check on its FIRST training
+                # batch (prior audit is skipped), so outputs are live autograd
+                # tensors. Detach a diagnostic-only copy for the NumPy renderer;
+                # PreparedColumns.outputs must retain the original source graph.
+                diagnostic_outputs = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+                reference = runtime._forecast_once(self.model, state, self.pcfg, self.strong, self.device,
+                                                   precomputed_out=diagnostic_outputs)
                 if any(not np.array_equal(a, b) for a, b in zip(reference, baseline)):
                     raise RuntimeError("layered column preparation differs from V18 renderer")
             finally: runtime._release_gpu_inputs(state)

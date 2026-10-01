@@ -172,8 +172,12 @@ def main(stop_event=None):
             raise RuntimeError('resume window/update counters inconsistent with epoch order')
     out.mkdir(parents=True); write_json(out/'execution_contract.json', {**identity, 'arguments': vars(args)})
     stages = {}; tick = time.perf_counter()
-    print(f'FULL RANDOM INIT: windows={len(records)} epochs={args.epochs} updates={target_updates} batch<={args.window_batch_size} '
+    label = 'FULL RESUME' if args.resume else 'FULL RANDOM INIT'
+    print(f'{label}: windows={len(records)} epochs={args.epochs} updates={target_updates} batch<={args.window_batch_size} '
           f'sources<={args.source_budget} whole_cosine_steps={schedule_steps} paired_control={args.paired_control}', flush=True)
+    if args.resume:
+        print(f'RESTORED checkpoint={args.resume} completed_updates={updates} epoch_cursor={cursor_epoch} '
+              f'batch_cursor={cursor_batch} next_update={updates+1} optimizer/RNG/cosine_restored prior_audit_skipped', flush=True)
     with (out/'progress.jsonl').open('x', encoding='utf-8') as handle:
         def progress(row):
             handle.write(json.dumps(finite_json(row), ensure_ascii=False, allow_nan=False)+'\n'); handle.flush()
