@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
+from threading import Event
 import copy
 import numpy as np
 import pytest
@@ -96,3 +97,52 @@ def test_concurrent_workers_atomic_files_and_quota(tmp_path):
     fresh = CausalGeometryCache(tmp_path, 'p', max_bytes=1800, ram_bytes=0, reserve_bytes=0)
     for path in fresh.root.glob('*.cgc'): assert path.stat().st_size > 40
     for i in range(12): assert np.array_equal(fresh.get_or_build(('s', str(i)), raw, lambda: {'v': np.arange(30)+i})[0]['v'], rows[i]['v'])
+
+
+def test_deferred_cold_geometry_never_persists_until_completed(tmp_path):
+    raw = raw_fixture(); cache = CausalGeometryCache(tmp_path, 'p', reserve_bytes=0)
+    light, hit = cache.get_or_build(('s', 't'), raw, lambda: {'history': np.arange(5)}, defer_write=True)
+    assert not hit and not cache.rows and not list(cache.root.glob('*.cgc'))
+    full = {**light, 'prepared_state': {'anchors': np.arange(12)}}
+    assert cache.store(('s', 't'), raw, full, asynchronous=True)
+    cache.close()
+    fresh = CausalGeometryCache(tmp_path, 'p', reserve_bytes=0)
+    actual, hit = fresh.get_or_build(('s', 't'), raw, lambda: pytest.fail('completed geometry must hit'))
+    assert hit and np.array_equal(actual['prepared_state']['anchors'], full['prepared_state']['anchors'])
+
+
+def test_background_compression_does_not_hold_reader_lock_and_queue_is_bounded(tmp_path):
+    import real_motion.causal_geometry_cache as module
+    raw = raw_fixture(); cache = CausalGeometryCache(tmp_path, 'p', reserve_bytes=0)
+    entered, release = Event(), Event(); original = module.zlib.compress
+    def slow(*args, **kwargs):
+        entered.set(); assert release.wait(5)
+        return original(*args, **kwargs)
+    try:
+        with patch.object(module.zlib, 'compress', side_effect=slow):
+            cache.store(('s', '0'), raw, {'v': np.arange(5)}, asynchronous=True)
+            assert entered.wait(2)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(cache.get_or_build, ('s', '0'), raw, lambda: pytest.fail('RAM hit required')).result(timeout=1)
+            assert result[1]
+            for i in range(1, 11): cache.store(('s', str(i)), raw, {'v': np.arange(5)}, asynchronous=True)
+            assert cache.stats()['pending_writes'] == 8 and cache.stats()['skipped_writes'] == 3
+            release.set(); cache.close()
+    finally:
+        release.set(); cache.close()
+    assert cache.stats()['pending_writes'] == 0 and cache.stats()['writes'] == 8
+    assert not list(cache.root.glob('*.tmp.*'))
+
+
+def test_background_writer_failures_are_reported_on_drain(tmp_path):
+    cache = CausalGeometryCache(tmp_path, 'p', reserve_bytes=0)
+    with patch.object(cache, '_store', side_effect=ValueError('bad geometry')):
+        cache.store(('s', 't'), raw_fixture(), {'v': np.arange(5)}, asynchronous=True)
+        with pytest.raises(RuntimeError, match='writer failed'): cache.close()
+
+
+def test_ram_budget_counts_whole_backing_allocation(tmp_path):
+    cache = CausalGeometryCache(tmp_path, 'p', max_bytes=0, ram_bytes=24, reserve_bytes=0)
+    backing = np.zeros(100, np.uint8)
+    cache.get_or_build(('s', 't'), raw_fixture(), lambda: {'current': backing[:2], 'previous': backing[2:4]})
+    assert cache.stats()['ram_mib'] == 0

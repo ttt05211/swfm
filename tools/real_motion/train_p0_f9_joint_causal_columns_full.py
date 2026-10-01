@@ -80,6 +80,15 @@ def full_summary(summary):
 
 
 def main(stop_event=None):
+    caches = []
+    try: return _main(stop_event, caches)
+    finally:
+        # Drain at most eight pending writes, including graceful stop/errors.
+        # No unwritten cache entry is required to recover the model checkpoint.
+        for cache in caches: cache.close()
+
+
+def _main(stop_event, caches):
     parser = argparse.ArgumentParser(description=__doc__); add_config_args(parser)
     for key in ('train-cache', 'dev-cache', 'population-manifest', 'base-checkpoint', 'dataroot', 'train-info', 'dev-info', 'out-dir'):
         parser.add_argument('--'+key, required=True)
@@ -89,7 +98,7 @@ def main(stop_event=None):
     parser.add_argument('--device', default='cuda'); parser.add_argument('--cpu-workers', type=int, default=8)
     parser.add_argument('--frame-cache-mib', type=int, default=256)
     parser.add_argument('--causal-geometry-cache', help='bounded compressed immutable geometry; never GT/model state')
-    parser.add_argument('--causal-cache-gib', type=float, default=16.)
+    parser.add_argument('--causal-cache-gib', type=float, default=48.)
     parser.add_argument('--causal-cache-ram-mib', type=int, default=4096)
     parser.add_argument('--eval-batch-size', type=int, default=256)
     parser.add_argument('--checkpoint-every', type=int, default=256)
@@ -156,7 +165,9 @@ def main(stop_event=None):
             dataroot=str(Path(args.dataroot).resolve())))
         provider.causal_geometry_cache = CausalGeometryCache(args.causal_geometry_cache, namespace,
             max_bytes=int(args.causal_cache_gib*2**30), ram_bytes=args.causal_cache_ram_mib*2**20)
+        caches.append(provider.causal_geometry_cache)
         print('CAUSAL GEOMETRY CACHE: '+json.dumps(dict(directory=str(provider.causal_geometry_cache.root),
+            cold_strong_device=str(device), persistence='bounded_async_after_main_thread_Strong',
             **provider.causal_geometry_cache.stats()), ensure_ascii=False), flush=True)
     rng = np.random.default_rng(args.seed+1); weights = None
     cursor_epoch = cursor_batch = updates = successes = executed = sampled = 0; link_observed = False
@@ -245,7 +256,7 @@ def main(stop_event=None):
                     per_window = sum(recent_time)/max(sum(recent_windows), 1)
                     print(f"epoch={e+1}/{args.epochs} batch={bi}/{len(plans[e])} update={updates}/{target_updates} "
                         f"motion={stats['motion_loss']:.5f} columns={stats['column_loss']:.5f} lr={optimizer.param_groups[0]['lr']:.3g} "
-                        f"seconds/window={per_window:.3f} remaining_train_hours={(args.epochs*len(records)-executed)*per_window/3600:.2f}", flush=True)
+                        f"seconds/window={per_window:.3f} remaining_train_hours_if_current_speed={(args.epochs*len(records)-executed)*per_window/3600:.2f}", flush=True)
                     if hasattr(provider, 'causal_geometry_cache'):
                         print('GEOMETRY_CACHE '+json.dumps(provider.causal_geometry_cache.stats()), flush=True)
                 stopping = stop_event is not None and stop_event.is_set()

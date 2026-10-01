@@ -68,10 +68,25 @@ class FullJointColumnProvider(JointColumnProvider):
             hit = False
         else:
             evidence, hit = cache.get_or_build((str(record['scene_name']), str(record['t0_token'])), raw,
-                lambda: build_fixed_geometry(raw, record, self.pcfg, self.strong, min(self.workers, 3), self.joint.columns.config))
+                lambda: prepare_causal_evidence(raw, self.pcfg, self.strong, min(self.workers, 3),
+                    column_config=self.joint.columns.config), defer_write=True)
+            raw['_causal_cache_deferred'] = not hit
         raw['_column_causal_preparation'] = evidence
         raw['_causal_geometry_cache_hit'] = hit; raw['_causal_geometry_seconds'] = time.perf_counter()-tick
         return raw
+
+    def prepare_columns(self, source, record, *, include_gt, raw_window=None, outputs=None):
+        prepared = super().prepare_columns(source, record, include_gt=include_gt, raw_window=raw_window, outputs=outputs)
+        if prepared.raw.get('_causal_cache_deferred'):
+            # Strong was computed on the ORIGINAL device in the main thread,
+            # not replayed on CPU in the history worker. Only its completed CPU
+            # arrays enter a bounded non-blocking disk writer. No model outputs,
+            # GT labels, owner/fallback or live query graph enter the artifact.
+            value = {**prepared.raw['_column_causal_preparation'],
+                'prepared_state': {k: v for k, v in prepared.state.items() if k not in ('rec', 'window', 'gpu')}}
+            self.causal_geometry_cache.store((str(record['scene_name']), str(record['t0_token'])),
+                prepared.raw, value, asynchronous=True)
+        return prepared
 
 
 def prefetch_column_batches(provider, source, records, batch_size, source_budget=128):

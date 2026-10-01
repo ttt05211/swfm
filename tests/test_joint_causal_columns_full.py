@@ -287,6 +287,61 @@ def test_cached_window_prefetch_order_errors_and_early_close():
         list(full.prefetch_column_batches(provider, None, rows, 4))
 
 
+def test_live_device_cold_cache_then_exact_persistent_hit_preserves_gradients(tmp_path):
+    from real_motion.causal_geometry_cache import CausalGeometryCache
+    from real_motion.strong_w2det import StrongW2DetConfig
+    prep, grid, joint, _, rec = fixture(); raw = copy.deepcopy(prep.raw)
+    prep.window.history_tokens = tuple(f'h{i}' for i in range(6))
+    raw['history_occ'][raw['history_occ'] == 4] = 17
+    for f in range(6): raw['history_occ'][f, 1+f:4+f, 5:8, 1] = 4
+    rec.update(scene_name='scene', t0_token='t0')
+    strong = StrongW2DetConfig(); pcfg = SimpleNamespace(grid=grid, free_label=17, frame_dt_s=.5)
+    evidence = full.prepare_causal_evidence(raw, pcfg, strong, 1)
+    center = torch.tensor(np.asarray([c['centroid_world'][:2] for c in evidence['current']]), dtype=torch.float32)
+    rec['source_centroid_xy_t0_m'] = center
+    rec['anchors_xy_t0_m'] = center[:, None, :].repeat(1, 6, 1)+rec['kta_displacement_xy_m']
+    provider = full.FullJointColumnProvider.__new__(full.FullJointColumnProvider)
+    provider.pcfg, provider.strong, provider.device, provider.workers = pcfg, strong, torch.device('cpu'), 1
+    provider.joint, provider.model, provider.columns_checked = joint, joint.transport, False
+    provider.causal_geometry_cache = CausalGeometryCache(tmp_path, 'p', ram_bytes=0, reserve_bytes=0)
+    caller = get_ident(); actual = columns.runtime._prepare_record; calls = []
+    def main_device(*args, **kwargs):
+        assert get_ident() == caller and args[4] == provider.device
+        calls.append(args[4]); return actual(*args, **kwargs)
+    torch.nn.init.normal_(joint.columns.refinement.weight, std=.01)
+    output = joint.motion(rec, provider.device)
+    with patch.object(columns, 'window_from_record', return_value=prep.window), \
+         patch.object(columns.runtime, 'window_from_record', return_value=prep.window), \
+         patch.object(columns, 'load_nuscenes_window_raw', side_effect=lambda *args, **kwargs: copy.deepcopy(raw)), \
+         patch.object(full, 'build_fixed_geometry', side_effect=AssertionError('CPU Strong builder must not run')), \
+         patch.object(columns.runtime, '_prepare_record', side_effect=main_device):
+        cold_raw = provider.load_raw_columns(None, rec, include_gt=True)
+        assert not calls and 'prepared_state' not in cold_raw['_column_causal_preparation']
+        assert not list(provider.causal_geometry_cache.root.glob('*.cgc'))
+        cold = provider.prepare_columns(None, rec, include_gt=True, raw_window=cold_raw, outputs=output)
+        assert len(calls) == 1 and cold.outputs is output
+        provider.causal_geometry_cache.close()
+        provider.causal_geometry_cache = CausalGeometryCache(tmp_path, 'p', ram_bytes=0, reserve_bytes=0)
+        warm_raw = provider.load_raw_columns(None, rec, include_gt=True)
+        assert warm_raw['_causal_geometry_cache_hit'] and not warm_raw['_causal_cache_deferred']
+        warm = provider.prepare_columns(None, rec, include_gt=True, raw_window=warm_raw, outputs=output)
+        assert len(calls) == 1  # no Strong recomputation on hits
+        for h in range(6):
+            assert np.array_equal(cold.baseline[h], warm.baseline[h])
+            a, b = (columns.candidate_plan(p, h, grid, joint.columns.config) for p in (cold, warm))
+            assert all(np.array_equal(v, getattr(b, k)) for k, v in vars(a).items())
+            x, y = (columns.sample_column_features(p, h, plan, grid, joint.columns.config) for p, plan in ((cold, a), (warm, b)))
+            assert all(np.array_equal(v, y[k]) for k, v in x.items())
+        batch = common.online_columns(warm, joint.columns, grid, np.random.default_rng(91), provider.device)
+        g, r = joint.columns(**{k: batch[k] for k in (*common.FEATURE_KEYS, 'source_features')})
+        loss, _ = full.column_loss(joint.columns, g, r, batch['kind'], batch['legal'], batch['target'], batch['weight'])
+        assert torch.autograd.grad(loss, output['future_transport_queries'], retain_graph=True)[0].norm() > 0
+        moved = provider.prepare_columns(None, rec, include_gt=True, raw_window=warm_raw,
+            outputs={**output, 'residual_xy_m': output['residual_xy_m']+1})
+        assert any(not np.array_equal(x, y) for x, y in zip(warm.baseline, moved.baseline))
+        provider.causal_geometry_cache.close()
+
+
 def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
     prep, grid, sample, _, template = fixture()
     train = [{**copy.deepcopy(template), 'scene_name': f'train{s}', 't0_token': f'{s}:{i}'} for s in range(10) for i in range(4)]

@@ -6,12 +6,14 @@ Raw causal inputs are hashed on every lookup; corrupt artifacts fail closed.
 The cache never evicts/deletes existing entries: when full it stops admitting.
 """
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 from pathlib import Path
 import pickle
 import shutil
-from threading import Lock
+from threading import Lock, BoundedSemaphore
+import time
 import uuid
 import warnings
 import zlib
@@ -35,7 +37,11 @@ def array_bytes(value):
     def size(v):
         if id(v) in seen: return 0
         seen.add(id(v))
-        if isinstance(v, np.ndarray): return v.nbytes
+        if isinstance(v, np.ndarray):
+            # A view can retain an entire six-frame history allocation. Count
+            # the backing allocation once, not just current/previous slices.
+            if isinstance(v.base, np.ndarray): return size(v.base)
+            return v.nbytes
         if isinstance(v, dict): return sum(size(a) for a in v.values())
         if isinstance(v, (list, tuple)): return sum(size(a) for a in v)
         if hasattr(v, '__dict__'): return size(vars(v))
@@ -63,6 +69,8 @@ class CausalGeometryCache:
                 self._root_usage[self.cache_root] = sum(p.stat().st_size for p in self.cache_root.glob('*/*.cgc')
                     if len(p.stem) == 64 and all(c in '0123456789abcdef' for c in p.stem))
         self.hits = self.misses = self.writes = self.skipped_writes = 0
+        self.writer = None; self.pending = set(); self.writer_slots = BoundedSemaphore(8)
+        self.writer_error = None; self.closed = False; self.write_seconds = 0.
 
     def _remember(self, key, value):
         size = array_bytes(value)
@@ -73,51 +81,113 @@ class CausalGeometryCache:
             _, (_, old) = self.rows.popitem(last=False); self.ram_used -= old
         self.rows[key] = (value, size); self.ram_used += size
 
-    def get_or_build(self, key, raw, builder):
+    def _address(self, key, raw):
         causal_sha = causal_input_digest(raw)
         name = hashlib.sha256((repr(tuple(key))+causal_sha).encode()).hexdigest()
+        return name, causal_sha
+
+    def _check_error(self):
+        if self.writer_error is not None:
+            raise RuntimeError('causal geometry background writer failed') from self.writer_error
+
+    def get_or_build(self, key, raw, builder, *, defer_write=False):
+        name, causal_sha = self._address(key, raw)
         path = self.root/(name+'.cgc')
         with self.lock:
+            self._check_error()
             if name in self.rows:
                 self.rows.move_to_end(name); self.hits += 1
                 return self.rows[name][0], True
-            if path.is_file():
-                blob = path.read_bytes()
-                if (len(blob) < len(MAGIC)+32 or not blob.startswith(MAGIC)
-                        or hashlib.sha256(blob[len(MAGIC)+32:]).digest() != blob[len(MAGIC):len(MAGIC)+32]):
-                    raise RuntimeError(f'corrupt causal geometry cache: {path}')
-                try: payload = pickle.loads(zlib.decompress(blob[len(MAGIC)+32:]))
-                except Exception as exc: raise RuntimeError(f'invalid causal geometry cache: {path}') from exc
-                if (payload.get('namespace') != self.namespace or payload.get('causal_sha') != causal_sha
-                        or tuple(payload.get('key', ())) != tuple(key)):
-                    raise RuntimeError(f'causal geometry cache provenance mismatch: {path}')
+        # No shared cache lock during disk read/decompression or compression.
+        # Atomic replace means readers only observe a complete artifact.
+        if path.is_file():
+            blob = path.read_bytes()
+            if (len(blob) < len(MAGIC)+32 or not blob.startswith(MAGIC)
+                    or hashlib.sha256(blob[len(MAGIC)+32:]).digest() != blob[len(MAGIC):len(MAGIC)+32]):
+                raise RuntimeError(f'corrupt causal geometry cache: {path}')
+            try: payload = pickle.loads(zlib.decompress(blob[len(MAGIC)+32:]))
+            except Exception as exc: raise RuntimeError(f'invalid causal geometry cache: {path}') from exc
+            if (payload.get('namespace') != self.namespace or payload.get('causal_sha') != causal_sha
+                    or tuple(payload.get('key', ())) != tuple(key)):
+                raise RuntimeError(f'causal geometry cache provenance mismatch: {path}')
+            with self.lock:
                 self.hits += 1; value = payload['geometry']; self._remember(name, value)
-                return value, True
+            return value, True
+        with self.lock:
             self.misses += 1
         value = builder()
+        # Cold training uses the ORIGINAL GPU Strong path on the caller. The
+        # worker returns causal history only; incomplete geometry is NOT stored.
+        if not defer_write: self._store(name, causal_sha, key, value)
+        return value, False
+
+    def store(self, key, raw, value, *, asynchronous=False):
+        """Complete immutable CPU geometry; no tensors/learned state/GT allowed."""
+        name, causal_sha = self._address(key, raw)
+        with self.lock:
+            self._check_error()
+            if self.closed: raise RuntimeError('causal geometry cache is closed')
+            self._remember(name, value)
+            if not asynchronous: pass
+            elif name in self.pending: return False
+            elif not self.writer_slots.acquire(blocking=False):
+                # Bounded memory: never stall GPU training waiting for a slow
+                # NAS writer. The exact result remains usable in this batch.
+                self.skipped_writes += 1; return False
+            else:
+                self.pending.add(name)
+                if self.writer is None: self.writer = ThreadPoolExecutor(max_workers=1)
+                self.writer.submit(self._background_store, name, causal_sha, tuple(key), value)
+                return True
+        self._store(name, causal_sha, key, value)
+        return True
+
+    def _background_store(self, name, causal_sha, key, value):
+        try: self._store(name, causal_sha, key, value)
+        except Exception as exc:
+            with self.lock: self.writer_error = exc
+        finally:
+            with self.lock: self.pending.discard(name)
+            self.writer_slots.release()
+
+    def _store(self, name, causal_sha, key, value):
+        path = self.root/(name+'.cgc')
         with self.lock:
             self._remember(name, value)
-            if path.is_file(): return value, False
+            if path.is_file(): return
             if not self.limit or self.disk_used >= self.limit:
-                self.skipped_writes += 1; return value, False
-            packed = zlib.compress(pickle.dumps({'namespace': self.namespace, 'key': tuple(key),
-                'causal_sha': causal_sha, 'geometry': value}, protocol=5), level=1)
-            blob = MAGIC+hashlib.sha256(packed).digest()+packed
-            with self._roots_lock:
-                if self._root_usage[self.cache_root]+len(blob) > self.limit or shutil.disk_usage(self.root).free < len(blob)+self.reserve:
-                    self.skipped_writes += 1; return value, False
+                self.skipped_writes += 1; return
+        started = time.perf_counter()
+        packed = zlib.compress(pickle.dumps({'namespace': self.namespace, 'key': tuple(key),
+            'causal_sha': causal_sha, 'geometry': value}, protocol=5), level=1)
+        blob = MAGIC+hashlib.sha256(packed).digest()+packed
+        written = skipped = disabled = False
+        with self._roots_lock:
+            if path.is_file(): return
+            if self._root_usage[self.cache_root]+len(blob) > self.limit or shutil.disk_usage(self.root).free < len(blob)+self.reserve:
+                skipped = True
+            else:
                 temporary = self.root/(name+'.tmp.'+uuid.uuid4().hex)
                 try:
                     with temporary.open('xb') as handle: handle.write(blob)
                     os.replace(temporary, path)
-                    self._root_usage[self.cache_root] += len(blob); self.writes += 1
+                    self._root_usage[self.cache_root] += len(blob); written = True
                 except OSError as exc:
                     # No scientific fallback: recomputed geometry is exact.
-                    self.limit = 0; self.skipped_writes += 1
+                    disabled = skipped = True
                     warnings.warn(f'geometry cache admission disabled: {exc}', RuntimeWarning)
                 finally:
                     if temporary.is_file(): temporary.unlink()
-        return value, False
+        with self.lock:
+            if disabled: self.limit = 0
+            self.writes += int(written); self.skipped_writes += int(skipped)
+            self.write_seconds += time.perf_counter()-started
+
+    def close(self):
+        with self.lock:
+            self.closed = True; writer = self.writer
+        if writer is not None: writer.shutdown(wait=True)
+        with self.lock: self._check_error()
 
     @property
     def disk_used(self):
@@ -125,6 +195,8 @@ class CausalGeometryCache:
 
     def stats(self):
         with self.lock:
+            self._check_error()
             return dict(hits=self.hits, misses=self.misses, writes=self.writes,
                 skipped_writes=self.skipped_writes, disk_mib=self.disk_used/2**20,
-                disk_limit_mib=self.limit/2**20, ram_mib=self.ram_used/2**20)
+                disk_limit_mib=self.limit/2**20, ram_mib=self.ram_used/2**20,
+                pending_writes=len(self.pending), background_write_seconds=self.write_seconds)

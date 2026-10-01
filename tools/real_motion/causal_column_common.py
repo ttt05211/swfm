@@ -125,7 +125,8 @@ class FrozenColumns(FrozenXYV18):
                 raise RuntimeError('cache/actual source-centre identity mismatch')
             outputs = self.encode_record(record) if outputs is None else outputs
         prepared_at = time.perf_counter()
-        baseline, owners, fallbacks, components, targets, yaws = render_column_layers(state, record, outputs, self.pcfg.grid)
+        baseline, owners, fallbacks, components, targets, yaws = render_column_layers(state, record, outputs, self.pcfg.grid,
+            capture_backgrounds=bool(raw.get('_causal_cache_deferred')))
         if not getattr(self, "columns_checked", False):
             runtime._stage_gpu_inputs(state, self.device)
             try:
@@ -168,11 +169,12 @@ class FrozenColumns(FrozenXYV18):
                                causal.get('fixed_candidate_geometry') if causal is not None else None)
 
 
-def render_column_layers(state, record, outputs, grid):
+def render_column_layers(state, record, outputs, grid, *, capture_backgrounds=False):
     """Model-dependent geometry ONLY; immutable history/registration can be reused."""
     res, yaw = numpy(outputs["residual_xy_m"]), numpy(outputs["yaw_delta_rad"])
     from real_motion.v18_two_wheel_diagnostic import renderer_yaw_delta
     baseline, owners, fallbacks, components, targets, yaws = [], [], [], [], [], []
+    backgrounds = []
     for h in range(6):
         centers = [runtime._target_world_from_xy_cached(numpy(record["anchors_xy_t0_m"])[i, h]+res[i, h],
             state["source_z_t0"][i], state["current_pose"]) for i in range(len(state["current"]))]
@@ -184,8 +186,10 @@ def render_column_layers(state, record, outputs, grid):
             background = compose_component_replacements_fast_exact(state["anchors"][h], state["baseline_by_hi"][h], [],
                 dynamic_class_ids=DYN, free_label=FREE, grid=grid,
                 precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][h])
+        if capture_backgrounds: backgrounds.append(background)
         b, own, fall = component_layers(background, layers)
         baseline.append(b); owners.append(own); fallbacks.append(fall); components.append(layers); targets.append(centers); yaws.append(yy)
+    if capture_backgrounds: state['column_backgrounds'] = backgrounds
     return baseline, owners, fallbacks, components, targets, yaws
 
 

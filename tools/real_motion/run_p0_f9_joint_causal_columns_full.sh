@@ -21,7 +21,7 @@ for file in "$FULL_ROOT/configs/real_motion_occfm.yaml" \
 done
 EXTRA=()
 GEOMETRY_CACHE="${FULL_JOINT_GEOMETRY_CACHE_DIR:-$FULL_ROOT/outputs/p0_f9_joint_causal_columns/causal_geometry_cache_v1}"
-EXTRA+=(--causal-geometry-cache "$GEOMETRY_CACHE" --causal-cache-gib "${FULL_JOINT_GEOMETRY_CACHE_GIB:-16}"
+EXTRA+=(--causal-geometry-cache "$GEOMETRY_CACHE" --causal-cache-gib "${FULL_JOINT_GEOMETRY_CACHE_GIB:-48}"
   --causal-cache-ram-mib "${FULL_JOINT_GEOMETRY_CACHE_RAM_MIB:-4096}")
 if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
   if [[ ! -f "$FULL_JOINT_RESUME" ]]; then echo "[MISSING] $FULL_JOINT_RESUME" >&2; exit 2; fi
@@ -41,7 +41,7 @@ else
 fi
 echo "window batch<=$WINDOWS / source budget=$SOURCES；每轮dev64，最后dev512；不跑full4369。"
 echo "默认不同时训练V18-only对照；E14只作评估参考；不会覆盖旧实验。输出：$RUN_DIR"
-echo "固定因果几何lazy缓存：$GEOMETRY_CACHE；上限${FULL_JOINT_GEOMETRY_CACHE_GIB:-16}GiB；绝不缓存learned poses/labels/features。"
+echo "固定因果几何lazy缓存：$GEOMETRY_CACHE；上限${FULL_JOINT_GEOMETRY_CACHE_GIB:-48}GiB；cold Strong仍走GPU，异步写盘，绝不缓存learned poses/labels/features。"
 "$PY" -u tools/real_motion/train_p0_f9_joint_causal_columns_full.py \
   --config "$FULL_ROOT/configs/real_motion_occfm.yaml" \
   --train-cache "$FULL_ROOT/data/p0_f9_v18_se2_train_full.pt" \

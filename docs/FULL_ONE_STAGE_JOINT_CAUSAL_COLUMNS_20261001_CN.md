@@ -24,7 +24,7 @@
 
 新增 **一整批NEXT raw/history evidence的CPU prefetch**，可与主线程当批的renderer、online sampling和GPU训练重叠。只预取下一批，不提前装下整个epoch。
 
-预计算包含：因果history-source association/ICP、历史footprint和static memory，以及下文追加的固定CPU Strong背景、静态frontier。worker不调用model/CUDA、不读取GT构建证据；current source与记录的类别/中心及prefetched source逐元素核验。
+预计算包含：因果history-source association/ICP、历史footprint、static memory及静态frontier。worker不调用model/CUDA、不读取GT构建证据；current source与记录的类别/中心及prefetched source逐元素核验。Strong保持主线程原GPU路径，完成后只将其CPU数组保存供后续复用。
 
 以下内容永不跨更新缓存：learned poses、owner/fallback、完整候选、action labels、learned features。运动更新后全部在线重建，不出现旧bank错配。来源帧RAM缓存默认TRAIN/dev各256MiB，保持原精确inverse-map采样；持久几何采用下文新增的有界压缩cache，不构造learned dense feature bank。
 
@@ -59,13 +59,13 @@ bash tools/real_motion/switch_p0_f9_joint_causal_columns_fast.sh \
 
 本补丁保持模型、loss、GT标签、采样顺序、source/window budget、梯度路径和整段余弦不变，合并以下计算优化：
 
-- 每窗因果固定几何按需持久化：source extraction/association/ICP、aligned history points、footprint、static memory、CPU bit-exact Strong anchor/KTA/CLEAR和无learned replacement背景。
+- 每窗因果固定几何按需持久化：source extraction/association/ICP、aligned history points、footprint、static memory，以及**主线程GPU原路径完成后**的bit-exact Strong anchor/KTA/CLEAR和无learned replacement背景。不得在cold history worker里改用CPU重算六帧Strong。
 - 六个horizon的history-only frontier、nearest anchor、road/sidewalk dominant class与Z support只算一次。完整合法候选仍由**当前**预测baseline/ownership/pose在线生成；不能缓存上一轮的sampled plan或labels。
 - 动态source的BEV padding在source-local bbox内做精确dilation，保持原整网格argwhere顺序，不改变padding或裁掉候选。
 - 下一批最多两窗并行CPU预备，每窗history几何workers不超过3；当批候选/特征最多4worker，RNG串行。Torch/CUDA及live source queries仅在主线程执行。
 - 外层loader完成后才关闭内层pool，避免安全停止时预取线程提交到已关闭pool。
 
-缓存默认位置 `outputs/p0_f9_joint_causal_columns/causal_geometry_cache_v1`，所有provenance namespace合计最多**16GiB磁盘**、单实例**4GiB RAM LRU**，写入前保留至少1GiB空闲磁盘；满额/空间不足继续精确重算，不删已有文件。原始输入/batch/optimizer本身仍占额外RAM，4GiB不是整个训练进程的内存上限。一个cache根目录只允许一个训练写入进程；同进程worker/实例共享quota核算。
+缓存默认位置 `outputs/p0_f9_joint_causal_columns/causal_geometry_cache_v1`，所有provenance namespace合计最多**48GiB磁盘**、单实例**4GiB RAM LRU**，写入前保留至少1GiB空闲磁盘；满额/空间不足继续精确重算，不删已有文件。原始输入/batch/optimizer及最多8窗writer queue仍占额外RAM，4GiB不是整个训练进程的内存上限。一个cache根目录只允许一个训练写入进程；同进程worker/实例共享quota核算。
 
 每次lookup对history occupancy/observed/poses及future ego poses做SHA256；namespace额外绑定runtime config、Strong/column config、train/dev cache和info SHA及dataroot。artifact压缩后有内容checksum，损坏或provenance不一致直接报错，不静默用错缓存。只有本机可信cache可加载，不能从不可信来源导入pickle。cache不保存future occupancy GT、record训练标签、Tensor、模型输出或learned geometry。初次真实renderer/Strong exactness检查仍执行。
 
@@ -80,6 +80,22 @@ bash tools/real_motion/switch_p0_f9_joint_causal_columns_fast.sh \
 ```
 
 恢复仍设15轮/window<=4/source<=128/paired-control=0，跳过prior，下一更新为1423，不重新训练前1422步。
+
+### 6b9ee9a冷缓存回退修正
+
+真实服务器后续日志：cold hits=0，约0.96–1.02s/window，较此前0.47s/window慢约一倍。代码审计发现6b9ee9a的完整CPU缓存builder把原本CUDA inverse-warp/majority-fill的六帧Strong搬到了CPU，压缩/读盘又占用cache共享锁。这是实现上的性能回退，不是模型或loss导致，不能要求用户只等到下一轮。
+
+修正后：history worker只准备原因果证据和frontier；cold Strong保持**主线程原device**；renderer顺带保留固定background，不重复compose；主线程完成后保存CPU-only prepared state，绝不保存完整PreparedColumns/live输出或GT。最多8个待写条目、单writer异步pickle/zlib/atomic write，队列满则跳过该次写盘，不阻塞训练。读取/解压/压缩均在LRU锁外，关闭时drain有限队列并传播writer错误。实际占用按ndarray backing allocation核算，避免view只按slice计数。
+
+324个文件约493.94MiB，即约1.52MiB/window；按当前样本均值线性推算全集约30.4GiB（估算，不保证所有scene大小相同）。所以default cap从16改为48GiB，仍小于用户允许的100GB存储额度，写盘仍保留1GiB空闲。namespace/文件协议及数学内容不变，已经构建的CPU artifact可直接复用，不删除或重建旧缓存。日志ETA更名为`remaining_train_hours_if_current_speed`，明确按当前吞吐外推，不当作后续warm阶段的已知耗时。
+
+当前cache版已经安装safe SIGTERM handler。新增PID-only切换模式读取完整/proc参数，校验脚本、输出路径、全部data/config/seed/batch后才TERM；完成当前batch保存新的last、退出并观察到checkpoint atomic替换才启动新版。不再等下一个256batch checkpoint；PID消失/身份不符/没有新保存则拒绝自动启动，绝不KILL或删除历史输出：
+
+```bash
+bash tools/real_motion/switch_p0_f9_joint_causal_columns_fast.sh --graceful-from-pid 1043
+```
+
+1043是此次用户确认的当前PID；执行前脚本仍重新核验，不假定它永远有效。恢复本次运行最新断点，**不是倒退到旧1422 checkpoint**。CPU-only测试验证冷缓存不调用CPU完整Strong builder、Strong仅主线程原device执行一次、warm disk hit不重算、候选/特征及live gradient一致、writer不持有读锁、队列有界且错误不丢失；CUDA实测吞吐仍需服务器正常训练日志确认。
 
 ## 校准和评估
 
