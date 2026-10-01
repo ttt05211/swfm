@@ -8,6 +8,8 @@ import argparse
 import cProfile
 import pstats
 import json
+import hashlib
+from io import BytesIO
 import numpy as np
 import torch
 from real_motion.runtime_config import load_runtime_config, make_prepare_config
@@ -18,6 +20,33 @@ from tools.real_motion.train_p0_f9_causal_columns import load_columns
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256
 from tools.real_motion.eval_p0_f9_v18_se2 import load_cache
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import align_records, sha256
+
+
+def verify_checkpoint_snapshot(checkpoint, snapshot_digest, original):
+    """Only final screen_pass metadata may change while profiling a snapshot."""
+    current_bytes = checkpoint.read_bytes()
+    current_digest = hashlib.sha256(current_bytes).hexdigest()
+    if current_digest == snapshot_digest:
+        print('CHECKPOINT AUDIT: original file unchanged', flush=True)
+        return
+    current = torch.load(BytesIO(current_bytes), map_location='cpu', weights_only=False)
+    old_state, new_state = original['state_dict'], current.get('state_dict', {})
+    same_state = (old_state.keys() == new_state.keys() and all(
+        isinstance(new_state[k], torch.Tensor) and v.dtype == new_state[k].dtype
+        and v.shape == new_state[k].shape and torch.equal(v, new_state[k])
+        for k, v in old_state.items()))
+    metadata = lambda ck: {k: v for k, v in ck.items() if k not in ('state_dict', 'screen_pass')}
+    same_metadata = stable_json_fingerprint(metadata(original)) == stable_json_fingerprint(metadata(current))
+    old_pass, new_pass = original.get('screen_pass'), current.get('screen_pass')
+    safe_pass = type(old_pass) is bool and type(new_pass) is bool and (old_pass == new_pass or not old_pass)
+    if not (same_state and same_metadata and safe_pass):
+        raise RuntimeError('checkpoint weights/thresholds/contracts changed during profile; '
+                           'timing used the initial snapshot, do not treat it as the current candidate')
+    print('CHECKPOINT AUDIT:', json.dumps({'status': 'external_reserialization_or_screen_finalization',
+        'initial_sha256': snapshot_digest, 'final_sha256': current_digest,
+        'screen_pass_before': old_pass, 'screen_pass_after': new_pass,
+        'weights_thresholds_and_contracts_identical': True,
+        'profile_used_initial_snapshot': True}), flush=True)
 
 
 def check_reference(provider, source, record, model):
@@ -51,11 +80,14 @@ def main():
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(): raise RuntimeError('CUDA/BF16 required')
     torch.set_num_threads(1)
     root = Path(__file__).resolve().parents[2]; checkpoint = Path(args.model_dir)/'candidate.pt'
-    digest = sha256(checkpoint)
+    # Read once: a concurrent atomic finalization cannot mix the file we hash
+    # with another file we load. This snapshot is in RAM, never written to disk.
+    snapshot = checkpoint.read_bytes(); digest = hashlib.sha256(snapshot).hexdigest()
     cfg = load_runtime_config(root/'configs/real_motion_occfm.yaml', [])
     device = torch.device('cuda')
-    ck, model = load_columns(checkpoint, device, base_sha=CLEAN_SHA256,
+    ck, model = load_columns(BytesIO(snapshot), device, base_sha=CLEAN_SHA256,
         config_sha=stable_json_fingerprint(cfg), allow_diagnostic=True)
+    del snapshot
     if ck['checkpoint_role'] != 'calibrated_candidate': raise RuntimeError('candidate.pt required')
     if args.window > len(ck['dev_keys']): parser.error('window exceeds original population')
     info = Path(args.dataroot)/'nuscenes_infos_val_temporal_v3_scene.pkl'
@@ -75,7 +107,7 @@ def main():
             print('SECOND_WINDOW_TIMING:', json.dumps(row, ensure_ascii=False), flush=True)
     common.evaluate_columns(provider, source, [record, record], model, tuple(ck['thresholds']), progress=progress)
     pstats.Stats(profile).strip_dirs().sort_stats('cumulative').print_stats(25)
-    if sha256(checkpoint) != digest: raise RuntimeError('checkpoint changed during read-only profile')
+    verify_checkpoint_snapshot(checkpoint, digest, ck)
     print('Profiling only; original checkpoint/thresholds unchanged; no formal validation or deployment promotion.')
 
 

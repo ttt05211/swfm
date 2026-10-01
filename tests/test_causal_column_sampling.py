@@ -127,3 +127,40 @@ def test_readonly_same_window_profile_cli_keeps_original_artifact_and_checks_rea
     assert 'REFERENCE FEATURE EXACTNESS:' in output and 'SECOND_WINDOW_TIMING:' in output
     assert checkpoint.read_bytes() == b'original checkpoint'
     assert list(model_dir.iterdir()) == [checkpoint]
+
+
+@pytest.mark.parametrize('change', ['unchanged', 'reserialize', 'screen_pass', 'weight', 'dtype',
+                                  'threshold', 'contract', 'population', 'remove_pass', 'regress_pass'])
+def test_profile_snapshot_audit_allows_only_serialization_or_final_screen_pass(tmp_path, capsys, change):
+    import hashlib
+    from tools.real_motion import profile_p0_f9_causal_columns as profiler
+    checkpoint = tmp_path/'candidate.pt'
+    original = {'state_dict': {'weight': torch.tensor([1., 2.])}, 'screen_pass': change == 'regress_pass',
+                'thresholds': (.5, .5, None), 'training_contract': {'frozen': True},
+                'dev_keys': [('dev', 'original220')]}
+    torch.save(original, checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    current = copy.deepcopy(original)
+    if change == 'screen_pass': current['screen_pass'] = True
+    elif change == 'weight': current['state_dict']['weight'][0] += 1
+    elif change == 'dtype': current['state_dict']['weight'] = current['state_dict']['weight'].double()
+    elif change == 'threshold': current['thresholds'] = (.75, .5, None)
+    elif change == 'contract': current['training_contract']['frozen'] = False
+    elif change == 'population': current['dev_keys'] = [('dev', 'other')]
+    elif change == 'remove_pass': del current['screen_pass']
+    elif change == 'regress_pass': current['screen_pass'] = False
+    if change != 'unchanged':
+        # Different serialization prefix changes bytes even when all fields match.
+        other = tmp_path/'external-finalization.pt'; torch.save(current, other)
+        other.replace(checkpoint)
+        assert hashlib.sha256(checkpoint.read_bytes()).hexdigest() != digest
+    before = checkpoint.read_bytes()
+    if change in ('unchanged', 'reserialize', 'screen_pass'):
+        profiler.verify_checkpoint_snapshot(checkpoint, digest, original)
+        output = capsys.readouterr().out
+        assert 'CHECKPOINT AUDIT:' in output
+        if change != 'unchanged': assert 'weights_thresholds_and_contracts_identical' in output
+    else:
+        with pytest.raises(RuntimeError, match='weights/thresholds/contracts changed'):
+            profiler.verify_checkpoint_snapshot(checkpoint, digest, original)
+    assert checkpoint.read_bytes() == before

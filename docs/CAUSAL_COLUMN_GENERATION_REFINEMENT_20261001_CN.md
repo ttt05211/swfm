@@ -87,6 +87,8 @@ python tools/real_motion/profile_p0_f9_causal_columns.py --model-dir <原model�
 
 该工具对 actor 分层采样，检查真实数据新旧历史特征完全一致后，重复同窗口预热/计时。它不保存结果、不改变模型/阈值、不将失败候选提升为成功。不应与当前GPU评估并行执行。
 
+诊断读取同一个内存 checkpoint 快照并对该快照计算 SHA256，避免文件哈希与加载间的并发替换。原 screen 在评估完成后会重新保存 `screen_pass`，因此文件 SHA 改变不一定表示模型改变。诊断结束仍检查原文件：只有全部权重（含 dtype/shape）、阈值、合同和 population 完全一致，且 `screen_pass` 不变或由 false 完成到 true，才报告外部序列化/验收更新；其他变化继续报错。该例外仅适用于计时工具，正式 expanded evaluation 的文件 SHA 严格检查保持不变。
+
 ## 已覆盖的逻辑验收
 
 测试覆盖原 renderer 六 horizon 的逐 voxel 一致性、空 t0 source、随机重叠物体的独立完整 layer recomposition 对照、下层类别恢复、occupied 保护、未来 GT 修改不影响候选/特征、真实因果 ICP 排序和 world Z、动态 patch motion alignment、importance/natural class counts、weighted score correction、非法动作梯度屏蔽、两个 head/共享主干学习、全 UNKNOWN、全拒绝/单 horizon/Moving 降级拒绝、checkpoint role/权重/阈值完整性、端到端 smoke、下一更新断点精确恢复。
