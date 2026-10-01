@@ -92,6 +92,7 @@ class PreparedColumns:
     memory: np.ndarray
     source_audit: dict
     outputs: dict | None = None
+    aligned_history_points: list | None = None
 
 
 class FrozenColumns(FrozenXYV18):
@@ -147,7 +148,8 @@ class FrozenColumns(FrozenXYV18):
         self.last_prepare_seconds = {"raw_and_v18": prepared_at-started, "layered_renderer": renderer_at-prepared_at,
             "source_history": history_at-renderer_at, "static_memory_and_footprint": time.perf_counter()-history_at}
         return PreparedColumns(window, raw, state, baseline, owners, fallbacks, components, targets, yaws,
-                               registrations, footprints, memory, audit, outputs)
+                               registrations, footprints, memory, audit, outputs,
+                               causal.get('aligned_history_points') if causal is not None else None)
 
 
 def render_column_layers(state, record, outputs, grid):
@@ -230,8 +232,11 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
         all_flat = [np.ravel_multi_index(prepared.components[h][i].voxel_indices.T, shape)]
         for f, reg in enumerate(registered[:5]):
             if reg is None: continue
-            points = rigid_source_points_world(reg[1], prepared.raw["history_poses"][f], grid=grid)
-            aligned = transform_points(points, reg[0])
+            if getattr(prepared, 'aligned_history_points', None) is not None:
+                aligned = prepared.aligned_history_points[i][f]
+            else:
+                points = rigid_source_points_world(reg[1], prepared.raw["history_poses"][f], grid=grid)
+                aligned = transform_points(points, reg[0])
             moved = planar_move(aligned, comp["centroid_world"], prepared.targets[h][i], prepared.yaws[h][i])
             ids, _ = raster_flat(moved, prepared.state["world_to_future"][h],
                                 (grid.x_min, grid.y_min, grid.z_min), grid.voxel_size, shape)

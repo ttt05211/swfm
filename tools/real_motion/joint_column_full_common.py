@@ -4,8 +4,10 @@ import time
 import numpy as np
 import torch
 from real_motion.rigid_transport import rigid_source_points_world
+from real_motion.source_evidence_audit import transform_points
 from real_motion.causal_column_model import column_loss
-from tools.real_motion.joint_column_common import JointColumnProvider, online_columns, motion_loss, set_lr
+from tools.real_motion.joint_column_common import (JointColumnProvider, select_online_columns,
+    build_online_column_candidates, sample_online_column, assemble_online_columns, motion_loss, set_lr)
 from tools.real_motion.causal_column_common import (causal_source_history, FEATURE_KEYS,
     history_grid_footprint_bev_sequence, build_future_static_memory_only, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
@@ -25,10 +27,14 @@ def prepare_causal_evidence(raw, pcfg, strong, workers):
     state = {'current': current, 'velocities': velocity,
         'source_world_points': [rigid_source_points_world(c['voxel_indices'], raw['history_poses'][-1], grid=grid) for c in current]}
     registrations, _, _, audit = causal_source_history(raw['history_occ'], raw['history_poses'], state, grid, strong, workers)
+    aligned = [[None if reg is None else transform_points(
+        rigid_source_points_world(reg[1], raw['history_poses'][f], grid=grid), reg[0])
+        for f, reg in enumerate(row)] for row in registrations]
     footprint = history_grid_footprint_bev_sequence(raw['history_poses'], raw['future_poses'], grid, workers=workers)
     memory = build_future_static_memory_only(raw['history_occ'], raw['history_observed'], raw['history_poses'], raw['future_poses'],
         grid=grid, dynamic_class_ids=DYN, free_label=FREE, workers=workers)
-    return {'current': current, 'registrations': registrations, 'audit': audit, 'footprints': footprint,
+    return {'current': current, 'registrations': registrations, 'aligned_history_points': aligned,
+            'audit': audit, 'footprints': footprint,
             'memory': memory, 'seconds': time.perf_counter()-started}
 
 
@@ -85,15 +91,41 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
     merged = pack_records(records, (*MOTION_KEYS, *LABEL_KEYS))
     output = joint.motion(merged, provider.device)
     local_outputs = [{k: v for k, v in zip(output, values)} for values in zip(*(v.split(sizes) for v in output.values()))]
-    batches = []; prep_seconds = 0.; sampling_seconds = 0.
-    for (record, raw), local in zip(rows, local_outputs):
-        tick = time.perf_counter()
-        prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw, outputs=local)
-        prep_seconds += time.perf_counter()-tick; tick = time.perf_counter()
-        b = online_columns(prep, joint.columns, provider.pcfg.grid, rng, provider.device)
-        sampling_seconds += time.perf_counter()-tick
-        if b is not None: batches.append(b)
-    lm, stats = motion_loss(output, merged, provider.device, patch_resolution)
+    batches = []; prep_seconds = selection_seconds = feature_wait_seconds = worker_seconds = 0.
+    candidate_wait_seconds = candidate_worker_seconds = 0.
+    workers = max(1, min(int(getattr(provider, 'workers', 4)), 4))
+    def sample(prep, selected):
+        started = time.perf_counter()
+        arrays = sample_online_column(prep, selected, provider.pcfg.grid, joint.columns.config)
+        return arrays, time.perf_counter()-started
+    def candidates(prep):
+        started = time.perf_counter()
+        plans = build_online_column_candidates(prep, joint.columns.config, provider.pcfg.grid)
+        return plans, time.perf_counter()-started
+    # One bounded batch of CPU-only jobs. The sampler RNG is consumed serially
+    # in EXACT original window/horizon order; no worker touches live tensors.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        planning = []; pending = []
+        for (record, raw), local in zip(rows, local_outputs):
+            tick = time.perf_counter()
+            prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw, outputs=local)
+            prep_seconds += time.perf_counter()-tick
+            planning.append((prep, pool.submit(candidates, prep)))
+        # GPU motion supervision can overlap queued CPU patch sampling.
+        lm, stats = motion_loss(output, merged, provider.device, patch_resolution)
+        for prep, job in planning:
+            tick = time.perf_counter(); plans, seconds = job.result()
+            candidate_wait_seconds += time.perf_counter()-tick; candidate_worker_seconds += seconds
+            tick = time.perf_counter()
+            selected = select_online_columns(prep, joint.columns.config, provider.pcfg.grid, rng, candidates=plans)
+            selection_seconds += time.perf_counter()-tick
+            pending.append((prep, selected, [pool.submit(sample, prep, item) for item in selected]))
+        for prep, selected, jobs in pending:
+            tick = time.perf_counter(); mapped = [job.result() for job in jobs]
+            feature_wait_seconds += time.perf_counter()-tick
+            worker_seconds += sum(seconds for _, seconds in mapped)
+            b = assemble_online_columns(prep, joint.columns, selected, [a for a, _ in mapped], provider.device)
+            if b is not None: batches.append(b)
     lc = lm.new_zeros(()); column_stats = {}; link_grad = None; sampled = 0
     if batches:
         batch = {k: torch.cat([b[k] for b in batches]) for k in batches[0]}
@@ -128,6 +160,10 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'grad_norm': float(mn), 'column_grad_norm': float(cn), 'optimizer_updated': bool(updated),
         'source_query_gradient_norm': link_grad, 'gradient_probe': probe, 'sampled_columns': sampled,
         'windows': len(rows), 'sources': sum(sizes), 'prepare_main_seconds': prep_seconds,
-        'online_sampling_seconds': sampling_seconds,
+        'online_sampling_seconds': candidate_wait_seconds+selection_seconds+feature_wait_seconds,
+        'online_candidate_wait_seconds': candidate_wait_seconds,
+        'online_candidate_worker_seconds_sum': candidate_worker_seconds,
+        'online_selection_seconds': selection_seconds, 'online_feature_wait_seconds': feature_wait_seconds,
+        'online_worker_seconds_sum': worker_seconds, 'online_sampling_workers': workers,
         'peak_memory_mib': torch.cuda.max_memory_allocated(provider.device)/2**20 if provider.device.type == 'cuda' else None,
         **stats, **column_stats}

@@ -32,6 +32,27 @@
 
 不能以小规模原循环0.84s/window承诺新的全量耗时。未优化循环线性放大15轮约70小时，本版新增合批/prefetch/移除默认control，实际时间应以服务器前几十batch为准。不是缩减数据/监督来提速。
 
+## CPU采样提速补丁（兼容b700519断点）
+
+服务器实测每批约2.22–2.36s，`online_sampling_seconds`占1.60–1.74s；input wait约0.0005s。优化针对CPU在线候选/历史patch，不将GPU低占用误诊为显存不足。
+
+- 每批最多4个CPU线程：candidate/label按窗口并行，patch映射跨horizon并行；RNG仍在主线程按原窗口/horizon顺序抽样，GT标签与importance weights不变。
+- worker只访问NumPy证据；live source feature gather、Torch/CUDA和梯度仍在主线程。GPU motion loss与CPU patch任务重叠。
+- frontier多个query读取同一历史anchor时，稀疏映射只计算一次，恢复原query顺序后按各自class设置membership bits。
+- registration后的历史世界坐标只在因果prefetch中算一次，六个horizon复用；learned未来位姿仍逐更新应用。
+- 保留完整标签/ownership/duplicate检查，用等价整数范围及字节键实现替代较慢的isin/结构化排序；移除单worker sampler的不必要嵌套线程。
+- 日志拆分`online_selection_seconds`、`online_feature_wait_seconds`及`online_worker_seconds_sum`（多线程CPU时间之和，不是墙钟）；总速度继续看`seconds/window`。未在服务器实测前不承诺倍数。
+- full训练协议、batch、scheduler及模型不变，可从b700519的last恢复，跳过prior1024重计数。以后SIGTERM/SIGINT只设置停止请求，完成当前batch后原子保存last并以130退出，不假报训练完成。
+
+旧b700519进程本身没有新信号处理，使用安全切换器：
+
+```bash
+bash tools/real_motion/switch_p0_f9_joint_causal_columns_fast.sh \
+  /root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/full15_20261001_180940_b700519 975
+```
+
+975来自用户此次nvidia-smi，切换前仍需核验：脚本读取/proc命令行，严格匹配full入口/原输出目录/config/cache/info/checkpoint/seed；不是目标则拒绝。脚本最多等待30min内下一次atomic last替换，完成后才TERM旧Python，确认退出后后台启动新版并打印新日志。原epochs/window/source/paired-control配置保持不变；不会删除旧目录或影响其他GPU进程。新旧版本数学计算的synthetic输入、RNG及优化更新一致性已检查，真实CUDA最终数值仍以服务器运行为准。
+
 ## 校准和评估
 
 - 类别先验只计数一次固定、scene-balanced TRAIN1024的**未采样合法proposals**，然后固定。明确是prior subset，绝不称full20430统计；不是每轮加一次3小时以上全量audit。

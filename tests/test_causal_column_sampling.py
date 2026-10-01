@@ -81,6 +81,17 @@ def test_cache_budget_sparse_fallback_and_no_future_gt_or_stale_window_cache():
     assert sampler.sample(empty, common.sample_column_features)['history'].shape == (0, 6, 7, 7, cfg.z_bins)
 
 
+def test_sparse_repeated_anchor_class_flags_and_original_order_exact():
+    prep, grid, cfg, plan = fixture(4)
+    small = plan.subset([1, 401, 1, 810, 810, 405, 5])
+    small.evidence_xy[:3] = small.evidence_xy[0]
+    small.classes[:3] = (11, 13, 11)
+    sampler = ColumnFeatureSampler(prep, 2, small, grid, cfg, common.pose_motion, max_cache_mib=0)
+    expected = common.sample_column_features(prep, 2, small, grid, cfg)
+    actual = sampler.sample(small, common.sample_column_features)
+    assert all(np.array_equal(expected[k], actual[k]) for k in common.FEATURE_KEYS)
+
+
 def test_existing_model_weights_batching_and_probabilities_unchanged():
     prep, grid, cfg, plan = fixture(3)
     # Keep enough dense queries to exercise map construction while using CPU NN.

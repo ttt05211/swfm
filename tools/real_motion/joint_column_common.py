@@ -52,25 +52,53 @@ def count_proposals(prep, grid, config, counts):
         counts['refine'] += np.bincount(target[ref], minlength=3)
 
 
-def online_columns(prep, model, grid, rng, device):
-    parts = defaultdict(list)
+def build_online_column_candidates(prep, config, grid):
+    """CPU-only plans/labels for one current prediction; no sampling/RNG."""
+    return [(h, plan, action_targets(plan, prep.raw['future_gt_occ'][h]))
+            for h in range(6) for plan in (candidate_plan(prep, h, grid, config),)]
+
+
+def select_online_columns(prep, config, grid, rng, candidates=None):
+    """Draw in original horizon/window order on the caller's sole RNG thread."""
+    selected = []
     # 2*sum(budgets) = 256; 128 GEN + 128 REF when all strata are available.
     # Missing strata are not filled with duplicate/replacement queries.
-    for h, budget in enumerate((24, 24, 20, 20, 20, 20)):
-        plan = candidate_plan(prep, h, grid, model.config)
-        labels = action_targets(plan, prep.raw['future_gt_occ'][h])
+    budgets = (24, 24, 20, 20, 20, 20)
+    if candidates is None: candidates = build_online_column_candidates(prep, config, grid)
+    for h, plan, labels in candidates:
+        budget = budgets[h]
         ids, weight = sample_queries(plan, labels, budget, rng)
         if not len(ids): continue
         small = plan.subset(ids)
-        features = ColumnFeatureSampler(prep, h, small, grid, model.config, pose_motion,
-            workers=1).sample(small, sample_column_features)
-        for k, v in {**features, 'legal': small.legal, 'target': labels[ids], 'weight': weight}.items(): parts[k].append(v)
+        selected.append((h, small, labels[ids], weight))
+    return selected
+
+
+def sample_online_column(prep, selected, grid, config):
+    """Pure CPU/NumPy: no RNG, Torch, CUDA or learned latent access."""
+    h, small, labels, weight = selected
+    features = ColumnFeatureSampler(prep, h, small, grid, config, pose_motion,
+        workers=1).sample(small, sample_column_features)
+    return {**features, 'legal': small.legal, 'target': labels, 'weight': weight}
+
+
+def assemble_online_columns(prep, model, selected, arrays, device):
+    """Latent gathering stays on the autograd-owning caller, never a worker."""
+    parts = defaultdict(list)
+    for (h, small, _, _), features in zip(selected, arrays):
+        for k, v in features.items(): parts[k].append(v)
         parts['source_features'].append(model.source_features_for(prep, h, small, device))
     if not parts: return None
     batch = {k: torch.as_tensor(np.concatenate(v), device=device) for k, v in parts.items() if k != 'source_features'}
     batch['source_features'] = torch.cat(parts['source_features'])
     if len(batch['kind']) > 256: raise RuntimeError('online query budget exceeded')
     return batch
+
+
+def online_columns(prep, model, grid, rng, device):
+    selected = select_online_columns(prep, model.config, grid, rng)
+    arrays = [sample_online_column(prep, row, grid, model.config) for row in selected]
+    return assemble_online_columns(prep, model, selected, arrays, device)
 
 
 def motion_loss(output, record, device, patch_resolution=.8):

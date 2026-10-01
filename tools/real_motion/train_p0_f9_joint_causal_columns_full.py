@@ -77,7 +77,7 @@ def full_summary(summary):
     return '\n'.join(lines)+'\n'
 
 
-def main():
+def main(stop_event=None):
     parser = argparse.ArgumentParser(description=__doc__); add_config_args(parser)
     for key in ('train-cache', 'dev-cache', 'population-manifest', 'base-checkpoint', 'dataroot', 'train-info', 'dev-info', 'out-dir'):
         parser.add_argument('--'+key, required=True)
@@ -200,6 +200,8 @@ def main():
             if control is not None: state.update(control_state_dict=control.state_dict(), control_optimizer=control_optimizer.state_dict())
             atomic_checkpoint(out/'last.pt', state)
         save_last(); training_started = time.perf_counter(); monitor_seconds = 0.
+        if stop_event is not None and stop_event.is_set():
+            print(f'STOPPED safely before training: {out}/last.pt', flush=True); return 130
         for e in range(cursor_epoch, args.epochs):
             epoch_started = time.perf_counter(); done_batch = cursor_batch if e == cursor_epoch else 0
             scheduled = (records[i] for group in plans[e][done_batch:] for i in group)
@@ -226,7 +228,11 @@ def main():
                     print(f"epoch={e+1}/{args.epochs} batch={bi}/{len(plans[e])} update={updates}/{target_updates} "
                         f"motion={stats['motion_loss']:.5f} columns={stats['column_loss']:.5f} lr={optimizer.param_groups[0]['lr']:.3g} "
                         f"seconds/window={per_window:.3f} remaining_train_hours={(args.epochs*len(records)-executed)*per_window/3600:.2f}", flush=True)
-                if updates % args.checkpoint_every == 0: save_last()
+                stopping = stop_event is not None and stop_event.is_set()
+                if updates % args.checkpoint_every == 0 or stopping: save_last()
+                if stopping:
+                    progress({'event': 'stopped_safely', 'update': updates, 'checkpoint': str(out/'last.pt')})
+                    print(f'STOPPED safely after update={updates}: {out}/last.pt', flush=True); return 130
                 previous_end = time.perf_counter()
             epoch_train_seconds = time.perf_counter()-epoch_started
             # Keep the completed epoch recoverable before validation begins.
@@ -282,4 +288,13 @@ def main():
         print(full_summary(summary), flush=True)
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    import signal
+    from threading import Event
+    stop_event = Event()
+    # Signal handlers only set a flag: never serialize while an update or an
+    # atomic checkpoint is incomplete. Existing b700519 runs need the switcher.
+    def request_stop(signum, frame): stop_event.set()
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    sys.exit(main(stop_event) or 0)

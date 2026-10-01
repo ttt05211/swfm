@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from threading import get_ident
+from threading import Event
 import numpy as np
 import pytest
 import torch
@@ -84,10 +85,39 @@ def test_unsupervised_no_query_window_does_not_decay_parameters():
     prep, grid, joint, control, rec = fixture(); rec['supervised_source'][:] = False
     opt, _ = optimizers(joint, control); before = copy.deepcopy(joint.state_dict())
     provider = provider_for(prep, grid, joint)
-    with patch.object(full, 'online_columns', return_value=None):
+    with patch.object(full, 'select_online_columns', return_value=[]):
         stats = full.train_full_batch(joint, opt, provider, None, [(rec, None)], np.random.default_rng(2), 1, 10)
     assert not stats['optimizer_updated']
     assert all(torch.equal(v, joint.state_dict()[k]) for k, v in before.items())
+
+
+def test_parallel_sampling_keeps_rng_order_updates_and_gpu_work_on_caller():
+    prep, grid, joint, control, rec = fixture(); serial = copy.deepcopy(joint)
+    opt, _ = optimizers(joint, control); opt2, _ = optimizers(serial, control)
+    p, q = provider_for(prep, grid, joint), provider_for(prep, grid, serial)
+    p.workers, q.workers = 4, 1
+    r1, r2 = np.random.default_rng(71), np.random.default_rng(71)
+    second = copy.deepcopy(rec); second['features'] += .2
+    caller = get_ident(); seen = []; actual = full.sample_online_column
+    actual_candidates = full.build_online_column_candidates
+    def planned(*args):
+        assert get_ident() != caller
+        return actual_candidates(*args)
+    def mapped(*args):
+        assert get_ident() != caller
+        seen.append(get_ident()); return actual(*args)
+    actual_gather = joint.columns.source_features_for
+    def gather(*args):
+        assert get_ident() == caller; return actual_gather(*args)
+    joint.columns.source_features_for = gather
+    for update in (1, 2):
+        with patch.object(full, 'sample_online_column', side_effect=mapped), \
+             patch.object(full, 'build_online_column_candidates', side_effect=planned):
+            full.train_full_batch(joint, opt, p, None, [(rec, None), (second, None)], r1, update, 12)
+            full.train_full_batch(serial, opt2, q, None, [(rec, None), (second, None)], r2, update, 12)
+        assert all(torch.equal(v, serial.state_dict()[k]) for k, v in joint.state_dict().items())
+        assert r1.bit_generator.state == r2.bit_generator.state
+    assert seen
 
 
 def test_whole_run_cosine_depends_on_declared_total_steps_and_has_no_tail():
@@ -200,7 +230,7 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
         result.load_raw_columns = load; result.prepare_columns = prepare
         result.reference_predictions = lambda p, r: {'frozen_E14': p.baseline} if result.reference_enabled else {}
         return result
-    def run(out, epochs, resume=None, fail_update=None):
+    def run(out, epochs, resume=None, fail_update=None, stop_update=None):
         argv = ['train', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot', str(tmp_path), '--out-dir', str(out), '--epochs', str(epochs), '--device', 'cpu',
             '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1']
@@ -212,9 +242,12 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
             chosen = records[:2]; kwargs['dev64_keys'] = keys[:2] if 'dev64_keys' in kwargs else None
             return actual_eval(provider, source, chosen, model, gates, **kwargs)
         actual_step = trainer.train_full_batch
+        stop = Event()
         def step(*args, **kwargs):
             if fail_update is not None and args[6] == fail_update: raise RuntimeError('simulated interruption')
-            return actual_step(*args, **kwargs)
+            result = actual_step(*args, **kwargs)
+            if stop_update is not None and args[6] == stop_update: stop.set()
+            return result
         with patch('sys.argv', argv), patch.object(trainer, 'TRAIN_WINDOWS', 40), patch.object(trainer, 'PRIOR_WINDOWS', 4), \
             patch.object(trainer, 'CALIBRATION_WINDOWS', 2), patch.object(trainer, 'make_prepare_config', return_value=pcfg), \
             patch.object(trainer, 'load_manifest', return_value=(manifest, keys, None)), \
@@ -225,7 +258,7 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
             patch.object(trainer, 'NuScenesWindowSource', return_value=SimpleNamespace(nusc=None)), \
             patch.object(columns, 'gt_moving_support_sequence', return_value=moving_fixture(prep)), \
             patch.object(trainer, 'evaluate_columns', side_effect=small_eval), patch.object(trainer, 'train_full_batch', side_effect=step):
-            trainer.main()
+            return trainer.main(stop if stop_update is not None else None)
     out = tmp_path/'run'; run(out, 2)
     summary = json.loads((out/'summary.json').read_text(encoding='utf-8'))
     assert summary['epochs_completed'] == 2 and summary['executed_windows'] == 80
@@ -246,6 +279,15 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
     a, b = (torch.load(p/'last.pt', weights_only=False) for p in (out, recovered))
     assert all(torch.equal(v, b['state_dict'][k]) for k, v in a['state_dict'].items())
     assert a['sampling_rng_state'] == b['sampling_rng_state'] and a['executed_windows'] == b['executed_windows']
+    graceful = tmp_path/'graceful'
+    assert run(graceful, 2, stop_update=4) == 130
+    assert not (graceful/'summary.json').exists()
+    stopped_ck = torch.load(graceful/'last.pt', weights_only=False)
+    assert stopped_ck['attempted_updates'] == 4 and stopped_ck['cursor_batch'] == 4
+    continued = tmp_path/'continued'; run(continued, 2, graceful/'last.pt')
+    continued_ck = torch.load(continued/'last.pt', weights_only=False)
+    assert all(torch.equal(v, continued_ck['state_dict'][k]) for k, v in a['state_dict'].items())
+    assert a['sampling_rng_state'] == continued_ck['sampling_rng_state']
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'extended', 3, out/'last.pt')
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'short', 1, out/'last.pt')
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'bad', 2, out/'candidate.pt')

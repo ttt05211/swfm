@@ -15,6 +15,14 @@ KEEP, ADD, REMOVE = 0, 1, 2
 CONTEXT_DIM = 12
 
 
+def _valid_semantics(values):
+    # Integer labels dominate the hot path; range checks are exactly equivalent
+    # to membership in 0..17 but avoid allocating a full-grid isin lookup result.
+    if np.asarray(values).dtype.kind in 'iu':
+        return not np.any(values < 0) and not np.any(values > FREE)
+    return np.isin(values, np.arange(18)).all()
+
+
 @dataclass(frozen=True)
 class ColumnConfig:
     width: int = 64
@@ -66,7 +74,7 @@ class ColumnPlan:
                 or np.any((self.kind == GENERATE) != (self.actor == -3))
                 or np.any((self.kind == REFINE) & (self.actor < -2))
                 or not np.isin(self.kind, (GENERATE, REFINE)).all()
-                or not np.isin(self.base, np.arange(18)).all() or not np.isin(self.fallback, np.arange(18)).all()):
+                or not _valid_semantics(self.base) or not _valid_semantics(self.fallback)):
             raise ValueError("invalid column plan")
         if (np.any(self.legal[..., ADD] & (self.base != FREE))
                 or np.any(self.legal[..., REMOVE] & ((self.kind[:, None] != REFINE)
@@ -74,7 +82,11 @@ class ColumnPlan:
                                                    | (self.fallback == self.base)))):
             raise ValueError("illegal source ownership/add/remove mask")
         keys = np.column_stack((self.actor, self.xy))
-        if len(np.unique(keys, axis=0)) != n:
+        # No ordering is consumed here, only equality/uniqueness. Integer row
+        # byte keys avoid NumPy's costly per-field lexicographic structured sort.
+        unique = (np.unique(np.ascontiguousarray(keys).view(np.dtype((np.void, keys.dtype.itemsize*3))))
+                  if keys.dtype.kind in 'iu' else np.unique(keys, axis=0))
+        if len(unique) != n:
             raise ValueError("duplicate actor-column query")
 
 
@@ -86,7 +98,7 @@ def action_targets(plan, future_gt):
     """
     plan.validate()
     gt = np.asarray(future_gt)
-    if gt.size <= int(plan.flat.max(initial=-1)) or not np.isin(gt, np.arange(18)).all():
+    if gt.size <= int(plan.flat.max(initial=-1)) or not _valid_semantics(gt):
         raise ValueError("invalid future supervision grid")
     g = gt.reshape(-1)[plan.flat]
     y = np.zeros_like(plan.base, dtype=np.int64)

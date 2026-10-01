@@ -24,8 +24,11 @@ class ColumnFeatureSampler:
         self.transforms = {}; self.members = {}
         inverse_history = [np.linalg.inv(t) for t in prepared.raw['history_poses']]
         future_pose = prepared.raw['future_poses'][h]
-        with ThreadPoolExecutor(max_workers=max(1, min(int(workers), 6))) as pool:
-            self._build(plan, inverse_history, future_pose, motion_factory, max_cache_mib, pool)
+        if int(workers) <= 1:
+            self._build(plan, inverse_history, future_pose, motion_factory, max_cache_mib, None)
+        else:
+            with ThreadPoolExecutor(max_workers=min(int(workers), 6)) as pool:
+                self._build(plan, inverse_history, future_pose, motion_factory, max_cache_mib, pool)
 
     def _build(self, plan, inverse_history, future_pose, motion_factory, max_cache_mib, pool):
         grid = self.grid
@@ -99,29 +102,35 @@ class ColumnFeatureSampler:
         # Single static map shared by generation + static refine, six frames
         # parallelized only here; no nested pools and no CUDA work in threads.
         frames = [None]*6
-        for f, mapped in zip(active, pool.map(frame, active)): frames[f] = mapped
+        mapped_frames = map(frame, active) if pool is None else pool.map(frame, active)
+        for f, mapped in zip(active, mapped_frames): frames[f] = mapped
         for f in range(6):
             if frames[f] is None: frames[f] = (np.full(shape, UNKNOWN, np.uint8), np.zeros(shape, np.uint8))
         return lo, np.stack([v[0] for v in frames]), np.stack([v[1] for v in frames])
 
     def _sparse(self, plan, actor):
         """Same reference arithmetic, reusing inverses for uncached/small actors."""
-        n, p, z = len(plan), self.p, self.z
+        # Several frontier queries attend the SAME nearest causal anchor. Warp
+        # each distinct anchor only once, then restore exact original query order.
+        # Class membership is applied after expansion (GEN/static may differ).
+        centres, inverse = np.unique(plan.evidence_xy, axis=0, return_inverse=True)
+        n, p, z = len(centres), self.p, self.z
         hist = np.full((n, 6, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
         offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing='ij'), -1)
-        idx = offsets[None]+np.pad(plan.evidence_xy, ((0, 0), (0, 1)))[:, None, None, None, :]
+        idx = offsets[None]+np.pad(centres, ((0, 0), (0, 1)))[:, None, None, None, :]
         xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
-        inherited = np.repeat(plan.classes, p*p*z) if actor < 0 else None
         for f, transform in enumerate(self.transforms[actor]):
             if transform is None: continue
             ijk = np.floor((transform_points(xyz, transform)-self.origin)/self.step).astype(np.int64)
             valid = ((ijk >= 0)&(ijk < self.shape)).all(1); at = tuple(ijk[valid].T)
             labels = np.full(len(ijk), UNKNOWN, np.uint8); bits = np.zeros(len(ijk), np.uint8)
             labels[valid] = self.history[f][at]; bits[valid] = self.observed[f][at].astype(np.uint8)
-            owned = (labels[valid] == inherited[valid]) if actor < 0 else np.isin(
-                np.ravel_multi_index(ijk[valid].T, tuple(self.shape)), self.members[actor][f])
-            bits[valid] |= owned.astype(np.uint8)*2
+            if actor >= 0:
+                owned = np.isin(np.ravel_multi_index(ijk[valid].T, tuple(self.shape)), self.members[actor][f])
+                bits[valid] |= owned.astype(np.uint8)*2
             hist[:, f] = labels.reshape(n, p, p, z); flags[:, f] = bits.reshape(n, p, p, z)
+        hist, flags = hist[inverse], flags[inverse]
+        if actor < 0: flags |= (hist == plan.classes[:, None, None, None, None]).astype(np.uint8)*2
         return hist, flags
 
     def sample(self, plan, reference_sampler):
