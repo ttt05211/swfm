@@ -193,19 +193,57 @@ def predict(model, record, device, config):
     return out
 
 
-def evaluate_models(provider, source, records, models, config, *, progress=None, prediction_fn=None):
+def evaluate_models(provider, source, records, models, config, *, progress=None, prediction_fn=None,
+                    population_groups=None, population_complete_fn=None):
     """Shared raw/Strong/base/support pass for all selected AND last candidates.
 
     Optional prediction_fn(model, record, device, config, base) lets an XY-only
     candidate reuse the frozen per-window baseline output, without repeating
     its forward or changing the existing full-model evaluation path.
+
+    Named populations accumulate the SAME integer counts in this one pass.
+    No second raw load, forward, renderer or metric scan for nested subsets.
     """
     names = ("V18_BASE", *models)
-    metrics = {k: Metrics() for k in names}
-    scenes = defaultdict(lambda: {k: Metrics() for k in names})
-    errors = {k: MotionErrors() for k in names}
-    quality = {k: defaultdict(int) for k in models}
+    groups = {"all": None}
+    membership = None
+    if population_groups is not None:
+        keys = tuple((str(r["scene_name"]), str(r["t0_token"])) for r in records)
+        if len(keys) != len(set(keys)):
+            raise RuntimeError("duplicate evaluation identities")
+        groups["all"] = frozenset(keys)
+        for name, selected in population_groups.items():
+            selected = tuple((str(a), str(b)) for a, b in selected)
+            if name == "all" or not selected or len(selected) != len(set(selected)):
+                raise RuntimeError("invalid/empty/duplicate evaluation population")
+            if not set(selected) <= groups["all"]:
+                raise RuntimeError("evaluation population contains missing keys")
+            groups[name] = frozenset(selected)
+        membership = {key: tuple(g for g, selected in groups.items() if key in selected) for key in keys}
+    metrics = {g: {k: Metrics() for k in names} for g in groups}
+    scenes = {g: defaultdict(lambda: {k: Metrics() for k in names}) for g in groups}
+    errors = {g: {k: MotionErrors() for k in names} for g in groups}
+    quality = {g: {k: defaultdict(int) for k in models} for g in groups}
+    remaining = {g: len(selected) for g, selected in groups.items() if selected is not None}
+    completed = {}
+
+    def report_group(group):
+        baseline = metrics[group]["V18_BASE"].compute()
+        reports = {}
+        for name in models:
+            current = metrics[group][name].compute()
+            report = {"metrics": current, "delta_vs_v18_pp": delta(current, baseline),
+                      "scene_delta": _scene_delta(scenes[group], name),
+                      "motion_errors": errors[group][name].compute(), "edit_quality": dict(quality[group][name])}
+            report["gate"] = xy_screen_gate(report)
+            reports[name] = report
+        result = {"baseline": baseline, "baseline_motion_errors": errors[group]["V18_BASE"].compute(), "variants": reports}
+        if membership is not None:
+            result.update(windows=len(groups[group]), scenes=len(scenes[group]))
+        return result
+
     for wi, rec in enumerate(records, 1):
+        active = membership[(str(rec["scene_name"]), str(rec["t0_token"]))] if membership is not None else ("all",)
         print(f"paired_eval={wi}/{len(records)} variants={len(models)}", flush=True)
         window, raw, state, base = provider.prepare(source, rec, include_gt=True)
         if wi == 1:
@@ -228,7 +266,8 @@ def evaluate_models(provider, source, records, models, config, *, progress=None,
                  tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
         before = [Metrics.counts(baseline[h], raw["future_gt_occ"][h], moving[h][0], 17) for h in (1, 3, 5)]
         for name, out in outputs.items():
-            errors[name].update(rec, out)
+            for group in active:
+                errors[group][name].update(rec, out)
             pred = [baseline[h] for h in (1, 3, 5)] if name == "V18_BASE" else render_outputs(state, provider.pcfg, out)
             for ri, h in enumerate((1, 3, 5)):
                 gt, b = raw["future_gt_occ"][h], baseline[h]
@@ -236,22 +275,28 @@ def evaluate_models(provider, source, records, models, config, *, progress=None,
                 if wi == 1 and any(not np.array_equal(a, z) for a, z in
                         zip(counts, Metrics.counts(pred[ri], gt, moving[h][0], 17))):
                     raise RuntimeError("changed-cell/full-grid metric mismatch")
-                metrics[name].update(ri, counts=counts)
-                scenes[window.scene_name][name].update(ri, counts=counts)
-                if name in quality:
-                    for key, value in edit_quality(b, pred[ri], gt).items():
-                        quality[name][key] += value
+                edits = edit_quality(b, pred[ri], gt) if name in models else None
+                for group in active:
+                    metrics[group][name].update(ri, counts=counts)
+                    scenes[group][window.scene_name][name].update(ri, counts=counts)
+                    if edits is not None:
+                        for key, value in edits.items():
+                            quality[group][name][key] += value
+        for group in active:
+            if group in remaining:
+                remaining[group] -= 1
+                if remaining[group] == 0:
+                    completed[group] = report_group(group)
+                    if population_complete_fn:
+                        population_complete_fn(group, completed[group])
         if progress:
             progress({"event": "evaluation", "window": wi, "windows": len(records)})
-    baseline = metrics["V18_BASE"].compute()
-    reports = {}
-    for name in models:
-        report = {"metrics": metrics[name].compute(), "delta_vs_v18_pp": delta(metrics[name].compute(), baseline),
-                  "scene_delta": _scene_delta(scenes, name), "motion_errors": errors[name].compute(),
-                  "edit_quality": dict(quality[name])}
-        report["gate"] = xy_screen_gate(report)
-        reports[name] = report
-    return {"baseline": baseline, "baseline_motion_errors": errors["V18_BASE"].compute(), "variants": reports}
+    if any(remaining.values()):
+        raise RuntimeError("evaluation population incomplete")
+    result = completed.get("all") if membership is not None else report_group("all")
+    if membership is not None:
+        result["populations"] = {g: r for g, r in completed.items() if g != "all"}
+    return result
 
 
 def forecast(provider, source, record, model, config=InteractionConfig()):

@@ -16,6 +16,7 @@ from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldMo
 from tools.real_motion import v18_xy_specialist_common as common
 from tools.real_motion import train_p0_f9_v18_xy_specialist as trainer
 from tools.real_motion import v18_source_interaction_common as evaluator
+from tools.real_motion import eval_p0_f9_v18_xy_specialist as expanded
 
 CFG = LocalSTWMV17Config(d_model=16, semantic_dim=8, heads=4, blocks=1, decoder_blocks=1)
 
@@ -283,3 +284,150 @@ def test_full_cli_paired_synthetic_smoke_saves_calibrated_candidates_and_real_me
         ck_saved = torch.load(path, weights_only=False)
         with pytest.raises(RuntimeError, match="cannot be deployed"):
             common.load_candidate(path, "cpu", base_sha="a"*64, config_sha=ck_saved["runtime_config_fingerprint"])
+
+
+def test_expanded_population_adds_scenes_not_just_windows_and_preserves_identities():
+    rows = [dict(scene_name=f"dev{s}", t0_token=f"d{s}_{i}")
+            for s in range(150) for i in range(29+(s < 19))]
+    assert len(rows) == 4369
+    parent = [(r["scene_name"], r["t0_token"]) for r in rows if int(r["scene_name"][3:]) < 18][:512]
+    dev64 = parent[::8][:64]
+    manifest = {"parent_keys": parent}
+    selected, keys, groups = expanded.plan_populations(rows, manifest, dev64, population="full4369")
+    assert len(selected) == len(set(keys)) == 4369 and keys[:64] == tuple(dev64)
+    assert len({s for s, _ in groups["new_scenes_only"]}) == 132
+    assert not {s for s, _ in groups["new_scenes_only"]} & {s for s, _ in parent}
+    _, small, small_groups = expanded.plan_populations(rows, manifest, dev64, population="dev512")
+    assert len(small) == 512 and small[:64] == tuple(dev64)
+    assert list(small_groups) == ["dev64_reproduction"]
+    with pytest.raises(RuntimeError, match="duplicate"):
+        expanded.plan_populations(rows+[rows[0]], manifest, dev64, population="full4369")
+    with pytest.raises(RuntimeError, match="missing"):
+        expanded.plan_populations(rows[1:], manifest, dev64, population="full4369")
+    with pytest.raises(RuntimeError, match="150-scene"):
+        expanded.plan_populations(rows[:-1], manifest, dev64, population="full4369")
+
+
+def evaluation_fixture():
+    state, pcfg, raw = render_fixture()
+    base = LocalSpatialTemporalWorldModelV18SE2(CFG)
+    with torch.no_grad():
+        base.residual_head.weight.zero_(); base.residual_head.bias.zero_()
+    calls = []
+    def prepare(source, r, include_gt):
+        calls.append(common.record_key(r))
+        assert include_gt is True
+        return (SimpleNamespace(scene_name=r["scene_name"], t0_token=r["t0_token"], future_tokens=r["future_tokens"]),
+                raw, {**state, "rec": r}, base_outputs(base, r))
+    provider = SimpleNamespace(device=torch.device("cpu"), model=base, pcfg=pcfg, strong=None,
+                               workers=1, sha="a"*64, prepare=prepare)
+    return provider, raw, calls
+
+
+def patch_renderer(raw):
+    from contextlib import ExitStack
+    stack = ExitStack()
+    stack.enter_context(patch.object(evaluator.runtime, "_stage_gpu_inputs"))
+    stack.enter_context(patch.object(evaluator.runtime, "_release_gpu_inputs"))
+    stack.enter_context(patch.object(evaluator, "assert_forward_exact"))
+    stack.enter_context(patch.object(evaluator.runtime, "_exactness_check"))
+    stack.enter_context(patch.object(evaluator, "gt_moving_support_sequence",
+        return_value=[(np.ones_like(raw["future_gt_occ"][0], bool), None)]*6))
+    return stack
+
+
+def test_population_reports_equal_separate_evaluation_without_repeated_prepare():
+    provider, raw, calls = evaluation_fixture()
+    rows = [record(1, f"dev{i%2}", f"d{i}") for i in range(4)]
+    candidate = copy.deepcopy(provider.model)
+    with torch.no_grad(): candidate.residual_head.bias[0] = 1.
+    completed = []
+    keys = tuple(common.record_key(r) for r in rows)
+    with patch_renderer(raw):
+        combined = evaluator.evaluate_models(provider, SimpleNamespace(nusc=None), rows, {"last": candidate}, None,
+            prediction_fn=common.predict, population_groups={"first": keys[:2], "overlap": keys[1:]},
+            population_complete_fn=lambda g, r: completed.append((g, len(calls))))
+        assert calls == list(keys) and completed == [("first", 2), ("all", 4), ("overlap", 4)]
+        separate = evaluator.evaluate_models(provider, SimpleNamespace(nusc=None), rows[:2], {"last": candidate}, None,
+                                              prediction_fn=common.predict)
+    assert combined["populations"]["first"]["windows"] == 2
+    assert combined["populations"]["overlap"]["windows"] == 3
+    from tools.real_motion.static_evidence_selector_common import finite_json
+    first = {k: v for k, v in combined["populations"]["first"].items() if k not in ("windows", "scenes")}
+    assert finite_json(first) == finite_json(separate)
+    assert first["variants"]["last"]["delta_vs_v18_pp"]["mIoU"] > 0
+    for groups in ({"all": keys}, {"empty": []}, {"duplicate": [keys[0]]*2}, {"missing": [("other", "absent")]}):
+        with pytest.raises(RuntimeError, match="population"):
+            evaluator.evaluate_models(provider, None, rows, {}, None, population_groups=groups)
+
+
+def test_expanded_cli_reproduces_dev64_in_single_512_pass_and_leaves_checkpoints_unchanged(tmp_path):
+    from real_motion.v21_source_induction import stable_json_fingerprint
+    from real_motion.runtime_config import load_runtime_config
+    from tools.real_motion.static_evidence_selector_common import write_json
+    provider, raw, calls = evaluation_fixture()
+    rows = [record(1, "dev", f"d{i}") for i in range(512)]
+    keys = [common.record_key(r) for r in rows]
+    manifest = {"parent_keys": keys, "selected_key_fingerprint": trainer.DEV64_FP,
+                "manifest_fingerprint": "b"*64}
+    config = Path(__file__).resolve().parents[1]/"configs/real_motion_occfm.yaml"
+    config_sha = stable_json_fingerprint(load_runtime_config(config, []))
+    train = [("train", f"t{i}") for i in range(4086)]
+    cal = [("cal", f"c{i}") for i in range(64)]
+    identity = dict(protocol=common.PROTOCOL, mode="screen", train_keys=train, calibration_keys=cal, dev_keys=keys[:64],
+                    population_fingerprint=stable_json_fingerprint({"train": train, "calibration": cal}),
+                    dev_manifest_fingerprint=manifest["manifest_fingerprint"], base_checkpoint_sha256=provider.sha,
+                    runtime_config_fingerprint=config_sha,
+                    deployment_contract="specialist_XY_plus_frozen_CleanE14_yaw_existence_two_forward_v1")
+    model_dir = tmp_path/"original"; model_dir.mkdir()
+    write_json(model_dir/"execution_contract.json", identity)
+    models = {}
+    for arm in common.ARMS:
+        last = copy.deepcopy(provider.model)
+        with torch.no_grad(): last.residual_head.bias[0] = 1.
+        models[arm+"_last"] = last
+        for suffix, model, role, update in (
+            ("best", provider.model, "selected_xy_specialist_candidate", 0),
+            ("last", last, "last_xy_specialist_diagnostic", 3)):
+            torch.save(trainer.checkpoint_payload({**identity, "arm": arm}, model, role=role, update=update),
+                       model_dir/(arm+"_"+suffix+".pt"))
+    with patch_renderer(raw):
+        previous_dev = evaluator.evaluate_models(provider, SimpleNamespace(nusc=None), rows[:64], models, None,
+                                                prediction_fn=common.predict)
+    aliases = {arm+"_selected": "V18_BASE" for arm in common.ARMS}
+    expanded.attach_baseline_aliases(previous_dev, aliases, keys[:64])
+    previous = dict(protocol=common.PROTOCOL, mode="screen", updates_per_arm=3, dev=previous_dev,
+                    arms={arm: {"selected_update": 0} for arm in common.ARMS})
+    write_json(model_dir/"summary.json", previous)
+    digests = {p.name: expanded.sha256(p) for p in model_dir.iterdir()}
+    calls.clear()
+    inputs = {k: tmp_path/k for k in ("dev-cache", "population-manifest", "base-checkpoint", "dev-info")}
+    for path in inputs.values(): path.touch()
+    argv = ["evaluate", "--config", str(config), "--model-dir", str(model_dir), "--out-dir", str(tmp_path/"expanded"),
+            "--dataroot", str(tmp_path), "--device", "cpu", "--population", "dev512"]
+    for k, path in inputs.items(): argv += ["--"+k, str(path)]
+    with patch("sys.argv", argv), patch_renderer(raw), \
+         patch.object(expanded, "make_prepare_config", return_value=provider.pcfg), \
+         patch.object(expanded, "load_manifest", return_value=(manifest, keys[:64], None)), \
+         patch.object(expanded, "load_cache", return_value=({}, rows)), \
+         patch.object(expanded, "FrozenXYV18", return_value=provider), \
+         patch.object(expanded, "NuScenesWindowSource", return_value=SimpleNamespace(nusc=None)):
+        expanded.main()
+    result = json.loads((tmp_path/"expanded/summary.json").read_text(encoding="utf-8"))
+    assert result["windows"] == len(calls) == len(set(calls)) == 512
+    assert result["dev64_reproduction"]["max_abs_difference_pp"] == 0.
+    assert result["reports"]["dev64_reproduction"]["windows"] == 64
+    assert sum(v["baseline_alias_verified"] for v in result["checkpoint_audit"].values()) == 2
+    assert not list((tmp_path/"expanded").glob("*.pt"))
+    assert {p.name: expanded.sha256(p) for p in model_dir.iterdir()} == digests
+    assert "no_retraining_or_checkpoint_reselection" in result["route"]
+    broken = copy.deepcopy(previous)
+    broken["dev"]["baseline"]["mIoU"] += .001
+    with pytest.raises(RuntimeError, match="reproduction mismatch"):
+        expanded.check_dev64_reproduction(previous_dev, broken)
+    bad_path = model_dir/(common.ARMS[0]+"_best.pt")
+    ck = torch.load(bad_path, weights_only=False)
+    ck["state_dict"]["residual_head.bias"][0] += 1.
+    torch.save(ck, bad_path)
+    with pytest.raises(RuntimeError, match="update0 checkpoint weights differ"):
+        expanded.read_bundle(model_dir, provider, config_sha, manifest, keys[:64])

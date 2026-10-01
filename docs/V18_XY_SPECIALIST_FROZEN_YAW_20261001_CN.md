@@ -98,3 +98,43 @@ bash tools/real_motion/run_p0_f9_v18_xy_specialist_20pct.sh screen
 - 自动验证：XY/core确实有梯度、head参数不变、最终 yaw/existence 与冻结输出逐元素相同；
   改动/删除未来标签不改变 forward；六帧部署只请求 include_gt=False；GT课程末段为零。
 - 本地仅用项目安全虚拟环境，不调用故障的 Anaconda base。没有服务器数据/GPU，尚未跑真实screen。
+
+## 已完成训练后的扩大验证
+
+用户返回真实 screen 结果：两组 selected_update=0；last 的 dev64 ΔmIoU 分别
++0.184729/+0.162832pp，但 ΔMovingMicro 为 -0.151142/-0.256194pp。
+因此扩大样本只检验已有固定模型的泛化，不依据新验证集重新选epoch或改写screen_pass。
+
+注意冻结dev64与dev512都来自18个scene；512只是更多窗口，并不是更多独立场景。
+默认一趟验证完整 **4369窗口、150场景**，并复用同一批raw integer counts输出：
+
+- full4369：原科学基线的全验证population。
+- dev64_reproduction：先精确复现旧64窗口；整体/1/2/3s指标误差需≤1e-8pp。
+- frozen_dev512：按dev64 manifest中的512个parent keys，无需另建V18_DEV512。
+- new_scenes_only：排除整个冻结dev512的18个场景，单独看其余132个scene。
+
+dev64先处理，若无法复现旧结果则立即报错，不继续把差异归因于更大population。
+所有组共用每窗口一次raw/Strong/E14/Moving support/渲染和metric count计算。
+两份update0 best只有逐参数验证等于E14后才复用基线，不重复神经前向或渲染。
+原checkpoint按SHA256记录、评估后重新核验；不存新模型，不覆盖原run。
+每个population完成即保存JSON报告，最终只有一份汇总summary.txt。
+
+```bash
+conda activate OccFM
+cd /root/nas/occ/swfm
+git fetch https://ghfast.top/https://github.com/ttt05211/swfm.git feature/v22-causal-emergence-tokens
+git merge --ff-only FETCH_HEAD
+bash tools/real_motion/run_p0_f9_v18_xy_specialist_validation.sh full4369
+```
+
+脚本默认读取用户报告中的真实目录：
+`outputs/p0_f9_v18_xy_specialist/screen20_20261001_103415_e5a122a/model`。
+可用`V18_XYS_EVAL_MODEL_DIR`显式指定另一已完成screen run；不自动猜“最新目录”。
+可选`dev512`仅作缩小预算验证，不声称增加场景数。按旧dev64共享评估耗时粗估full4369
+约一小时，实际由I/O和CPU renderer决定；脚本不断打印进度，不要求重跑训练或新oracle。
+
+扩大验证入口本地验收：专项与source-interaction回归32 passed；dependency-light全仓库
+646 passed / 4 skipped / 1 deselected（28条原有warnings）；447个Python文件AST、Bash语法检查通过。
+新增synthetic验证覆盖4369/150场景population规划、重叠子集与独立评估整数统计一致、
+dev64先复现、一次512窗口prepare且不重复读取、update0实际权重等于E14才能复用、
+源checkpoint所有字节保持不变及不保存新模型。真实服务器扩大验证尚未运行。
