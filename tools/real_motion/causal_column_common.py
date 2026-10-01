@@ -93,6 +93,7 @@ class PreparedColumns:
     source_audit: dict
     outputs: dict | None = None
     aligned_history_points: list | None = None
+    fixed_candidate_geometry: list | None = None
 
 
 class FrozenColumns(FrozenXYV18):
@@ -109,7 +110,15 @@ class FrozenColumns(FrozenXYV18):
             raw = self.load_raw_columns(source, record, include_gt=include_gt) if raw_window is None else raw_window
             if not include_gt and raw.get('future_gt_occ') is not None:
                 raise RuntimeError('causal deployment must not request future occupancy')
-            state = runtime._prepare_record(record, source, self.pcfg, self.strong, self.device, raw_window=raw)
+            causal = raw.get('_column_causal_preparation')
+            fixed_state = causal.get('prepared_state') if causal is not None else None
+            if fixed_state is not None:
+                state = {**fixed_state, 'rec': record, 'window': window, 'gpu': None}
+                if (len(state['current']) != len(record['features'])
+                        or [int(c['class_id']) for c in state['current']] != record['source_class_id'].tolist()):
+                    raise RuntimeError('cached Strong/source identity mismatch')
+            else:
+                state = runtime._prepare_record(record, source, self.pcfg, self.strong, self.device, raw_window=raw)
             centers = world_points_to_t0(np.asarray([c['centroid_world'] for c in state['current']]).reshape(-1, 3),
                                         state['current_pose'])[:, :2]
             if not np.allclose(centers, numpy(record['source_centroid_xy_t0_m']), rtol=0, atol=2e-4):
@@ -155,7 +164,8 @@ class FrozenColumns(FrozenXYV18):
             "source_history": history_at-renderer_at, "static_memory_and_footprint": time.perf_counter()-history_at}
         return PreparedColumns(window, raw, state, baseline, owners, fallbacks, components, targets, yaws,
                                registrations, footprints, memory, audit, outputs,
-                               causal.get('aligned_history_points') if causal is not None else None)
+                               causal.get('aligned_history_points') if causal is not None else None,
+                               causal.get('fixed_candidate_geometry') if causal is not None else None)
 
 
 def render_column_layers(state, record, outputs, grid):
@@ -169,12 +179,36 @@ def render_column_layers(state, record, outputs, grid):
         yy = [renderer_yaw_delta(int(c["class_id"]), yaw[i, h], zero_two_wheel_yaw=False) for i, c in enumerate(state["current"])]
         layers = runtime._rasterize_all_sources_horizon(state["current"], state["source_world_points"], state["source_rel_xy"],
                                                        centers, yy, state["world_to_future"][h], grid)
-        background = compose_component_replacements_fast_exact(state["anchors"][h], state["baseline_by_hi"][h], [],
-            dynamic_class_ids=DYN, free_label=FREE, grid=grid,
-            precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][h])
+        if 'column_backgrounds' in state: background = state['column_backgrounds'][h]
+        else:
+            background = compose_component_replacements_fast_exact(state["anchors"][h], state["baseline_by_hi"][h], [],
+                dynamic_class_ids=DYN, free_label=FREE, grid=grid,
+                precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][h])
         b, own, fall = component_layers(background, layers)
         baseline.append(b); owners.append(own); fallbacks.append(fall); components.append(layers); targets.append(centers); yaws.append(yy)
     return baseline, owners, fallbacks, components, targets, yaws
+
+
+def fixed_candidate_geometry(memory, footprints, grid, config):
+    """History/ego-only frontier, semantics and vertical support; never scores/GT."""
+    out = []
+    for m, footprint in zip(memory, footprints):
+        frontier = build_surface_frontier(m, footprint, class_ids=(11, 13), widths_m=(config.entry_radius_m,),
+                                         voxel_size_xy_m=grid.voxel_size[0], free_label=FREE)
+        counts = np.stack([(m == c).sum(2) for c in (11, 13)], -1)
+        historical = (m == 11)|(m == 13)
+        out.append(dict(radius=config.entry_radius_m, frontier=frontier,
+            dominant=np.asarray((11, 13), np.uint8)[counts.argmax(-1)], historical=historical,
+            static_allowed=binary_dilation(historical, structure=np.ones((1, 1, 3)), iterations=1)))
+    return out
+
+
+def padded_support_xy(xy, shape, padding=1):
+    """Exact full-grid binary dilation/argwhere order on a source-local bbox."""
+    lo = np.maximum(np.asarray(xy).min(0)-padding, 0)
+    hi = np.minimum(np.asarray(xy).max(0)+padding+1, shape)
+    support = np.zeros(tuple(hi-lo), bool); at = np.asarray(xy)-lo; support[tuple(at.T)] = True
+    return np.argwhere(binary_dilation(support, iterations=padding))+lo
 
 
 def candidate_plan(prepared, h, grid, config=ColumnConfig()):
@@ -185,10 +219,12 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
     if z != config.z_bins: raise RuntimeError("Z lattice/checkpoint mismatch")
     if not np.isclose(grid.voxel_size[0], grid.voxel_size[1], rtol=0, atol=1e-10):
         raise RuntimeError("frontier distance contract requires an isotropic XY lattice")
-    frontier = build_surface_frontier(m, footprint, class_ids=(11, 13), widths_m=(config.entry_radius_m,),
-                                     voxel_size_xy_m=grid.voxel_size[0], free_label=FREE)
-    counts = np.stack([(m == c).sum(2) for c in (11, 13)], -1)
-    dominant = np.asarray((11, 13), np.uint8)[counts.argmax(-1)]
+    fixed = getattr(prepared, 'fixed_candidate_geometry', None)
+    if fixed is not None and fixed[h]['radius'] == config.entry_radius_m:
+        geometry = fixed[h]
+    else:
+        geometry = fixed_candidate_geometry([m], [footprint], grid, config)[0]
+    frontier, dominant = geometry['frontier'], geometry['dominant']
     rows = []
     def append(xy, kind, actor, classes, allowed_z, ax, ay, age):
         if not len(xy): return
@@ -225,12 +261,11 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
     append(xy, GENERATE, -3, dominant[ax, ay], np.ones((len(xy), z), bool), ax, ay, 0.)
     # Historical road/sidewalk residuals ONLY inside visited grid; not full-scene
     # refinement. Static occupied edits never touch dynamic/source-owned labels.
-    historical = np.isin(m, (11, 13))
+    historical = geometry['historical']
     mismatch = (historical & (m != b)).any(2)
     static = footprint & mismatch & historical.any(2)
     xy = np.argwhere(static)
-    cls = dominant[static]; mask = historical[static]
-    mask = binary_dilation(mask, structure=np.ones((1, 3)), iterations=1)
+    cls = dominant[static]; mask = geometry['static_allowed'][static]
     append(xy, REFINE, -2, cls, mask, xy[:, 0], xy[:, 1], 0.)
     for i, comp in enumerate(prepared.state["current"]):
         registered = prepared.registrations[i]
@@ -250,9 +285,7 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
         ids = np.unique(np.concatenate(all_flat))
         if not len(ids): continue
         xyz = np.column_stack(np.unravel_index(ids, shape))
-        support = np.zeros(shape[:2], bool); support[xyz[:, 0], xyz[:, 1]] = True
-        support = binary_dilation(support, iterations=config.boundary_padding_cells)
-        xy = np.argwhere(support)
+        xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells)
         allowed = np.broadcast_to((np.arange(z) >= max(0, xyz[:, 2].min()-1))
                                   & (np.arange(z) <= min(z-1, xyz[:, 2].max()+1)), (len(xy), z)).copy()
         age = .5*(5-min(f for f, reg in enumerate(registered) if reg is not None))

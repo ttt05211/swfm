@@ -20,6 +20,9 @@ for file in "$FULL_ROOT/configs/real_motion_occfm.yaml" \
   if [[ ! -f "$file" ]]; then echo "[MISSING] $file" >&2; exit 2; fi
 done
 EXTRA=()
+GEOMETRY_CACHE="${FULL_JOINT_GEOMETRY_CACHE_DIR:-$FULL_ROOT/outputs/p0_f9_joint_causal_columns/causal_geometry_cache_v1}"
+EXTRA+=(--causal-geometry-cache "$GEOMETRY_CACHE" --causal-cache-gib "${FULL_JOINT_GEOMETRY_CACHE_GIB:-16}"
+  --causal-cache-ram-mib "${FULL_JOINT_GEOMETRY_CACHE_RAM_MIB:-4096}")
 if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
   if [[ ! -f "$FULL_JOINT_RESUME" ]]; then echo "[MISSING] $FULL_JOINT_RESUME" >&2; exit 2; fi
   EXTRA+=(--resume "$FULL_JOINT_RESUME")
@@ -29,7 +32,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$FULL_ROOT:$FULL_ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 "$PY" -c 'import torch,sys; print(sys.executable,torch.__version__); assert torch.cuda.is_available() and torch.cuda.is_bf16_supported(), "CUDA/BF16 unavailable"'
-"$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_column_runtime_pipeline.py
+"$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_column_runtime_pipeline.py tests/test_causal_geometry_cache.py
 mkdir -p "$RUN_DIR"
 if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
   echo "断点恢复一阶段：$FULL_JOINT_RESUME；原总轮数$EPOCHS，恢复optimizer/RNG/整段余弦，跳过prior。"
@@ -38,6 +41,7 @@ else
 fi
 echo "window batch<=$WINDOWS / source budget=$SOURCES；每轮dev64，最后dev512；不跑full4369。"
 echo "默认不同时训练V18-only对照；E14只作评估参考；不会覆盖旧实验。输出：$RUN_DIR"
+echo "固定因果几何lazy缓存：$GEOMETRY_CACHE；上限${FULL_JOINT_GEOMETRY_CACHE_GIB:-16}GiB；绝不缓存learned poses/labels/features。"
 "$PY" -u tools/real_motion/train_p0_f9_joint_causal_columns_full.py \
   --config "$FULL_ROOT/configs/real_motion_occfm.yaml" \
   --train-cache "$FULL_ROOT/data/p0_f9_v18_se2_train_full.pt" \

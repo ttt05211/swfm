@@ -9,7 +9,8 @@ from real_motion.causal_column_model import column_loss
 from tools.real_motion.joint_column_common import (JointColumnProvider, select_online_columns,
     build_online_column_candidates, sample_online_column, assemble_online_columns, motion_loss, set_lr)
 from tools.real_motion.causal_column_common import (causal_source_history, FEATURE_KEYS,
-    history_grid_footprint_bev_sequence, build_future_static_memory_only, DYN, FREE)
+    history_grid_footprint_bev_sequence, build_future_static_memory_only, fixed_candidate_geometry,
+    compose_component_replacements_fast_exact, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 
 MOTION_KEYS = ('features', 'local_semantic_tube', 'kta_displacement_xy_m',
@@ -18,14 +19,16 @@ LABEL_KEYS = ('supervised_source', 'se2_target_valid', 'target_source_residual_x
     'existence', 'target_yaw_rad', 'yaw_enabled', 'yaw_label_valid', 'target_source_displacement_xy_m')
 
 
-def prepare_causal_evidence(raw, pcfg, strong, workers):
+def prepare_causal_evidence(raw, pcfg, strong, workers, *, state=None, column_config=None):
     """No Torch/CUDA/model/GT access: safe worker-owned immutable evidence."""
     started = time.perf_counter(); grid = pcfg.grid
-    current = runtime.extract_instances_cropped_exact(raw['history_occ'][-1], raw['history_poses'][-1], grid=grid, cfg=strong)
-    previous = runtime.extract_instances_cropped_exact(raw['history_occ'][-2], raw['history_poses'][-2], grid=grid, cfg=strong)
-    velocity = runtime.match_instances(previous, current, float(pcfg.frame_dt_s), max_speed_mps=strong.max_match_speed_mps)
-    state = {'current': current, 'velocities': velocity,
-        'source_world_points': [rigid_source_points_world(c['voxel_indices'], raw['history_poses'][-1], grid=grid) for c in current]}
+    if state is None:
+        current = runtime.extract_instances_cropped_exact(raw['history_occ'][-1], raw['history_poses'][-1], grid=grid, cfg=strong)
+        previous = runtime.extract_instances_cropped_exact(raw['history_occ'][-2], raw['history_poses'][-2], grid=grid, cfg=strong)
+        velocity = runtime.match_instances(previous, current, float(pcfg.frame_dt_s), max_speed_mps=strong.max_match_speed_mps)
+        state = {'current': current, 'velocities': velocity,
+            'source_world_points': [rigid_source_points_world(c['voxel_indices'], raw['history_poses'][-1], grid=grid) for c in current]}
+    current = state['current']
     registrations, _, _, audit = causal_source_history(raw['history_occ'], raw['history_poses'], state, grid, strong, workers)
     aligned = [[None if reg is None else transform_points(
         rigid_source_points_world(reg[1], raw['history_poses'][f], grid=grid), reg[0])
@@ -33,15 +36,41 @@ def prepare_causal_evidence(raw, pcfg, strong, workers):
     footprint = history_grid_footprint_bev_sequence(raw['history_poses'], raw['future_poses'], grid, workers=workers)
     memory = build_future_static_memory_only(raw['history_occ'], raw['history_observed'], raw['history_poses'], raw['future_poses'],
         grid=grid, dynamic_class_ids=DYN, free_label=FREE, workers=workers)
-    return {'current': current, 'registrations': registrations, 'aligned_history_points': aligned,
+    result = {'current': current, 'registrations': registrations, 'aligned_history_points': aligned,
             'audit': audit, 'footprints': footprint,
             'memory': memory, 'seconds': time.perf_counter()-started}
+    if column_config is not None:
+        result['fixed_candidate_geometry'] = fixed_candidate_geometry(memory, footprint, grid, column_config)
+    return result
+
+
+def build_fixed_geometry(raw, record, pcfg, strong, workers, column_config):
+    # Runtime's CPU path contains no model forward/CUDA and uses the frozen
+    # bit-exact Strong implementation. First-use exactness still gates it live.
+    state = runtime._prepare_record(record, None, pcfg, strong, 'cpu', raw_window=raw)
+    state['column_backgrounds'] = [compose_component_replacements_fast_exact(a, comps, [],
+        dynamic_class_ids=DYN, free_label=FREE, grid=pcfg.grid, precomputed_clear_flat_indices=clear)
+        for a, comps, clear in zip(state['anchors'], state['baseline_by_hi'], state['baseline_clear_flat_by_hi'])]
+    evidence = prepare_causal_evidence(raw, pcfg, strong, workers, state=state, column_config=column_config)
+    # No V18 records/labels, window adapters, GPU inputs or network output may
+    # enter persistent artifacts. Reattach the CURRENT record after cache lookup.
+    evidence['prepared_state'] = {k: v for k, v in state.items() if k not in ('rec', 'window', 'gpu')}
+    return evidence
 
 
 class FullJointColumnProvider(JointColumnProvider):
     def load_raw_columns(self, source, record, *, include_gt):
         raw = super().load_raw_columns(source, record, include_gt=include_gt)
-        raw['_column_causal_preparation'] = prepare_causal_evidence(raw, self.pcfg, self.strong, self.workers)
+        cache = getattr(self, 'causal_geometry_cache', None)
+        tick = time.perf_counter()
+        if cache is None:
+            evidence = prepare_causal_evidence(raw, self.pcfg, self.strong, self.workers)
+            hit = False
+        else:
+            evidence, hit = cache.get_or_build((str(record['scene_name']), str(record['t0_token'])), raw,
+                lambda: build_fixed_geometry(raw, record, self.pcfg, self.strong, min(self.workers, 3), self.joint.columns.config))
+        raw['_column_causal_preparation'] = evidence
+        raw['_causal_geometry_cache_hit'] = hit; raw['_causal_geometry_seconds'] = time.perf_counter()-tick
         return raw
 
 
@@ -58,19 +87,30 @@ def prefetch_column_batches(provider, source, records, batch_size, source_budget
         if rows: yield rows
     iterator = iter(groups())
     def group(): return next(iterator, [])
+    io = None
     def load(rows):
+        if io is not None:
+            raws = list(io.map(lambda r: provider.load_raw_columns(source, r, include_gt=True), rows))
+            return list(zip(rows, raws))
         return [(r, provider.load_raw_columns(source, r, include_gt=True)) for r in rows]
     rows = group()
     if not rows: return
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pending = pool.submit(load, rows)
-        try:
-            while rows:
-                batch = pending.result(); rows = group()
-                pending = pool.submit(load, rows) if rows else None
-                yield batch
-        finally:
-            if pending is not None: pending.cancel()
+    if getattr(provider, 'causal_geometry_cache', None) is not None:
+        io = ThreadPoolExecutor(max_workers=2)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(load, rows)
+            try:
+                while rows:
+                    batch = pending.result(); rows = group()
+                    pending = pool.submit(load, rows) if rows else None
+                    yield batch
+            finally:
+                if pending is not None: pending.cancel()
+    finally:
+        # Join the outer loader before closing the inner window pool: an
+        # in-flight next-batch loader may not have called io.map yet.
+        if io is not None: io.shutdown(wait=True, cancel_futures=True)
 
 
 def epoch_order(length, seed, epoch):
@@ -165,5 +205,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'online_candidate_worker_seconds_sum': candidate_worker_seconds,
         'online_selection_seconds': selection_seconds, 'online_feature_wait_seconds': feature_wait_seconds,
         'online_worker_seconds_sum': worker_seconds, 'online_sampling_workers': workers,
+        'causal_geometry_cache_hits': sum(bool(raw.get('_causal_geometry_cache_hit')) for _, raw in rows if raw is not None),
+        'causal_geometry_worker_seconds_sum': sum(float(raw.get('_causal_geometry_seconds', 0.)) for _, raw in rows if raw is not None),
         'peak_memory_mib': torch.cuda.max_memory_allocated(provider.device)/2**20 if provider.device.type == 'cuda' else None,
         **stats, **column_stats}

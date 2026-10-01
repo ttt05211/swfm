@@ -763,6 +763,10 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
         runtime_device=device,
     )
     for hi in range(FUTURE_FRAMES):
+        # Preparation may now be reused from a CPU-only causal cache. Checking
+        # only a freshly recomputed CUDA anchor would not validate that state.
+        if not np.array_equal(ref_anchor[hi], state['anchors'][hi]):
+            raise RuntimeError(f'runtime prepared Strong anchor mismatch hi={hi}')
         if not np.array_equal(ref_anchor[hi], fast_anchor[hi]):
             n = int(np.count_nonzero(ref_anchor[hi] != fast_anchor[hi]))
             raise RuntimeError(f"runtime fast Strong mismatch hi={hi} voxels={n}")
@@ -787,6 +791,13 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
                 grid=pcfg.grid,
             )
             ref_baseline.append(rb)
+            cached_rows = state['baseline_by_hi'][hi]
+            if (i >= len(cached_rows) or int(cached_rows[i].class_id) != int(rb.class_id)
+                    or int(cached_rows[i].source_voxel_count) != int(rb.source_voxel_count)
+                    or not np.array_equal(
+                        np.unique(np.ravel_multi_index(cached_rows[i].voxel_indices.T, pcfg.grid.shape_hwd)),
+                        np.unique(np.ravel_multi_index(rb.voxel_indices.T, pcfg.grid.shape_hwd)))):
+                raise RuntimeError(f'runtime prepared Strong baseline footprint mismatch hi={hi} source={i}')
             if i >= len(fast_base[hi]):
                 raise RuntimeError(
                     f"runtime Strong baseline source-count mismatch hi={hi}"
@@ -804,6 +815,8 @@ def _exactness_check(model, state, pcfg, strong_cfg, device):
                 f"runtime Strong baseline source-count mismatch hi={hi}: "
                 f"ref={len(ref_baseline)} fast={len(fast_base[hi])}"
             )
+        if len(ref_baseline) != len(state['baseline_by_hi'][hi]):
+            raise RuntimeError(f'runtime prepared Strong baseline count mismatch hi={hi}')
         ref_clear = baseline_clear_mask(ref_baseline, grid=pcfg.grid)
         if not np.array_equal(ref_clear, state["baseline_clear_by_hi"][hi]):
             raise RuntimeError(f"runtime Strong baseline CLEAR mismatch hi={hi}")

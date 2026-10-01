@@ -24,9 +24,9 @@
 
 新增 **一整批NEXT raw/history evidence的CPU prefetch**，可与主线程当批的renderer、online sampling和GPU训练重叠。只预取下一批，不提前装下整个epoch。
 
-预计算仅包含：因果history-source association/ICP、历史footprint和static memory。worker不访问Torch/CUDA/model或GT来构建这些证据；主线程重新提取的current source与worker逐元素核验。
+预计算包含：因果history-source association/ICP、历史footprint和static memory，以及下文追加的固定CPU Strong背景、静态frontier。worker不调用model/CUDA、不读取GT构建证据；current source与记录的类别/中心及prefetched source逐元素核验。
 
-以下内容永不跨更新缓存：learned poses、owner/fallback、候选、action labels、learned features。运动更新后全部在线重建，不出现旧bank错配。来源帧RAM缓存默认TRAIN/dev各256MiB，保持原精确inverse-map采样，不创建新的dense磁盘cache。
+以下内容永不跨更新缓存：learned poses、owner/fallback、完整候选、action labels、learned features。运动更新后全部在线重建，不出现旧bank错配。来源帧RAM缓存默认TRAIN/dev各256MiB，保持原精确inverse-map采样；持久几何采用下文新增的有界压缩cache，不构造learned dense feature bank。
 
 新日志包含windows/sources/query数、prepare与sampling耗时、input wait、LR及CUDA peak memory。每32个batch显示滚动实测seconds/window和remaining training hours；ETA只涵盖训练，不假称包括所有评估/初始化。
 
@@ -52,6 +52,34 @@ bash tools/real_motion/switch_p0_f9_joint_causal_columns_fast.sh \
 ```
 
 975来自用户此次nvidia-smi，切换前仍需核验：脚本读取/proc命令行，严格匹配full入口/原输出目录/config/cache/info/checkpoint/seed；不是目标则拒绝。脚本最多等待30min内下一次atomic last替换，完成后才TERM旧Python，确认退出后后台启动新版并打印新日志。原epochs/window/source/paired-control配置保持不变；不会删除旧目录或影响其他GPU进程。新旧版本数学计算的synthetic输入、RNG及优化更新一致性已检查，真实CUDA最终数值仍以服务器运行为准。
+
+## 固定几何复用补丁（兼容第1422步断点）
+
+用户确认资源：10核/100GB RAM/48GB显存，训练已安全停止。新profile每批4窗口：prepare主线程约0.68–0.79s、online约0.76s（候选等待0.41–0.61s，feature等待0.10–0.27s），总计1.62–2.12s。GPU低占用与CPU准备吻合；不是单纯把batch加大可解决的问题。
+
+本补丁保持模型、loss、GT标签、采样顺序、source/window budget、梯度路径和整段余弦不变，合并以下计算优化：
+
+- 每窗因果固定几何按需持久化：source extraction/association/ICP、aligned history points、footprint、static memory、CPU bit-exact Strong anchor/KTA/CLEAR和无learned replacement背景。
+- 六个horizon的history-only frontier、nearest anchor、road/sidewalk dominant class与Z support只算一次。完整合法候选仍由**当前**预测baseline/ownership/pose在线生成；不能缓存上一轮的sampled plan或labels。
+- 动态source的BEV padding在source-local bbox内做精确dilation，保持原整网格argwhere顺序，不改变padding或裁掉候选。
+- 下一批最多两窗并行CPU预备，每窗history几何workers不超过3；当批候选/特征最多4worker，RNG串行。Torch/CUDA及live source queries仅在主线程执行。
+- 外层loader完成后才关闭内层pool，避免安全停止时预取线程提交到已关闭pool。
+
+缓存默认位置 `outputs/p0_f9_joint_causal_columns/causal_geometry_cache_v1`，所有provenance namespace合计最多**16GiB磁盘**、单实例**4GiB RAM LRU**，写入前保留至少1GiB空闲磁盘；满额/空间不足继续精确重算，不删已有文件。原始输入/batch/optimizer本身仍占额外RAM，4GiB不是整个训练进程的内存上限。一个cache根目录只允许一个训练写入进程；同进程worker/实例共享quota核算。
+
+每次lookup对history occupancy/observed/poses及future ego poses做SHA256；namespace额外绑定runtime config、Strong/column config、train/dev cache和info SHA及dataroot。artifact压缩后有内容checksum，损坏或provenance不一致直接报错，不静默用错缓存。只有本机可信cache可加载，不能从不可信来源导入pickle。cache不保存future occupancy GT、record训练标签、Tensor、模型输出或learned geometry。初次真实renderer/Strong exactness检查仍执行。
+
+这是lazy复用：没有独立预构建任务，训练正常进行时填充，后续窗口重访/epoch复用。**冷缓存第一轮仍有计算和写盘开销，不能凭本地unit tests承诺服务器倍数或V18的20min/epoch。** 从第1422步恢复，第一轮已处理过的窗口不会为cache重跑；它们下轮首次访问才填充。日志每32batch打印 `GEOMETRY_CACHE` hits/misses/disk/RAM，以及每batch `causal_geometry_cache_hits` 和worker耗时。看warm-cache后的真实`seconds/window`，不拿一次nvidia-smi快照判定全程吞吐。
+
+可用 `FULL_JOINT_GEOMETRY_CACHE_GIB` / `FULL_JOINT_GEOMETRY_CACHE_RAM_MIB` 修改工程budget，不影响resume scientific identity。零磁盘budget只保留有界RAM复用；Python入口不传`--causal-geometry-cache`则维持原无持久cache路径。更改算法需更新cache protocol，不能复用不同数学实现的旧artifact。
+
+用户此次确认的最新安全断点：
+
+```text
+/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/full15_resume_fix_20261001_195429/model/last.pt
+```
+
+恢复仍设15轮/window<=4/source<=128/paired-control=0，跳过prior，下一更新为1423，不重新训练前1422步。
 
 ## 校准和评估
 

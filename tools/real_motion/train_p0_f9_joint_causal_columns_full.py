@@ -11,6 +11,8 @@ import subprocess
 import time
 import numpy as np
 import torch
+from dataclasses import asdict
+from real_motion.causal_geometry_cache import CausalGeometryCache
 from real_motion.joint_causal_columns import JointCausalColumns, FULL_PROTOCOL, FULL_CONTRACT, LINK_PROTOCOL
 from real_motion.causal_column_completion import ColumnConfig
 from real_motion.column_runtime_pipeline import CachedColumnSource, prefetch_raw_columns
@@ -86,6 +88,9 @@ def main(stop_event=None):
     parser.add_argument('--source-budget', type=int, default=128)
     parser.add_argument('--device', default='cuda'); parser.add_argument('--cpu-workers', type=int, default=8)
     parser.add_argument('--frame-cache-mib', type=int, default=256)
+    parser.add_argument('--causal-geometry-cache', help='bounded compressed immutable geometry; never GT/model state')
+    parser.add_argument('--causal-cache-gib', type=float, default=16.)
+    parser.add_argument('--causal-cache-ram-mib', type=int, default=4096)
     parser.add_argument('--eval-batch-size', type=int, default=256)
     parser.add_argument('--checkpoint-every', type=int, default=256)
     parser.add_argument('--seed', type=int, default=20261002)
@@ -93,7 +98,8 @@ def main(stop_event=None):
     parser.add_argument('--resume', help='full-protocol last.pt into a NEW output directory; epochs/geometry/recipe must match')
     args = parser.parse_args(); started = time.perf_counter(); out = Path(args.out_dir)
     if out.exists(): parser.error('NEW output directory required')
-    if min(args.epochs, args.window_batch_size, args.source_budget, args.cpu_workers, args.eval_batch_size, args.checkpoint_every) < 1 or args.frame_cache_mib < 0:
+    if (min(args.epochs, args.window_batch_size, args.source_budget, args.cpu_workers, args.eval_batch_size, args.checkpoint_every) < 1
+            or min(args.frame_cache_mib, args.causal_cache_gib, args.causal_cache_ram_mib) < 0 or not np.isfinite(args.causal_cache_gib)):
         parser.error('positive budgets/epochs required')
     for key in ('config', 'train_cache', 'dev_cache', 'population_manifest', 'base_checkpoint', 'train_info', 'dev_info'):
         if not str(getattr(args, key) or '').strip() or not Path(getattr(args, key)).is_file(): parser.error(f'missing {key}')
@@ -144,6 +150,14 @@ def main(stop_event=None):
         'info_fingerprints': {'train': sha256(args.train_info), 'dev': sha256(args.dev_info)},
         'cache_fingerprints': {'train': sha256(args.train_cache), 'dev': sha256(args.dev_cache)},
         'patch_resolution_m': float(meta.get('patch_resolution_m', .8))}
+    if args.causal_geometry_cache:
+        namespace = stable_json_fingerprint(dict(runtime_config=cfg, strong=asdict(provider.strong),
+            columns=asdict(joint.columns.config), info=identity['info_fingerprints'], caches=identity['cache_fingerprints'],
+            dataroot=str(Path(args.dataroot).resolve())))
+        provider.causal_geometry_cache = CausalGeometryCache(args.causal_geometry_cache, namespace,
+            max_bytes=int(args.causal_cache_gib*2**30), ram_bytes=args.causal_cache_ram_mib*2**20)
+        print('CAUSAL GEOMETRY CACHE: '+json.dumps(dict(directory=str(provider.causal_geometry_cache.root),
+            **provider.causal_geometry_cache.stats()), ensure_ascii=False), flush=True)
     rng = np.random.default_rng(args.seed+1); weights = None
     cursor_epoch = cursor_batch = updates = successes = executed = sampled = 0; link_observed = False
     history = []
@@ -232,6 +246,8 @@ def main(stop_event=None):
                     print(f"epoch={e+1}/{args.epochs} batch={bi}/{len(plans[e])} update={updates}/{target_updates} "
                         f"motion={stats['motion_loss']:.5f} columns={stats['column_loss']:.5f} lr={optimizer.param_groups[0]['lr']:.3g} "
                         f"seconds/window={per_window:.3f} remaining_train_hours={(args.epochs*len(records)-executed)*per_window/3600:.2f}", flush=True)
+                    if hasattr(provider, 'causal_geometry_cache'):
+                        print('GEOMETRY_CACHE '+json.dumps(provider.causal_geometry_cache.stats()), flush=True)
                 stopping = stop_event is not None and stop_event.is_set()
                 if updates % args.checkpoint_every == 0 or stopping: save_last()
                 if stopping:

@@ -69,6 +69,37 @@ def tensors(features):
     return {k: torch.as_tensor(np.asarray(v)) for k, v in features.items()}
 
 
+@pytest.mark.parametrize('padding', (1, 2, 4))
+def test_local_support_roi_matches_full_grid_dilation_and_order(padding):
+    from scipy.ndimage import binary_dilation
+    rng = np.random.default_rng(17)
+    for shape in ((1, 1), (4, 7), (200, 200)):
+        for _ in range(20):
+            xy = np.column_stack([rng.integers(0, n, size=12) for n in shape])
+            mask = np.zeros(shape, bool); mask[tuple(xy.T)] = True
+            expected = np.argwhere(binary_dilation(mask, iterations=padding))
+            assert np.array_equal(common.padded_support_xy(xy, shape, padding), expected)
+
+
+def test_fixed_frontier_reuse_preserves_live_plans_features_and_gt_actions():
+    prep, grid, cfg = scene_fixture()
+    geometry = common.fixed_candidate_geometry(prep.memory, prep.footprints, grid, cfg)
+    for alteration in (False, True):
+        if alteration: prep.baseline[0][8, 6, 1] = 13
+        original = common.candidate_plan(prep, 0, grid, cfg)
+        prep.fixed_candidate_geometry = geometry
+        cached = common.candidate_plan(prep, 0, grid, cfg)
+        assert all(np.array_equal(v, getattr(cached, k)) for k, v in vars(original).items())
+        assert all(np.array_equal(v, common.sample_column_features(prep, 0, cached, grid, cfg)[k])
+            for k, v in common.sample_column_features(prep, 0, original, grid, cfg).items())
+        historical = (prep.memory[0] == 11)|(prep.memory[0] == 13)
+        from scipy.ndimage import binary_dilation
+        xy = np.argwhere(historical.any(2))
+        old = binary_dilation(historical[tuple(xy.T)], structure=np.ones((1, 3)), iterations=1)
+        assert np.array_equal(old, geometry[0]['static_allowed'][tuple(xy.T)])
+        prep.fixed_candidate_geometry = None
+
+
 def test_remove_labels_actual_restored_class_not_any_gt_mismatch():
     plan = plan_fixture()
     for gt, expected in ((5, REMOVE), (4, KEEP), (11, KEEP), (FREE, KEEP)):

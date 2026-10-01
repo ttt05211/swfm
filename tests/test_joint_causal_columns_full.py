@@ -161,7 +161,8 @@ def test_causal_evidence_prefetch_matches_main_and_does_not_read_future_gt():
     assert a.source_audit == b.source_audit and a.registrations == b.registrations
 
 
-def test_nonempty_prefetch_preserves_registration_features_labels_and_live_geometry():
+@pytest.mark.parametrize('persistent', (False, True))
+def test_nonempty_prefetch_preserves_registration_features_labels_and_live_geometry(tmp_path, persistent):
     from real_motion.strong_w2det import StrongW2DetConfig
     prep, grid, joint, control, rec = fixture(); raw = copy.deepcopy(prep.raw)
     prep.window.history_tokens = tuple(f'h{i}' for i in range(6))
@@ -183,7 +184,50 @@ def test_nonempty_prefetch_preserves_registration_features_labels_and_live_geome
     # registration, candidate generation, feature sampling and GT labels are real.
     with patch.object(columns, 'window_from_record', return_value=prep.window), \
          patch.object(columns.runtime, 'window_from_record', return_value=prep.window):
-        a = provider.prepare_columns(None, rec, include_gt=True, raw_window=raw, outputs=output)
+        if persistent:
+            from real_motion.causal_geometry_cache import CausalGeometryCache
+            cache = CausalGeometryCache(tmp_path, 'fixture', ram_bytes=0, reserve_bytes=0)
+            def build():
+                return full.build_fixed_geometry({**raw, 'future_gt_occ': 'forbidden'}, rec,
+                    pcfg, strong, 1, joint.columns.config)
+            fixed, hit = cache.get_or_build(('scene', 't0'), raw, build)
+            assert not hit
+            fresh = CausalGeometryCache(tmp_path, 'fixture', ram_bytes=0, reserve_bytes=0)
+            fixed, hit = fresh.get_or_build(('scene', 't0'), raw, lambda: pytest.fail('must load disk'))
+            assert hit and not any(k in fixed['prepared_state'] for k in ('rec', 'window', 'gpu', 'outputs'))
+            def no_tensors(v):
+                assert not isinstance(v, torch.Tensor)
+                if isinstance(v, dict):
+                    assert 'future_gt_occ' not in v
+                    for item in v.values(): no_tensors(item)
+                elif isinstance(v, (list, tuple)):
+                    for item in v: no_tensors(item)
+                elif hasattr(v, '__dict__'): no_tensors(vars(v))
+            no_tensors(fixed)
+            # A validly serialized but mathematically wrong background must
+            # fail the formal first-use gate, not merely pass content hashes.
+            corrupt = copy.deepcopy(fixed)
+            corrupt['prepared_state']['anchors'][0].flat[0] = 0
+            bad_provider = copy.copy(provider)
+            with pytest.raises(RuntimeError, match='prepared Strong anchor mismatch'):
+                bad_provider.prepare_columns(None, rec, include_gt=True,
+                    raw_window={**raw, '_column_causal_preparation': corrupt}, outputs=output)
+            # Strong's vectorized scatter may contain duplicate/unordered
+            # destination rows after ego rotation: compare occupied sets, not
+            # raw scatter order, just as the frozen CLEAR contract does.
+            equivalent = copy.deepcopy(fixed)
+            for rows in equivalent['prepared_state']['baseline_by_hi']:
+                for i, comp in enumerate(rows):
+                    rows[i] = type(comp)(comp.class_id,
+                        np.concatenate((comp.voxel_indices[::-1], comp.voxel_indices[:1])), comp.source_voxel_count)
+            equivalent_provider = copy.copy(provider)
+            equivalent_provider.prepare_columns(None, rec, include_gt=True,
+                raw_window={**raw, '_column_causal_preparation': equivalent}, outputs=output)
+            # Cold resume: first exactness check now uses the persistent CPU
+            # state but must preserve the original LIVE joint training graph.
+            first_raw = {**raw, '_column_causal_preparation': fixed}
+        else: first_raw = raw
+        a = provider.prepare_columns(None, rec, include_gt=True, raw_window=first_raw, outputs=output)
         assert provider.columns_checked and a.outputs is output
         assert a.outputs['future_transport_queries'].requires_grad
         # The REAL first-call exactness/forecast NumPy path must not sever the
@@ -215,10 +259,32 @@ def test_nonempty_prefetch_preserves_registration_features_labels_and_live_geome
         moved = {**output, 'residual_xy_m': output['residual_xy_m']+1.}
         c = provider.prepare_columns(None, rec, include_gt=True, raw_window=cached, outputs=moved)
         assert any(not np.array_equal(x, y) for x, y in zip(b.baseline, c.baseline))
+        if persistent:
+            d = provider.prepare_columns(None, rec, include_gt=True,
+                raw_window={**raw, '_column_causal_preparation': fixed}, outputs=moved)
+            assert all(np.array_equal(x, y) for x, y in zip(c.baseline, d.baseline))
+            assert d.outputs['future_transport_queries'].requires_grad
         bad = copy.deepcopy(evidence); bad['current'][0]['class_id'] = 5
         with pytest.raises(RuntimeError, match='source identity mismatch'):
             provider.prepare_columns(None, rec, include_gt=True,
                 raw_window={**raw, '_column_causal_preparation': bad}, outputs=output)
+
+
+def test_cached_window_prefetch_order_errors_and_early_close():
+    rows = [{'features': torch.zeros(1, 2), 'id': i} for i in range(9)]
+    def load(source, record, **kwargs): return {'id': record['id']}
+    provider = SimpleNamespace(load_raw_columns=load, causal_geometry_cache=object())
+    batches = list(full.prefetch_column_batches(provider, None, rows, 4))
+    assert [r['id'] for b in batches for r, raw in b] == list(range(9))
+    assert all(r['id'] == raw['id'] for b in batches for r, raw in b)
+    for _ in range(10):
+        iterator = full.prefetch_column_batches(provider, None, rows, 4)
+        assert len(next(iterator)) == 4
+        iterator.close()  # pending outer load may still be about to call io.map
+    def fail(*args, **kwargs): raise RuntimeError('cached geometry build failed')
+    provider.load_raw_columns = fail
+    with pytest.raises(RuntimeError, match='geometry build failed'):
+        list(full.prefetch_column_batches(provider, None, rows, 4))
 
 
 def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
