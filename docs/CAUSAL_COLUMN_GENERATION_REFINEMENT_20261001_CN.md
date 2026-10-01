@@ -71,6 +71,22 @@ dev64 是 dev512 的子集，两者不是独立统计检验；本 screen 仍是�
 
 每窗口打印开始/完成和耗时；progress.jsonl 给出 raw+V18、renderer、source_history、static_memory 阶段时间。不能在没有真实服务器 profile 的情况下承诺用时。只保存 `last.pt`（每128步覆盖，同协议恢复）和最终 `candidate.pt`，以及小型日志/报告。
 
+### Patch 采样提速（兼容已有 candidate.pt，无需重训）
+
+服务器第220窗口 profile：14.648s 总耗时中，119 次 NumPy patch sampling 累计13.125s；网络 forward 累计0.366s。主要瓶颈不是 GPU，也不是 0.556s 的 V18/历史准备。
+
+`causal_column_sampling.py` 为单窗口/单 horizon 的密集重叠 query 建立局部 inverse-map cache。生成与静态 refine 共享几何逆映射，source 各自使用原配准；相同历史 voxel 不再因49个邻域点重叠被重复变换几十次。缓存只存 uint8 原始 labels/visibility/source bits，最多64MiB，不写磁盘；空间分散、候选很少或超预算的 group 回到原始 sparse sampler，绝不截断候选。原始 sampler 保留为参考。地图构建最多六个 CPU threads，坐标变换维持原 float64 运算顺序/world-Z/越界 UNKNOWN；GPU batch256、模型与门控不改。
+
+本地200×200×16网格、20100 queries/一个 horizon 合成测试：首版原采样10.318s→优化0.699s（14.8×）；最终使用只读 sliding-window view 批量 gather，并包含 ego roll/pitch 后，原采样11.706s→优化含地图构建0.561s（20.9×），history digest完全一致，缓存2.33MiB。**这只是本地采样基准，不是服务器整段 eval 的实测提速承诺。** 单元测试进一步逐元素核对所有 feature keys、不同线程数、旋转/Z、source归属、unknown padding、预算回退，以及相同网络batch下预测概率逐元素一致。progress.jsonl 新增按horizon的地图构建/patch gather/网络与传输耗时。
+
+已有模型可先做只读同窗口检查和计时，不重训：
+
+```bash
+python tools/real_motion/profile_p0_f9_causal_columns.py --model-dir <原model目录> --window 220
+```
+
+该工具对 actor 分层采样，检查真实数据新旧历史特征完全一致后，重复同窗口预热/计时。它不保存结果、不改变模型/阈值、不将失败候选提升为成功。不应与当前GPU评估并行执行。
+
 ## 已覆盖的逻辑验收
 
 测试覆盖原 renderer 六 horizon 的逐 voxel 一致性、空 t0 source、随机重叠物体的独立完整 layer recomposition 对照、下层类别恢复、occupied 保护、未来 GT 修改不影响候选/特征、真实因果 ICP 排序和 world Z、动态 patch motion alignment、importance/natural class counts、weighted score correction、非法动作梯度屏蔽、两个 head/共享主干学习、全 UNKNOWN、全拒绝/单 horizon/Moving 降级拒绝、checkpoint role/权重/阈值完整性、端到端 smoke、下一更新断点精确恢复。

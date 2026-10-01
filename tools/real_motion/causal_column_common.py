@@ -21,6 +21,7 @@ from real_motion.v18_motion_gap import numpy
 from tools.real_motion.v18_xy_trajectory_common import FrozenXYV18
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics, DYN, delta
+from real_motion.causal_column_sampling import ColumnFeatureSampler
 
 REPORT = (1, 3, 5)
 FEATURE_KEYS = ("history", "flags", "base", "fallback", "context", "kind", "classes")
@@ -268,15 +269,24 @@ def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
 
 def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256):
     model.eval(); parts = []
+    started = time.perf_counter()
+    sampler = ColumnFeatureSampler(prepared, h, plan, grid, model.config, pose_motion,
+                                   workers=getattr(model, 'column_sampling_workers', 1))
+    mapped_at = time.perf_counter(); sampled_seconds = 0.
     with torch.inference_mode():
         for start in range(0, len(plan), batch_size):
             small = plan.subset(slice(start, start+batch_size))
-            arrays = sample_column_features(prepared, h, small, grid, model.config)
+            sampled_at = time.perf_counter()
+            arrays = sampler.sample(small, sample_column_features)
+            sampled_seconds += time.perf_counter()-sampled_at
             b = {k: torch.as_tensor(v, device=device) for k, v in arrays.items()}
             legal = torch.as_tensor(small.legal, device=device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 g, r = model(**b)
             parts.append(model.calibrated_probabilities(g, r, b["kind"], legal).cpu().numpy())
+    model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,
+        'inverse_map_seconds': mapped_at-started, 'patch_gather_seconds': sampled_seconds,
+        'network_transfer_and_other_seconds': time.perf_counter()-mapped_at-sampled_seconds}
     return np.concatenate(parts) if parts else np.empty((*plan.base.shape, 3), np.float32)
 
 
@@ -296,6 +306,7 @@ def report_states(base, metrics, quality, scenes):
 def evaluate_columns(provider, source, records, model, thresholds, *, progress=None, batch_size=256, dev64_keys=None,
                      diagnostic_thresholds=(.50, .50, .50)):
     """Four-way ablation ONE raw/V18/model probability pass, sparse exact counts."""
+    model.column_sampling_workers = provider.workers
     populations = {"all": None}
     if dev64_keys is not None: populations["dev64"] = set(tuple(k) for k in dev64_keys)
     variants = (*VARIANTS, *("diagnostic_"+n for n in VARIANTS)) if diagnostic_thresholds is not None else VARIANTS
@@ -316,10 +327,12 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
         for k, v in prep.source_audit.items(): audits[k] += v
         moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
                     tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
+        prediction_profile = {}
         for ri, h in enumerate(REPORT):
             plan = candidate_plan(prep, h, provider.pcfg.grid, model.config)
             layout = sparse_layout(plan)
             probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
+            prediction_profile[str(.5*(h+1))] = getattr(model, 'last_prediction_profile', {})
             for label, kind, action in (("generation_ADD", GENERATE, ADD), ("refine_ADD", REFINE, ADD),
                                          ("refine_REMOVE", REFINE, REMOVE)):
                 valid = (plan.kind == kind)[:, None] & plan.legal[..., action]
@@ -354,6 +367,7 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
         elapsed = time.perf_counter()-started
         print(f"evaluate_columns={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)
         if progress: progress({"event": "evaluation", "window": wi, "windows": len(records), "seconds": elapsed,
+                               "prediction_seconds_by_horizon": prediction_profile,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
     result = {}
     for p in populations:
@@ -369,6 +383,7 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
 
 def forecast_columns(provider, source, record, model, thresholds, batch_size=256):
     """Six horizons, causal deployment: never requests future occupancy."""
+    model.column_sampling_workers = provider.workers
     prep = provider.prepare_columns(source, record, include_gt=False)
     predictions = []
     for h in range(6):
@@ -400,6 +415,7 @@ def calibrate_columns(provider, source, records, model, *, progress=None, batch_
     confidence or correct-minus-wrong counts assumed to equal mIoU.
     """
     import itertools
+    model.column_sampling_workers = provider.workers
     levels = CALIBRATION_LEVELS
     tuples = list(itertools.product(levels, repeat=3))
     jobs = [("g", (g, None, None), True, False) for g in levels]
