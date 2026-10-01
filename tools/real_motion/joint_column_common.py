@@ -28,6 +28,7 @@ class JointColumnProvider(FrozenColumns):
         values = runtime._gpu_inputs(record, self.device)
         result = {}
         for name, model in (('frozen_E14', self.reference), ('paired_scratch_V18_only', self.control)):
+            if model is None: continue
             output = runtime._model_forward(model, values, self.device)
             result[name] = render_column_layers(prep.state, record, output, self.pcfg.grid)[0]
         return result

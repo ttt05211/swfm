@@ -4,3 +4,4 @@ tools/real_motion/run_p0_f9_v18_motion_gap_dev64.sh text eol=lf
 tools/real_motion/run_p0_f9_sparse_emergence_screen.sh text eol=lf
 tools/real_motion/run_p0_f9_v18_xy_trajectory_screen.sh text eol=lf
 tools/real_motion/run_p0_f9_v18_source_interaction_20pct.sh text eol=lf
+tools/real_motion/run_p0_f9_joint_causal_columns_full.sh text eol=lf

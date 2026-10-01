@@ -23,6 +23,16 @@ CONTRACT = {'initialization': 'random_both_transport_and_columns_no_E14_weights'
     'column_weight_decay': .01, 'yaw_weight': 19., 'shape_weight': .25,
     'motion_clip_norm': 5., 'column_clip_norm': 1.}
 
+FULL_PROTOCOL = 'p0_f9_joint_causal_columns_full_train_v1'
+FULL_CONTRACT = {**CONTRACT, 'control': 'optional_paired_control_default_off_E14_reference_only',
+    'schedule': 'whole_configured_epochs_cosine_floor0p1_no_tail',
+    'calibration': 'final_TRAIN64_in_sample_fixed_grid_no_dev_selection',
+    'prior_population': 'deterministic_TRAIN1024_unsampled_proposals_once',
+    'training_population': 'ALL_20430_unique_windows_every_epoch',
+    'batch_objective': 'all_sources_motion_mean_and_concatenated_columns_type_mean',
+    'selection': 'final_epoch_only_with_fixed_gate_dev64_each_epoch',
+    'prefetch': 'one_next_window_batch_causal_CPU_only_no_model_dependent_cache'}
+
 
 class LinkedColumns(CausalColumnModel):
     def __init__(self, config, source_dim):

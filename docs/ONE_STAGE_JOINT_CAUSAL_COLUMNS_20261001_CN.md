@@ -1,5 +1,7 @@
 # 一阶段 V18 Transport + Causal Columns 小规模 screen
 
+全量15/20轮训练另见 [全量一阶段统一余弦训练](FULL_ONE_STAGE_JOINT_CAUSAL_COLUMNS_20261001_CN.md)。下面保留原小规模screen定义，不改变已有实验协议。
+
 本版本只回答「已有生成/refine 是否能与 V18 一阶段共同优化」。不扩展新物体类别，不重写 V18 renderer，不运行 full4369，不把未收敛的随机初始化实验包装成正式方法。
 
 ## 结构与梯度

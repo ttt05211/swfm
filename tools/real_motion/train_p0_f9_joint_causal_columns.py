@@ -11,7 +11,7 @@ import subprocess
 import time
 import numpy as np
 import torch
-from real_motion.joint_causal_columns import JointCausalColumns, PROTOCOL, CONTRACT, LINK_PROTOCOL
+from real_motion.joint_causal_columns import JointCausalColumns, PROTOCOL, CONTRACT, LINK_PROTOCOL, FULL_PROTOCOL, FULL_CONTRACT
 from real_motion.causal_column_completion import ColumnConfig
 from real_motion.local_st_world_model_v17 import config_from_mapping_v17
 from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
@@ -31,11 +31,14 @@ from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 
 def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=False):
     ck = torch.load(path, map_location='cpu', weights_only=False)
-    if (ck.get('protocol') != PROTOCOL or ck.get('training_contract') != CONTRACT or ck.get('source_link') != LINK_PROTOCOL
+    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT}.get(ck.get('protocol'))
+    if (expected_contract is None or ck.get('training_contract') != expected_contract or ck.get('source_link') != LINK_PROTOCOL
             or ck.get('reference_checkpoint_sha256') != reference_sha or ck.get('runtime_config_fingerprint') != config_sha
-            or ck.get('checkpoint_role') not in ('resume_last', 'calibrated_candidate')):
+            or ck.get('checkpoint_role') not in (('resume_last', 'calibrated_candidate', 'epoch_snapshot')
+                if ck.get('protocol') == FULL_PROTOCOL else ('resume_last', 'calibrated_candidate'))):
         raise RuntimeError('joint checkpoint/reference/config contract mismatch')
-    if not allow_diagnostic and (ck['checkpoint_role'] != 'calibrated_candidate' or ck.get('mode') != 'screen'
+    allowed_mode = 'full' if ck.get('protocol') == FULL_PROTOCOL else 'screen'
+    if not allow_diagnostic and (ck['checkpoint_role'] != 'calibrated_candidate' or ck.get('mode') != allowed_mode
                                  or not ck.get('screen_pass') or ck.get('successful_updates', 0) <= 0):
         raise RuntimeError('failed/smoke/last joint candidate cannot be deployed')
     model = JointCausalColumns(config_from_mapping_v17(ck['model_configs']['motion']),

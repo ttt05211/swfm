@@ -126,12 +126,24 @@ class FrozenColumns(FrozenXYV18):
             finally: runtime._release_gpu_inputs(state)
             self.columns_checked = True
         renderer_at = time.perf_counter()
-        registrations, _, _, audit = causal_source_history(raw["history_occ"], raw["history_poses"], state,
-                                                          self.pcfg.grid, self.strong, self.workers)
+        causal = raw.get('_column_causal_preparation')
+        if causal is not None:
+            # Worker caches ONLY raw-history-dependent evidence. Never reuse
+            # learned target poses, owner/fallback, candidates, features or GT labels.
+            from real_motion.runtime_fastpath import component_lists_equal
+            if not component_lists_equal(state['current'], causal['current']):
+                raise RuntimeError('prefetched causal source identity mismatch')
+            registrations, audit = causal['registrations'], causal['audit']
+        else:
+            registrations, _, _, audit = causal_source_history(raw["history_occ"], raw["history_poses"], state,
+                                                              self.pcfg.grid, self.strong, self.workers)
         history_at = time.perf_counter()
-        footprints = history_grid_footprint_bev_sequence(raw["history_poses"], raw["future_poses"], self.pcfg.grid, workers=self.workers)
-        memory = build_future_static_memory_only(raw["history_occ"], raw["history_observed"], raw["history_poses"], raw["future_poses"],
-            grid=self.pcfg.grid, dynamic_class_ids=DYN, free_label=FREE, workers=self.workers)
+        if causal is not None:
+            footprints, memory = causal['footprints'], causal['memory']
+        else:
+            footprints = history_grid_footprint_bev_sequence(raw["history_poses"], raw["future_poses"], self.pcfg.grid, workers=self.workers)
+            memory = build_future_static_memory_only(raw["history_occ"], raw["history_observed"], raw["history_poses"], raw["future_poses"],
+                grid=self.pcfg.grid, dynamic_class_ids=DYN, free_label=FREE, workers=self.workers)
         self.last_prepare_seconds = {"raw_and_v18": prepared_at-started, "layered_renderer": renderer_at-prepared_at,
             "source_history": history_at-renderer_at, "static_memory_and_footprint": time.perf_counter()-history_at}
         return PreparedColumns(window, raw, state, baseline, owners, fallbacks, components, targets, yaws,
