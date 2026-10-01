@@ -193,8 +193,13 @@ def predict(model, record, device, config):
     return out
 
 
-def evaluate_models(provider, source, records, models, config, *, progress=None):
-    """Shared raw/Strong/base/support pass for all selected AND last candidates."""
+def evaluate_models(provider, source, records, models, config, *, progress=None, prediction_fn=None):
+    """Shared raw/Strong/base/support pass for all selected AND last candidates.
+
+    Optional prediction_fn(model, record, device, config, base) lets an XY-only
+    candidate reuse the frozen per-window baseline output, without repeating
+    its forward or changing the existing full-model evaluation path.
+    """
     names = ("V18_BASE", *models)
     metrics = {k: Metrics() for k in names}
     scenes = defaultdict(lambda: {k: Metrics() for k in names})
@@ -215,7 +220,10 @@ def evaluate_models(provider, source, records, models, config, *, progress=None)
         if wi == 1 and any(not np.array_equal(p, baseline[h]) for p, h in
                             zip(render_outputs(state, provider.pcfg, base), (1, 3, 5))):
             raise RuntimeError("original-output compositor not voxel-exact V18")
-        outputs = {"V18_BASE": base, **{k: predict(m, rec, provider.device, config) for k, m in models.items()}}
+        outputs = {"V18_BASE": base, **{
+            k: (predict(m, rec, provider.device, config) if prediction_fn is None
+                else prediction_fn(m, rec, provider.device, config, base))
+            for k, m in models.items()}}
         moving = gt_moving_support_sequence(source.nusc, window.t0_token, window.future_tokens,
                  tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
         before = [Metrics.counts(baseline[h], raw["future_gt_occ"][h], moving[h][0], 17) for h in (1, 3, 5)]
