@@ -22,6 +22,10 @@ from tools.real_motion.v18_xy_trajectory_common import FrozenXYV18
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics, DYN, delta
 from real_motion.causal_column_sampling import ColumnFeatureSampler
+from real_motion.column_runtime_pipeline import prefetch_raw_columns
+from real_motion.prepared import load_nuscenes_window_raw
+from real_motion.motion_transport import world_points_to_t0
+from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 
 REPORT = (1, 3, 5)
 FEATURE_KEYS = ("history", "flags", "base", "fallback", "context", "kind", "classes")
@@ -87,34 +91,38 @@ class PreparedColumns:
     footprints: np.ndarray
     memory: np.ndarray
     source_audit: dict
+    outputs: dict | None = None
 
 
 class FrozenColumns(FrozenXYV18):
-    def prepare_columns(self, source, record, *, include_gt):
+    def load_raw_columns(self, source, record, *, include_gt):
+        return load_nuscenes_window_raw(source, window_from_record(record), self.pcfg,
+            include_gt=include_gt, io_workers=min(self.workers, 4))
+
+    def prepare_columns(self, source, record, *, include_gt, raw_window=None, outputs=None):
         started = time.perf_counter()
-        window, raw, state, outputs = super().prepare(source, record, include_gt=include_gt)
+        if raw_window is None and outputs is None:
+            window, raw, state, outputs = super().prepare(source, record, include_gt=include_gt)
+        else:
+            window = window_from_record(record)
+            raw = self.load_raw_columns(source, record, include_gt=include_gt) if raw_window is None else raw_window
+            if not include_gt and raw.get('future_gt_occ') is not None:
+                raise RuntimeError('causal deployment must not request future occupancy')
+            state = runtime._prepare_record(record, source, self.pcfg, self.strong, self.device, raw_window=raw)
+            centers = world_points_to_t0(np.asarray([c['centroid_world'] for c in state['current']]).reshape(-1, 3),
+                                        state['current_pose'])[:, :2]
+            if not np.allclose(centers, numpy(record['source_centroid_xy_t0_m']), rtol=0, atol=2e-4):
+                raise RuntimeError('cache/actual source-centre identity mismatch')
+            outputs = self.encode_record(record) if outputs is None else outputs
         prepared_at = time.perf_counter()
-        res, yaw = numpy(outputs["residual_xy_m"]), numpy(outputs["yaw_delta_rad"])
-        from real_motion.v18_two_wheel_diagnostic import renderer_yaw_delta
-        baseline, owners, fallbacks, components, targets, yaws = [], [], [], [], [], []
-        for h in range(6):
-            centers = [runtime._target_world_from_xy_cached(numpy(record["anchors_xy_t0_m"])[i, h]+res[i, h],
-                state["source_z_t0"][i], state["current_pose"]) for i in range(len(state["current"]))]
-            yy = [renderer_yaw_delta(int(c["class_id"]), yaw[i, h], zero_two_wheel_yaw=False) for i, c in enumerate(state["current"])]
-            layers = runtime._rasterize_all_sources_horizon(state["current"], state["source_world_points"], state["source_rel_xy"],
-                                                           centers, yy, state["world_to_future"][h], self.pcfg.grid)
-            background = compose_component_replacements_fast_exact(state["anchors"][h], state["baseline_by_hi"][h], [],
-                dynamic_class_ids=DYN, free_label=FREE, grid=self.pcfg.grid,
-                precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][h])
-            b, own, fall = component_layers(background, layers)
-            baseline.append(b); owners.append(own); fallbacks.append(fall); components.append(layers); targets.append(centers); yaws.append(yy)
+        baseline, owners, fallbacks, components, targets, yaws = render_column_layers(state, record, outputs, self.pcfg.grid)
         if not getattr(self, "columns_checked", False):
             runtime._stage_gpu_inputs(state, self.device)
             try:
                 runtime._exactness_check(self.model, state, self.pcfg, self.strong, self.device)
                 reference = runtime._forecast_once(self.model, state, self.pcfg, self.strong, self.device, precomputed_out=outputs)
                 if any(not np.array_equal(a, b) for a, b in zip(reference, baseline)):
-                    raise RuntimeError("layered column preparation differs from frozen V18")
+                    raise RuntimeError("layered column preparation differs from V18 renderer")
             finally: runtime._release_gpu_inputs(state)
             self.columns_checked = True
         renderer_at = time.perf_counter()
@@ -127,7 +135,26 @@ class FrozenColumns(FrozenXYV18):
         self.last_prepare_seconds = {"raw_and_v18": prepared_at-started, "layered_renderer": renderer_at-prepared_at,
             "source_history": history_at-renderer_at, "static_memory_and_footprint": time.perf_counter()-history_at}
         return PreparedColumns(window, raw, state, baseline, owners, fallbacks, components, targets, yaws,
-                               registrations, footprints, memory, audit)
+                               registrations, footprints, memory, audit, outputs)
+
+
+def render_column_layers(state, record, outputs, grid):
+    """Model-dependent geometry ONLY; immutable history/registration can be reused."""
+    res, yaw = numpy(outputs["residual_xy_m"]), numpy(outputs["yaw_delta_rad"])
+    from real_motion.v18_two_wheel_diagnostic import renderer_yaw_delta
+    baseline, owners, fallbacks, components, targets, yaws = [], [], [], [], [], []
+    for h in range(6):
+        centers = [runtime._target_world_from_xy_cached(numpy(record["anchors_xy_t0_m"])[i, h]+res[i, h],
+            state["source_z_t0"][i], state["current_pose"]) for i in range(len(state["current"]))]
+        yy = [renderer_yaw_delta(int(c["class_id"]), yaw[i, h], zero_two_wheel_yaw=False) for i, c in enumerate(state["current"])]
+        layers = runtime._rasterize_all_sources_horizon(state["current"], state["source_world_points"], state["source_rel_xy"],
+                                                       centers, yy, state["world_to_future"][h], grid)
+        background = compose_component_replacements_fast_exact(state["anchors"][h], state["baseline_by_hi"][h], [],
+            dynamic_class_ids=DYN, free_label=FREE, grid=grid,
+            precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][h])
+        b, own, fall = component_layers(background, layers)
+        baseline.append(b); owners.append(own); fallbacks.append(fall); components.append(layers); targets.append(centers); yaws.append(yy)
+    return baseline, owners, fallbacks, components, targets, yaws
 
 
 def candidate_plan(prepared, h, grid, config=ColumnConfig()):
@@ -282,6 +309,8 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
             b = {k: torch.as_tensor(v, device=device) for k, v in arrays.items()}
             legal = torch.as_tensor(small.legal, device=device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                if hasattr(model, 'source_features_for'):
+                    b['source_features'] = model.source_features_for(prepared, h, small, device)
                 g, r = model(**b)
             parts.append(model.calibrated_probabilities(g, r, b["kind"], legal).cpu().numpy())
     model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,
@@ -315,13 +344,18 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
     quality = {p: {n: defaultdict(int) for n in variants} for p in populations}
     scenes = {p: defaultdict(lambda: {n: Metrics() for n in ("baseline", *variants)}) for p in populations}
     counts_windows = defaultdict(int)
+    reference_metrics = {p: {} for p in populations}
     audits = defaultdict(int)
     scores = {p: {k: {"legal_query_voxels": 0, "sum": 0., "max": 0., "ge_0_50": 0, "ge_0_75": 0, "ge_0_95": 0}
         for k in ("generation_ADD", "refine_ADD", "refine_REMOVE")} for p in populations}
-    for wi, record in enumerate(records, 1):
+    previous_end = time.perf_counter()
+    for wi, (record, raw_window) in enumerate(prefetch_raw_columns(provider, source, records), 1):
         started = time.perf_counter()
+        input_wait = started-previous_end
         print(f"evaluate_columns={wi}/{len(records)} four_way_shared_pass", flush=True)
-        prep = provider.prepare_columns(source, record, include_gt=True)
+        prep = (provider.prepare_columns(source, record, include_gt=True, raw_window=raw_window)
+                if raw_window is not None else provider.prepare_columns(source, record, include_gt=True))
+        references = provider.reference_predictions(prep, record) if hasattr(provider, 'reference_predictions') else {}
         active = [p for p, keys in populations.items() if keys is None or (str(record["scene_name"]), str(record["t0_token"])) in keys]
         for p in active: counts_windows[p] += 1
         for k, v in prep.source_audit.items(): audits[k] += v
@@ -348,6 +382,8 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
             before = Metrics.counts(prep.baseline[h], gt, mask, FREE)
             for p in active:
                 bases[p].update(ri, counts=before); scenes[p][prep.window.scene_name]["baseline"].update(ri, counts=before)
+                for name, predictions in references.items():
+                    reference_metrics[p].setdefault(name, Metrics()).update(ri, counts=Metrics.counts(predictions[h], gt, mask, FREE))
             choices = [(n, eg, er, actions) for n, eg, er in (("generation", True, False), ("refine", False, True), ("joint", True, True))]
             if diagnostic is not None:
                 choices += [("diagnostic_"+n, eg, er, diagnostic) for n, eg, er, _ in choices.copy()]
@@ -364,16 +400,23 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
                 for p in active:
                     metrics[p][name].update(ri, counts=current); scenes[p][prep.window.scene_name][name].update(ri, counts=current)
                     for k, v in edits.items(): quality[p][name][k] += v
-        elapsed = time.perf_counter()-started
+        compute_elapsed = time.perf_counter()-started
+        elapsed = compute_elapsed+input_wait
         print(f"evaluate_columns={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)
         if progress: progress({"event": "evaluation", "window": wi, "windows": len(records), "seconds": elapsed,
+                               "compute_seconds": compute_elapsed, "input_wait_seconds": input_wait,
                                "prediction_seconds_by_horizon": prediction_profile,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
+        previous_end = time.perf_counter()
     result = {}
     for p in populations:
         if p == "dev64" and counts_windows[p] != len(populations[p]): raise RuntimeError("incomplete frozen dev64 evaluation")
         result[p] = report_states(bases[p], metrics[p], quality[p], scenes[p])
         result[p].update(windows=counts_windows[p], scenes=len(scenes[p]), gate=acceptance_gate(result[p]["variants"]))
+        if reference_metrics[p]:
+            result[p]['reference_metrics'] = {k: v.compute() for k, v in reference_metrics[p].items()}
+            result[p]['joint_vs_reference_pp'] = {k: delta(result[p]['variants']['joint']['metrics'], v.compute())
+                                                  for k, v in reference_metrics[p].items()}
         for row in scores[p].values():
             total = row.pop("sum"); row["mean"] = total/row["legal_query_voxels"] if row["legal_query_voxels"] else None
         result[p]["confidence_audit"] = scores[p]
@@ -422,10 +465,13 @@ def calibrate_columns(provider, source, records, model, *, progress=None, batch_
     jobs += [("r", (None, a, r), False, True) for a, r in itertools.product(levels, repeat=2)]
     jobs += [("j", t, True, True) for t in tuples]
     base = Metrics(); metrics = [Metrics() for _ in jobs]; quality = [defaultdict(int) for _ in jobs]
-    for wi, record in enumerate(records, 1):
+    previous_end = time.perf_counter()
+    for wi, (record, raw_window) in enumerate(prefetch_raw_columns(provider, source, records), 1):
         started = time.perf_counter()
+        input_wait = started-previous_end
         print(f"calibrate_TRAIN={wi}/{len(records)} thresholds_fixed_grid_dev_unseen", flush=True)
-        prep = provider.prepare_columns(source, record, include_gt=True)
+        prep = (provider.prepare_columns(source, record, include_gt=True, raw_window=raw_window)
+                if raw_window is not None else provider.prepare_columns(source, record, include_gt=True))
         moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
                     tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
         for ri, h in enumerate(REPORT):
@@ -440,10 +486,13 @@ def calibrate_columns(provider, source, records, model, *, progress=None, batch_
                 target, mm = gt.reshape(-1)[ids], mask.reshape(-1)[ids]
                 metrics[k].update(ri, counts=sparse_counts(before, b, after, target, mm, DYN))
                 for name, value in edit_quality(b, after, target).items(): quality[k][name] += value
-        elapsed = time.perf_counter()-started
+        compute_elapsed = time.perf_counter()-started
+        elapsed = compute_elapsed+input_wait
         print(f"calibrate_TRAIN={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)
         if progress: progress({"event": "TRAIN_calibration", "window": wi, "windows": len(records), "seconds": elapsed,
+                               "compute_seconds": compute_elapsed, "input_wait_seconds": input_wait,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
+        previous_end = time.perf_counter()
     baseline = base.compute()
     lookup = {(task, gates): (m.compute(), dict(q)) for (task, gates, _, _), m, q in zip(jobs, metrics, quality)}
     selected = (None, None, None); best_score = (False, 0., -np.inf); candidates = []

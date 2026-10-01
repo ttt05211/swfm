@@ -24,6 +24,12 @@ class ColumnFeatureSampler:
         self.transforms = {}; self.members = {}
         inverse_history = [np.linalg.inv(t) for t in prepared.raw['history_poses']]
         future_pose = prepared.raw['future_poses'][h]
+        with ThreadPoolExecutor(max_workers=max(1, min(int(workers), 6))) as pool:
+            self._build(plan, inverse_history, future_pose, motion_factory, max_cache_mib, pool)
+
+    def _build(self, plan, inverse_history, future_pose, motion_factory, max_cache_mib, pool):
+        grid = self.grid
+        prepared, h = self.prepared, self.h
         groups = np.where(plan.actor < 0, -1, plan.actor)
         for actor in np.unique(groups):
             actor = int(actor)
@@ -54,7 +60,7 @@ class ColumnFeatureSampler:
             if (len(centres) < 32 or area*2 > len(centres)*self.p**2
                     or self.cache_bytes+bytes_needed > max_cache_mib*2**20):
                 continue
-            self.maps[actor] = self._map(actor, lo, extent, workers)
+            self.maps[actor] = self._map(actor, lo, extent, pool)
             _, labels, flags = self.maps[actor]
             # Views only: no 49x replicated dense cache. One gather copies just
             # the requested batch to its original N,6,P,P,Z ordering.
@@ -62,7 +68,7 @@ class ColumnFeatureSampler:
                                    np.lib.stride_tricks.sliding_window_view(flags, (self.p, self.p), axis=(1, 2)))
             self.cache_bytes += bytes_needed
 
-    def _map(self, actor, lo, extent, workers):
+    def _map(self, actor, lo, extent, pool):
         x = np.arange(lo[0], lo[0]+extent[0]); y = np.arange(lo[1], lo[1]+extent[1])
         idx = np.stack(np.meshgrid(x, y, np.arange(self.z), indexing='ij'), -1)
         xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
@@ -93,11 +99,30 @@ class ColumnFeatureSampler:
         # Single static map shared by generation + static refine, six frames
         # parallelized only here; no nested pools and no CUDA work in threads.
         frames = [None]*6
-        with ThreadPoolExecutor(max_workers=max(1, min(int(workers), 6))) as pool:
-            for f, mapped in zip(active, pool.map(frame, active)): frames[f] = mapped
+        for f, mapped in zip(active, pool.map(frame, active)): frames[f] = mapped
         for f in range(6):
             if frames[f] is None: frames[f] = (np.full(shape, UNKNOWN, np.uint8), np.zeros(shape, np.uint8))
         return lo, np.stack([v[0] for v in frames]), np.stack([v[1] for v in frames])
+
+    def _sparse(self, plan, actor):
+        """Same reference arithmetic, reusing inverses for uncached/small actors."""
+        n, p, z = len(plan), self.p, self.z
+        hist = np.full((n, 6, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
+        offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing='ij'), -1)
+        idx = offsets[None]+np.pad(plan.evidence_xy, ((0, 0), (0, 1)))[:, None, None, None, :]
+        xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
+        inherited = np.repeat(plan.classes, p*p*z) if actor < 0 else None
+        for f, transform in enumerate(self.transforms[actor]):
+            if transform is None: continue
+            ijk = np.floor((transform_points(xyz, transform)-self.origin)/self.step).astype(np.int64)
+            valid = ((ijk >= 0)&(ijk < self.shape)).all(1); at = tuple(ijk[valid].T)
+            labels = np.full(len(ijk), UNKNOWN, np.uint8); bits = np.zeros(len(ijk), np.uint8)
+            labels[valid] = self.history[f][at]; bits[valid] = self.observed[f][at].astype(np.uint8)
+            owned = (labels[valid] == inherited[valid]) if actor < 0 else np.isin(
+                np.ravel_multi_index(ijk[valid].T, tuple(self.shape)), self.members[actor][f])
+            bits[valid] |= owned.astype(np.uint8)*2
+            hist[:, f] = labels.reshape(n, p, p, z); flags[:, f] = bits.reshape(n, p, p, z)
+        return hist, flags
 
     def sample(self, plan, reference_sampler):
         n, p, z = len(plan), self.p, self.z
@@ -106,8 +131,7 @@ class ColumnFeatureSampler:
         for actor in np.unique(groups):
             take = np.flatnonzero(groups == actor); actor = int(actor)
             if actor not in self.maps:
-                values = reference_sampler(self.prepared, self.h, plan.subset(take), self.grid, self.config)
-                hist[take], flags[take] = values['history'], values['flags']; continue
+                hist[take], flags[take] = self._sparse(plan.subset(take), actor); continue
             lo, labels, bits = self.maps[actor]
             starts = plan.evidence_xy[take]-lo-p//2
             lw, fw = self.windows[actor]

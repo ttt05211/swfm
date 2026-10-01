@@ -45,7 +45,7 @@ class CausalColumnModel(nn.Module):
             torch.linspace(-1, 1, config.patch), indexing="ij"), dim=-1)
         self.register_buffer("memory_coordinates", coords.reshape(1, 6*config.patch**2, 3), persistent=False)
 
-    def forward(self, history, flags, base, fallback, context, kind, classes):
+    def forward(self, history, flags, base, fallback, context, kind, classes, *, query_extra=None):
         n, z, p, d = len(kind), self.config.z_bins, self.config.patch, self.config.width
         if (history.shape != (n, 6, p, p, z) or flags.shape != history.shape
                 or base.shape != (n, z) or fallback.shape != (n, z) or context.shape != (n, CONTEXT_DIM)
@@ -69,6 +69,9 @@ class CausalColumnModel(nn.Module):
         q = (self.query(torch.cat((context.float(), self.semantic(base.long()).flatten(1),
                                   self.semantic(fallback.long()).flatten(1)), dim=1))
              +self.kind(kind.long())+self.classes(classes.long())).unsqueeze(1)
+        if query_extra is not None:
+            if query_extra.shape != (n, d): raise ValueError('continuous source query shape mismatch')
+            q = q + query_extra[:, None].to(q.dtype)
         for block in self.decoder: q = block(q, x, invalid)
         q = self.norm(q[:, 0])
         return self.generation(q), self.refinement(q).reshape(n, z, 3)

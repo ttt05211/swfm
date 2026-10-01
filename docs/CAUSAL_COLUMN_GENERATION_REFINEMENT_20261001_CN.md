@@ -75,7 +75,7 @@ dev64 是 dev512 的子集，两者不是独立统计检验；本 screen 仍是�
 
 服务器第220窗口 profile：14.648s 总耗时中，119 次 NumPy patch sampling 累计13.125s；网络 forward 累计0.366s。主要瓶颈不是 GPU，也不是 0.556s 的 V18/历史准备。
 
-`causal_column_sampling.py` 为单窗口/单 horizon 的密集重叠 query 建立局部 inverse-map cache。生成与静态 refine 共享几何逆映射，source 各自使用原配准；相同历史 voxel 不再因49个邻域点重叠被重复变换几十次。缓存只存 uint8 原始 labels/visibility/source bits，最多64MiB，不写磁盘；空间分散、候选很少或超预算的 group 回到原始 sparse sampler，绝不截断候选。原始 sampler 保留为参考。地图构建最多六个 CPU threads，坐标变换维持原 float64 运算顺序/world-Z/越界 UNKNOWN；GPU batch256、模型与门控不改。
+`causal_column_sampling.py` 为单窗口/单 horizon 的密集重叠 query 建立局部 inverse-map cache。生成与静态 refine 共享几何逆映射，source 各自使用原配准；相同历史 voxel 不再因49个邻域点重叠被重复变换几十次。缓存只存 uint8 原始 labels/visibility/source bits，最多64MiB，不写磁盘；空间分散、候选很少或超预算的 group 使用精确 sparse fast path（复用 inverse matrices），绝不截断候选。原始 sampler 保留为参考。地图构建最多六个 CPU threads，复用单 horizon 线程池；坐标变换维持原 float64 运算顺序/world-Z/越界 UNKNOWN；GPU batch256、模型与门控不改。后续 bounded frame cache / CPU raw prefetch 与一阶段实验见 `ONE_STAGE_JOINT_CAUSAL_COLUMNS_20261001_CN.md`。
 
 本地200×200×16网格、20100 queries/一个 horizon 合成测试：首版原采样10.318s→优化0.699s（14.8×）；最终使用只读 sliding-window view 批量 gather，并包含 ego roll/pitch 后，原采样11.706s→优化含地图构建0.561s（20.9×），history digest完全一致，缓存2.33MiB。**这只是本地采样基准，不是服务器整段 eval 的实测提速承诺。** 单元测试进一步逐元素核对所有 feature keys、不同线程数、旋转/Z、source归属、unknown padding、预算回退，以及相同网络batch下预测概率逐元素一致。progress.jsonl 新增按horizon的地图构建/patch gather/网络与传输耗时。
 

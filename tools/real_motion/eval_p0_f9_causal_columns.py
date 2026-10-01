@@ -7,6 +7,7 @@ if __package__ in (None, ""): sys.path.insert(0, str(Path(__file__).resolve().pa
 import argparse
 import time
 import torch
+from real_motion.column_runtime_pipeline import CachedColumnSource
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.v21_source_induction import stable_json_fingerprint
@@ -54,7 +55,7 @@ def main():
         raise RuntimeError("TRAIN/expanded-dev scene overlap")
     records = align_records(records, chosen)
     provider = FrozenColumns(args.base_checkpoint, CLEAN_SHA256, pcfg, device, args.cpu_workers)
-    source = NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False)
+    source = CachedColumnSource(NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False))
     result = evaluate_columns(provider, source, records, model, tuple(ck["thresholds"]), batch_size=args.batch_size,
                               dev64_keys=dev64 if args.population != "dev64" else None)
     if sha256(args.checkpoint) != digest: raise RuntimeError("checkpoint changed during read-only evaluation")

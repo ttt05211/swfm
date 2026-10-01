@@ -25,6 +25,7 @@ from tools.real_motion.eval_p0_f9_v18_se2 import load_cache
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import load_manifest, align_records, sha256
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256, write_json, finite_json, atomic_checkpoint, bank_fingerprint
 from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
+from real_motion.column_runtime_pipeline import CachedColumnSource
 
 CONTRACT = {"v18_frozen": True, "grid_entry_classes": [11, 13], "generation_free_only": True,
     "refine": "visible_source_REMOVE_restore_lower_layer_and_free_ADD_v1", "static_refine_classes": [11, 13],
@@ -209,7 +210,7 @@ def main():
     used_scenes = {s for s, _ in (*train_keys, *cal_keys)}
     if used_scenes & dev_scenes: raise RuntimeError("TRAIN/calibration/dev scene leakage")
     provider = FrozenColumns(args.base_checkpoint, args.expected_base_sha256, pcfg, device, args.cpu_workers)
-    source = NuScenesWindowSource(args.dataroot, info_pkl=args.train_info, verbose=False)
+    source = CachedColumnSource(NuScenesWindowSource(args.dataroot, info_pkl=args.train_info, verbose=False))
     config_sha = stable_json_fingerprint(cfg); target_updates = 1024 if args.mode == "screen" else 2
     identity = {"protocol": PROTOCOL, "feature_protocol": FEATURE_PROTOCOL, "training_contract": CONTRACT,
         "model_config": asdict(model_cfg), "mode": args.mode, "base_checkpoint_sha256": provider.sha,
@@ -266,7 +267,7 @@ def main():
         ck, persisted = load_columns(out/"candidate.pt", device, base_sha=provider.sha, config_sha=config_sha, allow_diagnostic=True)
         if any(not torch.equal(v.cpu(), persisted.state_dict()[k].cpu()) for k, v in model.state_dict().items()):
             raise RuntimeError("checkpoint serialization changed model")
-        dev_source = NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False)
+        dev_source = CachedColumnSource(NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False))
         evaluation = evaluate_columns(provider, dev_source, dev_records, persisted, tuple(ck["thresholds"]), progress=progress,
             batch_size=args.batch_size, dev64_keys=dev64 if args.mode == "screen" else None)
         passed = args.mode == "screen" and evaluation["all"]["gate"]["pass"] and evaluation["dev64"]["gate"]["pass"]
