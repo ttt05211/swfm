@@ -35,6 +35,7 @@ FULL_CONTRACT = {**CONTRACT, 'control': 'optional_paired_control_default_off_E14
 
 
 class LinkedColumns(CausalColumnModel):
+    extra_input_keys = ('source_features',)
     def __init__(self, config, source_dim):
         super().__init__(config)
         self.source_dim = int(source_dim)
@@ -62,10 +63,14 @@ class LinkedColumns(CausalColumnModel):
 
 
 class JointCausalColumns(nn.Module):
-    def __init__(self, motion_config=LocalSTWMV17Config(), column_config=ColumnConfig()):
+    def __init__(self, motion_config=LocalSTWMV17Config(), column_config=ColumnConfig(), context_config=None):
         super().__init__()
         self.transport = LocalSpatialTemporalWorldModelV18SE2(motion_config)
-        self.columns = LinkedColumns(column_config, motion_config.d_model)
+        if context_config is None:
+            self.columns = LinkedColumns(column_config, motion_config.d_model)
+        else:
+            from .adaptive_column_context import AdaptiveLinkedColumns
+            self.columns = AdaptiveLinkedColumns(column_config, motion_config.d_model, context_config)
 
     def motion(self, record, device):
         keys = ('features', 'local_semantic_tube', 'kta_displacement_xy_m',
@@ -75,4 +80,7 @@ class JointCausalColumns(nn.Module):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
             return self.transport(*values, return_latents=True)
 
-    def configs(self): return {'motion': asdict(self.transport.config), 'columns': asdict(self.columns.config)}
+    def configs(self):
+        result = {'motion': asdict(self.transport.config), 'columns': asdict(self.columns.config)}
+        if hasattr(self.columns, 'context_config'): result['adaptive_context'] = asdict(self.columns.context_config)
+        return result

@@ -5,13 +5,17 @@ import sys
 from pathlib import Path
 if __package__ in (None, ''): sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import argparse
+import atexit
 import copy
+from dataclasses import asdict
 import json
 import subprocess
 import time
 import numpy as np
 import torch
 from real_motion.joint_causal_columns import JointCausalColumns, PROTOCOL, CONTRACT, LINK_PROTOCOL, FULL_PROTOCOL, FULL_CONTRACT
+from real_motion.adaptive_column_context import (AdaptiveContextConfig, PROTOCOL as CONTEXT_PROTOCOL,
+    TRAINING_CONTRACT as CONTEXT_CONTRACT, LINK_PROTOCOL as CONTEXT_LINK)
 from real_motion.causal_column_completion import ColumnConfig
 from real_motion.local_st_world_model_v17 import config_from_mapping_v17
 from real_motion.local_st_world_model_v18_se2 import LocalSpatialTemporalWorldModelV18SE2
@@ -31,8 +35,9 @@ from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 
 def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=False):
     ck = torch.load(path, map_location='cpu', weights_only=False)
-    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT}.get(ck.get('protocol'))
-    if (expected_contract is None or ck.get('training_contract') != expected_contract or ck.get('source_link') != LINK_PROTOCOL
+    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT, CONTEXT_PROTOCOL: CONTEXT_CONTRACT}.get(ck.get('protocol'))
+    expected_link = CONTEXT_LINK if ck.get('protocol') == CONTEXT_PROTOCOL else LINK_PROTOCOL
+    if (expected_contract is None or ck.get('training_contract') != expected_contract or ck.get('source_link') != expected_link
             or ck.get('reference_checkpoint_sha256') != reference_sha or ck.get('runtime_config_fingerprint') != config_sha
             or ck.get('checkpoint_role') not in (('resume_last', 'calibrated_candidate', 'epoch_snapshot')
                 if ck.get('protocol') == FULL_PROTOCOL else ('resume_last', 'calibrated_candidate'))):
@@ -41,8 +46,11 @@ def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=Fals
     if not allow_diagnostic and (ck['checkpoint_role'] != 'calibrated_candidate' or ck.get('mode') != allowed_mode
                                  or not ck.get('screen_pass') or ck.get('successful_updates', 0) <= 0):
         raise RuntimeError('failed/smoke/last joint candidate cannot be deployed')
+    adaptive = ck['model_configs'].get('adaptive_context')
+    if (adaptive is not None) != (ck['protocol'] == CONTEXT_PROTOCOL): raise RuntimeError('adaptive model/protocol mismatch')
+    extra = {'context_config': AdaptiveContextConfig(**adaptive)} if adaptive is not None else {}
     model = JointCausalColumns(config_from_mapping_v17(ck['model_configs']['motion']),
-                              ColumnConfig(**ck['model_configs']['columns'])).to(device)
+                              ColumnConfig(**ck['model_configs']['columns']), **extra).to(device)
     model.load_state_dict(ck['state_dict'], strict=True); model.eval()
     if not all(torch.isfinite(v).all() for v in model.state_dict().values()): raise RuntimeError('nonfinite joint state')
     weights = ck['TRAIN_weights']
@@ -58,7 +66,7 @@ def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=Fals
 
 
 def summary_text(summary):
-    lines = ['===== ONE-STAGE JOINT TRANSPORT + CAUSAL COLUMNS =====', f'protocol: {PROTOCOL}',
+    lines = ['===== ONE-STAGE JOINT TRANSPORT + CAUSAL COLUMNS =====', f"protocol: {summary['protocol']}",
         f"mode: {summary['mode']}", f"successful_updates: {summary['successful_updates']}",
         f"train_windows: {summary['train_windows']}", f"training_window_passes: {summary['training_window_passes']}",
         f"sampled_columns: {summary['sampled_columns']}", 'E14 weights NOT used for initialization; geometry stop-gradient only.',
@@ -94,6 +102,8 @@ def main():
     parser.add_argument('--frame-cache-mib', type=int, default=256)
     parser.add_argument('--seed', type=int, default=20261002)
     parser.add_argument('--resume', help='matching joint last.pt into a NEW output directory')
+    parser.add_argument('--adaptive-refine', action='store_true', help='optional spatial/temporal refine context; original generation unchanged')
+    parser.add_argument('--causal-geometry-cache', help='optional bounded shared FIXED history geometry cache; no learned outputs')
     args = parser.parse_args(); started = time.perf_counter(); out = Path(args.out_dir)
     if out.exists(): parser.error('NEW output directory required')
     for name in ('config', 'train_cache', 'dev_cache', 'population_manifest', 'base_checkpoint', 'train_info', 'dev_info'):
@@ -125,15 +135,30 @@ def main():
     base_sha = validate_clean_e14_checkpoint(base, args.base_checkpoint, CLEAN_SHA256)
     if not np.isclose(base.get('yaw_weight', 19.), 19.): raise RuntimeError('reference yaw loss contract mismatch')
     motion_config = config_from_mapping_v17(base['model_config']); del base
-    joint = JointCausalColumns(motion_config, ColumnConfig(z_bins=int(pcfg.grid.shape_hwd[2]))).to(device)
+    extra = {'context_config': AdaptiveContextConfig()} if args.adaptive_refine else {}
+    joint = JointCausalColumns(motion_config, ColumnConfig(z_bins=int(pcfg.grid.shape_hwd[2])), **extra).to(device)
     control = copy.deepcopy(joint.transport).to(device)
     if any(not torch.equal(v, control.state_dict()[k]) for k, v in joint.transport.state_dict().items()):
         raise RuntimeError('paired initialization mismatch')
-    provider = JointColumnProvider(args.base_checkpoint, base_sha, pcfg, device, args.cpu_workers, joint, control)
+    geometry_cache = None
+    if args.causal_geometry_cache:
+        from tools.real_motion.joint_column_full_common import FullJointColumnProvider
+        from real_motion.causal_geometry_cache import CausalGeometryCache
+        provider = FullJointColumnProvider(args.base_checkpoint, base_sha, pcfg, device, args.cpu_workers, joint, control)
+        namespace = stable_json_fingerprint(dict(runtime_config=cfg, strong=asdict(provider.strong),
+            columns=asdict(joint.columns.config), info={'train': sha256(args.train_info), 'dev': sha256(args.dev_info)},
+            caches={'train': sha256(args.train_cache), 'dev': sha256(args.dev_cache)}, dataroot=str(Path(args.dataroot).resolve())))
+        geometry_cache = CausalGeometryCache(args.causal_geometry_cache, namespace, max_bytes=4*2**30, ram_bytes=512*2**20)
+        provider.causal_geometry_cache = geometry_cache
+        atexit.register(geometry_cache.close)
+    else:
+        provider = JointColumnProvider(args.base_checkpoint, base_sha, pcfg, device, args.cpu_workers, joint, control)
     train_source = CachedColumnSource(NuScenesWindowSource(args.dataroot, info_pkl=args.train_info, verbose=False), args.frame_cache_mib)
     dev_source = CachedColumnSource(NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False), args.frame_cache_mib)
     target = 1024 if args.mode == 'screen' else 2
-    identity = {'protocol': PROTOCOL, 'training_contract': CONTRACT, 'source_link': LINK_PROTOCOL,
+    identity = {'protocol': CONTEXT_PROTOCOL if args.adaptive_refine else PROTOCOL,
+        'training_contract': CONTEXT_CONTRACT if args.adaptive_refine else CONTRACT,
+        'source_link': CONTEXT_LINK if args.adaptive_refine else LINK_PROTOCOL,
         'reference_checkpoint_sha256': base_sha, 'runtime_config_fingerprint': config_sha,
         'model_configs': joint.configs(), 'mode': args.mode, 'seed': args.seed, 'target_updates': target,
         'train_keys': train_keys, 'calibration_keys': cal_keys, 'dev_keys': dev_keys,
@@ -248,6 +273,8 @@ def main():
         try: commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
         except (OSError, subprocess.CalledProcessError): commit = 'unavailable'
         summary = {**identity, 'git_commit': commit, 'successful_updates': successful_total, 'executed_windows': target,
+            'column_parameters': sum(p.numel() for p in joint.columns.parameters()),
+            'geometry_cache': geometry_cache.stats() if geometry_cache is not None else None,
             'skipped_empty_windows': target-successful_total, 'train_windows': len(records),
             'training_window_passes': target/len(records), 'sampled_columns': sampled_total, 'gradient_link_observed': link_observed,
             'thresholds': gates, 'evaluation': evaluation, 'gates': checks, 'screen_pass': passed,
@@ -258,6 +285,7 @@ def main():
                 'joint_screen_passed_requires_explicit_next_step' if passed else 'joint_screen_not_passed_no_automatic_retry'}
         write_json(out/'summary.json', summary); (out/'summary.txt').write_text(summary_text(summary), encoding='utf-8')
         print(summary_text(summary), flush=True)
+    if geometry_cache is not None: geometry_cache.close()
 
 
 if __name__ == '__main__': main()

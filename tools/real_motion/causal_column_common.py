@@ -371,6 +371,8 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 if hasattr(model, 'source_features_for'):
                     b['source_features'] = model.source_features_for(prepared, h, small, device)
+                if hasattr(model, 'extra_inputs_for'):
+                    b.update(model.extra_inputs_for(prepared, h, small, grid, device))
                 g, r = model(**b)
             parts.append(model.calibrated_probabilities(g, r, b["kind"], legal).cpu().numpy())
     model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,

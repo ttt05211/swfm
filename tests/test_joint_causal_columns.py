@@ -208,9 +208,12 @@ def test_current_motion_rerender_updates_geometry_and_supervision_without_detach
             provider.prepare_columns(None, rec, include_gt=False, raw_window=prep.raw, outputs=output)
 
 
-def test_complete_cli_smoke_resume_real_losses_sampler_calibration_evaluation(tmp_path):
+@pytest.mark.parametrize('adaptive', (False, True))
+def test_complete_cli_smoke_resume_real_losses_sampler_calibration_evaluation(tmp_path, adaptive):
     from tools.real_motion import train_p0_f9_joint_causal_columns as trainer
     from tools.real_motion import causal_column_common as cc
+    from tools.real_motion import joint_column_full_common as full_common
+    from real_motion.strong_w2det import StrongW2DetConfig
     prep, grid, sample_joint, _, template = fixture()
     train = [{**copy.deepcopy(template), 'scene_name': f'train{s}', 't0_token': f'{s}:{i}'} for s in range(10) for i in range(4)]
     dev = [{**copy.deepcopy(template), 'scene_name': 'dev', 't0_token': f'd{i}'} for i in range(64)]
@@ -223,6 +226,7 @@ def test_complete_cli_smoke_resume_real_losses_sampler_calibration_evaluation(tm
     pcfg = SimpleNamespace(grid=grid)
     def make_provider(checkpoint, expected_sha, cfg, device, workers, joint, control):
         result = provider_for(prep, grid, joint); result.workers = workers; result.reference_enabled = False
+        result.strong = StrongW2DetConfig()
         result.control = control; result.joint = joint; result.model = joint.transport
         def prepare(source, record, *, include_gt, raw_window=None, outputs=None):
             row = copy.deepcopy(prep); row.window.scene_name = record['scene_name']; row.window.t0_token = record['t0_token']
@@ -232,17 +236,19 @@ def test_complete_cli_smoke_resume_real_losses_sampler_calibration_evaluation(tm
         result.reference_predictions = lambda p, r: {'frozen_E14': p.baseline, 'paired_scratch_V18_only': p.baseline} if result.reference_enabled else {}
         return result
     # Keep model widths tiny, all other actual orchestration/loss/report paths run.
-    def build(mc, config): return JointCausalColumns(mc, sample_joint.columns.config)
-    def run(out, resume=None):
+    def build(mc, config, **extra): return JointCausalColumns(mc, sample_joint.columns.config, **extra)
+    def run(out, resume=None, adaptive_arm=adaptive):
         argv = ['train', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot', str(tmp_path), '--out-dir', str(out), '--mode', 'smoke', '--device', 'cpu', '--cpu-workers', '1']
         for k, f in files.items(): argv += ['--'+k, str(f)]
         if resume: argv += ['--resume', str(resume)]
+        if adaptive_arm: argv += ['--adaptive-refine', '--causal-geometry-cache', str(tmp_path/'fixed-cache')]
         with patch('sys.argv', argv), patch.object(trainer, 'make_prepare_config', return_value=pcfg), \
             patch.object(trainer, 'load_manifest', return_value=(manifest, devkeys, None)), \
             patch.object(trainer, 'load_cache', side_effect=[({}, train), ({}, dev)]), \
             patch.object(trainer, 'JointCausalColumns', side_effect=build), \
             patch.object(trainer, 'JointColumnProvider', side_effect=make_provider), \
+            patch.object(full_common, 'FullJointColumnProvider', side_effect=make_provider), \
             patch.object(trainer, 'validate_clean_e14_checkpoint', return_value='a'*64), \
             patch.object(trainer, 'NuScenesWindowSource', return_value=SimpleNamespace(nusc=None)), \
             patch.object(cc, 'gt_moving_support_sequence', return_value=moving_fixture(prep)):
@@ -255,6 +261,13 @@ def test_complete_cli_smoke_resume_real_losses_sampler_calibration_evaluation(tm
     assert summary['evaluation']['all']['windows'] == 2
     assert set(summary['evaluation']['all']['reference_metrics']) == {'frozen_E14', 'paired_scratch_V18_only'}
     assert summary['route'] == 'smoke_only_not_effectiveness_evidence'
+    if adaptive:
+        from tools.real_motion.compare_p0_f9_adaptive_refine import compare
+        local_out = tmp_path/'local'; run(local_out, adaptive_arm=False)
+        local = json.loads((local_out/'summary.json').read_text(encoding='utf-8'))
+        comparison, text = compare(local, summary)
+        assert not comparison['pass_gate'] and 'fixed0.5 diagnostic_refine' in text
+        with pytest.raises(RuntimeError, match='budget mismatch: seed'): compare({**local, 'seed': 1}, summary)
     assert {k: f.read_bytes() for k, f in files.items()} == originals
     assert sorted(p.name for p in out.glob('*.pt')) == ['candidate.pt', 'last.pt']
     resumed = tmp_path/'resume'; run(resumed, out/'last.pt')

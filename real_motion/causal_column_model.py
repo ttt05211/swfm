@@ -45,13 +45,13 @@ class CausalColumnModel(nn.Module):
             torch.linspace(-1, 1, config.patch), indexing="ij"), dim=-1)
         self.register_buffer("memory_coordinates", coords.reshape(1, 6*config.patch**2, 3), persistent=False)
 
-    def forward(self, history, flags, base, fallback, context, kind, classes, *, query_extra=None):
+    def encode_local(self, history, flags, base, fallback, context, kind, classes, *, query_extra=None):
         n, z, p, d = len(kind), self.config.z_bins, self.config.patch, self.config.width
         if (history.shape != (n, 6, p, p, z) or flags.shape != history.shape
                 or base.shape != (n, z) or fallback.shape != (n, z) or context.shape != (n, CONTEXT_DIM)
                 or classes.shape != (n,)):
             raise ValueError("column feature shapes differ from checkpoint contract")
-        if n == 0: return context.new_empty((0, z)), context.new_empty((0, z, 3))
+        if n == 0: return context.new_empty((0, d))
         # UNKNOWN semantics are zeroed BEFORE spatial convolution; they may not
         # masquerade as free or become learned content through an embedding.
         valid = history != 18
@@ -73,8 +73,11 @@ class CausalColumnModel(nn.Module):
             if query_extra.shape != (n, d): raise ValueError('continuous source query shape mismatch')
             q = q + query_extra[:, None].to(q.dtype)
         for block in self.decoder: q = block(q, x, invalid)
-        q = self.norm(q[:, 0])
-        return self.generation(q), self.refinement(q).reshape(n, z, 3)
+        return self.norm(q[:, 0])
+
+    def forward(self, history, flags, base, fallback, context, kind, classes, *, query_extra=None):
+        q = self.encode_local(history, flags, base, fallback, context, kind, classes, query_extra=query_extra)
+        return self.generation(q), self.refinement(q).reshape(len(kind), self.config.z_bins, 3)
 
     def calibrated_probabilities(self, generation, refinement, kind, legal):
         if (not torch.isfinite(generation).all() or not torch.isfinite(refinement).all()

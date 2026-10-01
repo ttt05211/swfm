@@ -82,7 +82,7 @@ def sample_online_column(prep, selected, grid, config):
     return {**features, 'legal': small.legal, 'target': labels, 'weight': weight}
 
 
-def assemble_online_columns(prep, model, selected, arrays, device):
+def assemble_online_columns(prep, model, selected, arrays, device, *, grid=None):
     """Latent gathering stays on the autograd-owning caller, never a worker."""
     parts = defaultdict(list)
     for (h, small, _, _), features in zip(selected, arrays):
@@ -91,6 +91,14 @@ def assemble_online_columns(prep, model, selected, arrays, device):
     if not parts: return None
     batch = {k: torch.as_tensor(np.concatenate(v), device=device) for k, v in parts.items() if k != 'source_features'}
     batch['source_features'] = torch.cat(parts['source_features'])
+    if hasattr(model, 'extra_inputs_for'):
+        extra_parts = defaultdict(list); atlas_count = 0
+        for h, small, _, _ in selected:
+            extra = model.extra_inputs_for(prep, h, small, grid=grid, device=device)
+            extra['atlas_index'] = extra['atlas_index']+atlas_count
+            atlas_count += len(extra['static_atlas'])
+            for k, v in extra.items(): extra_parts[k].append(v)
+        batch.update({k: torch.cat(v) for k, v in extra_parts.items()})
     if len(batch['kind']) > 256: raise RuntimeError('online query budget exceeded')
     return batch
 
@@ -98,7 +106,7 @@ def assemble_online_columns(prep, model, selected, arrays, device):
 def online_columns(prep, model, grid, rng, device):
     selected = select_online_columns(prep, model.config, grid, rng)
     arrays = [sample_online_column(prep, row, grid, model.config) for row in selected]
-    return assemble_online_columns(prep, model, selected, arrays, device)
+    return assemble_online_columns(prep, model, selected, arrays, device, grid=grid)
 
 
 def motion_loss(output, record, device, patch_resolution=.8):
@@ -140,7 +148,7 @@ def train_window(joint, control, optimizer, control_optimizer, provider, source,
     link_grad = 0.; lc = lm.new_zeros(()); cs = {}; sampled = 0
     if batch is not None:
         with torch.autocast(device_type=provider.device.type, dtype=torch.bfloat16, enabled=provider.device.type == 'cuda'):
-            g, r = joint.columns(**{k: batch[k] for k in (*FEATURE_KEYS, 'source_features')})
+            g, r = joint.columns(**{k: batch[k] for k in (*FEATURE_KEYS, *joint.columns.extra_input_keys)})
         lc, cs = column_loss(joint.columns, g, r, batch['kind'], batch['legal'], batch['target'], batch['weight'])
         sampled = len(batch['kind'])
         if probe and output['future_transport_queries'].requires_grad and len(output['future_transport_queries']):
