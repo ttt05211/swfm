@@ -21,8 +21,10 @@ class CrossBlock(nn.Module):
 
 
 class CausalColumnModel(nn.Module):
-    def __init__(self, config=ColumnConfig()):
+    def __init__(self, config=ColumnConfig(), *, history_frames=6):
         super().__init__(); config.validate(); self.config = config
+        if history_frames not in (4, 6): raise ValueError('four or six history observations required')
+        self.history_frames = history_frames
         d, z, e = config.width, config.z_bins, config.semantic_dim
         self.semantic = nn.Embedding(19, e)
         # Ordered Z flattening preserves bin identity; no height mean/top-only collapse.
@@ -41,13 +43,14 @@ class CausalColumnModel(nn.Module):
         # Finite TRAIN-derived corrections persisted with checkpoint.
         self.register_buffer("generation_pos_weight", torch.ones(()))
         self.register_buffer("refine_class_weights", torch.ones(3))
-        coords = torch.stack(torch.meshgrid(torch.linspace(-1, 0, 6), torch.linspace(-1, 1, config.patch),
+        coords = torch.stack(torch.meshgrid(torch.linspace(-1, 0, history_frames), torch.linspace(-1, 1, config.patch),
             torch.linspace(-1, 1, config.patch), indexing="ij"), dim=-1)
-        self.register_buffer("memory_coordinates", coords.reshape(1, 6*config.patch**2, 3), persistent=False)
+        self.register_buffer("memory_coordinates", coords.reshape(1, history_frames*config.patch**2, 3), persistent=False)
 
     def encode_local(self, history, flags, base, fallback, context, kind, classes, *, query_extra=None):
         n, z, p, d = len(kind), self.config.z_bins, self.config.patch, self.config.width
-        if (history.shape != (n, 6, p, p, z) or flags.shape != history.shape
+        t = self.history_frames
+        if (history.shape != (n, t, p, p, z) or flags.shape != history.shape
                 or base.shape != (n, z) or fallback.shape != (n, z) or context.shape != (n, CONTEXT_DIM)
                 or classes.shape != (n,)):
             raise ValueError("column feature shapes differ from checkpoint contract")
@@ -58,8 +61,8 @@ class CausalColumnModel(nn.Module):
         emb = self.semantic(history.long())*valid[..., None]
         bits = torch.stack(((flags & 1) != 0, (flags & 2) != 0), dim=-1).to(emb.dtype)*valid[..., None]
         x = self.column(torch.cat((emb, bits), dim=-1).flatten(-2))*valid.any(-1)[..., None]
-        x = x.reshape(n*6, p, p, d).permute(0, 3, 1, 2)
-        x = self.spatial(x).permute(0, 2, 3, 1).reshape(n, 6*p*p, d)
+        x = x.reshape(n*t, p, p, d).permute(0, 3, 1, 2)
+        x = self.spatial(x).permute(0, 2, 3, 1).reshape(n, t*p*p, d)
         x = x+self.position(self.memory_coordinates.to(x.dtype))
         invalid = ~valid.any(-1).flatten(1)
         # An all-unknown query gets a ZERO dummy token, never all-masked NaNs.

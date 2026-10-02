@@ -13,7 +13,7 @@ import subprocess
 import time
 import numpy as np
 import torch
-from real_motion.joint_causal_columns import JointCausalColumns, PROTOCOL, CONTRACT, LINK_PROTOCOL, FULL_PROTOCOL, FULL_CONTRACT
+from real_motion.joint_causal_columns import JointCausalColumns, PROTOCOL, CONTRACT, LINK_PROTOCOL, FULL_PROTOCOL, FULL_CONTRACT, FULL4_PROTOCOL, FULL4_CONTRACT
 from real_motion.adaptive_column_context import (AdaptiveContextConfig, PROTOCOL as CONTEXT_PROTOCOL,
     TRAINING_CONTRACT as CONTEXT_CONTRACT, LINK_PROTOCOL as CONTEXT_LINK)
 from real_motion.causal_column_completion import ColumnConfig
@@ -35,18 +35,21 @@ from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 
 def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=False):
     ck = torch.load(path, map_location='cpu', weights_only=False)
-    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT, CONTEXT_PROTOCOL: CONTEXT_CONTRACT}.get(ck.get('protocol'))
+    full_protocol = ck.get('protocol') in (FULL_PROTOCOL, FULL4_PROTOCOL)
+    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT, FULL4_PROTOCOL: FULL4_CONTRACT, CONTEXT_PROTOCOL: CONTEXT_CONTRACT}.get(ck.get('protocol'))
     expected_link = CONTEXT_LINK if ck.get('protocol') == CONTEXT_PROTOCOL else LINK_PROTOCOL
     if (expected_contract is None or ck.get('training_contract') != expected_contract or ck.get('source_link') != expected_link
             or ck.get('reference_checkpoint_sha256') != reference_sha or ck.get('runtime_config_fingerprint') != config_sha
             or ck.get('checkpoint_role') not in (('resume_last', 'calibrated_candidate', 'epoch_snapshot')
-                if ck.get('protocol') == FULL_PROTOCOL else ('resume_last', 'calibrated_candidate'))):
+                if full_protocol else ('resume_last', 'calibrated_candidate'))):
         raise RuntimeError('joint checkpoint/reference/config contract mismatch')
-    allowed_mode = 'full' if ck.get('protocol') == FULL_PROTOCOL else 'screen'
+    allowed_mode = 'full' if full_protocol else 'screen'
     if not allow_diagnostic and (ck['checkpoint_role'] != 'calibrated_candidate' or ck.get('mode') != allowed_mode
                                  or not ck.get('screen_pass') or ck.get('successful_updates', 0) <= 0):
         raise RuntimeError('failed/smoke/last joint candidate cannot be deployed')
     adaptive = ck['model_configs'].get('adaptive_context')
+    if (ck['protocol'] == FULL4_PROTOCOL) != (ck['model_configs']['motion']['history_frames'] == 4):
+        raise RuntimeError('four-frame checkpoint/protocol mismatch')
     if (adaptive is not None) != (ck['protocol'] == CONTEXT_PROTOCOL): raise RuntimeError('adaptive model/protocol mismatch')
     extra = {'context_config': AdaptiveContextConfig(**adaptive)} if adaptive is not None else {}
     model = JointCausalColumns(config_from_mapping_v17(ck['model_configs']['motion']),

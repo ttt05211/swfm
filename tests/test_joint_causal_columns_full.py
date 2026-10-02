@@ -367,7 +367,7 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
     def run(out, epochs, resume=None, fail_update=None, stop_update=None):
         argv = ['train', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot', str(tmp_path), '--out-dir', str(out), '--epochs', str(epochs), '--device', 'cpu',
-            '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1']
+            '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1', '--history-frames', '6']
         for k, f in files.items(): argv += ['--'+k, str(f)]
         if resume: argv += ['--resume', str(resume)]
         # Reduce only evaluator population/width for this CPU orchestration test.

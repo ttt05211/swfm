@@ -186,17 +186,22 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         validate_label_values: bool = True,
     ) -> dict[str, torch.Tensor]:
         cfg = self.config
+        history_frames = cfg.history_frames
+        if history_frames == 4:
+            from .local_history_contract import four_frame_motion_inputs
+            features, local_semantic_tube, frame_motion_features, target_source_mask_tube = four_frame_motion_inputs(
+                features, local_semantic_tube, frame_motion_features, target_source_mask_tube)
         if features.ndim != 2 or features.shape[-1] != FEATURE_DIM:
             raise ValueError(f"features must be [B,{FEATURE_DIM}]")
         B = features.shape[0]
         if local_semantic_tube.ndim != 4 or tuple(local_semantic_tube.shape[1:]) != (
-            HISTORY_FRAMES, cfg.tube_hw, cfg.tube_hw
+            history_frames, cfg.tube_hw, cfg.tube_hw
         ):
             raise ValueError("local_semantic_tube shape mismatch")
         if kta_displacement_xy_m.shape != (B, FUTURE_FRAMES, 2):
             raise ValueError("kta_displacement_xy_m must be [B,6,2]")
         if frame_motion_features is None or frame_motion_features.shape != (
-            B, HISTORY_FRAMES, FRAME_MOTION_DIM
+            B, history_frames, FRAME_MOTION_DIM
         ):
             raise ValueError("frame_motion_features must be [B,6,5]")
         if target_source_mask_tube is None or target_source_mask_tube.shape != local_semantic_tube.shape:
@@ -230,21 +235,21 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
 
         emb = self.semantic_embedding(labels) + self.source_mask_embedding(mask_labels)
         x = emb.permute(0, 1, 4, 2, 3).reshape(
-            B * HISTORY_FRAMES, cfg.semantic_dim, cfg.tube_hw, cfg.tube_hw
+            B * history_frames, cfg.semantic_dim, cfg.tube_hw, cfg.tube_hw
         )
         x = self.spatial_stem(x)
         Hs, Ws = x.shape[-2:]
-        x = x.reshape(B, HISTORY_FRAMES, cfg.d_model, Hs, Ws)
+        x = x.reshape(B, history_frames, cfg.d_model, Hs, Ws)
         obj = self.kinematic_proj(features).view(B, 1, cfg.d_model, 1, 1)
         fm = self.frame_motion_proj(frame_motion_features.to(x.dtype)).view(
-            B, HISTORY_FRAMES, cfg.d_model, 1, 1
+            B, history_frames, cfg.d_model, 1, 1
         )
         x = x + obj + fm + self.time_embedding + self.spatial_embedding
         for block in self.blocks:
             x = block(x)
 
         context = x.permute(0, 1, 3, 4, 2).reshape(
-            B, HISTORY_FRAMES * Hs * Ws, cfg.d_model
+            B, history_frames * Hs * Ws, cfg.d_model
         )
         q = self.future_query.expand(B, -1, -1) + self.future_time_embedding
         q = q + self.kinematic_proj(features).unsqueeze(1)

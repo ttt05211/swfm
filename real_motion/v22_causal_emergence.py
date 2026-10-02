@@ -53,9 +53,9 @@ def build_future_static_memory_only(
         len(history_semantics)
         == len(history_observed)
         == len(history_poses)
-        == 6
+        in (4, 6)
     ):
-        raise ValueError("expected six history frames")
+        raise ValueError("expected four or six history frames")
     if len(future_poses) != 6:
         raise ValueError("expected six future frames")
     shape = tuple(int(x) for x in grid.shape_hwd)

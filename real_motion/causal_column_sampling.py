@@ -16,6 +16,8 @@ class ColumnFeatureSampler:
         self.prepared, self.h, self.grid, self.config = prepared, h, grid, config
         self.maps = {}; self.windows = {}; self.cache_bytes = 0
         self.history = np.asarray(prepared.raw['history_occ'])
+        self.t = len(self.history)
+        if self.t not in (4, 6): raise ValueError('four or six historical observations required')
         self.observed = np.asarray(prepared.raw['history_observed'])
         self.origin = np.asarray((grid.x_min, grid.y_min, grid.z_min))
         self.step = np.asarray(grid.voxel_size)
@@ -41,7 +43,7 @@ class ColumnFeatureSampler:
             if actor >= 0:
                 inverse_motion = np.linalg.inv(motion_factory(prepared.state['current'][actor]['centroid_world'],
                     prepared.targets[h][actor], prepared.yaws[h][actor]))
-            for f in range(6):
+            for f in range(self.t):
                 transform = inverse_history[f]@future_pose
                 owned = None
                 if actor >= 0:
@@ -57,7 +59,7 @@ class ColumnFeatureSampler:
             centres = plan.evidence_xy[groups == actor]
             if not len(centres): continue
             lo = centres.min(0)-self.p//2; hi = centres.max(0)+self.p//2+1
-            extent = hi-lo; area = int(np.prod(extent)); bytes_needed = 2*6*area*self.z
+            extent = hi-lo; area = int(np.prod(extent)); bytes_needed = 2*self.t*area*self.z
             # TRAIN's few sampled columns and pathological/dispersed components
             # should remain sparse. Never truncate candidates to fit a cache.
             if (len(centres) < 32 or area*2 > len(centres)*self.p**2
@@ -98,13 +100,13 @@ class ColumnFeatureSampler:
                     bits |= membership[np.ravel_multi_index(ijk[valid].T, tuple(self.shape))].astype(np.uint8)*2
                 flags[start:stop][valid] = bits
             return labels.reshape(shape), flags.reshape(shape)
-        active = [f for f in range(6) if self.transforms[actor][f] is not None]
+        active = [f for f in range(self.t) if self.transforms[actor][f] is not None]
         # Single static map shared by generation + static refine, six frames
         # parallelized only here; no nested pools and no CUDA work in threads.
-        frames = [None]*6
+        frames = [None]*self.t
         mapped_frames = map(frame, active) if pool is None else pool.map(frame, active)
         for f, mapped in zip(active, mapped_frames): frames[f] = mapped
-        for f in range(6):
+        for f in range(self.t):
             if frames[f] is None: frames[f] = (np.full(shape, UNKNOWN, np.uint8), np.zeros(shape, np.uint8))
         return lo, np.stack([v[0] for v in frames]), np.stack([v[1] for v in frames])
 
@@ -115,7 +117,7 @@ class ColumnFeatureSampler:
         # Class membership is applied after expansion (GEN/static may differ).
         centres, inverse = np.unique(plan.evidence_xy, axis=0, return_inverse=True)
         n, p, z = len(centres), self.p, self.z
-        hist = np.full((n, 6, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
+        hist = np.full((n, self.t, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
         offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing='ij'), -1)
         idx = offsets[None]+np.pad(centres, ((0, 0), (0, 1)))[:, None, None, None, :]
         xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
@@ -135,7 +137,7 @@ class ColumnFeatureSampler:
 
     def sample(self, plan, reference_sampler):
         n, p, z = len(plan), self.p, self.z
-        hist = np.full((n, 6, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
+        hist = np.full((n, self.t, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
         groups = np.where(plan.actor < 0, -1, plan.actor)
         for actor in np.unique(groups):
             take = np.flatnonzero(groups == actor); actor = int(actor)

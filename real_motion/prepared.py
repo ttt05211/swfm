@@ -125,11 +125,15 @@ def _load_history_semantics_and_observation(source, scene_name, tokens, free_lab
 
 
 def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(), include_gt=True,
-                              io_workers=1):
+                              io_workers=1, active_history_frames=None):
     """Load raw arrays/poses once; trajectory matches official OccFM-fut exactly."""
     io_workers=max(1,int(io_workers))
+    if active_history_frames not in (None, 4, 6): raise ValueError('unsupported active history')
+    history_tokens = window.history_tokens if active_history_frames is None else window.history_tokens[-active_history_frames:]
+    if active_history_frames is not None and len(history_tokens) != active_history_frames:
+        raise ValueError('insufficient history observations')
     hist, hist_obs = _load_history_semantics_and_observation(
-        source, window.scene_name, window.history_tokens, cfg.free_label,io_workers
+        source, window.scene_name, history_tokens, cfg.free_label,io_workers
     )
     if include_gt:
         nworkers=max(1,min(io_workers,len(window.future_tokens)))
@@ -157,7 +161,7 @@ def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(
         np.zeros((cfg.trajectory_zero_prefix,2),dtype=np.float32),
     ):
         raise ValueError("OccFM-fut trajectory prefix masking does not match HIST_LAST contract")
-    all_tokens=tuple(window.history_tokens)+tuple(window.future_tokens)
+    all_tokens=tuple(history_tokens)+tuple(window.future_tokens)
     nworkers=max(1,min(io_workers,len(all_tokens)))
     if nworkers==1:
         poses=[source.pose(t) for t in all_tokens]
@@ -168,8 +172,8 @@ def load_nuscenes_window_raw(source, window, cfg: PrepareConfig = PrepareConfig(
         "history_occ": hist,
         "history_observed": hist_obs,
         "future_gt_occ": fut_gt,
-        "history_poses": poses[:len(window.history_tokens)],
-        "future_poses": poses[len(window.history_tokens):],
+        "history_poses": poses[:len(history_tokens)],
+        "future_poses": poses[len(history_tokens):],
         "trajectory": trajectory,
     }
 

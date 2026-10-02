@@ -298,8 +298,8 @@ class LocalSpatialTemporalWorldModel(nn.Module):
         cfg = config
         if cfg.d_model % cfg.heads:
             raise ValueError("d_model must be divisible by heads")
-        if cfg.history_frames != HISTORY_FRAMES or cfg.future_frames != FUTURE_FRAMES:
-            raise ValueError("v16 requires the frozen 6-history + 6-future contract")
+        if cfg.history_frames not in (4, HISTORY_FRAMES) or cfg.future_frames != FUTURE_FRAMES:
+            raise ValueError("supported history counts are four or legacy six; six futures required")
         if cfg.tube_hw % 2:
             raise ValueError("tube_hw must be even for the stride-2 spatial stem")
         self.config = cfg
@@ -313,7 +313,7 @@ class LocalSpatialTemporalWorldModel(nn.Module):
         self.kinematic_proj = nn.Sequential(
             nn.Linear(FEATURE_DIM, cfg.d_model), nn.GELU(), nn.LayerNorm(cfg.d_model)
         )
-        self.time_embedding = nn.Parameter(torch.zeros(1, HISTORY_FRAMES, cfg.d_model, 1, 1))
+        self.time_embedding = nn.Parameter(torch.zeros(1, cfg.history_frames, cfg.d_model, 1, 1))
         stem_hw = cfg.tube_hw // 2
         self.spatial_embedding = nn.Parameter(torch.zeros(1, 1, cfg.d_model, stem_hw, stem_hw))
         self.blocks = nn.ModuleList([
@@ -347,10 +347,14 @@ class LocalSpatialTemporalWorldModel(nn.Module):
         kta_displacement_xy_m: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         cfg = self.config
+        if cfg.history_frames == 4:
+            from .local_history_contract import four_frame_motion_inputs
+            features, local_semantic_tube, _, _ = four_frame_motion_inputs(
+                features, local_semantic_tube, None, torch.zeros_like(local_semantic_tube))
         if features.ndim != 2 or features.shape[-1] != FEATURE_DIM:
             raise ValueError(f"features must be [B,{FEATURE_DIM}]")
         if local_semantic_tube.ndim != 4 or tuple(local_semantic_tube.shape[1:]) != (
-            HISTORY_FRAMES, cfg.tube_hw, cfg.tube_hw
+            cfg.history_frames, cfg.tube_hw, cfg.tube_hw
         ):
             raise ValueError("local_semantic_tube shape mismatch")
         if kta_displacement_xy_m.shape != (features.shape[0], FUTURE_FRAMES, 2):
@@ -372,17 +376,17 @@ class LocalSpatialTemporalWorldModel(nn.Module):
 
         emb = self.semantic_embedding(labels)  # [B,T,H,W,E]
         x = emb.permute(0, 1, 4, 2, 3).reshape(
-            B * HISTORY_FRAMES, cfg.semantic_dim, cfg.tube_hw, cfg.tube_hw
+            B * cfg.history_frames, cfg.semantic_dim, cfg.tube_hw, cfg.tube_hw
         )
         x = self.spatial_stem(x)
         Hs, Ws = x.shape[-2:]
-        x = x.reshape(B, HISTORY_FRAMES, cfg.d_model, Hs, Ws)
+        x = x.reshape(B, cfg.history_frames, cfg.d_model, Hs, Ws)
         obj = self.kinematic_proj(features).view(B, 1, cfg.d_model, 1, 1)
         x = x + obj + self.time_embedding + self.spatial_embedding
         for block in self.blocks:
             x = block(x)
 
-        context = x.permute(0, 1, 3, 4, 2).reshape(B, HISTORY_FRAMES * Hs * Ws, cfg.d_model)
+        context = x.permute(0, 1, 3, 4, 2).reshape(B, cfg.history_frames * Hs * Ws, cfg.d_model)
         q = self.future_query.expand(B, -1, -1) + self.future_time_embedding
         q = q + self.kinematic_proj(features).unsqueeze(1)
         q = q + self.kta_future_proj(kta_displacement_xy_m.to(q.dtype) / 20.0)

@@ -55,16 +55,18 @@ def pose_motion(center, target, yaw):
 
 def causal_source_history(raw_history, poses, state, grid, strong, workers):
     """Causal same-class association/ICP only. No annotation or future GT."""
-    with ThreadPoolExecutor(max_workers=min(workers, 5)) as pool:
-        frames = list(pool.map(lambda f: extract_instances_cropped_exact(raw_history[f], poses[f], grid=grid, cfg=strong), range(5)))
+    t = len(raw_history)
+    if t not in (4, 6) or len(poses) != t: raise ValueError('four or six aligned historical observations required')
+    with ThreadPoolExecutor(max_workers=min(workers, t-1)) as pool:
+        frames = list(pool.map(lambda f: extract_instances_cropped_exact(raw_history[f], poses[f], grid=grid, cfg=strong), range(t-1)))
     frames.append(state["current"])
     links, audit = associate_backwards(frames, state["current"], state["velocities"], dt=.5)
     points = [[rigid_source_points_world(c["voxel_indices"], pose, grid=grid) for c in frame]
               for frame, pose in zip(frames, poses)]
-    registrations = [[None]*6 for _ in state["current"]]
+    registrations = [[None]*t for _ in state["current"]]
     for i, comp in enumerate(state["current"]):
-        registrations[i][5] = (np.eye(4), np.asarray(comp["voxel_indices"], np.int64))
-        for f, j in enumerate(links[i][:5]):
+        registrations[i][-1] = (np.eye(4), np.asarray(comp["voxel_indices"], np.int64))
+        for f, j in enumerate(links[i][:-1]):
             if j is None: continue
             p = points[f][j]
             result = register_history_shape(p, state["source_world_points"][i], allow_yaw=int(comp["class_id"]) != 7)
@@ -99,11 +101,12 @@ class PreparedColumns:
 class FrozenColumns(FrozenXYV18):
     def load_raw_columns(self, source, record, *, include_gt):
         return load_nuscenes_window_raw(source, window_from_record(record), self.pcfg,
-            include_gt=include_gt, io_workers=min(self.workers, 4))
+            include_gt=include_gt, io_workers=min(self.workers, 4),
+            active_history_frames=getattr(getattr(getattr(getattr(self, 'joint', None), 'transport', self.model), 'config', None), 'history_frames', 6))
 
     def prepare_columns(self, source, record, *, include_gt, raw_window=None, outputs=None):
         started = time.perf_counter()
-        if raw_window is None and outputs is None:
+        if raw_window is None and outputs is None and getattr(getattr(self.model, 'config', None), 'history_frames', 6) == 6:
             window, raw, state, outputs = super().prepare(source, record, include_gt=include_gt)
         else:
             window = window_from_record(record)
@@ -273,9 +276,9 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
     append(xy, REFINE, -2, cls, mask, xy[:, 0], xy[:, 1], 0.)
     for i, comp in enumerate(prepared.state["current"]):
         registered = prepared.registrations[i]
-        if not any(r is not None for r in registered[:5]): continue
+        if not any(r is not None for r in registered[:-1]): continue
         all_flat = [np.ravel_multi_index(prepared.components[h][i].voxel_indices.T, shape)]
-        for f, reg in enumerate(registered[:5]):
+        for f, reg in enumerate(registered[:-1]):
             if reg is None: continue
             if getattr(prepared, 'aligned_history_points', None) is not None:
                 aligned = prepared.aligned_history_points[i][f]
@@ -292,7 +295,7 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
         xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells)
         allowed = np.broadcast_to((np.arange(z) >= max(0, xyz[:, 2].min()-1))
                                   & (np.arange(z) <= min(z-1, xyz[:, 2].max()+1)), (len(xy), z)).copy()
-        age = .5*(5-min(f for f, reg in enumerate(registered) if reg is not None))
+        age = .5*(len(registered)-1-min(f for f, reg in enumerate(registered) if reg is not None))
         center = xy.mean(0)
         append(xy, REFINE, i, np.full(len(xy), int(comp["class_id"]), np.uint8), allowed,
                np.full(len(xy), center[0]), np.full(len(xy), center[1]), age)
@@ -313,7 +316,8 @@ def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
     means outside grid/unmatched source, NEVER an observed free label.
     """
     n, p, z = len(plan), config.patch, config.z_bins
-    hist = np.full((n, 6, p, p, z), UNKNOWN, np.uint8)
+    t = len(prepared.raw['history_occ'])
+    hist = np.full((n, t, p, p, z), UNKNOWN, np.uint8)
     flags = np.zeros_like(hist)
     offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing="ij"), -1)
     # A GRID_ENTRY query can be >patch_radius outside ALL historical grids.
@@ -326,7 +330,7 @@ def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
     future_pose = prepared.raw["future_poses"][h]
     for actor in np.unique(plan.actor):
         take = np.flatnonzero(plan.actor == actor)
-        for f in range(6):
+        for f in range(t):
             transform = np.linalg.inv(prepared.raw["history_poses"][f])@future_pose
             owned_ids = None
             if actor >= 0:

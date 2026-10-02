@@ -11,9 +11,10 @@ import subprocess
 import time
 import numpy as np
 import torch
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from concurrent.futures import ThreadPoolExecutor
 from real_motion.causal_geometry_cache import CausalGeometryCache
-from real_motion.joint_causal_columns import JointCausalColumns, FULL_PROTOCOL, FULL_CONTRACT, LINK_PROTOCOL
+from real_motion.joint_causal_columns import JointCausalColumns, FULL_PROTOCOL, FULL_CONTRACT, FULL4_PROTOCOL, FULL4_CONTRACT, LINK_PROTOCOL
 from real_motion.causal_column_completion import ColumnConfig
 from real_motion.column_runtime_pipeline import CachedColumnSource, prefetch_raw_columns
 from real_motion.local_st_world_model_v17 import config_from_mapping_v17
@@ -36,6 +37,11 @@ PRIOR_WINDOWS = 1024
 CALIBRATION_WINDOWS = 64
 
 
+class SamplingPoolOwner:
+    def __init__(self, workers): self.pool = ThreadPoolExecutor(max_workers=workers)
+    def close(self): self.pool.shutdown(wait=True, cancel_futures=True)
+
+
 def batch_indices(order, source_counts, windows, sources):
     rows = []; n = 0
     for i in order:
@@ -52,7 +58,8 @@ def training_plans(source_counts, epochs, seed, windows, sources):
 
 
 def full_summary(summary):
-    lines = ['===== FULL ONE-STAGE JOINT V18 + CAUSAL COLUMNS =====', f'protocol: {FULL_PROTOCOL}',
+    lines = ['===== FULL ONE-STAGE JOINT V18 + CAUSAL COLUMNS =====', f"protocol: {summary.get('protocol', FULL_PROTOCOL)}",
+        f"active_history_frames: {summary.get('active_history_frames', 6)}; future_frames: 6",
         f"epochs: {summary['epochs_completed']}/{summary['epochs']}", f"train_windows_per_epoch: {summary['train_windows']}",
         f"successful_updates: {summary['successful_updates']}", f"executed_windows: {summary['executed_windows']}",
         f"window_batch_size: {summary['window_batch_size']}", f"source_budget: {summary['source_budget']}",
@@ -93,6 +100,7 @@ def _main(stop_event, caches):
     for key in ('train-cache', 'dev-cache', 'population-manifest', 'base-checkpoint', 'dataroot', 'train-info', 'dev-info', 'out-dir'):
         parser.add_argument('--'+key, required=True)
     parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--history-frames', type=int, choices=(4, 6), help='fresh training defaults to strict four; omitted on resume restores checkpoint history count')
     parser.add_argument('--window-batch-size', type=int, default=4)
     parser.add_argument('--source-budget', type=int, default=128)
     parser.add_argument('--device', default='cuda'); parser.add_argument('--cpu-workers', type=int, default=8)
@@ -105,14 +113,27 @@ def _main(stop_event, caches):
     parser.add_argument('--seed', type=int, default=20261002)
     parser.add_argument('--paired-control', action='store_true', help='also train matched V18-only (off by default)')
     parser.add_argument('--resume', help='full-protocol last.pt into a NEW output directory; epochs/geometry/recipe must match')
+    parser.add_argument('--prewarm-causal-cache', action='store_true', help='explicitly persist all TRAIN history geometry before optimization; first build cost is not free')
+    parser.add_argument('--profile-every', type=int, default=0, help='opt-in host/CUDA-stream stage clocks every N updates; 0 leaves normal path unchanged')
+    parser.add_argument('--sampling-workers', type=int, default=0, help='0 uses legacy capped-at-four budget; positive selects CPU candidate/patch workers')
+    parser.add_argument('--persistent-sampling-pool', action='store_true', help='reuse bounded pure-CPU sampler pool across batches; same RNG/order/objective')
+    parser.add_argument('--io-workers', type=int, default=2, help='bounded next-batch window loaders')
     args = parser.parse_args(); started = time.perf_counter(); out = Path(args.out_dir)
     if out.exists(): parser.error('NEW output directory required')
     if (min(args.epochs, args.window_batch_size, args.source_budget, args.cpu_workers, args.eval_batch_size, args.checkpoint_every) < 1
             or min(args.frame_cache_mib, args.causal_cache_gib, args.causal_cache_ram_mib) < 0 or not np.isfinite(args.causal_cache_gib)):
         parser.error('positive budgets/epochs required')
+    if min(args.profile_every, args.sampling_workers) < 0 or args.io_workers < 1 or (args.prewarm_causal_cache and not args.causal_geometry_cache):
+        parser.error('nonnegative profile interval and a cache directory for prewarm required')
     for key in ('config', 'train_cache', 'dev_cache', 'population_manifest', 'base_checkpoint', 'train_info', 'dev_info'):
         if not str(getattr(args, key) or '').strip() or not Path(getattr(args, key)).is_file(): parser.error(f'missing {key}')
     if not Path(args.dataroot).is_dir(): parser.error('missing dataroot')
+    if args.resume and not Path(args.resume).is_file(): parser.error('missing resume checkpoint')
+    if args.history_frames is None:
+        if args.resume:
+            metadata = torch.load(args.resume, map_location='cpu', weights_only=False)
+            args.history_frames = int(metadata['model_configs']['motion']['history_frames']); del metadata
+        else: args.history_frames = 4
     device = torch.device(args.device)
     if device.type == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()): raise RuntimeError('CUDA/BF16 required')
     torch.set_num_threads(1); torch.manual_seed(args.seed)
@@ -137,7 +158,7 @@ def _main(stop_event, caches):
     base = torch.load(args.base_checkpoint, map_location='cpu', weights_only=False)
     base_sha = validate_clean_e14_checkpoint(base, args.base_checkpoint, CLEAN_SHA256)
     if not np.isclose(base.get('yaw_weight', 19.), 19.): raise RuntimeError('reference yaw loss mismatch')
-    motion_config = config_from_mapping_v17(base['model_config']); del base
+    motion_config = replace(config_from_mapping_v17(base['model_config']), history_frames=args.history_frames); del base
     joint = JointCausalColumns(motion_config, ColumnConfig(z_bins=int(pcfg.grid.shape_hwd[2]))).to(device)
     control = copy.deepcopy(joint.transport) if args.paired_control else None
     provider = FullJointColumnProvider(args.base_checkpoint, base_sha, pcfg, device, args.cpu_workers, joint, control)
@@ -150,7 +171,8 @@ def _main(stop_event, caches):
     if control_optimizer: control_optimizer.param_groups[0]['initial_lr'] = 5e-4
     plans = training_plans([len(r['features']) for r in records], args.epochs, args.seed+2, args.window_batch_size, args.source_budget)
     target_updates = sum(map(len, plans)); schedule_steps = target_updates
-    identity = {'protocol': FULL_PROTOCOL, 'training_contract': FULL_CONTRACT, 'source_link': LINK_PROTOCOL, 'mode': 'full',
+    protocol, contract = (FULL4_PROTOCOL, FULL4_CONTRACT) if args.history_frames == 4 else (FULL_PROTOCOL, FULL_CONTRACT)
+    identity = {'protocol': protocol, 'training_contract': contract, 'source_link': LINK_PROTOCOL, 'mode': 'full',
         'reference_checkpoint_sha256': base_sha, 'runtime_config_fingerprint': config_sha, 'model_configs': joint.configs(),
         'train_keys': train_keys, 'prior_keys': prior_keys, 'calibration_keys': cal_keys, 'dev_keys': dev_keys,
         'dev_manifest_fingerprint': manifest['manifest_fingerprint'], 'seed': args.seed, 'epochs': args.epochs,
@@ -160,9 +182,8 @@ def _main(stop_event, caches):
         'cache_fingerprints': {'train': sha256(args.train_cache), 'dev': sha256(args.dev_cache)},
         'patch_resolution_m': float(meta.get('patch_resolution_m', .8))}
     if args.causal_geometry_cache:
-        namespace = stable_json_fingerprint(dict(runtime_config=cfg, strong=asdict(provider.strong),
-            columns=asdict(joint.columns.config), info=identity['info_fingerprints'], caches=identity['cache_fingerprints'],
-            dataroot=str(Path(args.dataroot).resolve())))
+        from tools.real_motion.local_warm_cache_common import geometry_namespace
+        namespace = geometry_namespace(cfg, provider, identity['info_fingerprints'], identity['cache_fingerprints'], args.dataroot)
         provider.causal_geometry_cache = CausalGeometryCache(args.causal_geometry_cache, namespace,
             max_bytes=int(args.causal_cache_gib*2**30), ram_bytes=args.causal_cache_ram_mib*2**20)
         caches.append(provider.causal_geometry_cache)
@@ -196,16 +217,33 @@ def _main(stop_event, caches):
         if updates != expected_updates or executed != expected_windows or not 0 <= successes <= updates:
             raise RuntimeError('resume window/update counters inconsistent with epoch order')
     out.mkdir(parents=True); write_json(out/'execution_contract.json', {**identity, 'arguments': vars(args)})
+    sampling_pool = None
+    if args.persistent_sampling_pool:
+        owner = SamplingPoolOwner(args.sampling_workers or max(1, min(args.cpu_workers, 4)))
+        caches.append(owner); sampling_pool = owner.pool
     stages = {}; tick = time.perf_counter()
     label = 'FULL RESUME' if args.resume else 'FULL RANDOM INIT'
     print(f'{label}: windows={len(records)} epochs={args.epochs} updates={target_updates} batch<={args.window_batch_size} '
           f'sources<={args.source_budget} whole_cosine_steps={schedule_steps} paired_control={args.paired_control}', flush=True)
+    print(f'OBSERVATIONS: {args.history_frames} historical occupancy frames; six futures. Frozen E14 reference is legacy six-frame, NOT a matched four-frame baseline.', flush=True)
     if args.resume:
         print(f'RESTORED checkpoint={args.resume} completed_updates={updates} epoch_cursor={cursor_epoch} '
               f'batch_cursor={cursor_batch} next_update={updates+1} optimizer/RNG/cosine_restored prior_audit_skipped', flush=True)
     with (out/'progress.jsonl').open('x', encoding='utf-8') as handle:
         def progress(row):
             handle.write(json.dumps(finite_json(row), ensure_ascii=False, allow_nan=False)+'\n'); handle.flush()
+        if args.prewarm_causal_cache:
+            from tools.real_motion.local_warm_cache_common import warm_causal_cache
+            print('PREWARM: all TRAIN20430 causal disk entries; no GT/optimizer updates, original Strong device.', flush=True)
+            try:
+                warm = warm_causal_cache(provider, source, records, progress=lambda row:
+                    (progress(row), print(f"warm_cache={row['windows']}/{len(records)} seconds={row['seconds']:.1f}", flush=True)),
+                    stop_event=stop_event)
+            except InterruptedError:
+                print('STOPPED safely during prewarm; existing training checkpoint unchanged, cache reusable.', flush=True)
+                return 130
+            write_json(out/'warm_cache.json', warm); stages['prewarm_causal_cache'] = warm['seconds']
+        tick = time.perf_counter()
         if weights is None:
             joint.eval(); counts = {'generation': np.zeros(2, np.float64), 'refine': np.zeros(3, np.float64)}
             for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, prior), 1):
@@ -235,13 +273,16 @@ def _main(stop_event, caches):
             epoch_started = time.perf_counter(); done_batch = cursor_batch if e == cursor_epoch else 0
             scheduled = (records[i] for group in plans[e][done_batch:] for i in group)
             previous_end = time.perf_counter(); recent_time = []; recent_windows = []; aggregate = {}
-            for bi, rows in enumerate(prefetch_column_batches(provider, source, scheduled, args.window_batch_size, args.source_budget), done_batch+1):
+            for bi, rows in enumerate(prefetch_column_batches(provider, source, scheduled, args.window_batch_size, args.source_budget,
+                                                            io_workers=args.io_workers), done_batch+1):
                 compute_started = time.perf_counter(); wait = compute_started-previous_end
                 if tuple((r['scene_name'], r['t0_token']) for r, _ in rows) != tuple((records[i]['scene_name'], records[i]['t0_token']) for i in plans[e][bi-1]):
                     raise RuntimeError('batch planning/order mismatch')
                 stats = train_full_batch(joint, optimizer, provider, source, rows, rng, updates+1, schedule_steps,
                     probe=updates < 2 or (updates+1) % 128 == 0, patch_resolution=identity['patch_resolution_m'],
-                    control=control, control_optimizer=control_optimizer)
+                    control=control, control_optimizer=control_optimizer,
+                    profile=args.profile_every > 0 and (updates+1) % args.profile_every == 0,
+                    sampling_pool=sampling_pool, sampling_workers=args.sampling_workers)
                 updates += 1; successes += int(stats['optimizer_updated']); executed += stats['windows']; sampled += stats['sampled_columns']
                 link_observed |= (stats['source_query_gradient_norm'] or 0.) > 0
                 cursor_epoch, cursor_batch = e, bi; wall = time.perf_counter()-compute_started+wait
@@ -310,6 +351,7 @@ def _main(stop_event, caches):
         try: commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
         except (OSError, subprocess.CalledProcessError): commit = 'unavailable'
         summary = {**identity, 'git_commit': commit, 'epochs_completed': cursor_epoch, 'train_windows': len(records),
+            'active_history_frames': args.history_frames,
             'successful_updates': successes, 'attempted_updates': updates, 'executed_windows': executed, 'sampled_columns': sampled,
             'gradient_link_observed': link_observed, 'thresholds': gates, 'evaluation': evaluation, 'gates': checks,
             'stage_seconds': stages, 'elapsed_seconds': time.perf_counter()-started, 'screen_pass': passed,

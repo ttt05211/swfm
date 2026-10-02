@@ -189,6 +189,18 @@ class CausalGeometryCache:
         if writer is not None: writer.shutdown(wait=True)
         with self.lock: self._check_error()
 
+    def flush(self):
+        """Drain preceding asynchronous writes without closing the reusable cache."""
+        with self.lock:
+            self._check_error(); writer = self.writer; closed = self.closed
+        if writer is not None and not closed: writer.submit(lambda: None).result()
+        with self.lock: self._check_error()
+
+    def is_persisted(self, key, raw):
+        """Admission audit only; get_or_build remains the integrity-checked reader."""
+        name, _ = self._address(key, raw)
+        return (self.root/(name+'.cgc')).is_file()
+
     @property
     def disk_used(self):
         with self._roots_lock: return self._root_usage[self.cache_root]

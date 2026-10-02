@@ -33,11 +33,15 @@ FULL_CONTRACT = {**CONTRACT, 'control': 'optional_paired_control_default_off_E14
     'selection': 'final_epoch_only_with_fixed_gate_dev64_each_epoch',
     'prefetch': 'one_next_window_batch_causal_CPU_only_no_model_dependent_cache'}
 
+FULL4_PROTOCOL = 'p0_f9_joint_causal_columns_full_train_history4_v1'
+FULL4_CONTRACT = {**FULL_CONTRACT, 'observations': 'last4_observations_no_old_slots_no_cross_boundary_velocity_v1',
+    'reference': 'legacy_E14_six_history_not_same_input_budget_comparison'}
+
 
 class LinkedColumns(CausalColumnModel):
     extra_input_keys = ('source_features',)
-    def __init__(self, config, source_dim):
-        super().__init__(config)
+    def __init__(self, config, source_dim, *, history_frames=6):
+        super().__init__(config, history_frames=history_frames)
         self.source_dim = int(source_dim)
         self.source_projection = nn.Linear(source_dim, config.width, bias=False)
         nn.init.normal_(self.source_projection.weight, std=1e-3)
@@ -66,8 +70,10 @@ class JointCausalColumns(nn.Module):
     def __init__(self, motion_config=LocalSTWMV17Config(), column_config=ColumnConfig(), context_config=None):
         super().__init__()
         self.transport = LocalSpatialTemporalWorldModelV18SE2(motion_config)
+        if context_config is not None and motion_config.history_frames != 6:
+            raise ValueError('adaptive is legacy six-history only; use strict-four Local instead')
         if context_config is None:
-            self.columns = LinkedColumns(column_config, motion_config.d_model)
+            self.columns = LinkedColumns(column_config, motion_config.d_model, history_frames=motion_config.history_frames)
         else:
             from .adaptive_column_context import AdaptiveLinkedColumns
             self.columns = AdaptiveLinkedColumns(column_config, motion_config.d_model, context_config)

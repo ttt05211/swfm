@@ -1,5 +1,6 @@
 """Full training: source batching + CPU-only causal batch look-ahead."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import time
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from tools.real_motion.causal_column_common import (causal_source_history, FEATU
     history_grid_footprint_bev_sequence, build_future_static_memory_only, fixed_candidate_geometry,
     compose_component_replacements_fast_exact, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
+from real_motion.local_training_profile import StageTimer
 
 MOTION_KEYS = ('features', 'local_semantic_tube', 'kta_displacement_xy_m',
                'frame_motion_features', 'target_source_mask_tube')
@@ -89,9 +91,9 @@ class FullJointColumnProvider(JointColumnProvider):
         return prepared
 
 
-def prefetch_column_batches(provider, source, records, batch_size, source_budget=128):
+def prefetch_column_batches(provider, source, records, batch_size, source_budget=128, *, io_workers=2):
     """One next complete batch, CPU-only; never prefetch entire epoch to RAM."""
-    if min(batch_size, source_budget) < 1: raise ValueError('positive window/source batch size required')
+    if min(batch_size, source_budget, io_workers) < 1: raise ValueError('positive window/source/I/O budget required')
     def groups():
         rows = []; sources = 0
         for record in records:
@@ -111,7 +113,7 @@ def prefetch_column_batches(provider, source, records, batch_size, source_budget
     rows = group()
     if not rows: return
     if getattr(provider, 'causal_geometry_cache', None) is not None:
-        io = ThreadPoolExecutor(max_workers=2)
+        io = ThreadPoolExecutor(max_workers=io_workers)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(load, rows)
@@ -138,36 +140,46 @@ def pack_records(records, keys):
 
 
 def train_full_batch(joint, optimizer, provider, source, rows, rng, update, schedule_steps,
-                     *, probe=False, patch_resolution=.8, control=None, control_optimizer=None):
+                     *, probe=False, patch_resolution=.8, control=None, control_optimizer=None,
+                     profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0):
     """True batching, not repeated optimizer steps or stale feature replay."""
     joint.train(); optimizer.zero_grad(set_to_none=True); set_lr(optimizer, update-1, schedule_steps)
+    timer = StageTimer(provider.device, profile)
     if provider.device.type == 'cuda': torch.cuda.reset_peak_memory_stats(provider.device)
     records = [r for r, _ in rows]; sizes = [len(r['features']) for r in records]
-    merged = pack_records(records, (*MOTION_KEYS, *LABEL_KEYS))
-    output = joint.motion(merged, provider.device)
+    merged = timer.call('pack_inputs', pack_records, records, (*MOTION_KEYS, *LABEL_KEYS))
+    output = timer.call('motion_forward', joint.motion, merged, provider.device, gpu=True)
     local_outputs = [{k: v for k, v in zip(output, values)} for values in zip(*(v.split(sizes) for v in output.values()))]
     batches = []; prep_seconds = selection_seconds = feature_wait_seconds = worker_seconds = 0.
     candidate_wait_seconds = candidate_worker_seconds = 0.
-    workers = max(1, min(int(getattr(provider, 'workers', 4)), 4))
+    workers = sampling_workers or max(1, min(int(getattr(provider, 'workers', 4)), 4))
+    if workers < 1: raise ValueError('positive sampling worker budget required')
     def sample(prep, selected):
         started = time.perf_counter()
-        arrays = sample_online_column(prep, selected, provider.pcfg.grid, joint.columns.config)
+        if cpu_profiles is None:
+            arrays = sample_online_column(prep, selected, provider.pcfg.grid, joint.columns.config)
+        else:
+            arrays = cpu_profiles.run('patch_workers', sample_online_column, prep, selected, provider.pcfg.grid, joint.columns.config)
         return arrays, time.perf_counter()-started
     def candidates(prep):
         started = time.perf_counter()
-        plans = build_online_column_candidates(prep, joint.columns.config, provider.pcfg.grid)
+        if cpu_profiles is None:
+            plans = build_online_column_candidates(prep, joint.columns.config, provider.pcfg.grid)
+        else:
+            plans = cpu_profiles.run('candidate_workers', build_online_column_candidates, prep, joint.columns.config, provider.pcfg.grid)
         return plans, time.perf_counter()-started
     # One bounded batch of CPU-only jobs. The sampler RNG is consumed serially
     # in EXACT original window/horizon order; no worker touches live tensors.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with (ThreadPoolExecutor(max_workers=workers) if sampling_pool is None else nullcontext(sampling_pool)) as pool:
         planning = []; pending = []
         for (record, raw), local in zip(rows, local_outputs):
             tick = time.perf_counter()
-            prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw, outputs=local)
+            prep = timer.call('prepare_render', provider.prepare_columns, source, record,
+                include_gt=True, raw_window=raw, outputs=local)
             prep_seconds += time.perf_counter()-tick
             planning.append((prep, pool.submit(candidates, prep)))
         # GPU motion supervision can overlap queued CPU patch sampling.
-        lm, stats = motion_loss(output, merged, provider.device, patch_resolution)
+        lm, stats = timer.call('motion_loss', motion_loss, output, merged, provider.device, patch_resolution, gpu=True)
         for prep, job in planning:
             tick = time.perf_counter(); plans, seconds = job.result()
             candidate_wait_seconds += time.perf_counter()-tick; candidate_worker_seconds += seconds
@@ -179,15 +191,18 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             tick = time.perf_counter(); mapped = [job.result() for job in jobs]
             feature_wait_seconds += time.perf_counter()-tick
             worker_seconds += sum(seconds for _, seconds in mapped)
-            b = assemble_online_columns(prep, joint.columns, selected, [a for a, _ in mapped], provider.device)
+            b = timer.call('assemble_transfer', assemble_online_columns, prep, joint.columns, selected,
+                [a for a, _ in mapped], provider.device)
             if b is not None: batches.append(b)
     lc = lm.new_zeros(()); column_stats = {}; link_grad = None; sampled = 0
     if batches:
-        batch = {k: torch.cat([b[k] for b in batches]) for k in batches[0]}
+        batch = timer.call('concatenate_columns', lambda: {k: torch.cat([b[k] for b in batches]) for k in batches[0]})
         sampled = len(batch['kind'])
         with torch.autocast(device_type=provider.device.type, dtype=torch.bfloat16, enabled=provider.device.type == 'cuda'):
-            g, r = joint.columns(**{k: batch[k] for k in (*FEATURE_KEYS, 'source_features')})
-        lc, column_stats = column_loss(joint.columns, g, r, batch['kind'], batch['legal'], batch['target'], batch['weight'])
+            g, r = timer.call('column_forward', joint.columns,
+                **{k: batch[k] for k in (*FEATURE_KEYS, 'source_features')}, gpu=True)
+        lc, column_stats = timer.call('column_loss', column_loss, joint.columns, g, r,
+            batch['kind'], batch['legal'], batch['target'], batch['weight'], gpu=True)
         if probe and len(output['future_transport_queries']) and output['future_transport_queries'].requires_grad:
             grad = torch.autograd.grad(lc, output['future_transport_queries'], retain_graph=True, allow_unused=True)[0]
             link_grad = float(grad.float().norm()) if grad is not None else 0.
@@ -195,10 +210,10 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
     updated = loss.requires_grad and (bool(batches) or bool(merged['supervised_source'].any()))
     mn = cn = 0.
     if updated:
-        loss.backward()
-        mn = torch.nn.utils.clip_grad_norm_(joint.transport.parameters(), 5., error_if_nonfinite=True)
-        cn = torch.nn.utils.clip_grad_norm_(joint.columns.parameters(), 1., error_if_nonfinite=True)
-        optimizer.step()
+        timer.call('backward', loss.backward, gpu=True)
+        mn = timer.call('clip_motion', torch.nn.utils.clip_grad_norm_, joint.transport.parameters(), 5., error_if_nonfinite=True, gpu=True)
+        cn = timer.call('clip_columns', torch.nn.utils.clip_grad_norm_, joint.columns.parameters(), 1., error_if_nonfinite=True, gpu=True)
+        timer.call('optimizer', optimizer.step, gpu=True)
     control_loss = None
     if control is not None:
         if control_optimizer is None: raise ValueError('control optimizer required')
@@ -210,7 +225,8 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         if control_loss.requires_grad and bool(merged['supervised_source'].any()):
             control_loss.backward(); torch.nn.utils.clip_grad_norm_(control.parameters(), 5., error_if_nonfinite=True)
             control_optimizer.step()
-    return {'loss': float(loss.detach()), 'motion_loss': float(lm.detach()), 'column_loss': float(lc.detach()),
+    timings = timer.finish()
+    return {**timings, 'loss': float(loss.detach()), 'motion_loss': float(lm.detach()), 'column_loss': float(lc.detach()),
         'paired_control_motion_loss': float(control_loss.detach()) if control_loss is not None else None,
         'grad_norm': float(mn), 'column_grad_norm': float(cn), 'optimizer_updated': bool(updated),
         'source_query_gradient_norm': link_grad, 'gradient_probe': probe, 'sampled_columns': sampled,
