@@ -211,4 +211,5 @@ class CausalGeometryCache:
             return dict(hits=self.hits, misses=self.misses, writes=self.writes,
                 skipped_writes=self.skipped_writes, disk_mib=self.disk_used/2**20,
                 disk_limit_mib=self.limit/2**20, ram_mib=self.ram_used/2**20,
-                pending_writes=len(self.pending), background_write_seconds=self.write_seconds)
+                pending_writes=len(self.pending), background_write_seconds=self.write_seconds,
+                directory=str(self.root), namespace=self.namespace)

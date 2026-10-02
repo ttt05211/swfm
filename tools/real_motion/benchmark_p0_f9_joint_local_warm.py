@@ -201,8 +201,20 @@ def validate_continuation(c, out):
             columns=SimpleNamespace(config=ColumnConfig(z_bins=int(pcfg.grid.shape_hwd[2])))))
     namespace = geometry_namespace(cfg, provider, c['info_fingerprints'], c['cache_fingerprints'], c['dataroot'])
     directory = Path(c['geometry_cache'])/hashlib.sha256((GEOMETRY_PROTOCOL+namespace).encode()).hexdigest()
-    if directory.resolve() != Path(warm['cache']['directory']).resolve():
+    saved_directory = warm['cache'].get('directory')
+    saved_namespace = warm['cache'].get('namespace')
+    if ((saved_directory is not None and directory.resolve() != Path(saved_directory).resolve())
+            or (saved_namespace is not None and saved_namespace != directory.name)):
         raise RuntimeError('warm geometry namespace changed; cannot mix timing populations')
+    if not directory.is_dir() or next(directory.glob('*.cgc'), None) is None:
+        raise RuntimeError('warm geometry namespace/cache missing; no silent rebuild during continuation')
+    if saved_directory is None:
+        # Original stats() recorded only counters. Do NOT fabricate or mutate
+        # historical metadata: derive the existing namespace from the contract
+        # and require strict per-window hash/provenance-checked disk hits in the
+        # child, before any measured update. Counts are not proof of integrity.
+        print('legacy_warm_stats_without_directory: existing contract-derived namespace found; '
+              'child still requires integrity-checked warm hits for every window', flush=True)
     return c
 
 

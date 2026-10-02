@@ -1,6 +1,5 @@
 """Large-batch attention and no-waste recovery of interrupted timing probes."""
 import copy
-import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,14 +7,16 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import numpy as np
 
 from real_motion.causal_column_completion import ColumnConfig
-from real_motion.causal_geometry_cache import PROTOCOL as GEOMETRY_PROTOCOL
+from real_motion.causal_geometry_cache import CausalGeometryCache
 from real_motion.local_st_world_model import batch_bounded_self_attention, SpatialTemporalBlock
 from real_motion.local_training_profile import trial_summary
 from real_motion.strong_w2det import StrongW2DetConfig
 from tools.real_motion import benchmark_p0_f9_joint_local_warm as bench
-from tools.real_motion.local_warm_cache_common import geometry_namespace
+from tools.real_motion.local_warm_cache_common import geometry_namespace, warm_causal_cache
+from test_causal_geometry_cache import raw_fixture
 
 
 @pytest.mark.parametrize('history', [4, 6])
@@ -161,7 +162,7 @@ def test_reusing_changed_trial_fails_closed(tmp_path, mutation):
     with pytest.raises(RuntimeError): bench.load_completed_trial(tmp_path, t, c)
 
 
-def test_legacy_v1_continuation_validates_record_identity_and_geometry_namespace(tmp_path):
+def real_continuation_fixture(tmp_path, *, legacy=False):
     c, _ = contract(tmp_path)
     rows = [dict(scene_name='s', t0_token=str(i)) for i in range(16)]
     bench.atomic_checkpoint(tmp_path/'records.pt', dict(typical=rows, stress=[dict(scene_name='s', t0_token='dense')]))
@@ -174,11 +175,81 @@ def test_legacy_v1_continuation_validates_record_identity_and_geometry_namespace
     provider = SimpleNamespace(strong=StrongW2DetConfig(free_label=17), joint=SimpleNamespace(
         transport=SimpleNamespace(config=SimpleNamespace(history_frames=4)), columns=SimpleNamespace(config=ColumnConfig(z_bins=3))))
     namespace = geometry_namespace(cfg, provider, c['info_fingerprints'], c['cache_fingerprints'], c['dataroot'])
-    directory = Path(c['geometry_cache'])/hashlib.sha256((GEOMETRY_PROTOCOL+namespace).encode()).hexdigest()
-    bench.write_json(tmp_path/'warm_cache.json', dict(complete=True, windows=17, cache={'directory': str(directory)}))
+    cache = CausalGeometryCache(c['geometry_cache'], namespace, ram_bytes=0, reserve_bytes=0)
+    # Produce the report through the REAL cache/prefill writer, not an invented
+    # schema containing fields that stats() never supplied on the server.
+    raw = raw_fixture(); raw['future_gt_occ'] = None
+    def load(source, record, *, include_gt):
+        assert not include_gt
+        value, _ = cache.get_or_build((record['scene_name'], record['t0_token']), raw,
+            lambda: {'memory': np.zeros(3)}, defer_write=True)
+        return {**raw, '_column_causal_preparation': value}
+    prefill = SimpleNamespace(causal_geometry_cache=cache, joint=torch.nn.Linear(1, 1),
+        device=torch.device('cpu'), load_raw_columns=load,
+        prepare_columns=lambda *a, **kw: SimpleNamespace(state={'fixed': np.ones(2)}))
+    warm = warm_causal_cache(prefill, None, rows+[dict(scene_name='s', t0_token='dense')]); cache.close()
+    assert warm['complete'] and warm['windows'] == 17
+    assert warm['cache']['directory'] == str(cache.root)
+    assert warm['cache']['namespace'] == cache.namespace
+    if legacy:
+        # Exactly the original producer schema: every statistic, no path or
+        # namespace. Preserve that report unchanged across recovery.
+        warm['cache'].pop('directory'); warm['cache'].pop('namespace')
+    bench.write_json(tmp_path/'warm_cache.json', warm)
+    return c, cfg, pcfg, cache
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_actual_prefill_report_continuation_validates_identity_and_namespace(tmp_path, legacy):
+    c, cfg, pcfg, _ = real_continuation_fixture(tmp_path, legacy=legacy)
+    before = (tmp_path/'warm_cache.json').read_bytes()
     with patch.object(bench, 'load_runtime_config', return_value=cfg), patch.object(bench, 'make_prepare_config', return_value=pcfg):
         assert bench.validate_continuation(c, tmp_path) == c
+        assert (tmp_path/'warm_cache.json').read_bytes() == before
         c['history_frames'] = 6
-        with pytest.raises(RuntimeError, match='namespace changed'): bench.validate_continuation(c, tmp_path)
+        with pytest.raises(RuntimeError, match='namespace'): bench.validate_continuation(c, tmp_path)
         c['history_frames'] = 4; c['typical_keys'].reverse()
         with pytest.raises(RuntimeError, match='identity/order changed'): bench.validate_continuation(c, tmp_path)
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_empty_or_missing_actual_namespace_is_not_rebuilt(tmp_path, legacy):
+    c, cfg, pcfg, cache = real_continuation_fixture(tmp_path, legacy=legacy)
+    # Rename within this test's isolated directory; never delete user artifacts.
+    saved = cache.root.with_name('saved-cache')
+    cache.root.rename(saved)
+    with patch.object(bench, 'load_runtime_config', return_value=cfg), patch.object(bench, 'make_prepare_config', return_value=pcfg):
+        with pytest.raises(RuntimeError, match='namespace/cache missing'): bench.validate_continuation(c, tmp_path)
+        assert not cache.root.exists()
+        cache.root.mkdir()
+        with pytest.raises(RuntimeError, match='namespace/cache missing'): bench.validate_continuation(c, tmp_path)
+
+
+def test_legacy_real_artifacts_continue_to_missing_batch_without_rewriting_completed_data(tmp_path):
+    c, cfg, pcfg, _ = real_continuation_fixture(tmp_path, legacy=True)
+    weights = json.loads((tmp_path/'diagnostic_weights.json').read_text())
+    for name, windows, workers, persistent in [('legacy_b4', 4, 4, False), ('pool4_b4', 4, 4, True),
+            ('pool6_b4', 4, 6, True), ('pool4_b8', 8, 4, True), ('pool4_b16', 16, 4, True)]:
+        save_trial(tmp_path, c, weights, name, windows, workers, persistent)
+    bench.write_json(tmp_path/'contract.json', c)
+    immutable = {p: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    launches = []
+    def launch(phase, t):
+        launches.append((phase, t['name']))
+        if phase == 'trial':
+            save_trial(tmp_path, c, weights, t['name'], t['window_batch'], status='oom'); return 42
+        (tmp_path/'cpu_profile.txt').write_text('test-only orchestration profile stub')
+        return 0
+    # Exercise the real CLI parsing + old-format contract validation + parent
+    # recovery together. Only the CUDA child launcher is replaced on CPU.
+    real_run = bench.run_contract
+    def run_with_cpu_launcher(*args, **kwargs): return real_run(*args, **kwargs, launch=launch)
+    with patch('sys.argv', ['benchmark', '--continue-run', str(tmp_path)]), \
+            patch.object(bench, 'load_runtime_config', return_value=cfg), \
+            patch.object(bench, 'make_prepare_config', return_value=pcfg), \
+            patch.object(bench, 'run_contract', side_effect=run_with_cpu_launcher):
+        assert bench.main() == 0
+    assert launches == [('trial', 'pool4_b32'), ('profile', 'pool4_b4')]
+    assert all(p.read_bytes() == old for p, old in immutable.items())
+    summary = json.loads((tmp_path/'summary.json').read_text())
+    assert len(summary['reused_trials']) == 5 and summary['status'] == 'complete'

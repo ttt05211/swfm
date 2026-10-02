@@ -28,6 +28,8 @@ LOCAL_WARM_CONTINUE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_s
 
 若只想立即补齐现有成功结果与最小CPU热点报告、不再测32/64/128，加 `LOCAL_WARM_FINISH_EXISTING=1`。报告会明确标记 `completed_existing_trials_only`，不宣称完成全容量扫描。接续摘要的elapsed仅包含本次接续时间，旧trial的时间保存在各自measurement中。原completed trial JSON、records、contract与checkpoint不覆盖；仅更新生成报告。
 
+兼容原版 `warm_cache.json`：原 `CausalGeometryCache.stats()` 只有统计计数，没有 `directory`。新报告补充实际目录和namespace；旧报告保持原样，接续从原合同计算namespace并要求对应磁盘目录非空，child仍逐窗口按原始因果输入hash校验缓存内容和身份，所有窗口必须命中后才允许该batch的训练更新。缺失目录不新建、不重新预热，也不把统计计数当作内容完整性的证明。回归测试通过真实cache/prefill生成报告，并同时覆盖原计数-only格式和新格式，而非手造不存在的schema字段。
+
 ## 帧数验收：此前六帧确有协议差异
 
 上游 `upstream_occfm/forecast/datasets/nuscenes_dataset.py` 在 cache path 根据 `HIST_LAST=4` 把六槽位的前两个 latent 与轨迹置零。此前本仓库只有 trajectory 前缀置零；V18 encoder、flat features、column patches、历史ICP、静态记忆和frontier实际仍读六帧 occupancy。因此旧 E14 与所有旧六帧结果不应表述为标准四帧协议。
