@@ -210,11 +210,29 @@ def build_local_semantic_tubes(
     return tubes
 
 
+def batch_bounded_self_attention(attention: nn.MultiheadAttention, q: torch.Tensor,
+                                 batch_limit: int = 65535) -> torch.Tensor:
+    """Bound SDPA's CUDA launch grid without splitting any attention sequence.
+
+    Each first-dimension row is independent. Small calls take exactly the old
+    path; splitting keeps autograd and the same parameters/state dictionary.
+    This helper is also CPU-testable, but production only bounds CUDA calls.
+    """
+    if batch_limit < 1:
+        raise ValueError('attention batch limit must be positive')
+    if q.shape[0] <= batch_limit:
+        return attention(q, q, q, need_weights=False)[0]
+    if not attention.batch_first or attention.dropout != 0:
+        raise ValueError('bounded temporal attention requires batch_first and zero dropout')
+    return torch.cat([attention(part, part, part, need_weights=False)[0]
+                      for part in q.split(batch_limit, dim=0)], dim=0)
+
+
 class SpatialTemporalBlock(nn.Module):
     """Efficient factorized spatial-temporal block.
 
     Spatial mixing is a ConvNeXt-style depthwise convolution on each local BEV
-    frame.  Temporal mixing is self-attention over the six history frames at each
+    frame.  Temporal mixing is self-attention over the active history frames at each
     source-relative spatial location.  This avoids the cost and ordering issues
     of full 4D attention while preserving explicit temporal reasoning.
     """
@@ -247,7 +265,10 @@ class SpatialTemporalBlock(nn.Module):
 
         seq = x.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
         q = self.temporal_norm(seq)
-        y, _ = self.temporal_attn(q, q, q, need_weights=False)
+        if q.is_cuda and q.shape[0] > 65535:
+            y = batch_bounded_self_attention(self.temporal_attn, q)
+        else:
+            y, _ = self.temporal_attn(q, q, q, need_weights=False)
         seq = seq + y
         seq = seq + self.temporal_ffn(self.temporal_ffn_norm(seq))
         return seq.reshape(B, H, W, T, C).permute(0, 3, 4, 1, 2).contiguous()

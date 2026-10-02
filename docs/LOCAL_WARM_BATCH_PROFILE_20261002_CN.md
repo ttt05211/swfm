@@ -14,6 +14,20 @@ bash tools/real_motion/run_p0_f9_joint_local_warm_benchmark.sh
 
 磁盘几何 RAM cache=0，防止把小样本全在RAM的速度冒充完整20430训练速度。原geometry根目录跨协议共用48GiB硬限额，满额/缺少安全剩余空间会明确报错，不删旧条目、不静默当作warm。记录子集文件限1GiB；试跑更新不保存科学checkpoint，不修改旧 `last.pt`。诊断 TRAIN16 prior仅用于速度，不作为正式训练prior；full仍使用固定TRAIN1024。最大安全batch是**最大已测**安全值，不是完整20430永不OOM的保证。
 
+## 中断接续 / 大 batch SDPA 限制
+
+时序 block 的 attention batch 是 `source_count × stem_height × stem_width`，不是窗口数。20×20 tube 经 stride-2 stem 后为10×10；当 source 多于655时可能越过 CUDA SDPA 的65535维度限制并报 `invalid configuration argument`，不是 OOM。新版在超过该值时仅按独立 batch 维分块；不切时间、不混 source、不detach，不新增参数，已有 checkpoint state_dict 和四/六帧合同均不变。小 batch 原路径不变，CPU测试比较输出与输入/参数梯度；CUDA回归测试须有GPU才运行。依据：[PyTorch #142228](https://github.com/pytorch/pytorch/issues/142228)、[PyTorch #146704](https://github.com/pytorch/pytorch/issues/146704)。
+
+测速每完成一档都会更新 `summary.txt/json`。非OOM错误仍失败退出，但保存 `failed_partial` 摘要；child另存 `failure_<phase>_<trial>.json`，不会把kernel错误冒充OOM或在污染的CUDA上下文里重试。人工接续仅复用已完成trial，重新启动缺失trial的独立子进程；不恢复正式optimizer。校验records内容/有序identity、base/snapshot、TRAIN info、runtime config/几何namespace、prior与原始计时行。旧v1结果注明复用，新结果记录Torch/CUDA/GPU/model代码hash，不把不同代码版本宣称为严格同软件对比。
+
+```bash
+# 使用本次实际失败目录；不重建缓存/prior，不重测4/8/16。
+LOCAL_WARM_CONTINUE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_speed_20261002_082412_3c09a99 \
+  bash tools/real_motion/run_p0_f9_joint_local_warm_benchmark.sh
+```
+
+若只想立即补齐现有成功结果与最小CPU热点报告、不再测32/64/128，加 `LOCAL_WARM_FINISH_EXISTING=1`。报告会明确标记 `completed_existing_trials_only`，不宣称完成全容量扫描。接续摘要的elapsed仅包含本次接续时间，旧trial的时间保存在各自measurement中。原completed trial JSON、records、contract与checkpoint不覆盖；仅更新生成报告。
+
 ## 帧数验收：此前六帧确有协议差异
 
 上游 `upstream_occfm/forecast/datasets/nuscenes_dataset.py` 在 cache path 根据 `HIST_LAST=4` 把六槽位的前两个 latent 与轨迹置零。此前本仓库只有 trajectory 前缀置零；V18 encoder、flat features、column patches、历史ICP、静态记忆和frontier实际仍读六帧 occupancy。因此旧 E14 与所有旧六帧结果不应表述为标准四帧协议。
