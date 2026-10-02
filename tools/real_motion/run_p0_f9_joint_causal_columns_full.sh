@@ -33,6 +33,7 @@ if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
 fi
 if [[ "${FULL_JOINT_PAIRED_CONTROL:-0}" == 1 ]]; then EXTRA+=(--paired-control); fi
 if [[ "${FULL_JOINT_PREWARM:-0}" == 1 ]]; then EXTRA+=(--prewarm-causal-cache); fi
+if [[ "${FULL_JOINT_REFERENCE_CPU:-0}" == 1 ]]; then EXTRA+=(--reference-cpu-pipeline); fi
 EXTRA+=(--profile-every "${FULL_JOINT_PROFILE_EVERY:-0}")
 EXTRA+=(--sampling-workers "${FULL_JOINT_SAMPLING_WORKERS:-0}" --io-workers "${FULL_JOINT_IO_WORKERS:-2}")
 if [[ "${FULL_JOINT_PERSISTENT_POOL:-1}" == 1 ]]; then EXTRA+=(--persistent-sampling-pool); fi

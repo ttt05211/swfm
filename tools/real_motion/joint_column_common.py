@@ -54,7 +54,9 @@ def count_proposals(prep, grid, config, counts):
 
 def build_online_column_candidates(prep, config, grid):
     """CPU-only plans/labels for one current prediction; no sampling/RNG."""
-    return [(h, plan, action_targets(plan, prep.raw['future_gt_occ'][h]))
+    from real_motion.causal_column_completion import _action_targets_validated_plan
+    label = _action_targets_validated_plan if getattr(prep, 'cpu_pipeline_optimized', True) else action_targets
+    return [(h, plan, label(plan, prep.raw['future_gt_occ'][h]))
             for h in range(6) for plan in (candidate_plan(prep, h, grid, config),)]
 
 
@@ -80,6 +82,15 @@ def sample_online_column(prep, selected, grid, config):
     features = ColumnFeatureSampler(prep, h, small, grid, config, pose_motion,
         workers=1).sample(small, sample_column_features)
     return {**features, 'legal': small.legal, 'target': labels, 'weight': weight}
+
+
+def sample_online_columns(prep, selected, grid, config):
+    """One window job, one bounded causal history index, six fresh live poses."""
+    if not selected: return []
+    from real_motion.causal_column_sampling import ColumnHistoryIndex
+    actors = {int(a) for _, plan, _, _ in selected for a in np.unique(plan.actor) if a >= 0}
+    prep.column_history_index = ColumnHistoryIndex(prep, grid, actors=actors)
+    return [sample_online_column(prep, row, grid, config) for row in selected]
 
 
 def assemble_online_columns(prep, model, selected, arrays, device, *, grid=None):

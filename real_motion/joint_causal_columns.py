@@ -1,5 +1,6 @@
 """One-stage source transport + linked refinement. Hard geometry has no gradient."""
 from dataclasses import asdict
+import numpy as np
 import torch
 from torch import nn
 from .causal_column_model import CausalColumnModel
@@ -51,12 +52,24 @@ class LinkedColumns(CausalColumnModel):
         q = prepared.outputs['future_transport_queries']
         if not isinstance(q, torch.Tensor) or q.shape[1:] != (6, self.source_dim):
             raise RuntimeError('source feature protocol mismatch')
-        actor = torch.as_tensor(plan.actor, device=device)
-        active = actor >= 0
-        if active.any() and int(actor[active].max()) >= len(q): raise RuntimeError('actor/source order mismatch')
+        if not getattr(prepared, 'cpu_pipeline_optimized', True):
+            actor = torch.as_tensor(plan.actor, device=device); active = actor >= 0
+            if active.any() and int(actor[active].max()) >= len(q): raise RuntimeError('actor/source order mismatch')
+            result = q.new_zeros((len(plan), self.source_dim))
+            if active.any(): result = result.index_copy(0, torch.nonzero(active).flatten(), q[actor[active].long(), h])
+            return result
+        # The plan is already CPU geometry. Decide validity/emptiness there,
+        # instead of three tiny CUDA reductions + host synchronizations per
+        # horizon. Gathering stays on the caller and remains differentiable.
+        actor = np.asarray(plan.actor)
+        active = np.flatnonzero(actor >= 0)
+        if len(active) and int(actor[active].max()) >= len(q): raise RuntimeError('actor/source order mismatch')
         # index_copy is differentiable; static/frontier get exactly zero (no bias).
         result = q.new_zeros((len(plan), self.source_dim))
-        if active.any(): result = result.index_copy(0, torch.nonzero(active).flatten(), q[actor[active].long(), h])
+        if len(active):
+            rows = torch.as_tensor(active, device=device)
+            sources = torch.as_tensor(actor[active].astype(np.int64), device=device)
+            result = result.index_copy(0, rows, q[sources, h])
         return result
 
     def forward(self, history, flags, base, fallback, context, kind, classes, *, source_features):

@@ -253,3 +253,32 @@ def test_legacy_real_artifacts_continue_to_missing_batch_without_rewriting_compl
     assert all(p.read_bytes() == old for p, old in immutable.items())
     summary = json.loads((tmp_path/'summary.json').read_text())
     assert len(summary['reused_trials']) == 5 and summary['status'] == 'complete'
+
+
+def test_cpu_comparison_reuses_real_population_prior_cache_but_never_old_report(tmp_path):
+    original = tmp_path/'original'; original.mkdir()
+    c, cfg, pcfg, _ = real_continuation_fixture(original, legacy=True)
+    bench.write_json(original/'contract.json', c)
+    weights = json.loads((original/'diagnostic_weights.json').read_text())
+    before = {p: p.read_bytes() for p in original.rglob('*') if p.is_file()}
+    out = tmp_path/'new-cpu-comparison'; calls = []
+    def launch(phase, t):
+        calls.append((phase, t['name']))
+        assert phase != 'warm'
+        if phase == 'trial':
+            saved_c = json.loads((out/'contract.json').read_text())
+            save_trial(out, saved_c, weights, t['name'], t['window_batch'])
+            row = json.loads((out/(t['name']+'.json')).read_text()); row.update(t)
+            bench.write_json(out/(t['name']+'.json'), row)
+        return 0
+    with patch.object(bench, 'load_runtime_config', return_value=cfg), patch.object(bench, 'make_prepare_config', return_value=pcfg):
+        bench.compare_cpu_paths(original, out, max_window_batch=16, launch=launch)
+        with pytest.raises(RuntimeError, match='NEW CPU comparison'): bench.compare_cpu_paths(original, out, launch=launch)
+    assert calls == [('trial', 'reference_b4'), ('trial', 'optimized_b4'), ('trial', 'optimized_b8'),
+        ('trial', 'optimized_b16'), ('profile', 'optimized_b4')]
+    assert all(p.read_bytes() == b for p, b in before.items())
+    summary = json.loads((out/'summary.json').read_text())
+    assert summary['recommendation']['recommended_trial'] == 'optimized_b4'
+    assert summary['cpu_comparison']['same_batch4_speedup'] == 1.0
+    assert (out/'diagnostic_weights.json').read_bytes() == (original/'diagnostic_weights.json').read_bytes()
+    assert (out/'records.pt').read_bytes() == (original/'records.pt').read_bytes()

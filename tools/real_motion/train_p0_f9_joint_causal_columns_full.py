@@ -118,6 +118,7 @@ def _main(stop_event, caches):
     parser.add_argument('--sampling-workers', type=int, default=0, help='0 uses legacy capped-at-four budget; positive selects CPU candidate/patch workers')
     parser.add_argument('--persistent-sampling-pool', action='store_true', help='reuse bounded pure-CPU sampler pool across batches; same RNG/order/objective')
     parser.add_argument('--io-workers', type=int, default=2, help='bounded next-batch window loaders')
+    parser.add_argument('--reference-cpu-pipeline', action='store_true', help='diagnostic fallback only; disable parallel warm prepare/shared sparse history/batched render readback')
     args = parser.parse_args(); started = time.perf_counter(); out = Path(args.out_dir)
     if out.exists(): parser.error('NEW output directory required')
     if (min(args.epochs, args.window_batch_size, args.source_budget, args.cpu_workers, args.eval_batch_size, args.checkpoint_every) < 1
@@ -282,7 +283,7 @@ def _main(stop_event, caches):
                     probe=updates < 2 or (updates+1) % 128 == 0, patch_resolution=identity['patch_resolution_m'],
                     control=control, control_optimizer=control_optimizer,
                     profile=args.profile_every > 0 and (updates+1) % args.profile_every == 0,
-                    sampling_pool=sampling_pool, sampling_workers=args.sampling_workers)
+                    sampling_pool=sampling_pool, sampling_workers=args.sampling_workers, optimize_cpu=not args.reference_cpu_pipeline)
                 updates += 1; successes += int(stats['optimizer_updated']); executed += stats['windows']; sampled += stats['sampled_columns']
                 link_observed |= (stats['source_query_gradient_norm'] or 0.) > 0
                 cursor_epoch, cursor_batch = e, bi; wall = time.perf_counter()-compute_started+wait

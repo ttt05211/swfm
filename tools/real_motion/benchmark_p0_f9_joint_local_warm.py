@@ -40,7 +40,7 @@ PROTOCOL = 'local_warm_disk_capacity_timing_v1'
 
 
 def measured_batches(joint, optimizer, provider, source, records, *, windows, sources,
-                     workers, persistent=True, io_workers=2, cpu_profiles=None, max_batches=None, progress=None):
+                     workers, persistent=True, io_workers=2, cpu_profiles=None, max_batches=None, progress=None, optimize_cpu=True):
     """Actual current-model forward/backward, strict warm hits, no weights saved."""
     rng = np.random.default_rng(20261003); rows = []
     pool = ThreadPoolExecutor(max_workers=workers) if persistent else None
@@ -52,7 +52,7 @@ def measured_batches(joint, optimizer, provider, source, records, *, windows, so
             if any(not raw.get('_causal_geometry_cache_hit') for _, raw in batch):
                 raise RuntimeError('benchmark requires persisted warm disk hits for EVERY window')
             started = time.perf_counter()
-            kwargs = dict(profile=True, sampling_pool=pool, sampling_workers=workers, cpu_profiles=cpu_profiles)
+            kwargs = dict(profile=True, sampling_pool=pool, sampling_workers=workers, cpu_profiles=cpu_profiles, optimize_cpu=optimize_cpu)
             kwargs['patch_resolution'] = getattr(provider, 'patch_resolution_m', .8)
             fn = lambda: train_full_batch(joint, optimizer, provider, source, batch, rng, update, 100000, **kwargs)
             stats = fn()
@@ -119,7 +119,7 @@ def worker(contract_path, phase, trial):
             {'params': joint.columns.parameters(), 'lr': 3e-4, 'initial_lr': 3e-4, 'weight_decay': .01}])
         available, total = torch.cuda.mem_get_info(device)
         t = json.loads(trial); name = t['name']; args = dict(windows=t['window_batch'], sources=t['source_budget'],
-            workers=t['workers'], persistent=t['persistent'], io_workers=2)
+            workers=t['workers'], persistent=t['persistent'], io_workers=2, optimize_cpu=t.get('optimize_cpu', True))
         print(f"trial={name} source_budget={t['source_budget']} CUDA warm-up then dense stress (excluded from throughput)", flush=True)
         # Two warm-up minibatches; not included in steady throughput.
         warm_records = data['typical'][:min(len(data['typical']), 2*t['window_batch'])]
@@ -150,7 +150,9 @@ def worker(contract_path, phase, trial):
                 execution=dict(torch_version=torch.__version__, cuda_version=torch.version.cuda,
                     gpu=torch.cuda.get_device_name(device), temporal_attention_batch_limit=65535,
                     temporal_attention_implementation='independent_batch_chunk_v1',
-                    model_code_sha256=sha256(Path(__file__).resolve().parents[2]/'real_motion/local_st_world_model.py')))
+                    model_code_sha256=sha256(Path(__file__).resolve().parents[2]/'real_motion/local_st_world_model.py'),
+                    cpu_pipeline='window_shared_history_parallel_warm_v1' if args['optimize_cpu'] else 'reference_serial_window_per_horizon_jobs',
+                    pipeline_code_sha256=sha256(Path(__file__).resolve().with_name('joint_column_full_common.py'))))
             write_json(out/(name+'.json'), result)
             print(f"{name}: {m['windows_per_second']:.3f} windows/s, mean_batch={m['mean_windows_per_batch']:.2f}, peak_reserved={capacity_peak:.0f}MiB", flush=True)
         return 0
@@ -239,7 +241,8 @@ def load_completed_trial(out, t, c):
 
 def publish_summary(c, trials, *, started, profile_status, status, error=None, reused=(), print_report=False):
     out = Path(c['out'])
-    decision = recommend_trials([t for t in trials if t.get('persistent')])
+    decision = recommend_trials([t for t in trials if t.get('persistent')
+        and (not c.get('cpu_comparison') or t.get('optimize_cpu'))])
     summary = dict(protocol=PROTOCOL, status=status, error=error, history_frames=c['history_frames'], future_frames=6,
         trials=trials, recommendation=decision, elapsed_seconds=time.perf_counter()-started,
         elapsed_scope='this_invocation_only_not_prior_completed_trials', reused_trials=list(reused),
@@ -248,6 +251,16 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
         existing_checkpoint_unchanged=(True if not c.get('original_checkpoint') or not error
             else False if 'checkpoint changed' in str(error) else None), geometry_ram_cache_mib=0,
         caution='OS/frame-cache and workload variation remain; ETA excludes full cold prefill/eval/checkpoint; larger batch changes optimizer update count; no automatic full training')
+    if c.get('cpu_comparison'):
+        reference = next((t for t in trials if t['name'] == 'reference_b4' and t['status'] == 'ok'), None)
+        fastest = next((t for t in trials if t['name'] == decision.get('recommended_trial')), None)
+        fixed_batch = next((t for t in trials if t['name'] == 'optimized_b4' and t['status'] == 'ok'), None)
+        summary['cpu_comparison'] = dict(parent=c['cpu_comparison'],
+            same_batch4_speedup=(fixed_batch['measurement']['windows_per_second']/reference['measurement']['windows_per_second']
+                if reference and fixed_batch else None),
+            recommended_speedup=(fastest['measurement']['windows_per_second']/reference['measurement']['windows_per_second']
+                if reference and fastest else None),
+            note='same records/prior/initialization; timed separately without cProfile; no scientific updates saved')
     write_json(out/'summary.json', summary)
     lines = ['===== LOCAL WARM DISK SPEED ONLY =====', 'status='+status,
         f"history_frames={c['history_frames']}, future_frames=6, geometry_RAM=0MiB",
@@ -263,10 +276,56 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
     lines += ['recommendation='+json.dumps(decision), 'CPU profile status: '+profile_status,
         'reused_trials='+json.dumps(list(reused)),
         'CPU function details: cpu_profile.txt if complete (separate serialized-worker cProfile pass, NOT throughput measurement)', summary['caution']]
+    if summary.get('cpu_comparison'): lines.append('CPU_OPTIMIZATION_COMPARISON='+json.dumps(summary['cpu_comparison']))
     if error: lines.append('ERROR: '+str(error))
     (out/'summary.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     if print_report: print('\n'.join(lines), flush=True)
     return summary
+
+
+def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None):
+    """Single bounded paired throughput check; no repeated prefill/prior/scan."""
+    import shutil
+    source_run, new_out = Path(source_run).resolve(), Path(new_out).resolve()
+    if new_out.exists(): raise RuntimeError('NEW CPU comparison output required; never overwrite the old timing report')
+    c = validate_continuation(json.loads((source_run/'contract.json').read_text(encoding='utf-8')), source_run)
+    if len(c['typical_keys']) < max_window_batch: raise RuntimeError('comparison batch larger than frozen sample')
+    new_out.mkdir(parents=True)
+    for name in ('records.pt', 'warm_cache.json', 'diagnostic_weights.json'):
+        shutil.copyfile(source_run/name, new_out/name)
+    c = {**c, 'out': str(new_out), 'cpu_comparison': str(source_run)}
+    if c.get('snapshot'):
+        shutil.copyfile(c['snapshot'], new_out/'checkpoint_snapshot.pt')
+        c['snapshot'] = str(new_out/'checkpoint_snapshot.pt')
+    write_json(new_out/'contract.json', c)
+    if launch is None:
+        def launch(phase, t):
+            cmd = [sys.executable, '-u', str(Path(__file__).resolve()), '--worker-contract', str(new_out/'contract.json'),
+                '--phase', phase, '--trial', json.dumps(t)]
+            code = subprocess.run(cmd, check=False).returncode
+            if code not in (0, 42): raise RuntimeError(f'{phase} {t["name"]} child failed ({code}); partial comparison saved')
+            return code
+    started = time.perf_counter(); trials = []; status = 'in_progress'; error = None; profile_status = 'not_run'
+    try:
+        recipes = [dict(name='reference_b4', window_batch=4, source_budget=128, workers=4, persistent=True, optimize_cpu=False)]
+        recipes += [dict(name=f'optimized_b{w}', window_batch=w, source_budget=32*w, workers=4, persistent=True, optimize_cpu=True)
+            for w in (4, 8, 16, 32) if w <= max_window_batch]
+        for t in recipes:
+            launch('trial', t); row = load_completed_trial(new_out, t, c); trials.append(row)
+            publish_summary(c, trials, started=started, profile_status=profile_status, status=status)
+            if row['status'] == 'oom': break
+        decision = recommend_trials([t for t in trials if t.get('optimize_cpu')])
+        if decision['recommended']:
+            selected = next(t for t in recipes if t['name'] == decision['recommended_trial'])
+            profile_status = 'complete' if launch('profile', selected) == 0 else 'oom_no_automatic_retry'
+        if c.get('original_checkpoint') and sha256(c['original_checkpoint']) != c['snapshot_sha']:
+            raise RuntimeError('source checkpoint changed externally; comparison used immutable snapshot')
+        status = 'complete'
+    except BaseException as failure:
+        status = 'failed_partial'; error = f'{type(failure).__name__}: {failure}'; raise
+    finally:
+        publish_summary(c, trials, started=started, profile_status=profile_status, status=status, error=error, print_report=True)
+    return 0
 
 
 def run_contract(c, *, max_window_batch=128, continuation=False, finish_existing=False, launch=None):
@@ -329,6 +388,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--worker-contract'); p.add_argument('--phase', choices=('warm', 'trial', 'profile')); p.add_argument('--trial')
     p.add_argument('--continue-run', help='existing diagnostic directory; reuse completed cache/prior/trials, NOT a training resume')
+    p.add_argument('--compare-run', help='reuse existing frozen diagnostic population in a NEW output; compare reference CPU path and all safe optimized batches')
     p.add_argument('--finish-existing', action='store_true', help='only summarize completed trials and run their tiny CPU profile; skip untested larger batches')
     for key in ('config', 'train-cache', 'dev-cache', 'train-info', 'dev-info', 'base-checkpoint', 'dataroot', 'geometry-cache', 'out-dir'):
         p.add_argument('--'+key)
@@ -339,6 +399,9 @@ def main():
     p.add_argument('--cache-gib', type=float, default=48.); p.add_argument('--seed', type=int, default=20261002)
     a = p.parse_args()
     if a.worker_contract: return worker(a.worker_contract, a.phase, a.trial)
+    if a.compare_run:
+        if a.continue_run or a.finish_existing or not a.out_dir: p.error('--compare-run requires NEW --out-dir and cannot continue/finish the old report')
+        return compare_cpu_paths(a.compare_run, a.out_dir, max_window_batch=min(a.max_window_batch, 32))
     if a.continue_run:
         out = Path(a.continue_run).resolve()
         c = validate_continuation(json.loads((out/'contract.json').read_text(encoding='utf-8')), out)

@@ -11,6 +11,47 @@ from .causal_column_completion import UNKNOWN
 from .source_evidence_audit import transform_points
 
 
+class ColumnHistoryIndex:
+    """One prepared window's immutable history geometry, shared by six horizons.
+
+    No GT or predicted pose is indexed. Bounded tight-range membership tables
+    replace repeated isin setup; larger/dispersed sources use sorted searches.
+    Never retain this index across prepare() calls or persist it to disk.
+    """
+    def __init__(self, prepared, grid, *, max_membership_mib=8, actors=None):
+        self.inverse_history = [np.linalg.inv(t) for t in prepared.raw['history_poses']]
+        self.inverse_registration = {}; self.members = {}; self.tables = {}
+        self.table_bytes = 0; limit = int(max_membership_mib*2**20)
+        wanted = None if actors is None else set(int(a) for a in actors if a >= 0)
+        for actor, row in enumerate(prepared.registrations):
+            if wanted is not None and actor not in wanted: continue
+            inverses, members, tables = [], [], []
+            for reg in row:
+                if reg is None:
+                    inverses.append(None); members.append(None); tables.append(None); continue
+                inverses.append(np.linalg.inv(reg[0]))
+                owned = np.unique(np.ravel_multi_index(reg[1].T, grid.shape_hwd))
+                members.append(owned); table = None
+                span = int(owned[-1]-owned[0]+1) if len(owned) else 0
+                if span and self.table_bytes+span <= limit:
+                    bits = np.zeros(span, bool); bits[owned-owned[0]] = True
+                    table = (int(owned[0]), bits); self.table_bytes += span
+                tables.append(table)
+            self.inverse_registration[actor] = inverses; self.members[actor] = members; self.tables[actor] = tables
+
+    def contains(self, actor, frame, flat):
+        table = self.tables[actor][frame]
+        if table is not None:
+            start, bits = table; at = flat-start
+            valid = (at >= 0)&(at < len(bits)); out = np.zeros(len(flat), bool)
+            out[valid] = bits[at[valid]]; return out
+        owned = self.members[actor][frame]
+        if not len(owned): return np.zeros(len(flat), bool)
+        at = np.searchsorted(owned, flat)
+        valid = at < len(owned); out = np.zeros(len(flat), bool)
+        out[valid] = owned[at[valid]] == flat[valid]; return out
+
+
 class ColumnFeatureSampler:
     def __init__(self, prepared, h, plan, grid, config, motion_factory, *, workers=1, max_cache_mib=64):
         self.prepared, self.h, self.grid, self.config = prepared, h, grid, config
@@ -24,7 +65,12 @@ class ColumnFeatureSampler:
         self.shape = np.asarray(grid.shape_hwd)
         self.p, self.z = config.patch, config.z_bins
         self.transforms = {}; self.members = {}
-        inverse_history = [np.linalg.inv(t) for t in prepared.raw['history_poses']]
+        self.optimized = getattr(prepared, 'cpu_pipeline_optimized', True)
+        self.index = getattr(prepared, 'column_history_index', None) if self.optimized else None
+        if self.optimized and self.index is None:
+            self.index = ColumnHistoryIndex(prepared, grid, actors=np.unique(plan.actor))
+        inverse_history = (self.index.inverse_history if self.index is not None else
+                           [np.linalg.inv(t) for t in prepared.raw['history_poses']])
         future_pose = prepared.raw['future_poses'][h]
         if int(workers) <= 1:
             self._build(plan, inverse_history, future_pose, motion_factory, max_cache_mib, None)
@@ -52,8 +98,9 @@ class ColumnFeatureSampler:
                         transforms.append(None); members.append(None); continue
                     # Preserve reference operation order; do not algebraically
                     # reassociate matrices or approximate with float32/GPU grids.
-                    transform = inverse_history[f]@np.linalg.inv(reg[0])@inverse_motion@future_pose
-                    owned = np.unique(np.ravel_multi_index(reg[1].T, grid.shape_hwd))
+                    inverse_reg = self.index.inverse_registration[actor][f] if self.index is not None else np.linalg.inv(reg[0])
+                    transform = inverse_history[f]@inverse_reg@inverse_motion@future_pose
+                    owned = self.index.members[actor][f] if self.index is not None else np.unique(np.ravel_multi_index(reg[1].T, grid.shape_hwd))
                 transforms.append(transform); members.append(owned)
             self.transforms[actor], self.members[actor] = transforms, members
             centres = plan.evidence_xy[groups == actor]
@@ -83,7 +130,7 @@ class ColumnFeatureSampler:
             transform = self.transforms[actor][f]
             if transform is None: return labels.reshape(shape), flags.reshape(shape)
             membership = None
-            if actor >= 0:
+            if actor >= 0 and self.index is None:
                 membership = np.zeros(int(np.prod(self.shape)), bool)
                 membership[self.members[actor][f]] = True
             # Bound working memory for six concurrent frames, independent of
@@ -96,7 +143,9 @@ class ColumnFeatureSampler:
                 at = tuple(ijk[valid].T)
                 labels[start:stop][valid] = self.history[f][at]
                 bits = self.observed[f][at].astype(np.uint8)
-                if membership is not None:
+                if actor >= 0 and self.index is not None:
+                    bits |= self.index.contains(actor, f, np.ravel_multi_index(ijk[valid].T, tuple(self.shape))).astype(np.uint8)*2
+                elif membership is not None:
                     bits |= membership[np.ravel_multi_index(ijk[valid].T, tuple(self.shape))].astype(np.uint8)*2
                 flags[start:stop][valid] = bits
             return labels.reshape(shape), flags.reshape(shape)
@@ -115,12 +164,27 @@ class ColumnFeatureSampler:
         # Several frontier queries attend the SAME nearest causal anchor. Warp
         # each distinct anchor only once, then restore exact original query order.
         # Class membership is applied after expansion (GEN/static may differ).
-        centres, inverse = np.unique(plan.evidence_xy, axis=0, return_inverse=True)
+        xy = plan.evidence_xy
+        if self.optimized and np.all((xy >= 0)&(xy < self.shape[:2])):
+            keys = xy[:, 0].astype(np.int64)*int(self.shape[1])+xy[:, 1]
+            _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+            centres = xy[first]  # identical lexicographic XY order, fewer sorts
+        else: centres, inverse = np.unique(xy, axis=0, return_inverse=True)
         n, p, z = len(centres), self.p, self.z
         hist = np.full((n, self.t, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
-        offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing='ij'), -1)
-        idx = offsets[None]+np.pad(centres, ((0, 0), (0, 1)))[:, None, None, None, :]
-        xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
+        if self.optimized:
+            # Same per-coordinate float64 multiply/add as reference, without
+            # allocating N*P*P*Z*3 integer indices and arithmetic temporaries.
+            xyz = np.empty((n, p, p, z, 3), np.float64)
+            offsets = np.arange(p)-p//2
+            xyz[..., 0] = (self.origin[0]+(centres[:, 0, None]+offsets[None]+.5)*self.step[0])[:, :, None, None]
+            xyz[..., 1] = (self.origin[1]+(centres[:, 1, None]+offsets[None]+.5)*self.step[1])[:, None, :, None]
+            xyz[..., 2] = self.origin[2]+(np.arange(z)+.5)*self.step[2]
+            xyz = xyz.reshape(-1, 3)
+        else:
+            offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing='ij'), -1)
+            idx = offsets[None]+np.pad(centres, ((0, 0), (0, 1)))[:, None, None, None, :]
+            xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
         for f, transform in enumerate(self.transforms[actor]):
             if transform is None: continue
             ijk = np.floor((transform_points(xyz, transform)-self.origin)/self.step).astype(np.int64)
@@ -128,7 +192,8 @@ class ColumnFeatureSampler:
             labels = np.full(len(ijk), UNKNOWN, np.uint8); bits = np.zeros(len(ijk), np.uint8)
             labels[valid] = self.history[f][at]; bits[valid] = self.observed[f][at].astype(np.uint8)
             if actor >= 0:
-                owned = np.isin(np.ravel_multi_index(ijk[valid].T, tuple(self.shape)), self.members[actor][f])
+                flat = np.ravel_multi_index(ijk[valid].T, tuple(self.shape))
+                owned = self.index.contains(actor, f, flat) if self.index is not None else np.isin(flat, self.members[actor][f])
                 bits[valid] |= owned.astype(np.uint8)*2
             hist[:, f] = labels.reshape(n, p, p, z); flags[:, f] = bits.reshape(n, p, p, z)
         hist, flags = hist[inverse], flags[inverse]

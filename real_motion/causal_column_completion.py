@@ -60,7 +60,10 @@ class ColumnPlan:
     def __len__(self): return len(self.kind)
 
     def subset(self, indices):
-        return ColumnPlan(**{k: np.asarray(v)[indices].copy() for k, v in vars(self).items()})
+        def independent(v):
+            source = np.asarray(v); result = source[indices]
+            return result.copy() if np.shares_memory(source, result) else result
+        return ColumnPlan(**{k: independent(v) for k, v in vars(self).items()})
 
     def validate(self):
         n, z = self.base.shape
@@ -97,6 +100,11 @@ def action_targets(plan, future_gt):
     exposes another wrong class, or destroys occupied GT, KEEP wins the tie.
     """
     plan.validate()
+    return _action_targets_validated_plan(plan, future_gt)
+
+
+def _action_targets_validated_plan(plan, future_gt):
+    """Internal label path immediately after candidate_plan's full validation."""
     gt = np.asarray(future_gt)
     if gt.size <= int(plan.flat.max(initial=-1)) or not _valid_semantics(gt):
         raise ValueError("invalid future supervision grid")

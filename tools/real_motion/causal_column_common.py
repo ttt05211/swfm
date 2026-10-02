@@ -174,12 +174,15 @@ class FrozenColumns(FrozenXYV18):
 
 def render_column_layers(state, record, outputs, grid, *, capture_backgrounds=False):
     """Model-dependent geometry ONLY; immutable history/registration can be reused."""
-    res, yaw = numpy(outputs["residual_xy_m"]), numpy(outputs["yaw_delta_rad"])
+    render = outputs.get('_column_render_numpy')
+    res, yaw = ((numpy(outputs["residual_xy_m"]), numpy(outputs["yaw_delta_rad"])) if render is None
+                else (render['residual_xy_m'], render['yaw_delta_rad']))
+    anchors = numpy(record['anchors_xy_t0_m'])
     from real_motion.v18_two_wheel_diagnostic import renderer_yaw_delta
     baseline, owners, fallbacks, components, targets, yaws = [], [], [], [], [], []
     backgrounds = []
     for h in range(6):
-        centers = [runtime._target_world_from_xy_cached(numpy(record["anchors_xy_t0_m"])[i, h]+res[i, h],
+        centers = [runtime._target_world_from_xy_cached(anchors[i, h]+res[i, h],
             state["source_z_t0"][i], state["current_pose"]) for i in range(len(state["current"]))]
         yy = [renderer_yaw_delta(int(c["class_id"]), yaw[i, h], zero_two_wheel_yaw=False) for i, c in enumerate(state["current"])]
         layers = runtime._rasterize_all_sources_horizon(state["current"], state["source_world_points"], state["source_rel_xy"],
@@ -194,6 +197,33 @@ def render_column_layers(state, record, outputs, grid, *, capture_backgrounds=Fa
         baseline.append(b); owners.append(own); fallbacks.append(fall); components.append(layers); targets.append(centers); yaws.append(yy)
     if capture_backgrounds: state['column_backgrounds'] = backgrounds
     return baseline, owners, fallbacks, components, targets, yaws
+
+
+def prepare_warm_columns_cpu(record, raw, outputs, grid):
+    """CPU-only warm preparation; live Tensor references are NEVER evaluated.
+
+    Caller has already checked the frozen renderer on its CUDA-owning thread
+    and supplied detached render arrays. Original outputs retain the graph.
+    """
+    causal = raw['_column_causal_preparation']; fixed = causal['prepared_state']
+    if 'column_backgrounds' not in fixed or '_column_render_numpy' not in outputs:
+        raise RuntimeError('CPU warm preparation requires complete geometry and detached render arrays')
+    window = window_from_record(record)
+    state = {**fixed, 'rec': record, 'window': window, 'gpu': None}
+    if (len(state['current']) != len(record['features'])
+            or [int(c['class_id']) for c in state['current']] != record['source_class_id'].tolist()):
+        raise RuntimeError('cached Strong/source identity mismatch')
+    centers = world_points_to_t0(np.asarray([c['centroid_world'] for c in state['current']]).reshape(-1, 3),
+                                state['current_pose'])[:, :2]
+    if not np.allclose(centers, numpy(record['source_centroid_xy_t0_m']), rtol=0, atol=2e-4):
+        raise RuntimeError('cache/actual source-centre identity mismatch')
+    from real_motion.runtime_fastpath import component_lists_equal
+    if not component_lists_equal(state['current'], causal['current']):
+        raise RuntimeError('prefetched causal source identity mismatch')
+    baseline, owners, fallbacks, components, targets, yaws = render_column_layers(state, record, outputs, grid)
+    return PreparedColumns(window, raw, state, baseline, owners, fallbacks, components, targets, yaws,
+        causal['registrations'], causal['footprints'], causal['memory'], causal['audit'], outputs,
+        causal.get('aligned_history_points'), causal.get('fixed_candidate_geometry'))
 
 
 def fixed_candidate_geometry(memory, footprints, grid, config):
@@ -232,8 +262,10 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
     else:
         geometry = fixed_candidate_geometry([m], [footprint], grid, config)[0]
     frontier, dominant = geometry['frontier'], geometry['dominant']
-    rows = []
+    rows = []; fast = getattr(prepared, 'cpu_pipeline_optimized', True)
+    relative_pose = None
     def append(xy, kind, actor, classes, allowed_z, ax, ay, age):
+        nonlocal relative_pose
         if not len(xy): return
         flat = ((xy[:, 0:1]*shape[1]+xy[:, 1:2])*z+np.arange(z)).astype(np.int64)
         base = b.reshape(-1)[flat].copy(); fall = base.copy()
@@ -252,7 +284,8 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
         context = np.zeros((len(xy), CONTEXT_DIM), np.float32)
         context[:, :2] = (xy+.5)/np.asarray(shape[:2])*2-1
         context[:, 2] = .5*(h+1)/3
-        rel = np.linalg.inv(prepared.state["current_pose"])@prepared.raw["future_poses"][h]
+        if fast and relative_pose is None: relative_pose = np.linalg.inv(prepared.state['current_pose'])@prepared.raw['future_poses'][h]
+        rel = relative_pose if fast else np.linalg.inv(prepared.state["current_pose"])@prepared.raw["future_poses"][h]
         context[:, 3:6] = (rel[0, 3]/40, rel[1, 3]/40, np.arctan2(rel[1, 0], rel[0, 0])/np.pi)
         context[:, 6:8] = (xy-np.column_stack((ax, ay)))*np.asarray(grid.voxel_size[:2])/config.entry_radius_m
         context[:, 8] = np.linalg.norm(context[:, 6:8], axis=1)
@@ -287,9 +320,10 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
                 aligned = transform_points(points, reg[0])
             moved = planar_move(aligned, comp["centroid_world"], prepared.targets[h][i], prepared.yaws[h][i])
             ids, _ = raster_flat(moved, prepared.state["world_to_future"][h],
-                                (grid.x_min, grid.y_min, grid.z_min), grid.voxel_size, shape)
+                                (grid.x_min, grid.y_min, grid.z_min), grid.voxel_size, shape, deduplicate=not fast)
             all_flat.append(ids)
-        ids = np.unique(np.concatenate(all_flat))
+        ids = np.concatenate(all_flat)
+        if not fast: ids = np.unique(ids)
         if not len(ids): continue
         xyz = np.column_stack(np.unravel_index(ids, shape))
         xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells)

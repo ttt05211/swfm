@@ -98,7 +98,7 @@ def test_parallel_sampling_keeps_rng_order_updates_and_gpu_work_on_caller():
     p.workers, q.workers = 4, 1
     r1, r2 = np.random.default_rng(71), np.random.default_rng(71)
     second = copy.deepcopy(rec); second['features'] += .2
-    caller = get_ident(); seen = []; actual = full.sample_online_column
+    caller = get_ident(); seen = []; actual = full.sample_online_columns
     actual_candidates = full.build_online_column_candidates
     def planned(*args):
         assert get_ident() != caller
@@ -111,7 +111,7 @@ def test_parallel_sampling_keeps_rng_order_updates_and_gpu_work_on_caller():
         assert get_ident() == caller; return actual_gather(*args)
     joint.columns.source_features_for = gather
     for update in (1, 2):
-        with patch.object(full, 'sample_online_column', side_effect=mapped), \
+        with patch.object(full, 'sample_online_columns', side_effect=mapped), \
              patch.object(full, 'build_online_column_candidates', side_effect=planned):
             full.train_full_batch(joint, opt, p, None, [(rec, None), (second, None)], r1, update, 12)
             full.train_full_batch(serial, opt2, q, None, [(rec, None), (second, None)], r2, update, 12)

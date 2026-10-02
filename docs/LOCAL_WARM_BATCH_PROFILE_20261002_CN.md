@@ -30,6 +30,29 @@ LOCAL_WARM_CONTINUE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_s
 
 兼容原版 `warm_cache.json`：原 `CausalGeometryCache.stats()` 只有统计计数，没有 `directory`。新报告补充实际目录和namespace；旧报告保持原样，接续从原合同计算namespace并要求对应磁盘目录非空，child仍逐窗口按原始因果输入hash校验缓存内容和身份，所有窗口必须命中后才允许该batch的训练更新。缺失目录不新建、不重新预热，也不把统计计数当作内容完整性的证明。回归测试通过真实cache/prefill生成报告，并同时覆盖原计数-only格式和新格式，而非手造不存在的schema字段。
 
+## 一次性 CPU 热点优化 / 旧新路径比较
+
+服务器已测 batch4/8/16/32 吞吐约4.8–4.9 windows/s，batch64虽未OOM但43408MiB reserved超过10%安全余量，batch128 OOM。不能把增加显存占用当作吞吐改善。batch4 的256个窗口约53s：candidate等待18.2s、patch等待10.7s、prepare/render10.7s，是优先优化对象；cProfile是另一个串行化worker的诊断pass，不拿它的累计时间当正常并行占比。
+
+本次集中落地以下保持训练行为的优化，默认用于完整Local训练：
+
+- 一个窗口的六个horizon共用因果历史索引：历史pose/registration逆矩阵、source membership；只索引本次被采样actor，紧区间bool表总量≤8MiB/窗口，超限走有序searchsorted。不存GT、learned pose/候选/特征；每次prepare重建，不改原几何磁盘cache namespace，不增加20k窗口特征缓存。
+- 每窗口合并六个采样任务，共用索引，保留主线程逐窗口/逐horizon唯一RNG的原抽样和importance权重。稀疏XYZ生成减少N×P×P×Z×3整数/浮点临时数组；逐坐标float64乘加顺序与reference一致。边界、membership、重复anchor不同class的flags均逐元素验收。
+- 候选构建把相对ego pose逆矩阵移出每actor追加循环；历史raster仅要BEV支持与Z范围时不重复做3D unique。支持dilation/argwhere、候选顺序、上下界、标签完全相同。刚生成并验证的plan直接进入内部标签函数，避免立即重复validate；公共action_targets仍完整验证。
+- 整个window batch只读回一份XY/yaw CPU数组；保留原始source query计算图。完成首次原设备renderer exactness、且cache含完整background后，窗口的CPU准备/渲染可在同一个有界worker pool并行；cold/首检仍在原CUDA-owning主线程。workers不跑forward/CUDA/latent gather/RNG；assembly和source latent gather仍在主线程。
+- source feature gather的actor合法性/非空判断使用已经存在的CPU plan，减少每horizon小CUDA reduction的同步；index_copy仍可微且不detach source queries。未改变模型参数、目标、LR、window/source budget或resume合同。`FULL_JOINT_REFERENCE_CPU=1`可选择诊断reference路径。
+
+CPU回归覆盖4/6历史、1/4窗口batch、多步AdamW，比较逐字段候选、逐元素采样特征、labels、抽样RNG、loss、source梯度、optimizer state和参数更新；真实完整预热几何验证并行准备和冷路径首检。CPU通过不代表L40S吞吐或GPU舍入已经实测，服务器速度以以下一次性比较为准。
+
+```bash
+LOCAL_WARM_COMPARE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_speed_20261002_082412_3c09a99 \
+  bash tools/real_motion/run_p0_f9_joint_local_warm_benchmark.sh
+```
+
+比较创建新目录，复用旧128+8身份/顺序、records、TRAIN16权重、checkpoint快照（如有）和geometry cache，不重建prior/cache，不重扫64/128。依次独立进程测 reference batch4、optimized batch4/8/16/32，最后只profile建议档。参考路径关闭共享索引、并行warm准备、批量readback和CPU actor判断；renderer的anchors转换移出source循环等公共小优化两边共有，因而是保守的旧/新recipe比较，不声称精确复现旧提交的每个CPU调用。
+
+`summary.json/txt`同时打印固定batch4吞吐比、推荐档吞吐比、实际显存/命中/阶段时间和条件性15轮纯训练ETA；推荐只来自优化档，within3%仍优先小batch，保留10%显存余量。正常吞吐无cProfile；OS文件缓存/窗口代表性仍会影响数字，不把测得的全局收益预先保证为某个倍率。若异常，保存部分摘要、停止，不自动启动正式训练或反复重试。
+
 ## 帧数验收：此前六帧确有协议差异
 
 上游 `upstream_occfm/forecast/datasets/nuscenes_dataset.py` 在 cache path 根据 `HIST_LAST=4` 把六槽位的前两个 latent 与轨迹置零。此前本仓库只有 trajectory 前缀置零；V18 encoder、flat features、column patches、历史ICP、静态记忆和frontier实际仍读六帧 occupancy。因此旧 E14 与所有旧六帧结果不应表述为标准四帧协议。
