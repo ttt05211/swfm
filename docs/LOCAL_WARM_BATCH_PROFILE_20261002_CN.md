@@ -53,6 +53,24 @@ LOCAL_WARM_COMPARE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_sp
 
 `summary.json/txt`同时打印固定batch4吞吐比、推荐档吞吐比、实际显存/命中/阶段时间和条件性15轮纯训练ETA；推荐只来自优化档，within3%仍优先小batch，保留10%显存余量。正常吞吐无cProfile；OS文件缓存/窗口代表性仍会影响数字，不把测得的全局收益预先保证为某个倍率。若异常，保存部分摘要、停止，不自动启动正式训练或反复重试。
 
+## 第二轮 CPU 优化：候选/采样，不再扫 batch
+
+5722b80 的实测 batch4 吞吐6.034 windows/s（原reference4.921），256窗口约42.4s：候选等待18.49s、特征等待8.04s、prepare/render4.86s。不能把cProfile中的线程等待或worker累计时间当正常运行占比。
+
+- TRAIN仍构建完整候选与真实edit标签、保持原抽样与importance权重，只延迟12维context计算到已抽中的普通ColumnPlan；保留全候选support centre/age，绝不从小子集重算中心。wrapper禁止直接读取未materialize的context，支持空/倒序/负索引/重复索引（正常训练不抽重复）。异常尺度回退完整context验证，pose非有限直接报错。
+- history/ego-only frontier先给潜在XY，CURRENT baseline只在该支持检查free；静态支持狭窄时局部索引，广覆盖时继续完整连续扫描，避免把索引拷贝当优化。新geometry可存可选XY，旧cache缺字段直接派生；无重建、namespace变更或GT/learned信息落盘。
+- source dilation使用与scipy默认完全相同的4-neighbor cross stencil；不变成8-neighbor，不减小支持。候选unique验证可用有界int64键，Python-int先验证乘法范围，超范围/特殊dtype回退原字节键，重复仍报错。
+- float64变换后的**新**坐标工作区原地执行减origin、除step、floor，避免多份大临时数组；三轴分别比较取代N×3临时bool+short-axis reduction。不改变矩阵乘法/浮点精度，不修改共享历史points/occupancy。TRAIN正负bucket用一次changed归约，population顺序、抽样RNG、权重保持一致。
+
+完整训练默认启用；网络/目标/LR/预算/历史4或6合同/optimizer与RNG恢复均不变。CPU比较新增`previous_b4`（上一轮优化，关闭本轮kernels）与`same_batch4_speedup_vs_previous`。公共合法性检查的小优化两边共享，比较保守，不声称逐调用复刻旧提交。
+
+```bash
+LOCAL_WARM_COMPARE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_speed_20261002_082412_3c09a99 \
+  LOCAL_WARM_MAX_BATCH=4 bash tools/real_motion/run_p0_f9_joint_local_warm_benchmark.sh
+```
+
+只测reference/previous/new三条batch4，每条同一冻结样本、prior、初始化与磁盘cache；不测8/16/32/64/128、不重建prior/cache、不启动full15。最后一小份profile另算，不混入吞吐。新增full-grid32-source、宽/窄支持、旧/新cache字段、极限voxel边界、跨int64范围unique和多步loss/gradient/AdamW/RNG一致性回归。Windows CPU合成计时只用来排除明显退化，不能替代真实L40S吞吐；没有保证新的15轮耗时。
+
 ## 帧数验收：此前六帧确有协议差异
 
 上游 `upstream_occfm/forecast/datasets/nuscenes_dataset.py` 在 cache path 根据 `HIST_LAST=4` 把六槽位的前两个 latent 与轨迹置零。此前本仓库只有 trajectory 前缀置零；V18 encoder、flat features、column patches、历史ICP、静态记忆和frontier实际仍读六帧 occupancy。因此旧 E14 与所有旧六帧结果不应表述为标准四帧协议。

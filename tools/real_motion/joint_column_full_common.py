@@ -151,7 +151,7 @@ def pack_records(records, keys):
 
 def train_full_batch(joint, optimizer, provider, source, rows, rng, update, schedule_steps,
                      *, probe=False, patch_resolution=.8, control=None, control_optimizer=None,
-                     profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0, optimize_cpu=True):
+                     profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0, optimize_cpu=True, optimize_kernels=True):
     """True batching, not repeated optimizer steps or stale feature replay."""
     joint.train(); optimizer.zero_grad(set_to_none=True); set_lr(optimizer, update-1, schedule_steps)
     timer = StageTimer(provider.device, profile)
@@ -183,9 +183,11 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
     def candidates(prep):
         started = time.perf_counter()
         if cpu_profiles is None:
-            plans = build_online_column_candidates(prep, joint.columns.config, provider.pcfg.grid)
+            plans = build_online_column_candidates(prep, joint.columns.config, provider.pcfg.grid,
+                defer_context=optimize_cpu and optimize_kernels)
         else:
-            plans = cpu_profiles.run('candidate_workers', build_online_column_candidates, prep, joint.columns.config, provider.pcfg.grid)
+            plans = cpu_profiles.run('candidate_workers', build_online_column_candidates, prep, joint.columns.config, provider.pcfg.grid,
+                defer_context=optimize_cpu and optimize_kernels)
         return plans, time.perf_counter()-started
     def sample_window(prep, selected):
         started = time.perf_counter()
@@ -214,6 +216,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
                     include_gt=True, raw_window=raw, outputs=local)
             else: prep = timer.call('prepare_render', prepared_job.result)
             prep.cpu_pipeline_optimized = optimize_cpu
+            prep.cpu_kernels_optimized = optimize_cpu and optimize_kernels
             # Fixtures/legacy providers may reuse a prepared object. No index
             # from a previous pose/window is allowed to leak into this update.
             if hasattr(prep, 'column_history_index'): del prep.column_history_index
@@ -281,6 +284,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'causal_geometry_cache_hits': sum(bool(raw.get('_causal_geometry_cache_hit')) for _, raw in rows if raw is not None),
         'causal_geometry_worker_seconds_sum': sum(float(raw.get('_causal_geometry_seconds', 0.)) for _, raw in rows if raw is not None),
         'cpu_pipeline_optimized': optimize_cpu,
+        'cpu_kernels_optimized': optimize_cpu and optimize_kernels,
         'parallel_warm_preparations': sum(job is not None for _, _, _, job in preparation),
         'peak_memory_mib': torch.cuda.max_memory_allocated(provider.device)/2**20 if provider.device.type == 'cuda' else None,
         **stats, **column_stats}

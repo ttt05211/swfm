@@ -40,7 +40,8 @@ PROTOCOL = 'local_warm_disk_capacity_timing_v1'
 
 
 def measured_batches(joint, optimizer, provider, source, records, *, windows, sources,
-                     workers, persistent=True, io_workers=2, cpu_profiles=None, max_batches=None, progress=None, optimize_cpu=True):
+                     workers, persistent=True, io_workers=2, cpu_profiles=None, max_batches=None, progress=None,
+                     optimize_cpu=True, optimize_kernels=True):
     """Actual current-model forward/backward, strict warm hits, no weights saved."""
     rng = np.random.default_rng(20261003); rows = []
     pool = ThreadPoolExecutor(max_workers=workers) if persistent else None
@@ -52,7 +53,8 @@ def measured_batches(joint, optimizer, provider, source, records, *, windows, so
             if any(not raw.get('_causal_geometry_cache_hit') for _, raw in batch):
                 raise RuntimeError('benchmark requires persisted warm disk hits for EVERY window')
             started = time.perf_counter()
-            kwargs = dict(profile=True, sampling_pool=pool, sampling_workers=workers, cpu_profiles=cpu_profiles, optimize_cpu=optimize_cpu)
+            kwargs = dict(profile=True, sampling_pool=pool, sampling_workers=workers, cpu_profiles=cpu_profiles,
+                optimize_cpu=optimize_cpu, optimize_kernels=optimize_kernels)
             kwargs['patch_resolution'] = getattr(provider, 'patch_resolution_m', .8)
             fn = lambda: train_full_batch(joint, optimizer, provider, source, batch, rng, update, 100000, **kwargs)
             stats = fn()
@@ -119,7 +121,8 @@ def worker(contract_path, phase, trial):
             {'params': joint.columns.parameters(), 'lr': 3e-4, 'initial_lr': 3e-4, 'weight_decay': .01}])
         available, total = torch.cuda.mem_get_info(device)
         t = json.loads(trial); name = t['name']; args = dict(windows=t['window_batch'], sources=t['source_budget'],
-            workers=t['workers'], persistent=t['persistent'], io_workers=2, optimize_cpu=t.get('optimize_cpu', True))
+            workers=t['workers'], persistent=t['persistent'], io_workers=2, optimize_cpu=t.get('optimize_cpu', True),
+            optimize_kernels=t.get('optimize_kernels', True))
         print(f"trial={name} source_budget={t['source_budget']} CUDA warm-up then dense stress (excluded from throughput)", flush=True)
         # Two warm-up minibatches; not included in steady throughput.
         warm_records = data['typical'][:min(len(data['typical']), 2*t['window_batch'])]
@@ -151,7 +154,8 @@ def worker(contract_path, phase, trial):
                     gpu=torch.cuda.get_device_name(device), temporal_attention_batch_limit=65535,
                     temporal_attention_implementation='independent_batch_chunk_v1',
                     model_code_sha256=sha256(Path(__file__).resolve().parents[2]/'real_motion/local_st_world_model.py'),
-                    cpu_pipeline='window_shared_history_parallel_warm_v1' if args['optimize_cpu'] else 'reference_serial_window_per_horizon_jobs',
+                    cpu_pipeline=('deferred_train_context_exact_numpy_v2' if args['optimize_kernels'] else 'window_shared_history_parallel_warm_v1')
+                        if args['optimize_cpu'] else 'reference_serial_window_per_horizon_jobs',
                     pipeline_code_sha256=sha256(Path(__file__).resolve().with_name('joint_column_full_common.py'))))
             write_json(out/(name+'.json'), result)
             print(f"{name}: {m['windows_per_second']:.3f} windows/s, mean_batch={m['mean_windows_per_batch']:.2f}, peak_reserved={capacity_peak:.0f}MiB", flush=True)
@@ -242,7 +246,7 @@ def load_completed_trial(out, t, c):
 def publish_summary(c, trials, *, started, profile_status, status, error=None, reused=(), print_report=False):
     out = Path(c['out'])
     decision = recommend_trials([t for t in trials if t.get('persistent')
-        and (not c.get('cpu_comparison') or t.get('optimize_cpu'))])
+        and (not c.get('cpu_comparison') or t.get('optimize_cpu') and t.get('optimize_kernels', True))])
     summary = dict(protocol=PROTOCOL, status=status, error=error, history_frames=c['history_frames'], future_frames=6,
         trials=trials, recommendation=decision, elapsed_seconds=time.perf_counter()-started,
         elapsed_scope='this_invocation_only_not_prior_completed_trials', reused_trials=list(reused),
@@ -255,11 +259,14 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
         reference = next((t for t in trials if t['name'] == 'reference_b4' and t['status'] == 'ok'), None)
         fastest = next((t for t in trials if t['name'] == decision.get('recommended_trial')), None)
         fixed_batch = next((t for t in trials if t['name'] == 'optimized_b4' and t['status'] == 'ok'), None)
+        previous = next((t for t in trials if t['name'] == 'previous_b4' and t['status'] == 'ok'), None)
         summary['cpu_comparison'] = dict(parent=c['cpu_comparison'],
             same_batch4_speedup=(fixed_batch['measurement']['windows_per_second']/reference['measurement']['windows_per_second']
                 if reference and fixed_batch else None),
             recommended_speedup=(fastest['measurement']['windows_per_second']/reference['measurement']['windows_per_second']
                 if reference and fastest else None),
+            same_batch4_speedup_vs_previous=(fixed_batch['measurement']['windows_per_second']/previous['measurement']['windows_per_second']
+                if previous and fixed_batch else None),
             note='same records/prior/initialization; timed separately without cProfile; no scientific updates saved')
     write_json(out/'summary.json', summary)
     lines = ['===== LOCAL WARM DISK SPEED ONLY =====', 'status='+status,
@@ -307,14 +314,15 @@ def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None):
             return code
     started = time.perf_counter(); trials = []; status = 'in_progress'; error = None; profile_status = 'not_run'
     try:
-        recipes = [dict(name='reference_b4', window_batch=4, source_budget=128, workers=4, persistent=True, optimize_cpu=False)]
-        recipes += [dict(name=f'optimized_b{w}', window_batch=w, source_budget=32*w, workers=4, persistent=True, optimize_cpu=True)
+        recipes = [dict(name='reference_b4', window_batch=4, source_budget=128, workers=4, persistent=True, optimize_cpu=False, optimize_kernels=False),
+            dict(name='previous_b4', window_batch=4, source_budget=128, workers=4, persistent=True, optimize_cpu=True, optimize_kernels=False)]
+        recipes += [dict(name=f'optimized_b{w}', window_batch=w, source_budget=32*w, workers=4, persistent=True, optimize_cpu=True, optimize_kernels=True)
             for w in (4, 8, 16, 32) if w <= max_window_batch]
         for t in recipes:
             launch('trial', t); row = load_completed_trial(new_out, t, c); trials.append(row)
             publish_summary(c, trials, started=started, profile_status=profile_status, status=status)
             if row['status'] == 'oom': break
-        decision = recommend_trials([t for t in trials if t.get('optimize_cpu')])
+        decision = recommend_trials([t for t in trials if t.get('optimize_cpu') and t.get('optimize_kernels', True)])
         if decision['recommended']:
             selected = next(t for t in recipes if t['name'] == decision['recommended_trial'])
             profile_status = 'complete' if launch('profile', selected) == 0 else 'oom_no_automatic_retry'

@@ -274,11 +274,12 @@ def test_cpu_comparison_reuses_real_population_prior_cache_but_never_old_report(
     with patch.object(bench, 'load_runtime_config', return_value=cfg), patch.object(bench, 'make_prepare_config', return_value=pcfg):
         bench.compare_cpu_paths(original, out, max_window_batch=16, launch=launch)
         with pytest.raises(RuntimeError, match='NEW CPU comparison'): bench.compare_cpu_paths(original, out, launch=launch)
-    assert calls == [('trial', 'reference_b4'), ('trial', 'optimized_b4'), ('trial', 'optimized_b8'),
+    assert calls == [('trial', 'reference_b4'), ('trial', 'previous_b4'), ('trial', 'optimized_b4'), ('trial', 'optimized_b8'),
         ('trial', 'optimized_b16'), ('profile', 'optimized_b4')]
     assert all(p.read_bytes() == b for p, b in before.items())
     summary = json.loads((out/'summary.json').read_text())
     assert summary['recommendation']['recommended_trial'] == 'optimized_b4'
     assert summary['cpu_comparison']['same_batch4_speedup'] == 1.0
+    assert summary['cpu_comparison']['same_batch4_speedup_vs_previous'] == 1.0
     assert (out/'diagnostic_weights.json').read_bytes() == (original/'diagnostic_weights.json').read_bytes()
     assert (out/'records.pt').read_bytes() == (original/'records.pt').read_bytes()

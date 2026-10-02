@@ -52,12 +52,12 @@ def count_proposals(prep, grid, config, counts):
         counts['refine'] += np.bincount(target[ref], minlength=3)
 
 
-def build_online_column_candidates(prep, config, grid):
+def build_online_column_candidates(prep, config, grid, *, defer_context=False):
     """CPU-only plans/labels for one current prediction; no sampling/RNG."""
     from real_motion.causal_column_completion import _action_targets_validated_plan
     label = _action_targets_validated_plan if getattr(prep, 'cpu_pipeline_optimized', True) else action_targets
     return [(h, plan, label(plan, prep.raw['future_gt_occ'][h]))
-            for h in range(6) for plan in (candidate_plan(prep, h, grid, config),)]
+            for h in range(6) for plan in (candidate_plan(prep, h, grid, config, defer_context=defer_context),)]
 
 
 def select_online_columns(prep, config, grid, rng, candidates=None):
@@ -69,7 +69,9 @@ def select_online_columns(prep, config, grid, rng, candidates=None):
     if candidates is None: candidates = build_online_column_candidates(prep, config, grid)
     for h, plan, labels in candidates:
         budget = budgets[h]
-        ids, weight = sample_queries(plan, labels, budget, rng)
+        if getattr(prep, 'cpu_pipeline_optimized', True) and getattr(prep, 'cpu_kernels_optimized', False):
+            ids, weight = sample_queries(plan, labels, budget, rng, optimize=True)
+        else: ids, weight = sample_queries(plan, labels, budget, rng)
         if not len(ids): continue
         small = plan.subset(ids)
         selected.append((h, small, labels[ids], weight))

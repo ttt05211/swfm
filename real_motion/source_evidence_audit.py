@@ -31,12 +31,16 @@ def planar_move(points, source_center, target_center, yaw):
     return out
 
 
-def raster_flat(points_world, world_to_ego, origin, step, shape, *, deduplicate=True):
+def raster_flat(points_world, world_to_ego, origin, step, shape, *, deduplicate=True, optimize=False):
     p = transform_points(points_world, world_to_ego)
     if not np.isfinite(p).all() or not np.isfinite(step).all() or np.any(np.asarray(step) <= 0):
         raise ValueError("nonfinite points or invalid voxel size")
-    idx = np.floor((p - np.asarray(origin)) / np.asarray(step)).astype(np.int64)
-    valid = np.all((idx >= 0) & (idx < np.asarray(shape)), axis=1)
+    if optimize:
+        from .column_cpu_kernels import metric_indices_inplace
+        idx, valid = metric_indices_inplace(p, np.asarray(origin), np.asarray(step), shape)
+    else:
+        idx = np.floor((p - np.asarray(origin)) / np.asarray(step)).astype(np.int64)
+        valid = np.all((idx >= 0) & (idx < np.asarray(shape)), axis=1)
     flat = np.ravel_multi_index(idx[valid].T, shape) if valid.any() else np.empty(0, np.int64)
     return (np.unique(flat) if deduplicate else flat), int((~valid).sum())
 

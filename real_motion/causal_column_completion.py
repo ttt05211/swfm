@@ -19,7 +19,8 @@ def _valid_semantics(values):
     # Integer labels dominate the hot path; range checks are exactly equivalent
     # to membership in 0..17 but avoid allocating a full-grid isin lookup result.
     if np.asarray(values).dtype.kind in 'iu':
-        return not np.any(values < 0) and not np.any(values > FREE)
+        values = np.asarray(values)
+        return (values.dtype.kind == 'u' or values.min(initial=0) >= 0) and values.max(initial=0) <= FREE
     return np.isin(values, np.arange(18)).all()
 
 
@@ -65,7 +66,7 @@ class ColumnPlan:
             return result.copy() if np.shares_memory(source, result) else result
         return ColumnPlan(**{k: independent(v) for k, v in vars(self).items()})
 
-    def validate(self):
+    def validate(self, *, packed_keys=False):
         n, z = self.base.shape
         if (self.xy.shape != (n, 2) or self.evidence_xy.shape != (n, 2)
                 or not np.isfinite(self.evidence_xy).all() or np.any(self.evidence_xy < 0)
@@ -87,8 +88,20 @@ class ColumnPlan:
         keys = np.column_stack((self.actor, self.xy))
         # No ordering is consumed here, only equality/uniqueness. Integer row
         # byte keys avoid NumPy's costly per-field lexicographic structured sort.
-        unique = (np.unique(np.ascontiguousarray(keys).view(np.dtype((np.void, keys.dtype.itemsize*3))))
-                  if keys.dtype.kind in 'iu' else np.unique(keys, axis=0))
+        packed = None
+        if packed_keys and n >= 64 and keys.dtype.kind in 'iu' and keys[:, 1:].min(initial=0) >= 0:
+            lo, hi = int(keys[:, 0].min(initial=0)), int(keys[:, 0].max(initial=0))
+            stride = int(keys[:, 2].max(initial=0))+1
+            area = (int(keys[:, 1].max(initial=0))+1)*stride
+            # Python-int bounds BEFORE arithmetic: never allow int64 collision
+            # through overflow. Larger/pathological keys retain reference sort.
+            if (hi-lo+1)*area <= np.iinfo(np.int64).max:
+                packed = ((keys[:, 0].astype(np.int64)-lo)*area
+                    +keys[:, 1].astype(np.int64)*stride+keys[:, 2].astype(np.int64))
+        if packed is not None: unique = np.unique(packed)
+        elif keys.dtype.kind in 'iu':
+            unique = np.unique(np.ascontiguousarray(keys).view(np.dtype((np.void, keys.dtype.itemsize*3))))
+        else: unique = np.unique(keys, axis=0)
         if len(unique) != n:
             raise ValueError("duplicate actor-column query")
 
@@ -189,7 +202,7 @@ def actions_from_probabilities(plan, probability, thresholds):
     return y
 
 
-def sample_queries(plan, targets, per_kind, rng):
+def sample_queries(plan, targets, per_kind, rng, *, optimize=False):
     """GT affects TRAIN sampling only; inverse probabilities preserve priors."""
     if per_kind < 2: raise ValueError("need >=2 TRAIN queries per kind")
     selected, weights = [], []
@@ -197,9 +210,14 @@ def sample_queries(plan, targets, per_kind, rng):
     populations = ((np.flatnonzero(plan.kind == GENERATE), per_kind),
                    (np.flatnonzero((plan.kind == REFINE)&(plan.actor < 0)), max(2, per_kind//2)),
                    (np.flatnonzero((plan.kind == REFINE)&(plan.actor >= 0)), max(2, per_kind//2)))
+    changed = (targets != KEEP).any(axis=1) if optimize else None
     for population, budget in populations:
-        buckets = [population[(targets[population] != KEEP).any(axis=1)],
-                   population[(targets[population] == KEEP).all(axis=1)]]
+        if optimize:
+            positive = changed[population]
+            buckets = [population[positive], population[~positive]]
+        else:
+            buckets = [population[(targets[population] != KEEP).any(axis=1)],
+                       population[(targets[population] == KEEP).all(axis=1)]]
         for bucket in buckets:
             if not len(bucket): continue
             count = min(len(bucket), max(1, budget//2))

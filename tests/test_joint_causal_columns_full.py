@@ -100,9 +100,9 @@ def test_parallel_sampling_keeps_rng_order_updates_and_gpu_work_on_caller():
     second = copy.deepcopy(rec); second['features'] += .2
     caller = get_ident(); seen = []; actual = full.sample_online_columns
     actual_candidates = full.build_online_column_candidates
-    def planned(*args):
+    def planned(*args, **kwargs):
         assert get_ident() != caller
-        return actual_candidates(*args)
+        return actual_candidates(*args, **kwargs)
     def mapped(*args):
         assert get_ident() != caller
         seen.append(get_ident()); return actual(*args)

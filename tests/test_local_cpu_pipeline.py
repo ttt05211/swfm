@@ -21,6 +21,76 @@ from test_causal_column_sampling import fixture as sampling_fixture
 
 
 @pytest.mark.parametrize('history', [4, 6])
+def test_deferred_training_context_dense_population_labels_and_sampled_fields_exact(history):
+    prep, grid, joint, _, _ = fixture()
+    for k in ('history_occ', 'history_observed', 'history_poses'): prep.raw[k] = prep.raw[k][-history:]
+    prep.registrations = [r[-history:] for r in prep.registrations]
+    prep.cpu_pipeline_optimized = True; prep.cpu_kernels_optimized = True
+    dense = common.build_online_column_candidates(prep, joint.columns.config, grid)
+    compact = common.build_online_column_candidates(prep, joint.columns.config, grid, defer_context=True)
+    for (h, plan, labels), (ch, wrapped, clabels) in zip(dense, compact):
+        assert h == ch and np.array_equal(labels, clabels)
+        with pytest.raises(RuntimeError, match='materialized'): _ = wrapped.context
+        indices = np.arange(len(plan))[::-1]
+        for take in (indices, indices[:11], np.empty(0, np.int64), slice(None, None, -2),
+                     np.arange(len(plan)) % 2 == 0, [-1] if len(plan) else []):
+            old, new = plan.subset(take), wrapped.subset(take)
+            assert type(new) is type(plan)
+            assert all(np.array_equal(v, getattr(new, k)) for k, v in vars(old).items())
+            new.validate()
+    x, y = np.random.default_rng(107), np.random.default_rng(107)
+    a = common.select_online_columns(prep, joint.columns.config, grid, x, candidates=dense)
+    b = common.select_online_columns(prep, joint.columns.config, grid, y, candidates=compact)
+    assert x.bit_generator.state == y.bit_generator.state
+    for old, new in zip(a, b):
+        assert old[0] == new[0]
+        assert all(np.array_equal(v, getattr(new[1], k)) for k, v in vars(old[1]).items())
+        assert np.array_equal(old[2], new[2]) and np.array_equal(old[3], new[3])
+
+
+@pytest.mark.parametrize('history', [4, 6])
+def test_previous_and_current_sparse_kernels_bit_exact_and_leave_history_unchanged(history):
+    prep, grid, cfg, plan = sampling_fixture(3)
+    for k in ('history_occ', 'history_observed', 'history_poses'): prep.raw[k] = prep.raw[k][-history:]
+    prep.registrations = [r[-history:] for r in prep.registrations]
+    small = plan.subset(np.r_[np.arange(12), np.arange(405, 416), np.arange(800, 819)])
+    before = copy.deepcopy(prep.raw)
+    prep.cpu_kernels_optimized = False
+    old = ColumnFeatureSampler(prep, 3, small, grid, cfg, columns.pose_motion, max_cache_mib=0).sample(small, None)
+    prep.cpu_kernels_optimized = True
+    new = ColumnFeatureSampler(prep, 3, small, grid, cfg, columns.pose_motion, max_cache_mib=0).sample(small, None)
+    assert all(np.array_equal(v, new[k]) for k, v in old.items())
+    assert all(np.array_equal(v, before[k]) for k, v in prep.raw.items())
+
+
+def test_inplace_metric_indices_at_exact_voxel_boundaries_and_neighbors():
+    from real_motion.column_cpu_kernels import metric_indices_inplace
+    from real_motion.source_evidence_audit import raster_flat
+    origin, step, shape = np.array([-.3, -2., -1.]), np.array([.4, .4, .4]), (200, 200, 16)
+    points = origin+np.array([[-1, 0, 1], [0, 0, 0], [199, 199, 15], [200, 200, 16]])*step
+    points = np.concatenate((points, np.nextafter(points, -np.inf), np.nextafter(points, np.inf)))
+    expected = np.floor((points-origin)/step).astype(np.int64)
+    actual, valid = metric_indices_inplace(points.copy(), origin, step, shape)
+    assert np.array_equal(actual, expected)
+    assert np.array_equal(valid, ((expected >= 0)&(expected < shape)).all(1))
+    for dedup in (False, True):
+        old = raster_flat(points, np.eye(4), origin, step, shape, deduplicate=dedup)
+        new = raster_flat(points, np.eye(4), origin, step, shape, deduplicate=dedup, optimize=True)
+        assert np.array_equal(old[0], new[0]) and old[1] == new[1]
+
+
+def test_single_reduction_sampling_buckets_weights_and_rng_exact():
+    prep, grid, joint, _, _ = fixture()
+    for _, plan, targets in common.build_online_column_candidates(prep, joint.columns.config, grid):
+        for labels in (targets, np.zeros_like(targets), np.ones_like(targets)):
+            x, y = np.random.default_rng(192), np.random.default_rng(192)
+            a = common.sample_queries(plan, labels, 24, x)
+            b = common.sample_queries(plan, labels, 24, y, optimize=True)
+            assert all(np.array_equal(v, w) for v, w in zip(a, b))
+            assert x.bit_generator.state == y.bit_generator.state
+
+
+@pytest.mark.parametrize('history', [4, 6])
 @pytest.mark.parametrize('seed', range(4))
 def test_sparse_features_bit_exact_reference_all_coordinates_and_ownership(history, seed):
     prep, grid, cfg, plan = sampling_fixture(seed)

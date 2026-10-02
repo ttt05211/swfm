@@ -29,7 +29,7 @@ fi
 echo "不启动15轮。输出 $RUN_DIR"
 if [[ -n "${LOCAL_WARM_COMPARE:-}" ]]; then
   if [[ -n "${LOCAL_WARM_CONTINUE:-}" ]]; then echo "比较模式不能同时接续旧报告" >&2; exit 2; fi
-  echo "复用旧样本/cache/prior：只比较reference batch4和优化batch4/8/16/32，不重扫64/128。"
+  echo "复用旧样本/cache/prior：比较reference/上一版/新版batch4；扩容上限=${LOCAL_WARM_MAX_BATCH:-32}，不重扫64/128。"
   # Tiny synthetic GPU integration gate, not another dataset experiment.
   "$PY" -m pytest -q tests/test_local_cpu_pipeline.py -k cuda
   "$PY" -u tools/real_motion/benchmark_p0_f9_joint_local_warm.py \

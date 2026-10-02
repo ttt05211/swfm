@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from .causal_column_completion import UNKNOWN
 from .source_evidence_audit import transform_points
+from .column_cpu_kernels import metric_indices_inplace
 
 
 class ColumnHistoryIndex:
@@ -66,6 +67,7 @@ class ColumnFeatureSampler:
         self.p, self.z = config.patch, config.z_bins
         self.transforms = {}; self.members = {}
         self.optimized = getattr(prepared, 'cpu_pipeline_optimized', True)
+        self.kernels_optimized = self.optimized and getattr(prepared, 'cpu_kernels_optimized', True)
         self.index = getattr(prepared, 'column_history_index', None) if self.optimized else None
         if self.optimized and self.index is None:
             self.index = ColumnHistoryIndex(prepared, grid, actors=np.unique(plan.actor))
@@ -138,8 +140,11 @@ class ColumnFeatureSampler:
             for start in range(0, len(xyz), 65536):
                 stop = min(start+65536, len(xyz))
                 pts = transform_points(xyz[start:stop], transform)
-                ijk = np.floor((pts-self.origin)/self.step).astype(np.int64)
-                valid = ((ijk >= 0)&(ijk < self.shape)).all(1)
+                if self.kernels_optimized:
+                    ijk, valid = metric_indices_inplace(pts, self.origin, self.step, self.shape)
+                else:
+                    ijk = np.floor((pts-self.origin)/self.step).astype(np.int64)
+                    valid = ((ijk >= 0)&(ijk < self.shape)).all(1)
                 at = tuple(ijk[valid].T)
                 labels[start:stop][valid] = self.history[f][at]
                 bits = self.observed[f][at].astype(np.uint8)
@@ -187,8 +192,13 @@ class ColumnFeatureSampler:
             xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
         for f, transform in enumerate(self.transforms[actor]):
             if transform is None: continue
-            ijk = np.floor((transform_points(xyz, transform)-self.origin)/self.step).astype(np.int64)
-            valid = ((ijk >= 0)&(ijk < self.shape)).all(1); at = tuple(ijk[valid].T)
+            pts = transform_points(xyz, transform)
+            if self.kernels_optimized:
+                ijk, valid = metric_indices_inplace(pts, self.origin, self.step, self.shape)
+            else:
+                ijk = np.floor((pts-self.origin)/self.step).astype(np.int64)
+                valid = ((ijk >= 0)&(ijk < self.shape)).all(1)
+            at = tuple(ijk[valid].T)
             labels = np.full(len(ijk), UNKNOWN, np.uint8); bits = np.zeros(len(ijk), np.uint8)
             labels[valid] = self.history[f][at]; bits[valid] = self.observed[f][at].astype(np.uint8)
             if actor >= 0:

@@ -236,19 +236,87 @@ def fixed_candidate_geometry(memory, footprints, grid, config):
         historical = (m == 11)|(m == 13)
         out.append(dict(radius=config.entry_radius_m, frontier=frontier,
             dominant=np.asarray((11, 13), np.uint8)[counts.argmax(-1)], historical=historical,
-            static_allowed=binary_dilation(historical, structure=np.ones((1, 1, 3)), iterations=1)))
+            static_allowed=binary_dilation(historical, structure=np.ones((1, 1, 3)), iterations=1),
+            generation_xy=np.argwhere(frontier.causal_by_width[config.entry_radius_m]).astype(np.int32),
+            static_xy=np.argwhere(footprint & historical.any(2)).astype(np.int32)))
     return out
 
 
-def padded_support_xy(xy, shape, padding=1):
+def padded_support_xy(xy, shape, padding=1, *, optimize=False):
     """Exact full-grid binary dilation/argwhere order on a source-local bbox."""
     lo = np.maximum(np.asarray(xy).min(0)-padding, 0)
     hi = np.minimum(np.asarray(xy).max(0)+padding+1, shape)
     support = np.zeros(tuple(hi-lo), bool); at = np.asarray(xy)-lo; support[tuple(at.T)] = True
+    if optimize and padding == 1:
+        # The exact default scipy cross stencil; NOT an 8-neighbor dilation.
+        grown = support.copy()
+        grown[1:] |= support[:-1]; grown[:-1] |= support[1:]
+        grown[:, 1:] |= support[:, :-1]; grown[:, :-1] |= support[:, 1:]
+        return np.argwhere(grown)+lo
     return np.argwhere(binary_dilation(support, iterations=padding))+lo
 
 
-def candidate_plan(prepared, h, grid, config=ColumnConfig()):
+def _column_context(xy, legal, actor, ax, ay, age, h, rel, grid, config):
+    """Reference arithmetic, materialized only for TRAIN's selected rows."""
+    context = np.zeros((len(xy), CONTEXT_DIM), np.float32)
+    context[:, :2] = (xy+.5)/np.asarray(grid.shape_hwd[:2])*2-1
+    context[:, 2] = .5*(h+1)/3
+    context[:, 3:6] = (rel[0, 3]/40, rel[1, 3]/40, np.arctan2(rel[1, 0], rel[0, 0])/np.pi)
+    context[:, 6:8] = (xy-np.column_stack((ax, ay)))*np.asarray(grid.voxel_size[:2])/config.entry_radius_m
+    context[:, 8] = np.linalg.norm(context[:, 6:8], axis=1)
+    context[:, 9] = age/2.5
+    context[:, 10] = legal[..., ADD].mean(1)
+    context[:, 11] = actor >= 0
+    return context
+
+
+class _DeferredContextColumns:
+    """TRAIN-only complete population. No model may consume this wrapper.
+
+    Candidate fields, labels and sampling order stay dense/exact. Only context
+    arithmetic is delayed; subset() always produces a normal ColumnPlan. The
+    original full actor support centre is retained, never recomputed from the
+    sampled subset. No geometry or scores survive the current window/update.
+    """
+    def __init__(self, plan, descriptors, h, rel, grid, config):
+        self.plan, self.descriptors = plan, descriptors
+        self.h, self.rel, self.grid, self.config = h, rel, grid, config
+        self.ends = np.asarray([row[1] for row in descriptors], np.int64)
+
+    def __getattr__(self, name):
+        if name == 'context': raise RuntimeError('TRAIN context must be materialized through subset()')
+        return getattr(self.plan, name)
+
+    def __len__(self): return len(self.plan)
+
+    def subset(self, indices):
+        ids = np.arange(len(self))[indices] if isinstance(indices, slice) else np.asarray(indices)
+        if ids.ndim != 1: raise ValueError('TRAIN subset indices must be one dimensional')
+        if ids.dtype == bool:
+            if len(ids) != len(self): raise ValueError('TRAIN boolean subset population mismatch')
+            ids = np.flatnonzero(ids)
+        if ids.size and ids.dtype.kind not in 'iu': raise IndexError('TRAIN subset requires integer indices')
+        if ids.dtype.kind == 'u' and np.any(ids > np.iinfo(np.int64).max): raise IndexError('TRAIN subset index out of bounds')
+        ids = ids.astype(np.int64, copy=False)
+        ids = np.where(ids < 0, ids+len(self), ids)
+        if np.any((ids < 0)|(ids >= len(self))): raise IndexError('TRAIN subset index out of bounds')
+        small = self.plan.subset(ids)
+        if not len(ids): return small
+        groups = np.searchsorted(self.ends, ids, side='right')
+        xs, ys, ages = (np.empty(len(ids), np.float64) for _ in range(3))
+        for group in np.unique(groups):
+            start, stop, actor, ax, ay, age = self.descriptors[group]
+            take = np.flatnonzero(groups == group)
+            local = ids[take]-start
+            xs[take] = ax[local]; ys[take] = ay[local]; ages[take] = age
+        # All integer anchors are bounded by this small grid, hence their
+        # float64 conversion is exact. Keep the reference float32 norm/mean.
+        small.context = _column_context(small.xy, small.legal, small.actor,
+            xs, ys, ages, self.h, self.rel, self.grid, self.config)
+        return small
+
+
+def candidate_plan(prepared, h, grid, config=ColumnConfig(), *, defer_context=False):
     """GT-free candidates, complete population, no evaluation top-positive cap."""
     config.validate()
     b, m, footprint = prepared.baseline[h], prepared.memory[h], prepared.footprints[h]
@@ -256,19 +324,28 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
     if z != config.z_bins: raise RuntimeError("Z lattice/checkpoint mismatch")
     if not np.isclose(grid.voxel_size[0], grid.voxel_size[1], rtol=0, atol=1e-10):
         raise RuntimeError("frontier distance contract requires an isotropic XY lattice")
+    if defer_context:
+        # Pathological scales must still fail through the original full-context
+        # validation, even when the offending row would not have been sampled.
+        with np.errstate(over='ignore', invalid='ignore'):
+            extent = np.asarray(shape[:2])*np.asarray(grid.voxel_size[:2])/config.entry_radius_m
+        if not np.isfinite(extent).all() or np.any(np.abs(extent) > np.sqrt(np.finfo(np.float32).max/4)):
+            defer_context = False
     fixed = getattr(prepared, 'fixed_candidate_geometry', None)
     if fixed is not None and fixed[h]['radius'] == config.entry_radius_m:
         geometry = fixed[h]
     else:
         geometry = fixed_candidate_geometry([m], [footprint], grid, config)[0]
     frontier, dominant = geometry['frontier'], geometry['dominant']
-    rows = []; fast = getattr(prepared, 'cpu_pipeline_optimized', True)
+    rows = []; descriptors = []; row_count = 0
+    fast = getattr(prepared, 'cpu_pipeline_optimized', True)
+    kernels = fast and getattr(prepared, 'cpu_kernels_optimized', True)
     relative_pose = None
     def append(xy, kind, actor, classes, allowed_z, ax, ay, age):
-        nonlocal relative_pose
+        nonlocal relative_pose, row_count
         if not len(xy): return
         flat = ((xy[:, 0:1]*shape[1]+xy[:, 1:2])*z+np.arange(z)).astype(np.int64)
-        base = b.reshape(-1)[flat].copy(); fall = base.copy()
+        base = b.reshape(-1)[flat]; fall = base.copy()
         legal = np.zeros((*base.shape, 3), bool); legal[..., KEEP] = True
         legal[..., ADD] = (base == FREE)&allowed_z
         if kind == REFINE:
@@ -281,31 +358,57 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
             legal[..., REMOVE] = own & (base == classes[:, None]) & (fall != base)
         active = legal[..., 1:].any(axis=(1, 2))
         xy, flat, base, fall, legal, classes, ax, ay = (v[active] for v in (xy, flat, base, fall, legal, classes, ax, ay))
-        context = np.zeros((len(xy), CONTEXT_DIM), np.float32)
-        context[:, :2] = (xy+.5)/np.asarray(shape[:2])*2-1
-        context[:, 2] = .5*(h+1)/3
-        if fast and relative_pose is None: relative_pose = np.linalg.inv(prepared.state['current_pose'])@prepared.raw['future_poses'][h]
-        rel = relative_pose if fast else np.linalg.inv(prepared.state["current_pose"])@prepared.raw["future_poses"][h]
-        context[:, 3:6] = (rel[0, 3]/40, rel[1, 3]/40, np.arctan2(rel[1, 0], rel[0, 0])/np.pi)
-        context[:, 6:8] = (xy-np.column_stack((ax, ay)))*np.asarray(grid.voxel_size[:2])/config.entry_radius_m
-        context[:, 8] = np.linalg.norm(context[:, 6:8], axis=1)
-        context[:, 9] = age/2.5
-        context[:, 10] = legal[..., ADD].mean(1)
-        context[:, 11] = actor >= 0
+        if (fast or defer_context) and relative_pose is None:
+            relative_pose = np.linalg.inv(prepared.state['current_pose'])@prepared.raw['future_poses'][h]
+            if defer_context and (not np.isfinite(relative_pose).all()
+                    or np.any(np.abs(relative_pose[:2, 3]) > float(np.finfo(np.float32).max)*40)):
+                raise ValueError('invalid TRAIN context pose')
+        rel = relative_pose if fast or defer_context else np.linalg.inv(prepared.state["current_pose"])@prepared.raw["future_poses"][h]
+        if defer_context:
+            # XY/anchors are bounded integer grid indices (dynamic anchors are
+            # means of those indices); age is an integer history-frame count.
+            # Pose finite-check is performed once above, not per source.
+            context = np.broadcast_to(np.zeros(CONTEXT_DIM, np.float32), (len(xy), CONTEXT_DIM))
+            descriptors.append((row_count, row_count+len(xy), actor, ax, ay, age))
+            row_count += len(xy)
+        else: context = _column_context(xy, legal, actor, ax, ay, age, h, rel, grid, config)
         rows.append(ColumnPlan(xy.astype(np.int32), np.full(len(xy), kind, np.uint8), np.full(len(xy), actor, np.int32),
                                classes.astype(np.uint8), flat, base, fall, legal, context,
                                np.column_stack((ax, ay)).astype(np.int32) if kind == GENERATE else xy.astype(np.int32)))
-    entry = frontier.causal_by_width[config.entry_radius_m] & (b == FREE).any(2)
-    xy = np.argwhere(entry)
-    ax, ay = frontier.nearest_x[entry], frontier.nearest_y[entry]
+    if kernels:
+        # Only history/ego defines these potential XY rows. Test the CURRENT
+        # baseline on that support, not every voxel of the entire grid.
+        potential = (geometry['generation_xy'] if 'generation_xy' in geometry
+            else np.argwhere(frontier.causal_by_width[config.entry_radius_m]))
+        xy = potential[(b[tuple(potential.T)] == FREE).any(1)]
+        ax, ay = frontier.nearest_x[tuple(xy.T)], frontier.nearest_y[tuple(xy.T)]
+    else:
+        entry = frontier.causal_by_width[config.entry_radius_m] & (b == FREE).any(2)
+        xy = np.argwhere(entry)
+        ax, ay = frontier.nearest_x[entry], frontier.nearest_y[entry]
     append(xy, GENERATE, -3, dominant[ax, ay], np.ones((len(xy), z), bool), ax, ay, 0.)
     # Historical road/sidewalk residuals ONLY inside visited grid; not full-scene
     # refinement. Static occupied edits never touch dynamic/source-owned labels.
     historical = geometry['historical']
-    mismatch = (historical & (m != b)).any(2)
-    static = footprint & mismatch & historical.any(2)
-    xy = np.argwhere(static)
-    cls = dominant[static]; mask = geometry['static_allowed'][static]
+    if kernels:
+        potential = geometry.get('static_xy')
+        static_support = None if potential is not None else footprint & historical.any(2)
+        count = len(potential) if potential is not None else np.count_nonzero(static_support)
+        if count*4 < shape[0]*shape[1]:
+            if potential is None: potential = np.argwhere(static_support)
+            at = tuple(potential.T)
+            xy = potential[(historical[at] & (m[at] != b[at])).any(1)]
+        else:
+            # For broad road support, contiguous full-grid reductions beat
+            # copying most of the grid through advanced indexing.
+            if static_support is None: static_support = footprint & historical.any(2)
+            xy = np.argwhere(static_support & (historical & (m != b)).any(2))
+        cls = dominant[tuple(xy.T)]; mask = geometry['static_allowed'][tuple(xy.T)]
+    else:
+        mismatch = (historical & (m != b)).any(2)
+        static = footprint & mismatch & historical.any(2)
+        xy = np.argwhere(static)
+        cls = dominant[static]; mask = geometry['static_allowed'][static]
     append(xy, REFINE, -2, cls, mask, xy[:, 0], xy[:, 1], 0.)
     for i, comp in enumerate(prepared.state["current"]):
         registered = prepared.registrations[i]
@@ -320,13 +423,14 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
                 aligned = transform_points(points, reg[0])
             moved = planar_move(aligned, comp["centroid_world"], prepared.targets[h][i], prepared.yaws[h][i])
             ids, _ = raster_flat(moved, prepared.state["world_to_future"][h],
-                                (grid.x_min, grid.y_min, grid.z_min), grid.voxel_size, shape, deduplicate=not fast)
+                                (grid.x_min, grid.y_min, grid.z_min), grid.voxel_size, shape,
+                                deduplicate=not fast, optimize=kernels)
             all_flat.append(ids)
         ids = np.concatenate(all_flat)
         if not fast: ids = np.unique(ids)
         if not len(ids): continue
         xyz = np.column_stack(np.unravel_index(ids, shape))
-        xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells)
+        xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells, optimize=kernels)
         allowed = np.broadcast_to((np.arange(z) >= max(0, xyz[:, 2].min()-1))
                                   & (np.arange(z) <= min(z-1, xyz[:, 2].max()+1)), (len(xy), z)).copy()
         age = .5*(len(registered)-1-min(f for f, reg in enumerate(registered) if reg is not None))
@@ -334,12 +438,15 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig()):
         append(xy, REFINE, i, np.full(len(xy), int(comp["class_id"]), np.uint8), allowed,
                np.full(len(xy), center[0]), np.full(len(xy), center[1]), age)
     if rows:
-        plan = ColumnPlan(**{k: np.concatenate([getattr(r, k) for r in rows]) for k in vars(rows[0])})
+        arrays = {k: np.concatenate([getattr(r, k) for r in rows]) for k in vars(rows[0]) if k != 'context' or not defer_context}
+        if defer_context: arrays['context'] = np.broadcast_to(np.zeros(CONTEXT_DIM, np.float32), (row_count, CONTEXT_DIM))
+        plan = ColumnPlan(**arrays)
     else:
         plan = ColumnPlan(np.empty((0, 2), np.int32), np.empty(0, np.uint8), np.empty(0, np.int32), np.empty(0, np.uint8),
             np.empty((0, z), np.int64), np.empty((0, z), np.uint8), np.empty((0, z), np.uint8),
             np.empty((0, z, 3), bool), np.empty((0, CONTEXT_DIM), np.float32))
-    plan.validate(); return plan
+    plan.validate(packed_keys=kernels)
+    return _DeferredContextColumns(plan, descriptors, h, relative_pose, grid, config) if defer_context else plan
 
 
 def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
