@@ -342,7 +342,8 @@ def test_live_device_cold_cache_then_exact_persistent_hit_preserves_gradients(tm
         provider.causal_geometry_cache.close()
 
 
-def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
+@pytest.fixture
+def full_cli_fixture(tmp_path):
     prep, grid, sample, _, template = fixture()
     train = [{**copy.deepcopy(template), 'scene_name': f'train{s}', 't0_token': f'{s}:{i}'} for s in range(10) for i in range(4)]
     dev = [{**copy.deepcopy(template), 'scene_name': 'dev', 't0_token': f'd{i}'} for i in range(512)]
@@ -359,29 +360,53 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
         def load(source, record, *, include_gt): return copy.deepcopy(prep.raw)
         def prepare(source, record, *, include_gt, raw_window=None, outputs=None):
             row = copy.deepcopy(prep); row.window.scene_name = record['scene_name']; row.window.t0_token = record['t0_token']
+            n = joint.transport.config.history_frames
+            for key in ('history_occ','history_observed','history_poses'): row.raw[key] = row.raw[key][-n:]
+            row.registrations = [r[-n:] for r in row.registrations]
             row.outputs = outputs if outputs is not None else result.joint.motion(record, device)
             return row
         result.load_raw_columns = load; result.prepare_columns = prepare
         result.reference_predictions = lambda p, r: {'frozen_E14': p.baseline} if result.reference_enabled else {}
         return result
-    def run(out, epochs, resume=None, fail_update=None, stop_update=None):
+    def run(out, epochs, resume=None, fail_update=None, stop_update=None, stop_prior=None,
+            stop_monitor=None, stop_calibration=False, stop_final=False, history_frames=6):
         argv = ['train', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot', str(tmp_path), '--out-dir', str(out), '--epochs', str(epochs), '--device', 'cpu',
-            '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1', '--history-frames', '6']
+            '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1', '--history-frames', str(history_frames)]
         for k, f in files.items(): argv += ['--'+k, str(f)]
         if resume: argv += ['--resume', str(resume)]
         # Reduce only evaluator population/width for this CPU orchestration test.
-        actual_eval = columns.evaluate_columns
+        actual_eval = columns.evaluate_columns; eval_calls = []
+        stop = Event()
         def small_eval(provider, source, records, model, gates, **kwargs):
+            eval_calls.append(1)
+            original_progress = kwargs.get('progress')
+            def progress(row):
+                if original_progress: original_progress(row)
+                if row['event'] == 'evaluation' and ((stop_monitor == len(eval_calls))
+                        or stop_final and len(records) == 512): stop.set()
+            kwargs['progress'] = progress
             chosen = records[:2]; kwargs['dev64_keys'] = keys[:2] if 'dev64_keys' in kwargs else None
             return actual_eval(provider, source, chosen, model, gates, **kwargs)
         actual_step = trainer.train_full_batch
-        stop = Event()
         def step(*args, **kwargs):
             if fail_update is not None and args[6] == fail_update: raise RuntimeError('simulated interruption')
             result = actual_step(*args, **kwargs)
             if stop_update is not None and args[6] == stop_update: stop.set()
             return result
+        actual_count = trainer.count_proposals; counts_calls = []
+        def count(*args, **kwargs):
+            result = actual_count(*args, **kwargs); counts_calls.append(1)
+            if stop_prior == len(counts_calls): stop.set()
+            return result
+        actual_calibrate = trainer.calibrate_columns
+        def calibrate(*args, **kwargs):
+            original_progress = kwargs.get('progress')
+            def progress(row):
+                if original_progress: original_progress(row)
+                if stop_calibration and row['event'] == 'TRAIN_calibration': stop.set()
+            kwargs['progress'] = progress
+            return actual_calibrate(*args, **kwargs)
         with patch('sys.argv', argv), patch.object(trainer, 'TRAIN_WINDOWS', 40), patch.object(trainer, 'PRIOR_WINDOWS', 4), \
             patch.object(trainer, 'CALIBRATION_WINDOWS', 2), patch.object(trainer, 'make_prepare_config', return_value=pcfg), \
             patch.object(trainer, 'load_manifest', return_value=(manifest, keys, None)), \
@@ -391,8 +416,15 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
             patch.object(trainer, 'validate_clean_e14_checkpoint', return_value='a'*64), \
             patch.object(trainer, 'NuScenesWindowSource', return_value=SimpleNamespace(nusc=None)), \
             patch.object(columns, 'gt_moving_support_sequence', return_value=moving_fixture(prep)), \
-            patch.object(trainer, 'evaluate_columns', side_effect=small_eval), patch.object(trainer, 'train_full_batch', side_effect=step):
-            return trainer.main(stop if stop_update is not None else None)
+            patch.object(trainer, 'evaluate_columns', side_effect=small_eval), patch.object(trainer, 'train_full_batch', side_effect=step), \
+            patch.object(trainer, 'count_proposals', side_effect=count), patch.object(trainer, 'calibrate_columns', side_effect=calibrate):
+            return trainer.main(stop)
+    run.eval_data = (prep, grid, dev, manifest, keys, make_provider)
+    return run, files, originals
+
+
+def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path,full_cli_fixture):
+    run,files,originals = full_cli_fixture
     out = tmp_path/'run'; run(out, 2)
     summary = json.loads((out/'summary.json').read_text(encoding='utf-8'))
     assert summary['epochs_completed'] == 2 and summary['executed_windows'] == 80
@@ -425,3 +457,92 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path):
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'extended', 3, out/'last.pt')
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'short', 1, out/'last.pt')
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'bad', 2, out/'candidate.pt')
+
+
+@pytest.mark.parametrize('where',['prior','last_batch','monitor','calibration','final_eval'])
+def test_full4_interruption_boundaries_restore_optimizer_rng_prior_and_epoch_means(tmp_path,full_cli_fixture,where):
+    run,_,_ = full_cli_fixture
+    # Use ONE epoch for these CPU orchestration cases; scientific full is 15/20.
+    baseline=tmp_path/'baseline';run(baseline,1,history_frames=4)
+    options={'prior':{'stop_prior':2},'last_batch':{'stop_update':10},'monitor':{'stop_monitor':1},
+        'calibration':{'stop_calibration':True},'final_eval':{'stop_final':True}}[where]
+    paused=tmp_path/'paused';assert run(paused,1,history_frames=4,**options) == 130
+    ck=torch.load(paused/'last.pt',weights_only=False)
+    assert json.loads((paused/'runtime_status.json').read_text())['phase'] == 'stopped'
+    if where == 'prior':assert ck['prior_cursor'] == 2 and not ck['prior_completed'] and ck['attempted_updates'] == 0
+    elif where in ('last_batch','monitor'):assert ck['cursor_batch'] == 10 and ck['cursor_epoch'] == 0
+    else:assert ck['cursor_epoch'] == 1 and ck['cursor_batch'] == 0
+    resumed=tmp_path/'resumed';run(resumed,1,paused/'last.pt',history_frames=4)
+    a,b=(torch.load(p/'last.pt',weights_only=False) for p in (baseline,resumed))
+    assert a['attempted_updates'] == b['attempted_updates'] == 10 and a['executed_windows'] == b['executed_windows'] == 40
+    assert all(torch.equal(v,b['state_dict'][k]) for k,v in a['state_dict'].items())
+    assert a['optimizer']['param_groups'] == b['optimizer']['param_groups']
+    for k,state in a['optimizer']['state'].items():
+        assert all(torch.equal(v,b['optimizer']['state'][k][n]) for n,v in state.items())
+    assert torch.equal(a['torch_rng_state'],b['torch_rng_state']) and a['sampling_rng_state'] == b['sampling_rng_state']
+    assert a['TRAIN_weights'] == b['TRAIN_weights']
+    assert len(b['epoch_history']) == 1 and b['epoch_history'][0]['training_statistics_complete_epoch']
+    assert a['epoch_history'][0]['training_means_accumulated'] == b['epoch_history'][0]['training_means_accumulated']
+    sa,sb=(json.loads((p/'summary.json').read_text()) for p in (baseline,resumed))
+    assert sa['evaluation'] == sb['evaluation'] and sa['thresholds'] == sb['thresholds']
+
+
+def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_population(tmp_path, full_cli_fixture):
+    from tools.real_motion import eval_p0_f9_joint_causal_columns as interim
+    run, files, _ = full_cli_fixture
+    prep, grid, dev, manifest, keys, make_provider = run.eval_data
+    trained = tmp_path/'trained'; assert run(trained, 1, stop_update=2, history_frames=4) == 130
+    checkpoint = trained/'last.pt'; original = checkpoint.read_bytes()
+    out = tmp_path/'interim64'; actual_eval = columns.evaluate_columns; calls = []
+    def small_eval(provider, source, records, model, gates, **kwargs):
+        calls.append((len(records), gates, provider.joint.transport.config.history_frames))
+        assert model is provider.joint.columns and provider.reference_enabled
+        assert not hasattr(provider, 'causal_geometry_cache')
+        return actual_eval(provider, source, records[:2], model, gates, **kwargs)
+    def evaluate(destination, population='dev64', evaluator=small_eval, event=None):
+        argv = ['eval', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
+            '--checkpoint', str(checkpoint), '--dev-cache', str(files['dev-cache']),
+            '--population-manifest', str(files['population-manifest']), '--base-checkpoint', str(files['base-checkpoint']),
+            '--dev-info', str(files['dev-info']), '--dataroot', str(tmp_path), '--out-dir', str(destination),
+            '--population', population, '--device', 'cpu', '--cpu-workers', '1']
+        with patch('sys.argv', argv), patch.object(interim, 'CLEAN_SHA256', 'a'*64), \
+            patch.object(interim, 'make_prepare_config', return_value=SimpleNamespace(grid=grid)), \
+            patch.object(interim, 'load_manifest', return_value=(manifest, keys, None)), \
+            patch.object(interim, 'load_cache', return_value=({}, dev)), \
+            patch.object(interim, 'sha256', side_effect=lambda p: 'a'*64 if Path(p) == files['base-checkpoint'] else trainer.sha256(p)), \
+            patch.object(interim, 'FullJointColumnProvider', side_effect=make_provider), \
+            patch.object(interim, 'NuScenesWindowSource', return_value=SimpleNamespace(nusc=None)), \
+            patch.object(columns, 'gt_moving_support_sequence', return_value=moving_fixture(prep)), \
+            patch.object(interim, 'evaluate_columns', side_effect=evaluator):
+            return interim.main(event)
+    assert evaluate(out) == 0
+    assert checkpoint.read_bytes() == original and calls == [(64, (.5,.5,None), 4)]
+    result = json.loads((out/'evaluation.json').read_text())
+    assert result['attempted_updates'] == 2 and result['threshold_source'] == 'fixed_monitor_0.5_0.5_REMOVE_off'
+    assert result['snapshot_sha256'] == trainer.sha256(checkpoint)
+    assert (out/'checkpoint_snapshot.pt').read_bytes() == original
+    report = result['reports']
+    def rotate_and_report(provider, source, records, model, gates, **kwargs):
+        assert len(records) == 512 and kwargs['dev64_keys'] == keys
+        replacement = tmp_path/'replacement.pt'; replacement.write_bytes(b'new last published by running trainer')
+        replacement.replace(checkpoint)
+        return report
+    second = tmp_path/'interim512'
+    assert evaluate(second, 'dev512', rotate_and_report) == 0
+    assert (second/'checkpoint_snapshot.pt').read_bytes() == original
+    checkpoint.write_bytes(original)
+    def cancel(*args, **kwargs): raise InterruptedError('window boundary')
+    cancelled = tmp_path/'cancelled'
+    assert evaluate(cancelled, evaluator=cancel) == 130
+    assert not (cancelled/'summary.txt').exists() and not (cancelled/'evaluation.json').exists()
+    assert json.loads((cancelled/'evaluation_status.json').read_text())['status'] == 'interrupted'
+    ck = torch.load(checkpoint, weights_only=False)
+    ck.update(checkpoint_role='calibrated_candidate', thresholds=(.75,.9,None)); torch.save(ck, checkpoint)
+    def calibrated(provider, source, records, model, gates, **kwargs):
+        assert gates == (.75,.9,None); return report
+    assert evaluate(tmp_path/'calibrated', evaluator=calibrated) == 0
+    ck['prior_completed'] = False; torch.save(ck, checkpoint)
+    with pytest.raises(RuntimeError, match='prior is incomplete'): evaluate(tmp_path/'bad_prior')
+    ck['prior_completed'] = True; ck['info_fingerprints']['dev'] = 'changed'; torch.save(ck, checkpoint)
+    with pytest.raises(RuntimeError, match='provenance'): evaluate(tmp_path/'bad_info')
+    assert not (tmp_path/'bad_info'/'summary.txt').exists()

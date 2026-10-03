@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Explicit immutable full-joint snapshot; never trains/recalibrates/promotes.
+set -euo pipefail
+if [[ "${CONDA_DEFAULT_ENV:-}" != OccFM ]]; then echo "请先 conda activate OccFM" >&2; exit 2; fi
+if [[ $# -lt 1 || $# -gt 3 ]]; then echo "用法: bash $0 RUN_DIR [dev64|dev512] [CHECKPOINT]" >&2; exit 2; fi
+ROOT=/root/nas/occ/swfm
+cd "$ROOT"
+RUN="$(realpath -e -- "$1")"
+if [[ "$RUN" == */model ]]; then MODEL="$RUN"; RUN="${RUN%/model}"; else MODEL="$RUN/model"; fi
+case "$RUN" in "$ROOT"/outputs/p0_f9_joint_causal_columns/*) ;; *) echo "拒绝非full-joint实验目录" >&2; exit 2 ;; esac
+POPULATION="${2:-dev64}"
+case "$POPULATION" in dev64|dev512) ;; *) echo "只能dev64或dev512，不自动扩到full4369" >&2; exit 2 ;; esac
+CHECKPOINT="${3:-$MODEL/last.pt}"
+[[ -f "$CHECKPOINT" ]] || { echo "[MISSING] $CHECKPOINT" >&2; exit 2; }
+OUT="${FULL_JOINT_EVAL_OUT:-$RUN/eval_${POPULATION}_$(date +%Y%m%d_%H%M%S)_$$}"
+[[ ! -e "$OUT" ]] || { echo "拒绝覆盖 $OUT" >&2; exit 2; }
+PY="$(command -v python)"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
+export SWFM_COLUMN_CPU_BACKEND=native SWFM_COLUMN_CPU_BUNDLE=1
+echo "只读快照评估 $POPULATION；last/epoch固定0.5/0.5/REMOVE-off，不用dev调阈值，不改变训练断点。"
+echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输出 $OUT"
+"$PY" -u tools/real_motion/eval_p0_f9_joint_causal_columns.py \
+  --config "$ROOT/configs/real_motion_occfm.yaml" --checkpoint "$CHECKPOINT" \
+  --dev-cache "$ROOT/data/p0_f9_v18_se2_val_all_4369.pt" \
+  --population-manifest "$ROOT/data/p0_f9_v21_dev64_manifest.json" \
+  --base-checkpoint "$ROOT/outputs/p0_f9_v18_se2_clean_tail15/epoch_0014.pt" \
+  --dataroot /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes \
+  --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
+  --population "$POPULATION" --out-dir "$OUT" \
+  --cpu-workers "${FULL_JOINT_EVAL_CPU_WORKERS:-8}" --batch-size 256
+echo "评估完成：$OUT/summary.txt；可继续恢复原训练，不会重置LR/RNG。"

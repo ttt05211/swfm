@@ -17,6 +17,9 @@ if [[ -n "${FULL_JOINT_RESUME:-}" && -z "${FULL_JOINT_HISTORY_FRAMES:-}" ]]; the
   HISTORY="$("$PY" -c 'import sys,torch; print(torch.load(sys.argv[1],map_location="cpu",weights_only=False)["model_configs"]["motion"]["history_frames"])' "$FULL_JOINT_RESUME")"
 fi
 if [[ -e "$RUN_DIR" ]]; then echo "拒绝覆盖：$RUN_DIR" >&2; exit 2; fi
+if pgrep -f '[p]ython.*(train_p0_f9_joint_causal_columns_full.py|benchmark_p0_f9_joint_local_warm.py|eval_p0_f9_joint_causal_columns.py)' >/dev/null; then
+  echo "先安全停止旧训练/测速/联合评估；不会自动kill任何进程。" >&2; exit 2
+fi
 for file in "$FULL_ROOT/configs/real_motion_occfm.yaml" \
   "$FULL_ROOT/data/p0_f9_v18_se2_train_full.pt" "$FULL_ROOT/data/p0_f9_v18_se2_val_all_4369.pt" \
   "$FULL_ROOT/data/p0_f9_v21_dev64_manifest.json" "$FULL_ROOT/outputs/p0_f9_v18_se2_clean_tail15/epoch_0014.pt" \
@@ -52,7 +55,7 @@ elif [[ "$SWFM_COLUMN_CPU_BACKEND" != numpy ]]; then
   echo "FULL_JOINT_CPU_BACKEND 只能是 numpy/native" >&2; exit 2
 fi
 "$PY" -c 'import torch,sys; print(sys.executable,torch.__version__); assert torch.cuda.is_available() and torch.cuda.is_bf16_supported(), "CUDA/BF16 unavailable"'
-SWFM_COLUMN_CPU_BACKEND=numpy "$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_column_runtime_pipeline.py tests/test_causal_geometry_cache.py
+SWFM_COLUMN_CPU_BACKEND=numpy "$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_joint_training_recovery.py tests/test_column_runtime_pipeline.py tests/test_causal_geometry_cache.py
 mkdir -p "$RUN_DIR"
 if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
   echo "断点恢复一阶段：$FULL_JOINT_RESUME；原总轮数$EPOCHS，恢复optimizer/RNG/整段余弦，跳过prior。"
@@ -72,7 +75,8 @@ echo "固定因果几何lazy缓存：$GEOMETRY_CACHE；上限${FULL_JOINT_GEOMET
   --dataroot "$DATAROOT" --train-info "$DATAROOT/nuscenes_infos_train_temporal_v3_scene.pkl" \
   --dev-info "$DATAROOT/nuscenes_infos_val_temporal_v3_scene.pkl" \
   --epochs "$EPOCHS" --history-frames "$HISTORY" --window-batch-size "$WINDOWS" --source-budget "$SOURCES" \
+  --checkpoint-every "${FULL_JOINT_CHECKPOINT_EVERY:-128}" \
   --cpu-workers "$WORKERS" --eval-batch-size 256 --frame-cache-mib 256 \
-  --out-dir "$RUN_DIR/model" "${EXTRA[@]}" 2>&1 | tee "$RUN_DIR/run.log"
+  --out-dir "$RUN_DIR/model" "${EXTRA[@]}" 2>&1 | tee -i "$RUN_DIR/run.log"
 echo "完成。发回 $RUN_DIR/model/summary.txt、epoch_history.json 和 progress.jsonl。"
 echo "last.pt用于断点恢复；epoch_*.pt仅权重快照；candidate.pt是最终固定TRAIN阈值模型。"

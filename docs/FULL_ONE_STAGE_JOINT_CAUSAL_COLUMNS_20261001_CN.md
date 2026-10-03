@@ -108,11 +108,33 @@ bash tools/real_motion/switch_p0_f9_joint_causal_columns_fast.sh --graceful-from
 
 ## 保存、恢复
 
-每256batch原子替换 `last.pt`，每轮结束前（开始eval之前）也保存，eval后再保存epoch cursor/history。last包含模型、optimizer、sampling/Torch/CUDA RNG和精确epoch/batch/window计数；若paired control开启也保存它。
+默认每128个完整update原子替换 `last.pt`（`FULL_JOINT_CHECKPOINT_EVERY`可调），每轮结束前（开始eval之前）也保存，eval后再保存epoch cursor/history。先写独立临时文件、flush/fsync，再发布；保留一个 `last.previous.pt` 备份。last包含模型、optimizer、sampling/Torch/CUDA/Python/NumPy RNG和精确epoch/batch/window计数；若paired control开启也保存它。
+
+启动时先保存零update断点；TRAIN prior保存已完成窗口和原计数，暂停后不从头统计。每轮loss sum/count也跨暂停累加，避免只报告恢复后的半轮均值。监控/校准和评估模型重新加载均保护训练RNG。旧断点没有累积统计时明确标注不完整，不伪造完整轮均值。
 
 weight-only `epoch_*.pt` 只保留最新三轮以及10/14/15/20关键轮次（旧快照在本次新输出目录内轮转，不碰历史实验）。epoch snapshot没有optimizer，不可用于resume。`candidate.pt`是最终固定阈值artifact，也不可恢复训练。
 
-恢复只支持本full protocol的last，使用 **新输出目录**。SHA256校验train/dev cache与info，核验config/model、reference、population order、batch和原schedule；恢复后不重做prior audit，不重新随机初始化或重置学习率。原本已完成的epoch不会再训。
+恢复只支持本full protocol的last（或显式指定last.previous），使用 **新输出目录**。SHA256校验train/dev cache与info，核验config/model、reference、population order、batch和原schedule；完成的prior不重计数，未完成的prior从保存位置续接；不重新随机初始化或重置学习率。原本已完成的batch不会再训。轮末监控或最终评估中断时，最多重做被打断的诊断，不重训完成的batch。
+
+SIGINT/SIGTERM只设置停止请求：完成当前optimizer update或当前评估窗口后保存，再退出130（预期的安全停止状态）。shell使用 `tee -i`，避免Ctrl-C先关闭日志pipe使模型来不及保存。不要Ctrl-Z或kill -9；强制杀进程只能恢复上次完整发布的定期断点，不能保证最后未保存的update。未完成初始化时也不能声称已有可恢复模型。
+
+`runtime_status.json`记录PID、Linux启动时间token、输出目录和阶段。管理入口核验/proc实际脚本和out-dir后才发送一次TERM并等待，拒绝PID复用/错误目录，不升级到KILL。发生异常不序列化未完成的optimizer update，只标记failed并使用原完整断点。
+
+```bash
+# RUN明确指定此次完整训练的根目录，不猜“最近的”实验。
+PY="$(command -v python)"
+"$PY" tools/real_motion/manage_p0_f9_joint_training.py status --run-dir "$RUN"
+"$PY" tools/real_motion/manage_p0_f9_joint_training.py stop --run-dir "$RUN"
+bash tools/real_motion/run_p0_f9_joint_interim_eval.sh "$RUN" dev64
+# dev512可替代dev64；不跑full4369，不用dev重校准或选择best。
+"$PY" -u tools/real_motion/manage_p0_f9_joint_training.py resume --run-dir "$RUN"
+```
+
+管理入口从原execution_contract完整重放训练参数，自动设置新输出目录；也可 `--out-dir NEW_RUN_ROOT`。不会默默改变batch/source/epochs/history。旧六历史断点只能续旧六历史；本次正式新实验严格四历史→六未来。改变观察预算必须从头启动。
+
+中途评估先复制**单次打开的完整checkpoint**并计算内容SHA，以快照运行真正的learned joint transport+columns；原last可继续被训练原子轮换，不再用“原路径SHA变了”误报只读评估失败。独立进程不修改训练模型、optimizer/RNG、阈值或cache，不自动promote。last/epoch使用固定GEN=.5、REF=.5、REMOVE-off，与轮末监控一致；candidate使用其原TRAIN-only校准阈值。评估期间中断不生成完成summary。
+
+此独立评估仍使用CPU/GPU，大范围dev512建议先安全暂停训练。legacy E14有六历史观察，仅作旧参考，不是严格四历史的公平同预算baseline。正常小规模读快照可以并行，但可能降低训练吞吐。
 
 ## 运行
 

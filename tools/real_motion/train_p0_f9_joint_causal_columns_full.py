@@ -7,8 +7,11 @@ if __package__ in (None, ''): sys.path.insert(0, str(Path(__file__).resolve().pa
 import argparse
 import copy
 import json
+import os
+import random
 import subprocess
 import time
+from datetime import datetime, timezone
 import numpy as np
 import torch
 from dataclasses import asdict, replace
@@ -31,6 +34,9 @@ from tools.real_motion.eval_p0_f9_v18_se2 import load_cache
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import load_manifest, align_records, sha256, validate_clean_e14_checkpoint
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256, write_json, atomic_checkpoint, finite_json
 from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
+from tools.real_motion.joint_training_recovery import (
+    save_resume_checkpoint, preserve_training_rng, process_start_token, stop_requested, validate_prior_resume,
+)
 
 TRAIN_WINDOWS = 20430
 PRIOR_WINDOWS = 1024
@@ -87,15 +93,21 @@ def full_summary(summary):
 
 
 def main(stop_event=None):
-    caches = []
-    try: return _main(stop_event, caches)
-    finally:
-        # Drain at most eight pending writes, including graceful stop/errors.
-        # No unwritten cache entry is required to recover the model checkpoint.
-        for cache in caches: cache.close()
+    caches = []; runtime_state = {}
+    try:
+        try: return _main(stop_event, caches, runtime_state)
+        finally:
+            # Drain bounded cache writes and sampling work before advertising
+            # that the process has exited. A drain failure is still reported.
+            for cache in caches: cache.close()
+    except BaseException as error:
+        if 'write' in runtime_state:
+            runtime_state['write']('failed', error=f'{type(error).__name__}: {error}',
+                                   recovery='resume the last fully published checkpoint; never save a partial optimizer update')
+        raise
 
 
-def _main(stop_event, caches):
+def _main(stop_event, caches, runtime_state):
     parser = argparse.ArgumentParser(description=__doc__); add_config_args(parser)
     for key in ('train-cache', 'dev-cache', 'population-manifest', 'base-checkpoint', 'dataroot', 'train-info', 'dev-info', 'out-dir'):
         parser.add_argument('--'+key, required=True)
@@ -109,7 +121,7 @@ def _main(stop_event, caches):
     parser.add_argument('--causal-cache-gib', type=float, default=48.)
     parser.add_argument('--causal-cache-ram-mib', type=int, default=4096)
     parser.add_argument('--eval-batch-size', type=int, default=256)
-    parser.add_argument('--checkpoint-every', type=int, default=256)
+    parser.add_argument('--checkpoint-every', type=int, default=128)
     parser.add_argument('--seed', type=int, default=20261002)
     parser.add_argument('--paired-control', action='store_true', help='also train matched V18-only (off by default)')
     parser.add_argument('--resume', help='full-protocol last.pt into a NEW output directory; epochs/geometry/recipe must match')
@@ -140,7 +152,7 @@ def _main(stop_event, caches):
         else: args.history_frames = 4
     device = torch.device(args.device)
     if device.type == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()): raise RuntimeError('CUDA/BF16 required')
-    torch.set_num_threads(1); torch.manual_seed(args.seed)
+    torch.set_num_threads(1); torch.manual_seed(args.seed); random.seed(args.seed); np.random.seed(args.seed)
     if device.type == 'cuda': torch.cuda.manual_seed_all(args.seed)
     cfg = load_runtime_config(args.config, args.override); pcfg = make_prepare_config(cfg); config_sha = stable_json_fingerprint(cfg)
     manifest, dev64, _ = load_manifest(args.population_manifest)
@@ -196,7 +208,9 @@ def _main(stop_event, caches):
             **provider.causal_geometry_cache.stats()), ensure_ascii=False), flush=True)
     rng = np.random.default_rng(args.seed+1); weights = None
     cursor_epoch = cursor_batch = updates = successes = executed = sampled = 0; link_observed = False
-    history = []
+    history = []; counts = {'generation': np.zeros(2, np.float64), 'refine': np.zeros(3, np.float64)}
+    prior_completed = False; prior_cursor = 0
+    epoch_totals = {}; epoch_seconds = 0.; epoch_stats_complete = True
     if args.resume:
         ck, restored = load_joint(args.resume, device, reference_sha=base_sha, config_sha=config_sha, allow_diagnostic=True)
         # Whole-run cosine depends on the declared total epochs. Resume cannot
@@ -211,7 +225,17 @@ def _main(stop_event, caches):
         cursor_epoch, cursor_batch = ck['cursor_epoch'], ck['cursor_batch']; updates, successes = ck['attempted_updates'], ck['successful_updates']
         executed, sampled, link_observed = ck['executed_windows'], ck['sampled_columns'], ck['gradient_link_observed']
         weights = ck['TRAIN_weights']; history = ck['epoch_history']
+        prior_completed, prior_cursor, counts = validate_prior_resume(ck, PRIOR_WINDOWS)
+        epoch_totals = copy.deepcopy(ck.get('epoch_totals', {})); epoch_seconds = ck.get('epoch_seconds', 0.)
+        epoch_stats_complete = ck.get('epoch_stats_complete', cursor_batch == 0)
+        if (type(epoch_stats_complete) is not bool or not np.isfinite(epoch_seconds) or epoch_seconds < 0
+                or any(set(v) != {'sum', 'count'} or type(v['count']) is not int
+                       or not 0 < v['count'] <= cursor_batch or not np.isfinite(v['sum'])
+                       for v in epoch_totals.values())):
+            raise RuntimeError('invalid accumulated epoch statistics')
         rng.bit_generator.state = ck['sampling_rng_state']; torch.set_rng_state(ck['torch_rng_state'])
+        if 'python_rng_state' in ck: random.setstate(ck['python_rng_state'])
+        if 'numpy_global_rng_state' in ck: np.random.set_state(ck['numpy_global_rng_state'])
         if device.type == 'cuda': torch.cuda.set_rng_state_all(ck['cuda_rng_states'])
         if not (0 <= cursor_epoch <= args.epochs and 0 <= updates <= target_updates): raise RuntimeError('invalid resume cursor')
         if cursor_epoch < args.epochs and not 0 <= cursor_batch <= len(plans[cursor_epoch]): raise RuntimeError('invalid batch cursor')
@@ -220,7 +244,18 @@ def _main(stop_event, caches):
         expected_windows = cursor_epoch*len(records)+(sum(map(len, plans[cursor_epoch][:cursor_batch])) if cursor_epoch < args.epochs else 0)
         if updates != expected_updates or executed != expected_windows or not 0 <= successes <= updates:
             raise RuntimeError('resume window/update counters inconsistent with epoch order')
-    out.mkdir(parents=True); write_json(out/'execution_contract.json', {**identity, 'arguments': vars(args)})
+    out.mkdir(parents=True); write_json(out/'execution_contract.json', {**identity, 'arguments': vars(args), 'launch_cwd': str(Path.cwd())})
+    def write_status(phase, **extra):
+        runtime_state['phase'] = phase
+        write_json(out/'runtime_status.json', {'phase': phase, 'pid': os.getpid(),
+            'process_start_token': process_start_token(os.getpid()), 'out_dir': str(out.resolve()),
+            'argv': list(sys.argv), 'updated_utc': datetime.now(timezone.utc).isoformat(),
+            'checkpoint': str((out/'last.pt').resolve()), 'attempted_updates': updates,
+            'successful_updates': successes, 'cursor_epoch': cursor_epoch, 'cursor_batch': cursor_batch,
+            'prior_completed': prior_completed, 'prior_cursor': prior_cursor, **extra})
+    runtime_state['write'] = write_status
+    write_status('initializing')
+    print(f'TRAINING_PROCESS pid={os.getpid()} out_dir={out.resolve()} status={out}/runtime_status.json', flush=True)
     sampling_pool = None
     if args.persistent_sampling_pool:
         owner = SamplingPoolOwner(args.sampling_workers or max(1, min(args.cpu_workers, 4)))
@@ -232,54 +267,80 @@ def _main(stop_event, caches):
     print(f'OBSERVATIONS: {args.history_frames} historical occupancy frames; six futures. Frozen E14 reference is legacy six-frame, NOT a matched four-frame baseline.', flush=True)
     if args.resume:
         print(f'RESTORED checkpoint={args.resume} completed_updates={updates} epoch_cursor={cursor_epoch} '
-              f'batch_cursor={cursor_batch} next_update={updates+1} optimizer/RNG/cosine_restored prior_audit_skipped', flush=True)
+              f'batch_cursor={cursor_batch} next_update={updates+1} optimizer/RNG/cosine_restored '
+              f'prior={"complete_skipped" if prior_completed else str(prior_cursor)+"/"+str(PRIOR_WINDOWS)+"_resumed"}', flush=True)
     with (out/'progress.jsonl').open('x', encoding='utf-8') as handle:
         def progress(row):
             handle.write(json.dumps(finite_json(row), ensure_ascii=False, allow_nan=False)+'\n'); handle.flush()
+        if weights is None:
+            # A zero-update checkpoint can safely resume an unfinished TRAIN
+            # prior. These are the ORIGINAL initial buffers, not new weights.
+            weights = {'generation_pos_weight': float(joint.columns.generation_pos_weight),
+                'refine_class_weights': joint.columns.refine_class_weights.detach().cpu().tolist(),
+                'population': 'pending_original_TRAIN1024_prior_no_training_updates'}
+        def payload(role):
+            return {**identity, 'checkpoint_role': role, 'screen_pass': False, 'cursor_epoch': cursor_epoch, 'cursor_batch': cursor_batch,
+                'attempted_updates': updates, 'successful_updates': successes, 'executed_windows': executed,
+                'sampled_columns': sampled, 'gradient_link_observed': link_observed, 'TRAIN_weights': weights, 'epoch_history': history,
+                'prior_completed': prior_completed, 'prior_cursor': prior_cursor,
+                'prior_counts': {k: v.tolist() for k, v in counts.items()},
+                'epoch_totals': epoch_totals, 'epoch_seconds': epoch_seconds, 'epoch_stats_complete': epoch_stats_complete,
+                'state_dict': {k: v.detach().cpu().clone() for k, v in joint.state_dict().items()}}
+        def save_last():
+            state = {**payload('resume_last'), 'optimizer': optimizer.state_dict(), 'sampling_rng_state': rng.bit_generator.state,
+                'torch_rng_state': torch.get_rng_state(), 'cuda_rng_states': torch.cuda.get_rng_state_all() if device.type == 'cuda' else [],
+                'python_rng_state': random.getstate(), 'numpy_global_rng_state': np.random.get_state()}
+            if control is not None: state.update(control_state_dict=control.state_dict(), control_optimizer=control_optimizer.state_dict())
+            save_resume_checkpoint(out/'last.pt', state)
+            write_status(runtime_state['phase'], checkpoint_saved=True)
+        def stop_safely(reason):
+            save_last()
+            progress({'event': 'stopped_safely', 'update': updates, 'reason': reason, 'checkpoint': str(out/'last.pt')})
+            write_status('stopped', reason=reason)
+            print(f'STOPPED safely {reason}; completed_update={updates}: {out}/last.pt', flush=True)
+            return 130
+        save_last()
+        if stop_requested(stop_event): return stop_safely('before prior/training')
         if args.prewarm_causal_cache:
             from tools.real_motion.local_warm_cache_common import warm_causal_cache
             print('PREWARM: all TRAIN20430 causal disk entries; no GT/optimizer updates, original Strong device.', flush=True)
+            write_status('prewarm')
             try:
                 warm = warm_causal_cache(provider, source, records, progress=lambda row:
                     (progress(row), print(f"warm_cache={row['windows']}/{len(records)} seconds={row['seconds']:.1f}", flush=True)),
                     stop_event=stop_event)
             except InterruptedError:
-                print('STOPPED safely during prewarm; existing training checkpoint unchanged, cache reusable.', flush=True)
-                return 130
+                return stop_safely('during prewarm; cache remains reusable')
             write_json(out/'warm_cache.json', warm); stages['prewarm_causal_cache'] = warm['seconds']
         tick = time.perf_counter()
-        if weights is None:
-            joint.eval(); counts = {'generation': np.zeros(2, np.float64), 'refine': np.zeros(3, np.float64)}
-            for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, prior), 1):
+        if not prior_completed:
+            joint.eval(); write_status('prior')
+            for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, prior[prior_cursor:]), prior_cursor+1):
+                if stop_requested(stop_event): return stop_safely('during TRAIN prior')
                 prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw)
                 count_proposals(prep, pcfg.grid, joint.columns.config, counts)
+                prior_cursor = wi
                 if wi == 1 or wi % 32 == 0 or wi == len(prior): print(f'prior_audit={wi}/{len(prior)} TRAIN_only', flush=True)
+                if stop_requested(stop_event): return stop_safely('during TRAIN prior')
+                if wi % args.checkpoint_every == 0: save_last()
             weights = weights_from_counts(counts)
             weights.update(population='deterministic_TRAIN1024_unsampled_proposals_initial_random_transport', records_used=len(prior),
                 complete_train_population=False, key_fingerprint=stable_json_fingerprint(prior_keys))
             joint.columns.generation_pos_weight.fill_(weights['generation_pos_weight'])
             joint.columns.refine_class_weights.copy_(torch.tensor(weights['refine_class_weights'], device=device))
+            prior_completed = True
         write_json(out/'TRAIN_prior_counts.json', weights); stages['TRAIN1024_prior'] = time.perf_counter()-tick
-        def payload(role):
-            return {**identity, 'checkpoint_role': role, 'screen_pass': False, 'cursor_epoch': cursor_epoch, 'cursor_batch': cursor_batch,
-                'attempted_updates': updates, 'successful_updates': successes, 'executed_windows': executed,
-                'sampled_columns': sampled, 'gradient_link_observed': link_observed, 'TRAIN_weights': weights, 'epoch_history': history,
-                'state_dict': {k: v.detach().cpu().clone() for k, v in joint.state_dict().items()}}
-        def save_last():
-            state = {**payload('resume_last'), 'optimizer': optimizer.state_dict(), 'sampling_rng_state': rng.bit_generator.state,
-                'torch_rng_state': torch.get_rng_state(), 'cuda_rng_states': torch.cuda.get_rng_state_all() if device.type == 'cuda' else []}
-            if control is not None: state.update(control_state_dict=control.state_dict(), control_optimizer=control_optimizer.state_dict())
-            atomic_checkpoint(out/'last.pt', state)
         save_last(); training_started = time.perf_counter(); monitor_seconds = 0.
-        if stop_event is not None and stop_event.is_set():
-            print(f'STOPPED safely before training: {out}/last.pt', flush=True); return 130
+        if stop_requested(stop_event): return stop_safely('before training')
         for e in range(cursor_epoch, args.epochs):
+            write_status('training')
             epoch_started = time.perf_counter(); done_batch = cursor_batch if e == cursor_epoch else 0
             scheduled = (records[i] for group in plans[e][done_batch:] for i in group)
             previous_end = time.perf_counter(); recent_time = []; recent_windows = []; aggregate = {}
             for bi, rows in enumerate(prefetch_column_batches(provider, source, scheduled, args.window_batch_size, args.source_budget,
                                                             io_workers=args.io_workers), done_batch+1):
                 compute_started = time.perf_counter(); wait = compute_started-previous_end
+                if stop_requested(stop_event): return stop_safely('before next update')
                 if tuple((r['scene_name'], r['t0_token']) for r, _ in rows) != tuple((records[i]['scene_name'], records[i]['t0_token']) for i in plans[e][bi-1]):
                     raise RuntimeError('batch planning/order mismatch')
                 stats = train_full_batch(joint, optimizer, provider, source, rows, rng, updates+1, schedule_steps,
@@ -290,10 +351,14 @@ def _main(stop_event, caches):
                 updates += 1; successes += int(stats['optimizer_updated']); executed += stats['windows']; sampled += stats['sampled_columns']
                 link_observed |= (stats['source_query_gradient_norm'] or 0.) > 0
                 cursor_epoch, cursor_batch = e, bi; wall = time.perf_counter()-compute_started+wait
+                epoch_seconds += wall
                 recent_time.append(wall); recent_windows.append(stats['windows'])
                 if len(recent_time) > 128: recent_time.pop(0); recent_windows.pop(0)
                 for k in ('loss', 'motion_loss', 'column_loss', 'generation_bce', 'refine_action_ce'):
-                    if k in stats: aggregate.setdefault(k, []).append(stats[k])
+                    if k in stats:
+                        aggregate.setdefault(k, []).append(stats[k])
+                        total = epoch_totals.setdefault(k, {'sum': 0., 'count': 0})
+                        total['sum'] += stats[k]; total['count'] += 1
                 progress({'event': 'train_full', 'epoch': e+1, 'epoch_batch': bi, 'epoch_batches': len(plans[e]),
                     'update': updates, **stats, 'seconds': wall, 'input_wait_seconds': wait,
                     'learning_rates': [g['lr'] for g in optimizer.param_groups]})
@@ -305,21 +370,28 @@ def _main(stop_event, caches):
                     if hasattr(provider, 'causal_geometry_cache'):
                         print('GEOMETRY_CACHE '+json.dumps(provider.causal_geometry_cache.stats()), flush=True)
                 stopping = stop_event is not None and stop_event.is_set()
-                if updates % args.checkpoint_every == 0 or stopping: save_last()
+                if updates % args.checkpoint_every == 0 and not stopping: save_last()
                 if stopping:
-                    progress({'event': 'stopped_safely', 'update': updates, 'checkpoint': str(out/'last.pt')})
-                    print(f'STOPPED safely after update={updates}: {out}/last.pt', flush=True); return 130
+                    return stop_safely('after completed update')
                 previous_end = time.perf_counter()
             epoch_train_seconds = time.perf_counter()-epoch_started
             # Keep the completed epoch recoverable before validation begins.
             save_last(); monitor_started = time.perf_counter(); joint.eval()
             if control is not None: control.eval()
             provider.reference_enabled = True
-            report = evaluate_columns(provider, dev_source, align_records(dev, dev64), joint.columns, (.5, .5, None),
-                progress=progress, batch_size=args.eval_batch_size, diagnostic_thresholds=None)
-            provider.reference_enabled = False; monitor_seconds += time.perf_counter()-monitor_started
+            write_status('epoch_monitor')
+            try:
+                with preserve_training_rng(rng):
+                    report = evaluate_columns(provider, dev_source, align_records(dev, dev64), joint.columns, (.5, .5, None),
+                        progress=progress, batch_size=args.eval_batch_size, diagnostic_thresholds=None, stop_event=stop_event)
+            except InterruptedError: return stop_safely('during epoch monitor; completed batches will not replay')
+            finally: provider.reference_enabled = False
+            monitor_seconds += time.perf_counter()-monitor_started
             row = report['all']; record = {'epoch': e+1, 'training_seconds_this_invocation': epoch_train_seconds,
                 'training_means_this_invocation': {k: sum(v)/len(v) for k, v in aggregate.items()},
+                'training_seconds_accumulated': epoch_seconds,
+                'training_means_accumulated': {k: v['sum']/v['count'] for k,v in epoch_totals.items() if v['count']},
+                'training_statistics_complete_epoch': epoch_stats_complete,
                 'dev64_fixed_gate': row, 'successful_updates': successes, 'attempted_updates': updates}
             history.append(record); write_json(out/f'monitor_epoch_{e+1:04d}.json', report); write_json(out/'epoch_history.json', history)
             progress({'event': 'epoch_complete', **record})
@@ -327,23 +399,38 @@ def _main(stop_event, caches):
             print(f"EPOCH_RESULT {e+1}: transport={row['baseline']['mIoU']:.6f} joint={row['variants']['joint']['metrics']['mIoU']:.6f} "
                 f"vs_E14={d['mIoU']:+.6f} MovingMicro={d['MovingMicro']:+.6f}", flush=True)
             cursor_epoch, cursor_batch = e+1, 0
+            epoch_totals = {}; epoch_seconds = 0.; epoch_stats_complete = True
             # Weight-only snapshots are NOT resumable. Last.pt has optimizer/RNG.
             atomic_checkpoint(out/f'epoch_{e+1:04d}.pt', payload('epoch_snapshot')); save_last()
             keep = {10, 14, 15, 20, *range(max(1, e-1), e+2)}
             for p in out.glob('epoch_*.pt'):
                 if int(p.stem.split('_')[-1]) not in keep: p.unlink()
+            if stop_requested(stop_event): return stop_safely('after epoch monitor')
         stages['training'] = time.perf_counter()-training_started-monitor_seconds; stages['dev64_epoch_monitors'] = monitor_seconds
         if executed != args.epochs*len(records) or updates != target_updates: raise RuntimeError('incomplete full training population')
         joint.eval(); tick = time.perf_counter()
-        gates, calibration_report = calibrate_columns(provider, source, calibration, joint.columns, progress=progress, batch_size=args.eval_batch_size)
+        write_status('final_TRAIN_calibration')
+        try:
+            with preserve_training_rng(rng):
+                gates, calibration_report = calibrate_columns(provider, source, calibration, joint.columns,
+                    progress=progress, batch_size=args.eval_batch_size, stop_event=stop_event)
+        except InterruptedError: return stop_safely('during final calibration; training already complete')
         calibration_report.update(population='TRAIN64_in_sample_ALL_train_windows_optimized', held_out=False)
         write_json(out/'TRAIN_calibration.json', calibration_report); stages['TRAIN64_calibration'] = time.perf_counter()-tick
         candidate = {**payload('calibrated_candidate'), 'thresholds': gates, 'calibration': calibration_report}
         atomic_checkpoint(out/'candidate.pt', candidate)
-        ck, persisted = load_joint(out/'candidate.pt', device, reference_sha=base_sha, config_sha=config_sha, allow_diagnostic=True)
+        # Reconstructing a module consumes initialization RNG even when all its
+        # weights are immediately loaded. Keep diagnostic interruption resumable
+        # with exactly the completed training RNG, not that extra initialization.
+        with preserve_training_rng(rng):
+            ck, persisted = load_joint(out/'candidate.pt', device, reference_sha=base_sha, config_sha=config_sha, allow_diagnostic=True)
         provider.joint, provider.model = persisted, persisted.transport; provider.reference_enabled = True; tick = time.perf_counter()
-        evaluation = evaluate_columns(provider, dev_source, dev, persisted.columns, tuple(gates), progress=progress,
-            batch_size=args.eval_batch_size, dev64_keys=dev64)
+        write_status('final_dev512')
+        try:
+            with preserve_training_rng(rng):
+                evaluation = evaluate_columns(provider, dev_source, dev, persisted.columns, tuple(gates), progress=progress,
+                    batch_size=args.eval_batch_size, dev64_keys=dev64, stop_event=stop_event)
+        except InterruptedError: return stop_safely('during final dev512; training already complete')
         stages['final_dev512'] = time.perf_counter()-tick; checks = {}
         for population in ('dev64', 'all'):
             row = evaluation[population]; jm = row['variants']['joint']['metrics']
@@ -363,6 +450,7 @@ def _main(stop_event, caches):
             'route': 'full_joint_passed_no_automatic_promotion' if passed else 'full_joint_not_passed_no_automatic_retry'}
         write_json(out/'summary.json', summary); (out/'summary.txt').write_text(full_summary(summary), encoding='utf-8')
         print(full_summary(summary), flush=True)
+        write_status('finished', summary=str(out/'summary.txt'))
 
 
 if __name__ == '__main__':

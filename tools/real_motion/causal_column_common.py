@@ -557,7 +557,7 @@ def report_states(base, metrics, quality, scenes):
 
 
 def evaluate_columns(provider, source, records, model, thresholds, *, progress=None, batch_size=256, dev64_keys=None,
-                     diagnostic_thresholds=(.50, .50, .50)):
+                     diagnostic_thresholds=(.50, .50, .50), stop_event=None):
     """Four-way ablation ONE raw/V18/model probability pass, sparse exact counts."""
     model.column_sampling_workers = provider.workers
     populations = {"all": None}
@@ -574,6 +574,7 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
         for k in ("generation_ADD", "refine_ADD", "refine_REMOVE")} for p in populations}
     previous_end = time.perf_counter()
     for wi, (record, raw_window) in enumerate(prefetch_raw_columns(provider, source, records), 1):
+        if stop_event is not None and stop_event.is_set(): raise InterruptedError('evaluation stopped at window boundary')
         started = time.perf_counter()
         input_wait = started-previous_end
         print(f"evaluate_columns={wi}/{len(records)} four_way_shared_pass", flush=True)
@@ -632,6 +633,7 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
                                "prediction_seconds_by_horizon": prediction_profile,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
         previous_end = time.perf_counter()
+        if stop_event is not None and stop_event.is_set(): raise InterruptedError('evaluation stopped at window boundary')
     result = {}
     for p in populations:
         if p == "dev64" and counts_windows[p] != len(populations[p]): raise RuntimeError("incomplete frozen dev64 evaluation")
@@ -673,7 +675,7 @@ def safe_metrics(row, baseline):
     return all(v is not None and np.isfinite(v) and v >= -1e-10 for v in values)
 
 
-def calibrate_columns(provider, source, records, model, *, progress=None, batch_size=256):
+def calibrate_columns(provider, source, records, model, *, progress=None, batch_size=256, stop_event=None):
     """ONE held-out TRAIN pass, predeclared finite grid, NO dev tuning.
 
     4 generation settings, 16 refine settings, 64 joint settings share the same
@@ -691,6 +693,7 @@ def calibrate_columns(provider, source, records, model, *, progress=None, batch_
     base = Metrics(); metrics = [Metrics() for _ in jobs]; quality = [defaultdict(int) for _ in jobs]
     previous_end = time.perf_counter()
     for wi, (record, raw_window) in enumerate(prefetch_raw_columns(provider, source, records), 1):
+        if stop_event is not None and stop_event.is_set(): raise InterruptedError('TRAIN calibration stopped at window boundary')
         started = time.perf_counter()
         input_wait = started-previous_end
         print(f"calibrate_TRAIN={wi}/{len(records)} thresholds_fixed_grid_dev_unseen", flush=True)
@@ -717,6 +720,7 @@ def calibrate_columns(provider, source, records, model, *, progress=None, batch_
                                "compute_seconds": compute_elapsed, "input_wait_seconds": input_wait,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
         previous_end = time.perf_counter()
+        if stop_event is not None and stop_event.is_set(): raise InterruptedError('TRAIN calibration stopped at window boundary')
     baseline = base.compute()
     lookup = {(task, gates): (m.compute(), dict(q)) for (task, gates, _, _), m, q in zip(jobs, metrics, quality)}
     selected = (None, None, None); best_score = (False, 0., -np.inf); candidates = []
