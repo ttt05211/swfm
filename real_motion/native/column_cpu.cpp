@@ -32,7 +32,31 @@ extern "C" void* memcpy(void* dst, const void* src, decltype(sizeof(0)) n) {
 }
 #endif
 
-API int swfm_column_cpu_abi() noexcept { return 2; }
+API int swfm_column_cpu_abi() noexcept { return 3; }
+
+// Original six TRAIN strata, each retaining ascending candidate-row order.
+// Counts/fill are integer-only; random draws ALWAYS remain on the caller.
+API int swfm_sampling_strata(const u8* kinds, const i32* actors, const u8* positive,
+    i64 n, i64* rows, i64* offsets) noexcept {
+    if (n < 0) return -1;
+    i64 counts[6] = {0, 0, 0, 0, 0, 0};
+    for (i64 row = 0; row < n; ++row) {
+        if (kinds[row] > 1 || positive[row] > 1) return -2;
+        const int population = kinds[row] == 0 ? 0 : actors[row] < 0 ? 1 : 2;
+        ++counts[population*2+(positive[row] ? 0 : 1)];
+    }
+    offsets[0] = 0;
+    i64 cursor[6];
+    for (int b = 0; b < 6; ++b) {
+        offsets[b+1] = offsets[b]+counts[b]; cursor[b] = offsets[b];
+    }
+    for (i64 row = 0; row < n; ++row) {
+        const int population = kinds[row] == 0 ? 0 : actors[row] < 0 ? 1 : 2;
+        const int b = population*2+(positive[row] ? 0 : 1);
+        rows[cursor[b]++] = row;
+    }
+    return 0;
+}
 
 // Reject overflow BEFORE any multiplication/indexing.
 static i64 cells(i64 x, i64 y, i64 z) noexcept {

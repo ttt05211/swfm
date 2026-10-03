@@ -211,22 +211,31 @@ def sample_queries(plan, targets, per_kind, rng, *, optimize=False):
     if per_kind < 2: raise ValueError("need >=2 TRAIN queries per kind")
     selected, weights = [], []
     # Do not let static road columns starve source-local dynamic refinement.
-    populations = ((np.flatnonzero(plan.kind == GENERATE), per_kind),
-                   (np.flatnonzero((plan.kind == REFINE)&(plan.actor < 0)), max(2, per_kind//2)),
-                   (np.flatnonzero((plan.kind == REFINE)&(plan.actor >= 0)), max(2, per_kind//2)))
+    budgets = (per_kind, max(2, per_kind//2), max(2, per_kind//2))
     from .native_column_cpu import get_native
     native = get_native() if optimize else None
     if targets is None:
         if not optimize or not hasattr(plan,'positive_rows'): raise ValueError('compact TRAIN sampling requires scanned buckets')
         changed=plan.positive_rows
     else: changed = (native.changed(targets) if native is not None else (targets != KEEP).any(axis=1)) if optimize else None
-    for population, budget in populations:
-        if optimize:
-            positive = changed[population]
-            buckets = [population[positive], population[~positive]]
-        else:
-            buckets = [population[(targets[population] != KEEP).any(axis=1)],
-                       population[(targets[population] == KEEP).all(axis=1)]]
+    cached = getattr(plan, 'sampling_buckets', None) if optimize and targets is None else None
+    if cached is not None:
+        # Same six ordered arrays fed to SAME rng.choice calls below. This
+        # only avoids rescanning full candidates at the serial RNG barrier.
+        if len(cached) != 6: raise ValueError('six TRAIN sampling buckets required')
+        strata = ((cached[2*i:2*i+2], budget) for i, budget in enumerate(budgets))
+    else:
+        populations = (np.flatnonzero(plan.kind == GENERATE),
+                       np.flatnonzero((plan.kind == REFINE)&(plan.actor < 0)),
+                       np.flatnonzero((plan.kind == REFINE)&(plan.actor >= 0)))
+        def rows(population):
+            if optimize:
+                positive = changed[population]
+                return population[positive], population[~positive]
+            return (population[(targets[population] != KEEP).any(axis=1)],
+                    population[(targets[population] == KEEP).all(axis=1)])
+        strata = ((rows(population), budget) for population, budget in zip(populations, budgets))
+    for buckets, budget in strata:
         for bucket in buckets:
             if not len(bucket): continue
             count = min(len(bucket), max(1, budget//2))

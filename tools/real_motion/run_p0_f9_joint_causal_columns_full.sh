@@ -54,7 +54,7 @@ if [[ "$SWFM_COLUMN_CPU_HORIZONS" != 0 && "$SWFM_COLUMN_CPU_HORIZONS" != 1 ]]; t
 fi
 if [[ "$SWFM_COLUMN_CPU_BACKEND" == native ]]; then
   "$PY" -u tools/real_motion/check_column_native_cpu.py
-  SWFM_COLUMN_CPU_BUNDLE=1 "$PY" -m pytest -q tests/test_native_column_cpu.py tests/test_compact_column_pipeline.py tests/test_column_horizon_pipeline.py
+  SWFM_COLUMN_CPU_BUNDLE=1 "$PY" -m pytest -q tests/test_native_column_cpu.py tests/test_compact_column_pipeline.py tests/test_column_horizon_pipeline.py tests/test_column_sampling_strata.py
 elif [[ "$SWFM_COLUMN_CPU_BACKEND" != numpy ]]; then
   echo "FULL_JOINT_CPU_BACKEND 只能是 numpy/native" >&2; exit 2
 fi

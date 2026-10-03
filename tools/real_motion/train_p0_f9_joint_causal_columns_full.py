@@ -264,8 +264,8 @@ def _main(stop_event, caches, runtime_state):
         caches.append(owner); sampling_pool = owner.pool
     print('CPU_PIPELINE '+json.dumps({'task_granularity': 'horizon' if cpu_horizons else 'window',
         'combined_workers': cpu_pool_workers, 'io_workers': args.io_workers,
-        'candidate_workers': max(1, cpu_pool_workers//2) if cpu_horizons else cpu_pool_workers,
-        'feature_workers': max(1, cpu_pool_workers-cpu_pool_workers//2) if cpu_horizons else cpu_pool_workers,
+        'candidate_workers': cpu_pool_workers, 'feature_workers': cpu_pool_workers,
+        'shared_worker_pool': cpu_horizons,
         'sampling_rng': 'caller_window_horizon_order', 'geometry_ram_mib': args.causal_cache_ram_mib,
         'prefetch': 'one_batch_unchanged', 'nested_pools': False}), flush=True)
     stages = {}; tick = time.perf_counter()

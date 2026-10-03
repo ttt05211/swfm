@@ -371,6 +371,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'online_materialize_worker_seconds_sum': materialize_seconds,
         'online_candidate_pool_workers': getattr(pool, 'candidate_workers', workers),
         'online_feature_pool_workers': getattr(pool, 'feature_workers', workers),
+        'online_shared_worker_pool': getattr(pool, 'shared_worker_pool', False),
         'causal_geometry_cache_hits': sum(bool(raw.get('_causal_geometry_cache_hit')) for _, raw in rows if raw is not None),
         'causal_geometry_worker_seconds_sum': sum(float(raw.get('_causal_geometry_seconds', 0.)) for _, raw in rows if raw is not None),
         'cpu_pipeline_optimized': optimize_cpu,

@@ -40,6 +40,18 @@ def test_scan_has_no_dense_rows_and_only_draws_materialize(monkeypatch,compiled)
     assert compiled.info()['calls']['support_many'] > 0
 
 
+def test_ordered_unique_fastpath_still_rejects_full_unsampled_duplicate_rows():
+    prep, grid, cfg = candidate_fixture(0, legacy=False)
+    original = prep.fixed_candidate_geometry[0]['generation_xy']
+    assert len(original) > 100
+    prep.fixed_candidate_geometry[0]['generation_xy'] = original[::-1].copy()
+    # Out-of-order unique inputs remain valid, just as with full np.unique.
+    common.build_online_column_candidates(prep, cfg, grid, defer_context=True)
+    prep.fixed_candidate_geometry[0]['generation_xy'] = np.concatenate((original, original[:1]))
+    with pytest.raises(ValueError, match='duplicate actor-column'):
+        common.build_online_column_candidates(prep, cfg, grid, defer_context=True)
+
+
 @pytest.mark.parametrize('gtmode',['natural','free','random'])
 def test_compact_full_fields_every_stratum_subset_order_and_rng(monkeypatch,gtmode):
     prep,grid,cfg=candidate_fixture(8,legacy=True)
@@ -96,6 +108,7 @@ def test_train_prior_complete_unsampled_action_counts_and_weights_exact(monkeypa
     monkeypatch.setenv('SWFM_COLUMN_CPU_BUNDLE','1')
     def forbidden(*args,**kwargs): raise AssertionError('TRAIN prior materialized full voxel rows')
     monkeypatch.setattr(compiled,'rows',forbidden); monkeypatch.setattr(compiled,'targets',forbidden)
+    monkeypatch.setattr(compiled,'sampling_strata',forbidden)  # unsampled prior never needs draw buckets
     common.count_proposals(prep,grid,cfg,new)
     assert all(np.array_equal(v,new[k]) for k,v in old.items())
     assert common.weights_from_counts(old) == common.weights_from_counts(new)

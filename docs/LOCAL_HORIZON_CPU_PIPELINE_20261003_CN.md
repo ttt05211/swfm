@@ -1,5 +1,8 @@
 # Local 暖缓存训练：按未来帧拆分的 CPU 流水线
 
+> 本文记录 719202c 的初版。服务器回测未提速；后续共享容量/整数分桶修正见
+> `LOCAL_SHARED_STRATA_CPU_20261003_CN.md`，固定 3+3 与 native ABI 不变的说明已被替代。
+
 ## 本次边界
 
 仅优化在线 CPU 调度；不更换 Local 网络、loss、梯度连接、数据 population 或训练配方。

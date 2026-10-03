@@ -44,6 +44,10 @@ def main():
     _, _, counts = kernel.compact(*args, prior_counts=True)
     if not np.array_equal(counts, [4, 1, 0, 0, 0]):
         raise RuntimeError('native complete TRAIN prior preflight failed')
+    buckets = kernel.sampling_strata(np.array([0, 0, 1, 1, 1, 1], np.uint8),
+        np.array([-3, -3, -2, -2, 0, 0], np.int32), np.array([1, 0, 1, 0, 1, 0], bool))
+    if any(not np.array_equal(bucket, [i]) for i, bucket in enumerate(buckets)):
+        raise RuntimeError('native original-order TRAIN sampling strata preflight failed')
     print(json.dumps(dict(ok=True, **kernel.info()), ensure_ascii=True), flush=True)
     return 0
 

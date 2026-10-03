@@ -54,11 +54,19 @@ class CompactColumns:
         self.raw_rows=np.flatnonzero(active)
         self.xy,self.kind,self.actor,self.classes,self.masks=(a[active] for a in (xy,kinds,actors,cls,masks))
         self.positive_rows=positive[active]
+        # Compute buckets while the candidate worker owns the arrays, not in
+        # the caller's RNG stage. No masks/positive-negative gathers repeated
+        # in the main thread, and one packed native buffer replaces six copies.
+        self.sampling_buckets = (None if count_prior else
+            self.native.sampling_strata(self.kind, self.actor, self.positive_rows))
         # Full-population identity check, NOT only the sampled rows.
         if len(self):
             area=int(grid.shape_hwd[0])*int(grid.shape_hwd[1])
             keys=(self.actor.astype(np.int64)+3)*area+self.xy[:,0].astype(np.int64)*int(grid.shape_hwd[1])+self.xy[:,1]
-            if len(np.unique(keys)) != len(keys): raise ValueError('duplicate actor-column query')
+            # Production groups/XY are already ordered. Keep FULL duplicate
+            # validation for unordered inputs too; never validate only draws.
+            if np.any(keys[1:] <= keys[:-1]) and len(np.unique(keys)) != len(keys):
+                raise ValueError('duplicate actor-column query')
             self.rel=np.linalg.inv(prep.state['current_pose'])@prep.raw['future_poses'][h]
             if (not np.isfinite(self.rel).all()
                     or np.any(np.abs(self.rel[:2,3]) > float(np.finfo(np.float32).max)*40)):
@@ -111,7 +119,8 @@ class CompactColumns:
 
     def audit(self):
         return dict(population=len(self),materialized_rows=self.materialized_rows,
-            compact_bytes=sum(a.nbytes for a in (self.raw_rows,self.xy,self.kind,self.actor,self.classes,self.masks,self.positive_rows)))
+            compact_bytes=sum(a.nbytes for a in (self.raw_rows,self.xy,self.kind,self.actor,self.classes,self.masks,self.positive_rows,
+                                                   *(self.sampling_buckets or ()))))
 
 
 def dynamic_evidence(prep,grid):

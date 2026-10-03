@@ -31,16 +31,30 @@ def assert_state_equal(left, right):
         assert left == right
 
 
-def test_bounded_budget_and_independent_queues_do_not_starve_features():
+def test_shared_capacity_and_feature_priority_avoid_queued_candidate_backlog():
     assert sampling_worker_budget(8, horizons=True) == 6
     assert sampling_worker_budget(8) == 4
     assert sampling_worker_budget(128, 128, horizons=True) == 8
-    gate = Event()
+    gate = Event(); started = Event(); order = []
+    with HorizonCpuPool(1) as pool:
+        def blocking():
+            started.set(); gate.wait(5)
+        active = pool.submit(blocking)
+        assert started.wait(2)
+        backlog = [pool.submit(lambda i=i: order.append(('candidate', i))) for i in range(12)]
+        feature = pool.submit_features(lambda: order.append(('feature', 0)))
+        gate.set(); feature.result(timeout=2); active.result(timeout=2)
+        assert order[0] == ('feature', 0)
+        for job in backlog: job.result(timeout=2)
     with HorizonCpuPool(6) as pool:
-        assert pool.candidate_workers + pool.feature_workers == 6
-        blocked = [pool.submit(gate.wait, 5) for _ in range(12)]
+        assert pool.candidate_workers == pool.feature_workers == pool.workers == 6
+        assert pool.shared_worker_pool
+        gate.clear(); starts = [Event() for _ in range(6)]
+        def occupied(event):
+            event.set(); return gate.wait(5)
+        blocked = [pool.submit(occupied, event) for event in starts]
         try:
-            assert pool.submit_features(lambda: 'not queued behind candidates').result(timeout=2)
+            assert all(event.wait(2) for event in starts)  # all SIX, not three, can do candidates
         finally:
             gate.set()
         assert all(job.result(timeout=2) for job in blocked)
@@ -58,6 +72,33 @@ def test_fifo_parent_index_precedes_dependent_jobs_even_with_one_worker(workers)
             parents.append(index)
             jobs.extend(pool.submit_features(lambda p, h: (p.result()[0], h), index, h) for h in range(6))
         assert [job.result(timeout=5) for job in jobs] == [(w, h) for w in range(4) for h in range(6)]
+
+
+def test_shutdown_cancels_pending_only_and_running_task_finishes():
+    gate = Event(); started = Event(); ran = []
+    pool = HorizonCpuPool(1)
+    def active():
+        started.set(); gate.wait(5); return 'committed CPU result'
+    job = pool.submit(active)
+    try:
+        assert started.wait(2)
+        a = pool.submit(lambda: ran.append('candidate'))
+        b = pool.submit_features(lambda: ran.append('feature'))
+        pool.shutdown(wait=False, cancel_futures=True)
+        assert a.cancelled() and b.cancelled() and not job.cancelled()
+        with pytest.raises(RuntimeError, match='shutdown'): pool.submit(lambda: None)
+    finally:
+        gate.set(); pool.shutdown(wait=True)
+    assert job.result(timeout=2) == 'committed CPU result' and not ran
+
+
+def test_worker_exception_does_not_kill_shared_worker_or_drop_remaining_jobs():
+    with HorizonCpuPool(1) as pool:
+        def bad(): raise ValueError('CPU job error')
+        job = pool.submit_features(bad)
+        good = pool.submit(lambda: 42)
+        with pytest.raises(ValueError, match='CPU job error'): job.result(timeout=2)
+        assert good.result(timeout=2) == 42
 
 
 def test_draw_only_does_not_materialize_and_keeps_original_rng(monkeypatch):
@@ -190,7 +231,7 @@ def test_native_compact_horizon_order_fields_draws_and_features_exact(monkeypatc
         draws = common.draw_online_column_indices(prep, cfg, grid, b, candidates=new)
         assert a.bit_generator.state == b.bit_generator.state
         index = common.online_column_history_index(prep, draws, grid)
-        rows = list(pool.features.map(common.materialize_online_column, draws))
+        rows = [job.result() for job in [pool.submit_features(common.materialize_online_column, draw) for draw in draws]]
         for old, row in zip(old_rows, rows):
             assert all(np.array_equal(v, getattr(row[1], k)) for k, v in vars(old[1]).items())
             assert np.array_equal(old[2], row[2]) and np.array_equal(old[3], row[3])

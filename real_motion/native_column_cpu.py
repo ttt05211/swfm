@@ -17,7 +17,7 @@ from threading import Lock
 
 import numpy as np
 
-ABI = 2
+ABI = 3
 SOURCE = Path(__file__).resolve().parent/'native'/'column_cpu.cpp'
 _loaded = None
 _load_lock = Lock()
@@ -142,6 +142,7 @@ class NativeColumns:
         self.gather_fn = self._bind('swfm_gather', [P,I,P,P,I,I,I,J,P,I,P,I,I,P,P])
         self.expand_fn = self._bind('swfm_expand', [P]*4+[I]*3+[J]+[P]*2)
         self.changed_fn = self._bind('swfm_changed', [P,I,I,P])
+        self.strata_fn = self._bind('swfm_sampling_strata', [P,P,P,I,P,P])
         self.compact_fn = self._bind('swfm_compact_columns', [P]*9+[I]*4+[J]+[P]*8)
         self.support_many_fn = self._bind('swfm_support_many', [P]*2+[I]*5+[P,I]+[P]*3, count=True)
         self.gather_many_fn = self._bind('swfm_gather_many', [P]+[I]*3+[P]*2+[I]*3+[P]*9)
@@ -251,6 +252,17 @@ class NativeColumns:
         n,z=targets.shape; changed=np.empty(n,bool)
         self._call('changed',self.changed_fn,_pointer(targets),n,z,_pointer(changed))
         return changed
+
+    def sampling_strata(self, kinds, actors, positive):
+        """One packed row buffer; exact original sorted six TRAIN buckets."""
+        kinds = _array(kinds, np.uint8)
+        if kinds.ndim != 1: raise ValueError('sampling strata kinds must be 1D')
+        n = len(kinds)
+        actors = _array(actors, np.int32, (n,)); positive = _bits(positive, (n,))
+        rows = np.empty(n, np.int64); offsets = np.empty(7, np.int64)
+        self._call('sampling_strata', self.strata_fn, *map(_pointer, (kinds, actors, positive)),
+                   n, _pointer(rows), _pointer(offsets))
+        return tuple(rows[offsets[b]:offsets[b+1]] for b in range(6))
 
     def compact(self, xy, kinds, actors, classes, masks, baseline, owners, restored, gt, *, materialize=False, prior_counts=False):
         if materialize and prior_counts: raise ValueError('prior scan must not materialize voxel rows')
