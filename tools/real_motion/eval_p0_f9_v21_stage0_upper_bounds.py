@@ -190,15 +190,24 @@ def load_manifest(path):
     return x,keys,lattice
 
 def align_records(records,keys):
+    """Select identities in frozen order, accepting JSON list pairs as well as tuples."""
+    ordered_keys=[]; seen=set()
+    for i,key in enumerate(keys):
+        if (not isinstance(key,(list,tuple)) or len(key)!=2
+                or any(not isinstance(part,str) or not part for part in key)):
+            raise RuntimeError(f"invalid population identity at index {i}: {key!r}")
+        key=tuple(key)
+        if key in seen:raise RuntimeError(f"duplicate population identities: {key!r}")
+        seen.add(key); ordered_keys.append(key)
     m={}; duplicate=[]
     for r in records:
         key=(str(r["scene_name"]),str(r["t0_token"]))
         if key in m:duplicate.append(key)
         else:m[key]=r
     if duplicate:raise RuntimeError(f"V18 cache has duplicate identities: {duplicate[:5]}")
-    missing=[k for k in keys if k not in m]
+    missing=[k for k in ordered_keys if k not in m]
     if missing: raise RuntimeError(f"V18 cache missing keys: {missing[:5]}")
-    return [m[k] for k in keys]
+    return [m[k] for k in ordered_keys]
 
 def _parse_shape(row):
     return CanonicalShape(

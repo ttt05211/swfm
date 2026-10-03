@@ -76,7 +76,8 @@ def main(stop_event=None):
     if (manifest['selected_key_fingerprint'] != DEV64_FP or manifest['manifest_fingerprint'] != ck['dev_manifest_fingerprint']
             or tuple(map(tuple,manifest['parent_keys'])) != tuple(map(tuple,ck['dev_keys']))):
         raise RuntimeError('frozen dev64/dev512 identity/order changed')
-    chosen=dev64 if a.population == 'dev64' else manifest['parent_keys']
+    # load_manifest validates the JSON but preserves lists in its raw payload.
+    chosen=dev64 if a.population == 'dev64' else tuple(map(tuple,manifest['parent_keys']))
     if {str(s) for s,_ in chosen}&{str(s) for s,_ in ck['train_keys']}:raise RuntimeError('TRAIN/dev scene overlap')
     _,all_records=load_cache(a.dev_cache);record_keys(all_records);records=align_records(all_records,chosen);del all_records
     gates=tuple(ck['thresholds']) if ck['checkpoint_role'] == 'calibrated_candidate' else (.5,.5,None)

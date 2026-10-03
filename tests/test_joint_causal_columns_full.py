@@ -516,6 +516,8 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
     from tools.real_motion import eval_p0_f9_joint_causal_columns as interim
     run, files, _ = full_cli_fixture
     prep, grid, dev, manifest, keys, make_provider = run.eval_data
+    # A real JSON manifest contains lists, not the fixture's Python tuples.
+    manifest = json.loads(json.dumps(manifest))
     trained = tmp_path/'trained'; assert run(trained, 1, stop_update=2, history_frames=4) == 130
     checkpoint = trained/'last.pt'; original = checkpoint.read_bytes()
     out = tmp_path/'interim64'; actual_eval = columns.evaluate_columns; calls = []
@@ -533,7 +535,7 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
         with patch('sys.argv', argv), patch.object(interim, 'CLEAN_SHA256', 'a'*64), \
             patch.object(interim, 'make_prepare_config', return_value=SimpleNamespace(grid=grid)), \
             patch.object(interim, 'load_manifest', return_value=(manifest, keys, None)), \
-            patch.object(interim, 'load_cache', return_value=({}, dev)), \
+            patch.object(interim, 'load_cache', return_value=({}, list(reversed(dev)))), \
             patch.object(interim, 'sha256', side_effect=lambda p: 'a'*64 if Path(p) == files['base-checkpoint'] else trainer.sha256(p)), \
             patch.object(interim, 'FullJointColumnProvider', side_effect=make_provider), \
             patch.object(interim, 'NuScenesWindowSource', return_value=SimpleNamespace(nusc=None)), \
@@ -549,6 +551,8 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
     report = result['reports']
     def rotate_and_report(provider, source, records, model, gates, **kwargs):
         assert len(records) == 512 and kwargs['dev64_keys'] == keys
+        assert trainer.record_keys(records) == tuple(map(tuple, manifest['parent_keys']))
+        assert all(isinstance(key, list) for key in manifest['parent_keys'])
         replacement = tmp_path/'replacement.pt'; replacement.write_bytes(b'new last published by running trainer')
         replacement.replace(checkpoint)
         return report
