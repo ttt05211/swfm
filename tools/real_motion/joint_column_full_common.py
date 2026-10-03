@@ -8,13 +8,15 @@ from real_motion.rigid_transport import rigid_source_points_world
 from real_motion.source_evidence_audit import transform_points
 from real_motion.causal_column_model import column_loss
 from tools.real_motion.joint_column_common import (JointColumnProvider, select_online_columns,
-    build_online_column_candidates, sample_online_column, sample_online_columns, assemble_online_columns, motion_loss, set_lr)
+    build_online_column_candidates, sample_online_column, sample_online_columns, assemble_online_columns, motion_loss, set_lr,
+    OnlineColumnCandidateBuilder, draw_online_column_indices, materialize_online_column, online_column_history_index)
 from tools.real_motion.causal_column_common import (causal_source_history, FEATURE_KEYS,
     history_grid_footprint_bev_sequence, build_future_static_memory_only, fixed_candidate_geometry,
     compose_component_replacements_fast_exact, prepare_warm_columns_cpu, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from real_motion.local_training_profile import StageTimer
 from real_motion.native_column_cpu import backend_name, bundle_enabled
+from real_motion.column_cpu_pipeline import horizon_pipeline_enabled, sampling_worker_budget, cpu_sampling_pool
 from real_motion.v18_motion_gap import numpy
 
 MOTION_KEYS = ('features', 'local_semantic_tube', 'kta_displacement_xy_m',
@@ -166,6 +168,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
     joint.train(); optimizer.zero_grad(set_to_none=True); set_lr(optimizer, update-1, schedule_steps)
     timer = StageTimer(provider.device, profile)
     bundle=optimize_cpu and optimize_kernels and bundle_enabled()
+    horizons=bundle and horizon_pipeline_enabled()
     if provider.device.type == 'cuda': torch.cuda.reset_peak_memory_stats(provider.device)
     records = [r for r, _ in rows]; sizes = [len(r['features']) for r in records]
     merged = timer.call('pack_inputs', pack_records, records, (*MOTION_KEYS, *LABEL_KEYS))
@@ -182,9 +185,34 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             local['_column_render_numpy'] = {k: v[cursor:cursor+size] for k, v in render.items()}; cursor += size
     batches = []; prep_seconds = selection_seconds = feature_wait_seconds = worker_seconds = 0.
     candidate_wait_seconds = candidate_worker_seconds = 0.
+    materialize_seconds = index_worker_seconds = 0.
+    candidate_jobs = feature_jobs = index_jobs = 0
     candidate_columns=compact_columns=compact_bytes=materialized_columns=0
-    workers = sampling_workers or max(1, min(int(getattr(provider, 'workers', 4)), 4))
-    if workers < 1: raise ValueError('positive sampling worker budget required')
+    workers = sampling_worker_budget(int(getattr(provider, 'workers', 4)), sampling_workers, horizons=horizons)
+    def cpu_call(name, fn, *args, **kwargs):
+        return fn(*args, **kwargs) if cpu_profiles is None else cpu_profiles.run(name, fn, *args, **kwargs)
+    def candidate_builder(prep):
+        started = time.perf_counter()
+        builder = cpu_call('candidate_setup_workers', OnlineColumnCandidateBuilder,
+            prep, joint.columns.config, provider.pcfg.grid, defer_context=True)
+        return builder, time.perf_counter()-started
+    def candidate_horizon(builder, h):
+        started = time.perf_counter()
+        return cpu_call('candidate_workers', builder.build, h), time.perf_counter()-started
+    def history_index(prep, draws):
+        started = time.perf_counter()
+        index = cpu_call('history_index_workers', online_column_history_index, prep, draws, provider.pcfg.grid)
+        return index, time.perf_counter()-started
+    def sample_horizon(prep, draw, index_job):
+        # The index was queued BEFORE every dependent job in the feature FIFO.
+        # No worker submits children, and even a single worker cannot deadlock.
+        index, _ = index_job.result()
+        started = time.perf_counter(); tick = started
+        selected = cpu_call('materialize_workers', materialize_online_column, draw)
+        materialized = time.perf_counter()-tick
+        arrays = cpu_call('patch_workers', sample_online_column, prep, selected,
+            provider.pcfg.grid, joint.columns.config, history_index=index)
+        return selected, arrays, time.perf_counter()-started, materialized
     def sample(prep, selected):
         started = time.perf_counter()
         if cpu_profiles is None:
@@ -211,8 +239,9 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         return cpu_profiles.run('prepare_workers', provider.prepare_columns_cpu, record, raw, local)
     # One bounded batch of CPU-only jobs. The sampler RNG is consumed serially
     # in EXACT original window/horizon order; no worker touches live tensors.
-    with (ThreadPoolExecutor(max_workers=workers) if sampling_pool is None else nullcontext(sampling_pool)) as pool:
+    with (cpu_sampling_pool(workers, horizons=horizons) if sampling_pool is None else nullcontext(sampling_pool)) as pool:
         planning = []; pending = []; preparation = []
+        submit_features = getattr(pool, 'submit_features', pool.submit)
         # Warm geometry workers never run CUDA, forward, RNG or latent gathers.
         # Cold/first-exactness calls remain on the original owning thread.
         for (record, raw), local in zip(rows, local_outputs):
@@ -234,31 +263,62 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             # from a previous pose/window is allowed to leak into this update.
             if hasattr(prep, 'column_history_index'): del prep.column_history_index
             prep_seconds += time.perf_counter()-tick
-            planning.append((prep, pool.submit(candidates, prep)))
+            planning.append((prep, pool.submit(candidate_builder if horizons else candidates, prep)))
+        if horizons:
+            split_planning = []
+            for prep, job in planning:
+                tick = time.perf_counter(); builder, seconds = job.result()
+                candidate_wait_seconds += time.perf_counter()-tick; candidate_worker_seconds += seconds
+                jobs = [pool.submit(candidate_horizon, builder, h) for h in range(6)]
+                candidate_jobs += len(jobs); split_planning.append((prep, jobs))
+            planning = split_planning
         # GPU motion supervision can overlap queued CPU patch sampling.
         lm, stats = timer.call('motion_loss', motion_loss, output, merged, provider.device, patch_resolution,
             materialize_stats=not bundle, gpu=True)
+        audits = []
         for prep, job in planning:
-            tick = time.perf_counter(); plans, seconds = job.result()
+            tick = time.perf_counter()
+            if horizons:
+                mapped = [future.result() for future in job]
+                plans = [plan for plan, _ in mapped]; seconds = sum(s for _, s in mapped)
+            else: plans, seconds = job.result()
             candidate_wait_seconds += time.perf_counter()-tick; candidate_worker_seconds += seconds
             tick = time.perf_counter()
-            selected = select_online_columns(prep, joint.columns.config, provider.pcfg.grid, rng, candidates=plans)
+            selected = (draw_online_column_indices if horizons else select_online_columns)(
+                prep, joint.columns.config, provider.pcfg.grid, rng, candidates=plans)
             selection_seconds += time.perf_counter()-tick
             candidate_columns+=sum(len(plan) for _,plan,_ in plans)
-            for _,plan,_ in plans:
-                if hasattr(plan,'audit'):
-                    audit=plan.audit(); compact_columns+=audit['population']; compact_bytes+=audit['compact_bytes']
-                    materialized_columns+=audit['materialized_rows']
-                else: materialized_columns+=len(plan)
-            pending.append((prep, selected, [pool.submit(sample_window, prep, selected)] if optimize_cpu
-                else [pool.submit(sample, prep, item) for item in selected]))
-        for prep, selected, jobs in pending:
+            audits.extend(plan for _,plan,_ in plans)
+            if horizons:
+                # One immutable membership index per window, no repeated
+                # inversions/tables per horizon and no large process copies.
+                index_job = submit_features(history_index, prep, selected) if selected else None
+                jobs = [submit_features(sample_horizon, prep, draw, index_job) for draw in selected]
+                feature_jobs += len(jobs); index_jobs += int(index_job is not None)
+                pending.append((prep, selected, jobs, index_job))
+            else:
+                jobs = [pool.submit(sample_window, prep, selected)] if optimize_cpu else [pool.submit(sample, prep, item) for item in selected]
+                pending.append((prep, selected, jobs, None))
+        for prep, selected, jobs, index_job in pending:
             tick = time.perf_counter(); mapped = [job.result() for job in jobs]
             feature_wait_seconds += time.perf_counter()-tick
-            worker_seconds += sum(seconds for _, seconds in mapped)
-            arrays = mapped[0][0] if optimize_cpu else [a for a, _ in mapped]
+            if horizons:
+                if index_job is not None: index_worker_seconds += index_job.result()[1]
+                selected = [row for row, _, _, _ in mapped]
+                arrays = [a for _, a, _, _ in mapped]
+                worker_seconds += sum(seconds for _, _, seconds, _ in mapped)
+                materialize_seconds += sum(seconds for _, _, _, seconds in mapped)
+            else:
+                worker_seconds += sum(seconds for _, seconds in mapped)
+                arrays = mapped[0][0] if optimize_cpu else [a for a, _ in mapped]
             b = timer.call('assemble_transfer', assemble_online_columns, prep, joint.columns, selected, arrays, provider.device)
             if b is not None: batches.append(b)
+        # Audit AFTER worker-owned materialization, not at the draw-only stage.
+        for plan in audits:
+            if hasattr(plan, 'audit'):
+                audit=plan.audit(); compact_columns+=audit['population']; compact_bytes+=audit['compact_bytes']
+                materialized_columns+=audit['materialized_rows']
+            else: materialized_columns+=len(plan)
     lc = lm.new_zeros(()); column_stats = {}; link_grad = None; sampled = 0
     if batches:
         batch = timer.call('concatenate_columns', lambda: {k: torch.cat([b[k] for b in batches]) for k in batches[0]})
@@ -304,6 +364,13 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'online_candidate_worker_seconds_sum': candidate_worker_seconds,
         'online_selection_seconds': selection_seconds, 'online_feature_wait_seconds': feature_wait_seconds,
         'online_worker_seconds_sum': worker_seconds, 'online_sampling_workers': workers,
+        'cpu_task_granularity': 'horizon' if horizons else 'window',
+        'online_candidate_horizon_jobs': candidate_jobs, 'online_feature_horizon_jobs': feature_jobs,
+        'online_history_index_jobs': index_jobs,
+        'online_history_index_worker_seconds_sum': index_worker_seconds,
+        'online_materialize_worker_seconds_sum': materialize_seconds,
+        'online_candidate_pool_workers': getattr(pool, 'candidate_workers', workers),
+        'online_feature_pool_workers': getattr(pool, 'feature_workers', workers),
         'causal_geometry_cache_hits': sum(bool(raw.get('_causal_geometry_cache_hit')) for _, raw in rows if raw is not None),
         'causal_geometry_worker_seconds_sum': sum(float(raw.get('_causal_geometry_seconds', 0.)) for _, raw in rows if raw is not None),
         'cpu_pipeline_optimized': optimize_cpu,

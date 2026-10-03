@@ -54,7 +54,7 @@ class ColumnHistoryIndex:
 
 
 class ColumnFeatureSampler:
-    def __init__(self, prepared, h, plan, grid, config, motion_factory, *, workers=1, max_cache_mib=64):
+    def __init__(self, prepared, h, plan, grid, config, motion_factory, *, workers=1, max_cache_mib=64, history_index=None):
         self.prepared, self.h, self.grid, self.config = prepared, h, grid, config
         self.maps = {}; self.windows = {}; self.cache_bytes = 0
         self.history = np.asarray(prepared.raw['history_occ'])
@@ -72,7 +72,8 @@ class ColumnFeatureSampler:
         self.native = get_native() if self.kernels_optimized else None
         from .native_column_cpu import bundle_enabled
         self.bundle = self.native is not None and getattr(prepared,'cpu_bundle_optimized',True) and bundle_enabled()
-        self.index = getattr(prepared, 'column_history_index', None) if self.optimized else None
+        self.index = ((history_index if history_index is not None else getattr(prepared, 'column_history_index', None))
+                      if self.optimized else None)
         if self.optimized and self.index is None:
             self.index = ColumnHistoryIndex(prepared, grid, actors=np.unique(plan.actor))
         inverse_history = (self.index.inverse_history if self.index is not None else

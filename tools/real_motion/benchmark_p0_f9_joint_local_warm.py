@@ -6,7 +6,6 @@ from pathlib import Path
 if __package__ in (None, ''): sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import argparse
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import os
@@ -20,6 +19,7 @@ from real_motion.causal_geometry_cache import CausalGeometryCache
 from real_motion.causal_geometry_cache import PROTOCOL as GEOMETRY_PROTOCOL
 from real_motion.causal_column_completion import ColumnConfig
 from real_motion.column_runtime_pipeline import CachedColumnSource
+from real_motion.column_cpu_pipeline import horizon_pipeline_enabled, cpu_sampling_pool
 from real_motion.joint_causal_columns import JointCausalColumns
 from real_motion.local_st_world_model_v17 import config_from_mapping_v17
 from real_motion.local_training_profile import CpuProfiles, trial_summary, recommend_trials
@@ -45,7 +45,7 @@ def measured_batches(joint, optimizer, provider, source, records, *, windows, so
                      optimize_cpu=True, optimize_kernels=True):
     """Actual current-model forward/backward, strict warm hits, no weights saved."""
     rng = np.random.default_rng(20261003); rows = []
-    pool = ThreadPoolExecutor(max_workers=workers) if persistent else None
+    pool = cpu_sampling_pool(workers, horizons=optimize_cpu and optimize_kernels and horizon_pipeline_enabled()) if persistent else None
     iterator = prefetch_column_batches(provider, source, records, windows, sources, io_workers=io_workers)
     tick = time.perf_counter()
     try:

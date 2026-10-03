@@ -134,13 +134,14 @@ def dynamic_evidence(prep,grid):
     return tasks
 
 
-def build_compact_candidates(prep,grid,config,*,count_prior=False):
+def build_compact_candidates(prep,grid,config,*,count_prior=False,horizons=range(6),tasks=None):
     config.validate(); shape=tuple(grid.shape_hwd); z=shape[2]
     if z != config.z_bins: raise RuntimeError('Z lattice/checkpoint mismatch')
     if not np.isclose(grid.voxel_size[0],grid.voxel_size[1],rtol=0,atol=1e-10):
         raise RuntimeError('frontier distance contract requires an isotropic XY lattice')
-    native=get_native(); tasks=dynamic_evidence(prep,grid); results=[]
-    for h in range(6):
+    native=get_native(); tasks=dynamic_evidence(prep,grid) if tasks is None else tasks; results=[]
+    for h in horizons:
+        if not 0 <= h < 6: raise ValueError('future horizon must be 0..5')
         b,m,footprint=prep.baseline[h],prep.memory[h],prep.footprints[h]
         fixed=getattr(prep,'fixed_candidate_geometry',None)
         geometry=fixed[h] if fixed is not None and fixed[h]['radius'] == config.entry_radius_m else col.fixed_candidate_geometry([m],[footprint],grid,config)[0]

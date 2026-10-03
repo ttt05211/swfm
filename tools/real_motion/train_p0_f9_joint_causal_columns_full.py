@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import numpy as np
 import torch
 from dataclasses import asdict, replace
-from concurrent.futures import ThreadPoolExecutor
+from real_motion.column_cpu_pipeline import horizon_pipeline_enabled, sampling_worker_budget, cpu_sampling_pool
 from real_motion.causal_geometry_cache import CausalGeometryCache
 from real_motion.joint_causal_columns import JointCausalColumns, FULL_PROTOCOL, FULL_CONTRACT, FULL4_PROTOCOL, FULL4_CONTRACT, LINK_PROTOCOL
 from real_motion.causal_column_completion import ColumnConfig
@@ -44,7 +44,7 @@ CALIBRATION_WINDOWS = 64
 
 
 class SamplingPoolOwner:
-    def __init__(self, workers): self.pool = ThreadPoolExecutor(max_workers=workers)
+    def __init__(self, workers, *, horizons=False): self.pool = cpu_sampling_pool(workers, horizons=horizons)
     def close(self): self.pool.shutdown(wait=True, cancel_futures=True)
 
 
@@ -127,7 +127,7 @@ def _main(stop_event, caches, runtime_state):
     parser.add_argument('--resume', help='full-protocol last.pt into a NEW output directory; epochs/geometry/recipe must match')
     parser.add_argument('--prewarm-causal-cache', action='store_true', help='explicitly persist all TRAIN history geometry before optimization; first build cost is not free')
     parser.add_argument('--profile-every', type=int, default=0, help='opt-in host/CUDA-stream stage clocks every N updates; 0 leaves normal path unchanged')
-    parser.add_argument('--sampling-workers', type=int, default=0, help='0 uses legacy capped-at-four budget; positive selects CPU candidate/patch workers')
+    parser.add_argument('--sampling-workers', type=int, default=0, help='0 uses 6 combined native horizon workers (legacy 4); horizon path capped at 8')
     parser.add_argument('--persistent-sampling-pool', action='store_true', help='reuse bounded pure-CPU sampler pool across batches; same RNG/order/objective')
     parser.add_argument('--io-workers', type=int, default=2, help='bounded next-batch window loaders')
     parser.add_argument('--reference-cpu-pipeline', action='store_true', help='diagnostic fallback only; disable parallel warm prepare/shared sparse history/batched render readback')
@@ -257,9 +257,17 @@ def _main(stop_event, caches, runtime_state):
     write_status('initializing')
     print(f'TRAINING_PROCESS pid={os.getpid()} out_dir={out.resolve()} status={out}/runtime_status.json', flush=True)
     sampling_pool = None
+    cpu_horizons = not args.reference_cpu_pipeline and horizon_pipeline_enabled()
+    cpu_pool_workers = sampling_worker_budget(args.cpu_workers, args.sampling_workers, horizons=cpu_horizons)
     if args.persistent_sampling_pool:
-        owner = SamplingPoolOwner(args.sampling_workers or max(1, min(args.cpu_workers, 4)))
+        owner = SamplingPoolOwner(cpu_pool_workers, horizons=cpu_horizons)
         caches.append(owner); sampling_pool = owner.pool
+    print('CPU_PIPELINE '+json.dumps({'task_granularity': 'horizon' if cpu_horizons else 'window',
+        'combined_workers': cpu_pool_workers, 'io_workers': args.io_workers,
+        'candidate_workers': max(1, cpu_pool_workers//2) if cpu_horizons else cpu_pool_workers,
+        'feature_workers': max(1, cpu_pool_workers-cpu_pool_workers//2) if cpu_horizons else cpu_pool_workers,
+        'sampling_rng': 'caller_window_horizon_order', 'geometry_ram_mib': args.causal_cache_ram_mib,
+        'prefetch': 'one_batch_unchanged', 'nested_pools': False}), flush=True)
     stages = {}; tick = time.perf_counter()
     label = 'FULL RESUME' if args.resume else 'FULL RANDOM INIT'
     print(f'{label}: windows={len(records)} epochs={args.epochs} updates={target_updates} batch<={args.window_batch_size} '

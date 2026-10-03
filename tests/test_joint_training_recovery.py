@@ -123,6 +123,24 @@ def test_resume_launcher_reads_original_recipe_tuple_keys_and_never_changes_epoc
     with pytest.raises(RuntimeError,match='mismatch'):manage.resume_command(directory)
 
 
+def test_resume_performance_overrides_do_not_change_scientific_recipe_or_source_checkpoint(tmp_path):
+    directory, ck = manager_fixture(tmp_path)
+    ck['attempted_updates'] = 20694; torch.save(ck, directory/'last.pt')
+    before = {p: p.read_bytes() for p in directory.iterdir()}
+    command, env, out = manage.resume_command(directory, sampling_workers=6, profile_every=32,
+                                             expected_update=20694)
+    value = lambda key: command[command.index('--'+key)+1]
+    assert value('sampling-workers') == '6' and value('profile-every') == '32'
+    for key, expected in (('epochs', '15'), ('window-batch-size', '4'), ('source-budget', '128'), ('seed', '3')):
+        assert value(key) == expected
+    assert value('resume') == str(directory/'last.pt') and env['SWFM_COLUMN_CPU_HORIZONS'] == '1'
+    assert not out.exists() and all(p.read_bytes() == data for p, data in before.items())
+    with pytest.raises(RuntimeError, match='expected update'):
+        manage.resume_command(directory, expected_update=20693)
+    for count in (0, 9, -1):
+        with pytest.raises(ValueError): manage.resume_command(directory, sampling_workers=count)
+
+
 def test_stop_refuses_wrong_directory_and_pid_reuse_never_sends_any_signal(tmp_path):
     directory,ck=manager_fixture(tmp_path)
     state={'out_dir':str(directory),'pid':12345,'process_start_token':'old','phase':'training'}

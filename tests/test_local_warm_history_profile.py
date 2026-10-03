@@ -47,6 +47,21 @@ def test_four_namespace_separate_and_legacy_namespace_exactly_preserved(tmp_path
     assert geometry_namespace(cfg, p, info, caches, tmp_path) != before
 
 
+def test_horizon_scheduling_does_not_invalidate_existing_warm_cache_namespace(tmp_path, monkeypatch):
+    from real_motion.strong_w2det import StrongW2DetConfig
+    _, _, joint, _, _ = fixture()
+    provider = SimpleNamespace(joint=JointCausalColumns(
+        replace(joint.transport.v17_config, history_frames=4), joint.columns.config), strong=StrongW2DetConfig())
+    args = ({'runtime': 'frozen'}, provider, {'train': 'i', 'dev': 'j'}, {'train': 'k', 'dev': 'l'}, tmp_path)
+    before = geometry_namespace(*args)
+    for workers in (1, 6, 8):
+        provider.workers = workers
+        monkeypatch.setenv('SWFM_COLUMN_CPU_HORIZONS', '1')
+        assert geometry_namespace(*args) == before
+        monkeypatch.setenv('SWFM_COLUMN_CPU_HORIZONS', '0')
+        assert geometry_namespace(*args) == before
+
+
 def test_four_parent_models_and_empty_source_supported():
     from real_motion.local_st_world_model import LocalSpatialTemporalWorldModel, LocalSTWMConfig
     from real_motion.local_st_world_model_v17 import LocalSpatialTemporalWorldModelV17

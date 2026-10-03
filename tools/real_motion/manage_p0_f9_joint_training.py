@@ -77,7 +77,7 @@ def request_stop(directory, *, timeout=300.):
     return 0
 
 
-def resume_command(directory, checkpoint=None, new_out=None):
+def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers=None, profile_every=None, expected_update=None):
     state_path = directory/'runtime_status.json'
     if state_path.is_file() and status(directory)['matching_trainer_running']:
         raise RuntimeError('original trainer is still running; stop it before resume')
@@ -85,10 +85,23 @@ def resume_command(directory, checkpoint=None, new_out=None):
     ck_path = Path(checkpoint).resolve() if checkpoint else directory/'last.pt'
     ck = torch.load(ck_path,map_location='cpu',weights_only=False)
     if ck.get('checkpoint_role') != 'resume_last': raise RuntimeError('resume requires full last.pt (or explicit last.previous.pt), not epoch/candidate')
+    if expected_update is not None and (type(expected_update) is not int or expected_update < 0
+                                       or ck.get('attempted_updates') != expected_update):
+        raise RuntimeError('checkpoint completed update does not match expected update')
     for key in ('protocol','training_contract','train_keys','dev_keys','seed','epochs','window_batch_size','source_budget','model_configs'):
         if stable_json_fingerprint(ck.get(key)) != stable_json_fingerprint(contract.get(key)):
             raise RuntimeError('checkpoint/original execution contract mismatch at '+key)
     args = dict(contract['arguments'])
+    # Explicit performance-only overrides. No batch/source/epoch/LR/seed/RNG
+    # override is accepted; original cache budgets are also preserved.
+    if sampling_workers is not None:
+        if type(sampling_workers) is not int or not 1 <= sampling_workers <= 8:
+            raise ValueError('resume sampling workers must be 1..8 combined CPU workers')
+        args['sampling_workers'] = sampling_workers
+    if profile_every is not None:
+        if type(profile_every) is not int or profile_every < 0:
+            raise ValueError('nonnegative profiling interval required')
+        args['profile_every'] = profile_every
     root = directory.parent if directory.name == 'model' else directory
     out = Path(new_out).resolve() if new_out else root.parent/(
         f"full{ck['epochs']}_history{ck['model_configs']['motion']['history_frames']}_resume_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}")
@@ -115,6 +128,7 @@ def resume_command(directory, checkpoint=None, new_out=None):
     env = os.environ.copy()
     env.update(SWFM_COLUMN_CPU_BACKEND='native',SWFM_COLUMN_CPU_BUNDLE='1',OMP_NUM_THREADS='1',
                MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1')
+    env.setdefault('SWFM_COLUMN_CPU_HORIZONS', '1')
     repository = TRAINER.parents[2]
     env['PYTHONPATH'] = os.pathsep.join([str(repository),str(repository/'upstream_occfm'),env.get('PYTHONPATH','')])
     env.setdefault('CUDA_VISIBLE_DEVICES','0')
@@ -128,14 +142,19 @@ def main():
     p.add_argument('--checkpoint',help='explicit full backup checkpoint; no silent fallback')
     p.add_argument('--out-dir',help='NEW root for resume (model subdirectory created by trainer)')
     p.add_argument('--print-command',action='store_true',help='read-only recipe inspection, do not launch')
+    p.add_argument('--sampling-workers',type=int,help='performance-only override, 1..8 combined CPU workers')
+    p.add_argument('--profile-every',type=int,help='performance-only stage timing interval; 0 disables')
+    p.add_argument('--expected-update',type=int,help='refuse a checkpoint other than this committed update')
     p.add_argument('--timeout',type=float,default=300.)
     a = p.parse_args(); directory=model_directory(a.run_dir)
     if a.action == 'status': print(json.dumps(status(directory),ensure_ascii=False,indent=2)); return 0
     if a.action == 'stop':
         if not 0 < a.timeout <= 3600: p.error('positive bounded stop timeout required')
         return request_stop(directory,timeout=a.timeout)
-    command,env,out=resume_command(directory,a.checkpoint,a.out_dir)
+    command,env,out=resume_command(directory,a.checkpoint,a.out_dir,sampling_workers=a.sampling_workers,
+                                  profile_every=a.profile_every,expected_update=a.expected_update)
     print(json.dumps({'resume_output':str(out),'command':command,'cpu_backend':env['SWFM_COLUMN_CPU_BACKEND'],
+        'cpu_horizon_pipeline':env['SWFM_COLUMN_CPU_HORIZONS'],
         'checkpoint_role':'full optimizer/RNG/cursor, NOT weight-only'},ensure_ascii=False,indent=2),flush=True)
     if a.print_command: return 0
     out.mkdir(parents=True)

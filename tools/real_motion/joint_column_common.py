@@ -60,19 +60,36 @@ def count_proposals(prep, grid, config, counts):
         counts['refine'] += np.bincount(target[ref], minlength=3)
 
 
+class OnlineColumnCandidateBuilder:
+    """One window's immutable setup; six independent current-pose CPU jobs."""
+    def __init__(self, prep, config, grid, *, defer_context=False):
+        from real_motion.causal_column_completion import _action_targets_validated_plan
+        from real_motion.native_column_cpu import bundle_enabled
+        self.prep, self.config, self.grid, self.defer_context = prep, config, grid, defer_context
+        self.compact = False; self.tasks = None
+        if defer_context and getattr(prep, 'cpu_bundle_optimized', True) and bundle_enabled():
+            from tools.real_motion.compact_column_candidates import can_compact, dynamic_evidence
+            self.compact = can_compact(grid, config)
+            if self.compact: self.tasks = dynamic_evidence(prep, grid)
+        self.label = _action_targets_validated_plan if getattr(prep, 'cpu_pipeline_optimized', True) else action_targets
+
+    def build(self, h):
+        if not 0 <= h < 6: raise ValueError('future horizon must be 0..5')
+        if self.compact:
+            from tools.real_motion.compact_column_candidates import build_compact_candidates
+            return build_compact_candidates(self.prep, self.grid, self.config,
+                                             horizons=(h,), tasks=self.tasks)[0]
+        plan = candidate_plan(self.prep, h, self.grid, self.config, defer_context=self.defer_context)
+        return h, plan, self.label(plan, self.prep.raw['future_gt_occ'][h])
+
+
 def build_online_column_candidates(prep, config, grid, *, defer_context=False):
     """CPU-only plans/labels for one current prediction; no sampling/RNG."""
-    from real_motion.causal_column_completion import _action_targets_validated_plan
-    from real_motion.native_column_cpu import bundle_enabled
-    if (defer_context and getattr(prep,'cpu_bundle_optimized',True) and bundle_enabled()):
-        from tools.real_motion.compact_column_candidates import can_compact, build_compact_candidates
-        if can_compact(grid,config): return build_compact_candidates(prep,grid,config)
-    label = _action_targets_validated_plan if getattr(prep, 'cpu_pipeline_optimized', True) else action_targets
-    return [(h, plan, label(plan, prep.raw['future_gt_occ'][h]))
-            for h in range(6) for plan in (candidate_plan(prep, h, grid, config, defer_context=defer_context),)]
+    builder = OnlineColumnCandidateBuilder(prep, config, grid, defer_context=defer_context)
+    return [builder.build(h) for h in range(6)]
 
 
-def select_online_columns(prep, config, grid, rng, candidates=None):
+def draw_online_column_indices(prep, config, grid, rng, candidates=None):
     """Draw in original horizon/window order on the caller's sole RNG thread."""
     selected = []
     # 2*sum(budgets) = 256; 128 GEN + 128 REF when all strata are available.
@@ -85,18 +102,35 @@ def select_online_columns(prep, config, grid, rng, candidates=None):
             ids, weight = sample_queries(plan, labels, budget, rng, optimize=True)
         else: ids, weight = sample_queries(plan, labels, budget, rng)
         if not len(ids): continue
-        if labels is None:
-            small, selected_labels = plan.materialize(ids)
-        else: small, selected_labels = plan.subset(ids), labels[ids]
-        selected.append((h, small, selected_labels, weight))
+        selected.append((h, plan, labels, ids, weight))
     return selected
 
 
-def sample_online_column(prep, selected, grid, config):
+def materialize_online_column(draw):
+    """Pure CPU operation, deliberately separated from caller-owned RNG."""
+    h, plan, labels, ids, weight = draw
+    if labels is None: small, selected_labels = plan.materialize(ids)
+    else: small, selected_labels = plan.subset(ids), labels[ids]
+    return h, small, selected_labels, weight
+
+
+def select_online_columns(prep, config, grid, rng, candidates=None):
+    draws = draw_online_column_indices(prep, config, grid, rng, candidates)
+    return [materialize_online_column(draw) for draw in draws]
+
+
+def online_column_history_index(prep, draws, grid):
+    """Once per window, read-only in all six feature jobs; never persisted."""
+    from real_motion.causal_column_sampling import ColumnHistoryIndex
+    actors = {int(a) for _, plan, _, ids, _ in draws for a in np.unique(plan.actor[ids]) if a >= 0}
+    return ColumnHistoryIndex(prep, grid, actors=actors)
+
+
+def sample_online_column(prep, selected, grid, config, *, history_index=None):
     """Pure CPU/NumPy: no RNG, Torch, CUDA or learned latent access."""
     h, small, labels, weight = selected
     features = ColumnFeatureSampler(prep, h, small, grid, config, pose_motion,
-        workers=1).sample(small, sample_column_features)
+        workers=1, history_index=history_index).sample(small, sample_column_features)
     return {**features, 'legal': small.legal, 'target': labels, 'weight': weight}
 
 

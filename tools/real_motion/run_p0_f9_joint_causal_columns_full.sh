@@ -45,12 +45,16 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRIT
 export PYTHONPATH="$FULL_ROOT:$FULL_ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 export SWFM_COLUMN_CPU_BACKEND="${FULL_JOINT_CPU_BACKEND:-numpy}"
 export SWFM_COLUMN_CPU_BUNDLE="${FULL_JOINT_CPU_BUNDLE:-1}"
+export SWFM_COLUMN_CPU_HORIZONS="${FULL_JOINT_CPU_HORIZONS:-1}"
 if [[ "$SWFM_COLUMN_CPU_BUNDLE" != 0 && "$SWFM_COLUMN_CPU_BUNDLE" != 1 ]]; then
   echo "FULL_JOINT_CPU_BUNDLE 只能是0或1" >&2; exit 2
 fi
+if [[ "$SWFM_COLUMN_CPU_HORIZONS" != 0 && "$SWFM_COLUMN_CPU_HORIZONS" != 1 ]]; then
+  echo "FULL_JOINT_CPU_HORIZONS 只能是0或1" >&2; exit 2
+fi
 if [[ "$SWFM_COLUMN_CPU_BACKEND" == native ]]; then
   "$PY" -u tools/real_motion/check_column_native_cpu.py
-  SWFM_COLUMN_CPU_BUNDLE=1 "$PY" -m pytest -q tests/test_native_column_cpu.py tests/test_compact_column_pipeline.py
+  SWFM_COLUMN_CPU_BUNDLE=1 "$PY" -m pytest -q tests/test_native_column_cpu.py tests/test_compact_column_pipeline.py tests/test_column_horizon_pipeline.py
 elif [[ "$SWFM_COLUMN_CPU_BACKEND" != numpy ]]; then
   echo "FULL_JOINT_CPU_BACKEND 只能是 numpy/native" >&2; exit 2
 fi
