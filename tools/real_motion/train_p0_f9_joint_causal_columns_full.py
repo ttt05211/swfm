@@ -203,9 +203,9 @@ def _main(stop_event, caches, runtime_state):
         provider.causal_geometry_cache = CausalGeometryCache(args.causal_geometry_cache, namespace,
             max_bytes=int(args.causal_cache_gib*2**30), ram_bytes=args.causal_cache_ram_mib*2**20)
         caches.append(provider.causal_geometry_cache)
-        print('CAUSAL GEOMETRY CACHE: '+json.dumps(dict(directory=str(provider.causal_geometry_cache.root),
-            cold_strong_device=str(device), persistence='bounded_async_after_main_thread_Strong',
-            **provider.causal_geometry_cache.stats()), ensure_ascii=False), flush=True)
+        print('CAUSAL GEOMETRY CACHE: '+json.dumps({**provider.causal_geometry_cache.stats(),
+            'cold_strong_device': str(device), 'persistence': 'bounded_async_after_main_thread_Strong'},
+            ensure_ascii=False), flush=True)
     rng = np.random.default_rng(args.seed+1); weights = None
     cursor_epoch = cursor_batch = updates = successes = executed = sampled = 0; link_observed = False
     history = []; counts = {'generation': np.zeros(2, np.float64), 'refine': np.zeros(3, np.float64)}

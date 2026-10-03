@@ -355,8 +355,10 @@ def full_cli_fixture(tmp_path):
     originals = {k: f.read_bytes() for k, f in files.items()}
     pcfg = SimpleNamespace(grid=grid)
     def make_provider(checkpoint, expected_sha, cfg, device, workers, joint, control):
+        from real_motion.strong_w2det import StrongW2DetConfig
         result = provider_for(prep, grid, joint); result.workers = workers; result.reference_enabled = False
         result.joint, result.control, result.model = joint, control, joint.transport
+        result.strong = StrongW2DetConfig()
         def load(source, record, *, include_gt): return copy.deepcopy(prep.raw)
         def prepare(source, record, *, include_gt, raw_window=None, outputs=None):
             row = copy.deepcopy(prep); row.window.scene_name = record['scene_name']; row.window.t0_token = record['t0_token']
@@ -369,15 +371,18 @@ def full_cli_fixture(tmp_path):
         result.reference_predictions = lambda p, r: {'frozen_E14': p.baseline} if result.reference_enabled else {}
         return result
     def run(out, epochs, resume=None, fail_update=None, stop_update=None, stop_prior=None,
-            stop_monitor=None, stop_calibration=False, stop_final=False, history_frames=6):
+            stop_monitor=None, stop_calibration=False, stop_final=False, history_frames=6,
+            causal_cache=None, stop_before_prior=False):
         argv = ['train', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot', str(tmp_path), '--out-dir', str(out), '--epochs', str(epochs), '--device', 'cpu',
             '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1', '--history-frames', str(history_frames)]
         for k, f in files.items(): argv += ['--'+k, str(f)]
         if resume: argv += ['--resume', str(resume)]
+        if causal_cache: argv += ['--causal-geometry-cache', str(causal_cache)]
         # Reduce only evaluator population/width for this CPU orchestration test.
         actual_eval = columns.evaluate_columns; eval_calls = []
         stop = Event()
+        if stop_before_prior: stop.set()
         def small_eval(provider, source, records, model, gates, **kwargs):
             eval_calls.append(1)
             original_progress = kwargs.get('progress')
@@ -421,6 +426,26 @@ def full_cli_fixture(tmp_path):
             return trainer.main(stop)
     run.eval_data = (prep, grid, dev, manifest, keys, make_provider)
     return run, files, originals
+
+
+def test_full_cli_real_cache_startup_log_and_resume_before_prior(tmp_path, full_cli_fixture, capsys):
+    run, _, _ = full_cli_fixture
+    cache = tmp_path/'geometry'; first = tmp_path/'first'; second = tmp_path/'second'
+    for destination, resume in ((first, None), (second, first/'last.pt')):
+        assert run(destination, 1, resume=resume, history_frames=4,
+                   causal_cache=cache, stop_before_prior=True) == 130
+        output = capsys.readouterr().out
+        rows = [json.loads(line.split(': ', 1)[1]) for line in output.splitlines()
+                if line.startswith('CAUSAL GEOMETRY CACHE: ')]
+        assert len(rows) == 1
+        row = rows[0]
+        assert Path(row['directory']).is_dir() and Path(row['directory']).parent == cache
+        assert row['namespace'] and row['cold_strong_device'] == 'cpu'
+        assert row['disk_limit_mib'] == 48*1024 and row['hits'] == row['writes'] == 0
+        ck = torch.load(destination/'last.pt', weights_only=False)
+        assert ck['attempted_updates'] == 0 and ck['prior_cursor'] == 0 and not ck['prior_completed']
+    a, b = (torch.load(p/'last.pt', weights_only=False) for p in (first, second))
+    assert all(torch.equal(v, b['state_dict'][k]) for k, v in a['state_dict'].items())
 
 
 def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path,full_cli_fixture):
