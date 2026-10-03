@@ -40,7 +40,8 @@ def test_complete_population_context_labels_draws_exact(monkeypatch, sources, le
     monkeypatch.setenv('SWFM_COLUMN_CPU_BACKEND', 'native')
     new = common.build_online_column_candidates(prep, cfg, grid, defer_context=True)
     for (h, a, y), (hh, wrapped, yy) in zip(old, new):
-        b = wrapped.subset(np.arange(len(wrapped)))
+        if yy is None: b,yy = wrapped.materialize(np.arange(len(wrapped)))
+        else: b = wrapped.subset(np.arange(len(wrapped)))
         assert h == hh and np.array_equal(y, yy)
         assert all(np.array_equal(v, getattr(b, k)) for k, v in vars(a).items())
     x, y = np.random.default_rng(29), np.random.default_rng(29)

@@ -100,7 +100,7 @@ class CausalColumnModel(nn.Module):
     def contract(self): return asdict(self.config)
 
 
-def column_loss(model, generation, refinement, kind, legal, target, weight):
+def column_loss(model, generation, refinement, kind, legal, target, weight, *, materialize_stats=True):
     """Two task losses, averaged by type; importance restores query sampling.
 
     Refine target is action utility with KEEP-on-tie, NOT indiscriminate deletion
@@ -127,7 +127,7 @@ def column_loss(model, generation, refinement, kind, legal, target, weight):
         denom = (w*mask).sum()
         if denom <= 0: continue
         value = (loss*w*mask).sum()/denom
-        terms.append(value); stats["generation_bce" if task == 0 else "refine_action_ce"] = float(value.detach())
+        terms.append(value); stats["generation_bce" if task == 0 else "refine_action_ce"] = float(value.detach()) if materialize_stats else value.detach()
     if not terms: raise RuntimeError("batch has no legal supervised edits")
     total = torch.stack(terms).mean()
     if not torch.isfinite(total): raise RuntimeError("nonfinite completion loss")

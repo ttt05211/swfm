@@ -38,3 +38,27 @@ bash tools/real_motion/run_p0_f9_joint_local_warm_benchmark.sh
 只有对照通过且服务器吞吐值得切换时才考虑 `FULL_JOINT_CPU_BACKEND=native`。NumPy/compiled 的 batch、source、history 和 schedule 保持相同，允许原合同的断点恢复；**不能**借此把旧六历史断点改成四历史，或静默改变 batch/source。后端开关默认 `numpy`，本脚本不自动恢复/启动训练。
 
 编译后的微内核加速不能等同整轮加速：未编译的 float64 transform、渲染、候选 Python orchestration 和 GPU 仍有耗时；以服务器同样本配对吞吐为准。
+
+## 完整 CPU 优化包（ABI 2）
+
+两项主要优化同时交付，不改变完整候选/标签、抽样顺序、重要性权重或训练配方：
+
+- **TRAIN 两遍扫描**：第一遍用 XY、kind、actor、class、uint64 竖向支持掩码扫描全体候选，得到原顺序的有效候选和正负桶；原主线程消费原 RNG 抽样后，第二遍只为选中行生成 flat/base/fallback/legal/target/context。所有候选仍参与分桶，不是减少难负样本或先筛选高置信候选。Z>64 的非当前合同走原完整实现，不截断竖向格子。
+- **批量 native 调用**：每个 horizon 一次处理全部动态 source 的整数 support；stamp 工作区只清一次 BEV，但保持原 cross 膨胀、边界和 XY 顺序。每个 patch/map chunk 一次读取全部历史帧，通过指针保留独立的原整数索引，不再复制一个 F×N×3 大数组；坐标变换仍逐帧使用原 float64 运算顺序。
+
+同批完成相关冗余消除：复用一个窗口内不可变的对齐历史证据（不复用预测 XY/yaw）；TRAIN prior 完整 voxel/action 计数直接在扫描中累加，不生成全体列数组；日志用一次 detached scalar transfer，减少逐项读回的同步，loss/梯度和非有限值检查不变。`diagnostics_readback` 会单独计时，不能把原 loss 内的 GPU 等待移动后误报成计算量下降。
+
+临时内存有界：support 工作区由完整 source 体素数给出安全上界，历史批量索引预算 32MiB、dense map 每 chunk 最多 65536 点，超过索引预算保留原路径，不删候选。`compact_descriptor_bytes` 仅是被扫描有效候选的紧凑描述大小，**不是**整进程 RAM 或峰值临时内存；不增加持久 GT/预测/feature 缓存，不重建几何缓存。
+
+用下列模式一次比较上一版 native 执行与整包 native 优化：
+
+```bash
+LOCAL_WARM_NATIVE_BUNDLE=1 \
+LOCAL_WARM_COMPARE=/root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/warm_speed_20261002_082412_3c09a99 \
+LOCAL_WARM_MAX_BATCH=4 \
+bash tools/real_motion/run_p0_f9_joint_local_warm_benchmark.sh
+```
+
+只启动 `previous_native_b4`（bundle=0）与 `optimized_native_b4`（bundle=1）两个配对子进程，batch4/source128/workers4 不变；同样的已冻记录/prior/初始化、严格 warm hits、RAM 几何缓存为零。旧 native 函数保持不变作为对照，只有新优化分支使用 ABI 2 新函数。编译、合成一致性检查和独立 cProfile 不算稳态吞吐；不会重建 prior/cache、扫描大 batch、启动 15 轮、覆盖旧报告或保存科学训练更新。
+
+`NATIVE_BUNDLE_COMPARISON` 同时报告整步 speedup、完整/紧凑/物化候选数及真实调用计数。CPU 微测试的候选加速比不等于服务器 CUDA 端到端加速比；以此配对结果决定是否启用。默认后端仍 NumPy；显式 native 下默认启用 bundle，可用 `FULL_JOINT_CPU_BUNDLE=0` 对照回退到旧 native，编译/ABI 故障不静默回退。

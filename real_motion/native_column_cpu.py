@@ -17,7 +17,7 @@ from threading import Lock
 
 import numpy as np
 
-ABI = 1
+ABI = 2
 SOURCE = Path(__file__).resolve().parent/'native'/'column_cpu.cpp'
 _loaded = None
 _load_lock = Lock()
@@ -33,6 +33,12 @@ def get_native():
     if backend_name() == 'numpy': return None
     if _loaded is None: raise RuntimeError('native CPU requested before prepare_native(); run native preflight first')
     return _loaded
+
+
+def bundle_enabled():
+    value = os.environ.get('SWFM_COLUMN_CPU_BUNDLE', '1')
+    if value not in ('0', '1'): raise ValueError('SWFM_COLUMN_CPU_BUNDLE must be 0 or 1')
+    return backend_name() == 'native' and value == '1'
 
 
 def _sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -136,6 +142,9 @@ class NativeColumns:
         self.gather_fn = self._bind('swfm_gather', [P,I,P,P,I,I,I,J,P,I,P,I,I,P,P])
         self.expand_fn = self._bind('swfm_expand', [P]*4+[I]*3+[J]+[P]*2)
         self.changed_fn = self._bind('swfm_changed', [P,I,I,P])
+        self.compact_fn = self._bind('swfm_compact_columns', [P]*9+[I]*4+[J]+[P]*8)
+        self.support_many_fn = self._bind('swfm_support_many', [P]*2+[I]*5+[P,I]+[P]*3, count=True)
+        self.gather_many_fn = self._bind('swfm_gather_many', [P]+[I]*3+[P]*2+[I]*3+[P]*9)
         self.lock = Lock(); self.calls = {}
 
     def _bind(self, name, args, count=False):
@@ -242,3 +251,67 @@ class NativeColumns:
         n,z=targets.shape; changed=np.empty(n,bool)
         self._call('changed',self.changed_fn,_pointer(targets),n,z,_pointer(changed))
         return changed
+
+    def compact(self, xy, kinds, actors, classes, masks, baseline, owners, restored, gt, *, materialize=False, prior_counts=False):
+        if materialize and prior_counts: raise ValueError('prior scan must not materialize voxel rows')
+        shape=self._grid(np.asarray(baseline).shape); n=len(xy); z=shape[2]
+        if z > 64: raise ValueError('compact vertical masks support at most 64 bins')
+        arrays=(_array(xy,np.int32,(n,2)), _array(kinds,np.uint8,(n,)), _array(actors,np.int32,(n,)),
+            _array(classes,np.uint8,(n,)), _array(masks,np.uint64,(n,)), _array(baseline,np.uint8,shape),
+            _array(owners,np.int32,shape), _array(restored,np.uint8,shape), _array(gt,np.uint8,shape))
+        active=np.empty(n,bool); positive=np.empty(n,bool)
+        dense=(np.empty((n,z),np.int64), np.empty((n,z),np.uint8), np.empty((n,z),np.uint8),
+            np.empty((n,z,3),bool), np.empty((n,z),np.int64)) if materialize else ()
+        output_ptrs=list(map(_pointer,dense)) if materialize else [None]*5
+        counts=np.empty(5,np.int64) if prior_counts else None
+        self._call('compact_materialize' if materialize else 'compact_prior' if prior_counts else 'compact_scan', self.compact_fn,
+            *map(_pointer,arrays),n,*shape,2 if prior_counts else int(materialize),_pointer(active),_pointer(positive),
+            *output_ptrs,_pointer(counts) if counts is not None else None)
+        return (active,positive,*dense,*((counts,) if prior_counts else ()))
+
+    def support_many(self, groups, shape):
+        shape=self._grid(shape); arrays=[_array(g,np.int64) for g in groups]
+        if any(a.ndim != 1 for a in arrays): raise ValueError('support groups must contain 1D flat arrays')
+        offsets=np.r_[0,np.cumsum([len(a) for a in arrays],dtype=np.int64)]
+        flat=np.concatenate(arrays) if arrays else np.empty(0,np.int64)
+        capacity=sum(min(shape[0]*shape[1],5*len(a)) for a in arrays)
+        stamp=np.empty(shape[:2],np.uint32); xy=np.empty((capacity,2),np.int64)
+        rows=np.empty(len(arrays)+1,np.int64); bounds=np.empty((len(arrays),2),np.int64)
+        count=self._call('support_many',self.support_many_fn,_pointer(flat),_pointer(offsets),
+            len(arrays),len(flat),*shape,_pointer(stamp),capacity,*map(_pointer,(xy,rows,bounds)))
+        return xy[:count],rows,bounds
+
+    def gather_many(self, indices, history, observed, members, tables, valid_frames, row_size):
+        history=_array(history,np.uint8)
+        if history.ndim != 4: raise ValueError('batch history must be F,X,Y,Z')
+        frames=len(history); shape=self._grid(history.shape[1:])
+        valid=_bits(valid_frames,(frames,))
+        if len(indices) != frames: raise ValueError('batch indices must be F,N,3')
+        # Independent float64 transforms already produce one integer array per
+        # frame. Retain those arrays and pass pointers, not a second F*N*3 copy.
+        frame_indices=[None if a is None else _array(a,np.int64) for a in indices]
+        points=next((len(a) for a in frame_indices if a is not None),0)
+        for f,a in enumerate(frame_indices):
+            if a is None:
+                if valid[f]: raise ValueError('missing indices for valid historical frame')
+                frame_indices[f]=np.empty((0,3),np.int64)
+            elif a.shape != (points,3): raise ValueError('batch indices must be F,N,3')
+        ip=np.array([a.ctypes.data for a in frame_indices],np.uintp)
+        row_size=int(row_size)
+        if row_size < 1 or points%row_size: raise ValueError('batch gather rows must divide point count')
+        observed=_bits(observed,history.shape)
+        if len(members) != frames or len(tables) != frames: raise ValueError('batch membership frame mismatch')
+        # Retain every normalized pointed-to array until CDLL returns.
+        owned=[np.empty(0,np.int64) if a is None else _array(a,np.int64) for a in members]
+        bits=[np.empty(0,np.uint8) if a is None else _bits(a[1]) for a in tables]
+        if any(a.ndim != 1 for a in (*owned,*bits)): raise ValueError('batch membership must be 1D')
+        starts=np.array([0 if a is None else int(a[0]) for a in tables],np.int64)
+        if np.any(starts < 0): raise ValueError('negative membership table start')
+        op=np.array([a.ctypes.data for a in owned],np.uintp); tp=np.array([a.ctypes.data for a in bits],np.uintp)
+        on=np.array([len(a) for a in owned],np.int64); tn=np.array([len(a) for a in bits],np.int64)
+        has=np.array([a is not None for a in members],np.uint8)
+        out=np.empty((points//row_size,frames,row_size),np.uint8); flags=np.empty_like(out)
+        self._call('gather_many',self.gather_many_fn,_pointer(ip),frames,points,row_size,
+            _pointer(history),_pointer(observed),*shape,
+            *map(_pointer,(valid,has,op,on,tp,starts,tn,out,flags)))
+        return out,flags

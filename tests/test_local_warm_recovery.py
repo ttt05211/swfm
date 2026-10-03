@@ -309,3 +309,41 @@ def test_native_comparison_only_two_batch4_children_no_prefill_or_capacity_sweep
     summary = json.loads((out/'summary.json').read_text())
     assert summary['native_comparison']['speedup'] == 1.0
     assert summary['native_comparison']['native_artifact']['calls']['rows'] == 100
+
+
+def test_native_bundle_only_two_matched_children_and_does_not_rewrite_previous_artifacts(tmp_path):
+    original = tmp_path/'original'; original.mkdir()
+    c, cfg, pcfg, _ = real_continuation_fixture(original, legacy=True)
+    # Comparing from an earlier comparison must not inherit conflicting flags.
+    c['native_comparison'] = True
+    bench.write_json(original/'contract.json', c)
+    weights = json.loads((original/'diagnostic_weights.json').read_text())
+    before = {p: p.read_bytes() for p in original.rglob('*') if p.is_file()}
+    out = tmp_path/'native-bundle'; calls = []
+    def launch(phase, t):
+        calls.append((phase, t['name'], t['backend'], t['bundle']))
+        assert phase != 'warm' and t['window_batch'] == 4 and t['source_budget'] == 128
+        assert t['workers'] == 4 and t['persistent'] and t['optimize_kernels'] and t['optimize_cpu']
+        if phase == 'trial':
+            saved_c = json.loads((out/'contract.json').read_text())
+            save_trial(out, saved_c, weights, t['name'], 4)
+            row = json.loads((out/(t['name']+'.json')).read_text()); row.update(t)
+            row['execution'] = {'native_cpu': {'calls': {'support_many': 100} if t['bundle'] else {'support': 100}}}
+            for r in row['rows']:
+                r.update(full_candidate_columns=600, compact_candidate_columns=600 if t['bundle'] else 0,
+                    materialized_candidate_columns=100 if t['bundle'] else 600, compact_descriptor_bytes=18000 if t['bundle'] else 0)
+            bench.write_json(out/(t['name']+'.json'), row)
+        return 0
+    with patch.object(bench, 'load_runtime_config', return_value=cfg), patch.object(bench, 'make_prepare_config', return_value=pcfg):
+        bench.compare_cpu_paths(original, out, max_window_batch=128, launch=launch, native_bundle_compare=True)
+    assert calls == [('trial','previous_native_b4','native',False), ('trial','optimized_native_b4','native',True),
+        ('profile','previous_native_b4','native',False)]
+    assert all(p.read_bytes() == b for p,b in before.items())
+    summary = json.loads((out/'summary.json').read_text())
+    comparison = summary['native_bundle_comparison']
+    assert comparison['speedup'] == 1.0 and comparison['population_audit']['full_candidate_columns'] == 4800
+    assert comparison['population_audit']['materialized_candidate_columns'] == 800
+    assert comparison['native_artifact']['calls']['support_many'] == 100
+    assert 'native_comparison' not in summary and 'cpu_comparison' not in summary
+    assert (out/'records.pt').read_bytes() == (original/'records.pt').read_bytes()
+    assert (out/'diagnostic_weights.json').read_bytes() == (original/'diagnostic_weights.json').read_bytes()

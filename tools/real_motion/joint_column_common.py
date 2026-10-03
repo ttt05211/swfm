@@ -44,6 +44,14 @@ def weights_from_counts(counts):
 
 
 def count_proposals(prep, grid, config, counts):
+    from real_motion.native_column_cpu import bundle_enabled
+    if getattr(prep,'cpu_bundle_optimized',True) and bundle_enabled():
+        from tools.real_motion.compact_column_candidates import can_compact, build_compact_candidates
+        if can_compact(grid,config):
+            for _,plan,_ in build_compact_candidates(prep,grid,config,count_prior=True):
+                counts['generation']+=plan.prior_counts[:2]
+                counts['refine']+=plan.prior_counts[2:]
+            return
     for h in range(6):
         plan = candidate_plan(prep, h, grid, config); target = action_targets(plan, prep.raw['future_gt_occ'][h])
         gen = (plan.kind == GENERATE)[:, None]&plan.legal[..., ADD]
@@ -55,6 +63,10 @@ def count_proposals(prep, grid, config, counts):
 def build_online_column_candidates(prep, config, grid, *, defer_context=False):
     """CPU-only plans/labels for one current prediction; no sampling/RNG."""
     from real_motion.causal_column_completion import _action_targets_validated_plan
+    from real_motion.native_column_cpu import bundle_enabled
+    if (defer_context and getattr(prep,'cpu_bundle_optimized',True) and bundle_enabled()):
+        from tools.real_motion.compact_column_candidates import can_compact, build_compact_candidates
+        if can_compact(grid,config): return build_compact_candidates(prep,grid,config)
     label = _action_targets_validated_plan if getattr(prep, 'cpu_pipeline_optimized', True) else action_targets
     return [(h, plan, label(plan, prep.raw['future_gt_occ'][h]))
             for h in range(6) for plan in (candidate_plan(prep, h, grid, config, defer_context=defer_context),)]
@@ -69,12 +81,14 @@ def select_online_columns(prep, config, grid, rng, candidates=None):
     if candidates is None: candidates = build_online_column_candidates(prep, config, grid)
     for h, plan, labels in candidates:
         budget = budgets[h]
-        if getattr(prep, 'cpu_pipeline_optimized', True) and getattr(prep, 'cpu_kernels_optimized', False):
+        if labels is None or (getattr(prep, 'cpu_pipeline_optimized', True) and getattr(prep, 'cpu_kernels_optimized', False)):
             ids, weight = sample_queries(plan, labels, budget, rng, optimize=True)
         else: ids, weight = sample_queries(plan, labels, budget, rng)
         if not len(ids): continue
-        small = plan.subset(ids)
-        selected.append((h, small, labels[ids], weight))
+        if labels is None:
+            small, selected_labels = plan.materialize(ids)
+        else: small, selected_labels = plan.subset(ids), labels[ids]
+        selected.append((h, small, selected_labels, weight))
     return selected
 
 
@@ -122,7 +136,7 @@ def online_columns(prep, model, grid, rng, device):
     return assemble_online_columns(prep, model, selected, arrays, device, grid=grid)
 
 
-def motion_loss(output, record, device, patch_resolution=.8):
+def motion_loss(output, record, device, patch_resolution=.8, *, materialize_stats=True):
     """Original V18 objective; future labels enter this function, NOT motion()."""
     pred = output['residual_xy_m'].float()
     if not len(pred):
@@ -142,7 +156,7 @@ def motion_loss(output, record, device, patch_resolution=.8):
         get('target_source_mask_tube')[:, -1].float(), valid, get('yaw_enabled'), get('yaw_label_valid'),
         patch_resolution_m=patch_resolution, materialize_stats=False)
     values = {'translation_smooth_l1': trans, 'existence_bce': exist, 'yaw_periodic_loss': yaw, 'se2_shape_loss': shape}
-    return trans+exist+19.*yaw+.25*shape, {k: float(v.detach()) for k, v in values.items()}
+    return trans+exist+19.*yaw+.25*shape, {k: float(v.detach()) if materialize_stats else v.detach() for k, v in values.items()}
 
 
 def set_lr(optimizer, update, target):

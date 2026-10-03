@@ -70,6 +70,8 @@ class ColumnFeatureSampler:
         self.kernels_optimized = self.optimized and getattr(prepared, 'cpu_kernels_optimized', True)
         from .native_column_cpu import get_native
         self.native = get_native() if self.kernels_optimized else None
+        from .native_column_cpu import bundle_enabled
+        self.bundle = self.native is not None and getattr(prepared,'cpu_bundle_optimized',True) and bundle_enabled()
         self.index = getattr(prepared, 'column_history_index', None) if self.optimized else None
         if self.optimized and self.index is None:
             self.index = ColumnHistoryIndex(prepared, grid, actors=np.unique(plan.actor))
@@ -129,6 +131,15 @@ class ColumnFeatureSampler:
         idx = np.stack(np.meshgrid(x, y, np.arange(self.z), indexing='ij'), -1)
         xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
         shape = (*extent, self.z)
+        if self.bundle and pool is None:
+            # TRAIN has a window-level pool already. One bounded integer call
+            # for all frames per chunk, not nested frame pools/calls/copies.
+            labels=np.empty((self.t,len(xyz)),np.uint8); flags=np.empty_like(labels)
+            for start in range(0,len(xyz),65536):
+                stop=min(start+65536,len(xyz))
+                values,bits=self._batch_gather(actor,xyz[start:stop],stop-start)
+                labels[:,start:stop]=values[0]; flags[:,start:stop]=bits[0]
+            return lo,labels.reshape((self.t,*shape)),flags.reshape((self.t,*shape))
         def frame(f):
             labels = np.full(len(xyz), UNKNOWN, np.uint8); flags = np.zeros(len(xyz), np.uint8)
             transform = self.transforms[actor][f]
@@ -174,6 +185,18 @@ class ColumnFeatureSampler:
         table = self.index.tables[actor][frame] if actor >= 0 and self.index is not None else None
         return self.native.gather(indices, self.history[frame], self.observed[frame], owned, table)
 
+    def _batch_gather(self,actor,xyz,row_size):
+        indices=[None]*self.t
+        valid=np.array([m is not None for m in self.transforms[actor]],bool)
+        for f,transform in enumerate(self.transforms[actor]):
+            if transform is None: continue
+            # Exact original float64 operations, independently for every frame.
+            pts=transform_points(xyz,transform)
+            indices[f],_=metric_indices_inplace(pts,self.origin,self.step,self.shape,check_bounds=False)
+        members=self.members[actor] if actor >= 0 else [None]*self.t
+        tables=self.index.tables[actor] if actor >= 0 and self.index is not None else [None]*self.t
+        return self.native.gather_many(indices,self.history,self.observed,members,tables,valid,row_size)
+
     def _sparse(self, plan, actor):
         """Same reference arithmetic, reusing inverses for uncached/small actors."""
         # Several frontier queries attend the SAME nearest causal anchor. Warp
@@ -186,7 +209,9 @@ class ColumnFeatureSampler:
             centres = xy[first]  # identical lexicographic XY order, fewer sorts
         else: centres, inverse = np.unique(xy, axis=0, return_inverse=True)
         n, p, z = len(centres), self.p, self.z
-        hist = np.full((n, self.t, p, p, z), UNKNOWN, np.uint8); flags = np.zeros_like(hist)
+        batched=self.bundle and n*p*p*z*self.t*3*8 <= 32*2**20
+        hist = None if batched else np.full((n, self.t, p, p, z), UNKNOWN, np.uint8)
+        flags = None if batched else np.zeros_like(hist)
         if self.optimized:
             # Same per-coordinate float64 multiply/add as reference, without
             # allocating N*P*P*Z*3 integer indices and arithmetic temporaries.
@@ -200,6 +225,10 @@ class ColumnFeatureSampler:
             offsets = np.stack(np.meshgrid(np.arange(p)-p//2, np.arange(p)-p//2, np.arange(z), indexing='ij'), -1)
             idx = offsets[None]+np.pad(centres, ((0, 0), (0, 1)))[:, None, None, None, :]
             xyz = (self.origin+(idx+.5)*self.step).reshape(-1, 3)
+        if batched:
+            hist,flags=self._batch_gather(actor,xyz,p*p*z)
+            hist=hist.reshape(n,self.t,p,p,z); flags=flags.reshape(n,self.t,p,p,z)
+            return self.native.expand(hist,flags,inverse.astype(np.int64,copy=False),plan.classes,actor < 0)
         for f, transform in enumerate(self.transforms[actor]):
             if transform is None: continue
             pts = transform_points(xyz, transform)

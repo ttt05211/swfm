@@ -14,7 +14,7 @@ from tools.real_motion.causal_column_common import (causal_source_history, FEATU
     compose_component_replacements_fast_exact, prepare_warm_columns_cpu, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from real_motion.local_training_profile import StageTimer
-from real_motion.native_column_cpu import backend_name
+from real_motion.native_column_cpu import backend_name, bundle_enabled
 from real_motion.v18_motion_gap import numpy
 
 MOTION_KEYS = ('features', 'local_semantic_tube', 'kta_displacement_xy_m',
@@ -150,12 +150,22 @@ def pack_records(records, keys):
     return {k: torch.cat([torch.as_tensor(r[k]) for r in records]) for k in keys}
 
 
+def materialize_scalar_stats(values):
+    """One detached scalar transfer, preserving each scalar's exact value."""
+    tensors={k:v.detach().reshape(()) for k,v in values.items() if isinstance(v,torch.Tensor)}
+    result=dict(values)
+    if tensors:
+        result.update(zip(tensors,torch.stack(list(tensors.values())).cpu().tolist()))
+    return result
+
+
 def train_full_batch(joint, optimizer, provider, source, rows, rng, update, schedule_steps,
                      *, probe=False, patch_resolution=.8, control=None, control_optimizer=None,
                      profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0, optimize_cpu=True, optimize_kernels=True):
     """True batching, not repeated optimizer steps or stale feature replay."""
     joint.train(); optimizer.zero_grad(set_to_none=True); set_lr(optimizer, update-1, schedule_steps)
     timer = StageTimer(provider.device, profile)
+    bundle=optimize_cpu and optimize_kernels and bundle_enabled()
     if provider.device.type == 'cuda': torch.cuda.reset_peak_memory_stats(provider.device)
     records = [r for r, _ in rows]; sizes = [len(r['features']) for r in records]
     merged = timer.call('pack_inputs', pack_records, records, (*MOTION_KEYS, *LABEL_KEYS))
@@ -172,6 +182,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             local['_column_render_numpy'] = {k: v[cursor:cursor+size] for k, v in render.items()}; cursor += size
     batches = []; prep_seconds = selection_seconds = feature_wait_seconds = worker_seconds = 0.
     candidate_wait_seconds = candidate_worker_seconds = 0.
+    candidate_columns=compact_columns=compact_bytes=materialized_columns=0
     workers = sampling_workers or max(1, min(int(getattr(provider, 'workers', 4)), 4))
     if workers < 1: raise ValueError('positive sampling worker budget required')
     def sample(prep, selected):
@@ -218,19 +229,27 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             else: prep = timer.call('prepare_render', prepared_job.result)
             prep.cpu_pipeline_optimized = optimize_cpu
             prep.cpu_kernels_optimized = optimize_cpu and optimize_kernels
+            prep.cpu_bundle_optimized = bundle
             # Fixtures/legacy providers may reuse a prepared object. No index
             # from a previous pose/window is allowed to leak into this update.
             if hasattr(prep, 'column_history_index'): del prep.column_history_index
             prep_seconds += time.perf_counter()-tick
             planning.append((prep, pool.submit(candidates, prep)))
         # GPU motion supervision can overlap queued CPU patch sampling.
-        lm, stats = timer.call('motion_loss', motion_loss, output, merged, provider.device, patch_resolution, gpu=True)
+        lm, stats = timer.call('motion_loss', motion_loss, output, merged, provider.device, patch_resolution,
+            materialize_stats=not bundle, gpu=True)
         for prep, job in planning:
             tick = time.perf_counter(); plans, seconds = job.result()
             candidate_wait_seconds += time.perf_counter()-tick; candidate_worker_seconds += seconds
             tick = time.perf_counter()
             selected = select_online_columns(prep, joint.columns.config, provider.pcfg.grid, rng, candidates=plans)
             selection_seconds += time.perf_counter()-tick
+            candidate_columns+=sum(len(plan) for _,plan,_ in plans)
+            for _,plan,_ in plans:
+                if hasattr(plan,'audit'):
+                    audit=plan.audit(); compact_columns+=audit['population']; compact_bytes+=audit['compact_bytes']
+                    materialized_columns+=audit['materialized_rows']
+                else: materialized_columns+=len(plan)
             pending.append((prep, selected, [pool.submit(sample_window, prep, selected)] if optimize_cpu
                 else [pool.submit(sample, prep, item) for item in selected]))
         for prep, selected, jobs in pending:
@@ -248,7 +267,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             g, r = timer.call('column_forward', joint.columns,
                 **{k: batch[k] for k in (*FEATURE_KEYS, 'source_features')}, gpu=True)
         lc, column_stats = timer.call('column_loss', column_loss, joint.columns, g, r,
-            batch['kind'], batch['legal'], batch['target'], batch['weight'], gpu=True)
+            batch['kind'], batch['legal'], batch['target'], batch['weight'], materialize_stats=not bundle, gpu=True)
         if probe and len(output['future_transport_queries']) and output['future_transport_queries'].requires_grad:
             grad = torch.autograd.grad(lc, output['future_transport_queries'], retain_graph=True, allow_unused=True)[0]
             link_grad = float(grad.float().norm()) if grad is not None else 0.
@@ -271,10 +290,13 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         if control_loss.requires_grad and bool(merged['supervised_source'].any()):
             control_loss.backward(); torch.nn.utils.clip_grad_norm_(control.parameters(), 5., error_if_nonfinite=True)
             control_optimizer.step()
+    scalars={'loss':loss.detach(),'motion_loss':lm.detach(),'column_loss':lc.detach(),
+        'paired_control_motion_loss':control_loss.detach() if control_loss is not None else None,
+        'grad_norm':mn,'column_grad_norm':cn,**stats,**column_stats}
+    if bundle: scalars=timer.call('diagnostics_readback',materialize_scalar_stats,scalars)
+    else: scalars={k:float(v) if isinstance(v,torch.Tensor) else v for k,v in scalars.items()}
     timings = timer.finish()
-    return {**timings, 'loss': float(loss.detach()), 'motion_loss': float(lm.detach()), 'column_loss': float(lc.detach()),
-        'paired_control_motion_loss': float(control_loss.detach()) if control_loss is not None else None,
-        'grad_norm': float(mn), 'column_grad_norm': float(cn), 'optimizer_updated': bool(updated),
+    return {**timings,**scalars,'optimizer_updated': bool(updated),
         'source_query_gradient_norm': link_grad, 'gradient_probe': probe, 'sampled_columns': sampled,
         'windows': len(rows), 'sources': sum(sizes), 'prepare_main_seconds': prep_seconds,
         'online_sampling_seconds': candidate_wait_seconds+selection_seconds+feature_wait_seconds,
@@ -287,6 +309,9 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'cpu_pipeline_optimized': optimize_cpu,
         'cpu_kernels_optimized': optimize_cpu and optimize_kernels,
         'integer_cpu_backend': backend_name(),
+        'cpu_bundle_optimized': bundle,
+        'full_candidate_columns':candidate_columns,'compact_candidate_columns':compact_columns,
+        'materialized_candidate_columns':materialized_columns,'compact_descriptor_bytes':compact_bytes,
         'parallel_warm_preparations': sum(job is not None for _, _, _, job in preparation),
         'peak_memory_mib': torch.cuda.max_memory_allocated(provider.device)/2**20 if provider.device.type == 'cuda' else None,
-        **stats, **column_stats}
+        }

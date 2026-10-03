@@ -5,6 +5,10 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != OccFM ]]; then echo "请先 conda activate Occ
 ROOT=/root/nas/occ/swfm
 cd "$ROOT"
 PY="$(command -v python)"
+for FLAG in "${LOCAL_WARM_NATIVE:-0}" "${LOCAL_WARM_NATIVE_BUNDLE:-0}"; do
+  if [[ "$FLAG" != 0 && "$FLAG" != 1 ]]; then echo "native 开关只能是0或1" >&2; exit 2; fi
+done
+if [[ "${LOCAL_WARM_NATIVE_BUNDLE:-0}" == 1 ]]; then export LOCAL_WARM_NATIVE=1; fi
 if [[ "${LOCAL_WARM_NATIVE:-0}" == 1 && -z "${LOCAL_WARM_COMPARE:-}" ]]; then
   echo "编译CPU对照必须指定 LOCAL_WARM_COMPARE，避免误跑冷缓存或扩容扫描。" >&2; exit 2
 fi
@@ -38,10 +42,13 @@ if [[ -n "${LOCAL_WARM_COMPARE:-}" ]]; then
   # Tiny synthetic GPU integration gate, not another dataset experiment.
   NATIVE_EXTRA=()
   if [[ "${LOCAL_WARM_NATIVE:-0}" == 1 ]]; then
-    echo "仅 NumPy/C++ batch4/source128 对照；编译与一致性检查不计入吞吐，不重建缓存。"
+    echo "仅配对 batch4/source128 对照；编译与一致性检查不计入吞吐，不重建缓存。"
     "$PY" -u tools/real_motion/check_column_native_cpu.py
-    "$PY" -m pytest -q tests/test_native_column_cpu.py
-    NATIVE_EXTRA+=(--native-compare)
+    SWFM_COLUMN_CPU_BUNDLE=1 "$PY" -m pytest -q tests/test_native_column_cpu.py tests/test_compact_column_pipeline.py
+    if [[ "${LOCAL_WARM_NATIVE_BUNDLE:-0}" == 1 ]]; then
+      echo "本次只比较上一版native和整包优化native；batch/source/workers不变。"
+      NATIVE_EXTRA+=(--native-bundle-compare)
+    else NATIVE_EXTRA+=(--native-compare); fi
   else
     "$PY" -m pytest -q tests/test_local_cpu_pipeline.py -k cuda
   fi

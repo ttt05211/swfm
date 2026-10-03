@@ -21,6 +21,29 @@ def main():
         raise RuntimeError('native CPU gather preflight failed')
     if not np.array_equal(kernel.changed(np.array([[0, 0], [0, 1]], np.int64)), [False, True]):
         raise RuntimeError('native CPU labels preflight failed')
+    v, b = kernel.gather_many([ijk, None], np.stack((history, history)),
+        np.stack((observed, observed)), [None, None], [None, None], np.array([True, False]), 5)
+    if not (np.array_equal(v[:, 0].ravel(), history.ravel()) and np.all(b[:, 0] == 1)
+            and np.all(v[:, 1] == 18) and np.all(b[:, 1] == 0)):
+        raise RuntimeError('native batch gather preflight failed')
+    xy, offsets, bounds = kernel.support_many([np.array([25], np.int64), np.empty(0, np.int64)], shape)
+    if not (np.array_equal(xy, [[0, 1], [1, 0], [1, 1], [1, 2], [2, 1]])
+            and np.array_equal(offsets, [0, 5, 5]) and np.array_equal(bounds, [[0, 0], [5, -1]])):
+        raise RuntimeError('native batch support preflight failed')
+    free = np.full(shape, 17, np.uint8); owner = np.full(shape, -1, np.int32)
+    truth = free.copy(); truth[1, 1, 2] = 11
+    args = (np.array([[1, 1]], np.int32), np.array([0], np.uint8), np.array([-3], np.int32),
+        np.array([11], np.uint8), np.array([31], np.uint64), free, owner, free, truth)
+    active, positive = kernel.compact(*args)
+    aa, pp, flat, base, fallback, legal, targets = kernel.compact(*args, materialize=True)
+    if not (active.all() and positive.all() and np.array_equal(aa, active) and np.array_equal(pp, positive)
+            and np.array_equal(flat, [[25, 26, 27, 28, 29]]) and np.all(base == 17)
+            and np.all(fallback == 17) and np.all(legal[..., :2]) and not legal[..., 2].any()
+            and np.array_equal(targets, [[0, 0, 1, 0, 0]])):
+        raise RuntimeError('native compact candidate preflight failed')
+    _, _, counts = kernel.compact(*args, prior_counts=True)
+    if not np.array_equal(counts, [4, 1, 0, 0, 0]):
+        raise RuntimeError('native complete TRAIN prior preflight failed')
     print(json.dumps(dict(ok=True, **kernel.info()), ensure_ascii=True), flush=True)
     return 0
 

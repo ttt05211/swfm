@@ -216,7 +216,10 @@ def sample_queries(plan, targets, per_kind, rng, *, optimize=False):
                    (np.flatnonzero((plan.kind == REFINE)&(plan.actor >= 0)), max(2, per_kind//2)))
     from .native_column_cpu import get_native
     native = get_native() if optimize else None
-    changed = (native.changed(targets) if native is not None else (targets != KEEP).any(axis=1)) if optimize else None
+    if targets is None:
+        if not optimize or not hasattr(plan,'positive_rows'): raise ValueError('compact TRAIN sampling requires scanned buckets')
+        changed=plan.positive_rows
+    else: changed = (native.changed(targets) if native is not None else (targets != KEEP).any(axis=1)) if optimize else None
     for population, budget in populations:
         if optimize:
             positive = changed[population]
