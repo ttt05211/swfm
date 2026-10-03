@@ -155,6 +155,20 @@ def test_stop_refuses_wrong_directory_and_pid_reuse_never_sends_any_signal(tmp_p
         kill.assert_not_called()
 
 
+@pytest.mark.parametrize('backend', ['cpu', 'gpu'])
+def test_gpu_resume_override_is_readonly_and_performance_only(tmp_path, backend):
+    directory, ck = manager_fixture(tmp_path)
+    before = {p: p.read_bytes() for p in directory.iterdir()}
+    command, _, out = manage.resume_command(directory, column_feature_backend=backend)
+    value = lambda key: command[command.index('--'+key)+1]
+    assert value('column-feature-backend') == backend
+    assert value('window-batch-size') == '4' and value('source-budget') == '128'
+    assert value('epochs') == '15' and value('resume') == str(directory/'last.pt')
+    assert not out.exists() and all(p.read_bytes() == data for p, data in before.items())
+    with pytest.raises(ValueError, match='must be cpu or gpu'):
+        manage.resume_command(directory, column_feature_backend='float32_warp')
+
+
 def test_stop_scopes_single_term_and_waits_no_force_kill(tmp_path):
     directory,ck=manager_fixture(tmp_path)
     ck.update(attempted_updates=12,cursor_epoch=0,cursor_batch=12);torch.save(ck,directory/'last.pt')

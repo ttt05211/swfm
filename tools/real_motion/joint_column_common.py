@@ -150,7 +150,12 @@ def assemble_online_columns(prep, model, selected, arrays, device, *, grid=None)
         for k, v in features.items(): parts[k].append(v)
         parts['source_features'].append(model.source_features_for(prep, h, small, device))
     if not parts: return None
-    batch = {k: torch.as_tensor(np.concatenate(v), device=device) for k, v in parts.items() if k != 'source_features'}
+    def concatenate(values):
+        # GPU byte sampling stays on device; never round-trip through NumPy.
+        if any(isinstance(v, torch.Tensor) for v in values):
+            return torch.cat([torch.as_tensor(v, device=device) for v in values])
+        return torch.as_tensor(np.concatenate(values), device=device)
+    batch = {k: concatenate(v) for k, v in parts.items() if k != 'source_features'}
     batch['source_features'] = torch.cat(parts['source_features'])
     if hasattr(model, 'extra_inputs_for'):
         extra_parts = defaultdict(list); atlas_count = 0

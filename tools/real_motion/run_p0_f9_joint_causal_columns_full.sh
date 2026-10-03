@@ -38,6 +38,9 @@ if [[ "${FULL_JOINT_PAIRED_CONTROL:-0}" == 1 ]]; then EXTRA+=(--paired-control);
 if [[ "${FULL_JOINT_PREWARM:-0}" == 1 ]]; then EXTRA+=(--prewarm-causal-cache); fi
 if [[ "${FULL_JOINT_REFERENCE_CPU:-0}" == 1 ]]; then EXTRA+=(--reference-cpu-pipeline); fi
 EXTRA+=(--profile-every "${FULL_JOINT_PROFILE_EVERY:-0}")
+FEATURE_BACKEND="${FULL_JOINT_COLUMN_FEATURE_BACKEND:-cpu}"
+case "$FEATURE_BACKEND" in cpu|gpu) ;; *) echo "历史采样后端只能是cpu/gpu" >&2; exit 2 ;; esac
+EXTRA+=(--column-feature-backend "$FEATURE_BACKEND")
 EXTRA+=(--sampling-workers "${FULL_JOINT_SAMPLING_WORKERS:-0}" --io-workers "${FULL_JOINT_IO_WORKERS:-2}")
 if [[ "${FULL_JOINT_PERSISTENT_POOL:-1}" == 1 ]]; then EXTRA+=(--persistent-sampling-pool); fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -59,6 +62,9 @@ elif [[ "$SWFM_COLUMN_CPU_BACKEND" != numpy ]]; then
   echo "FULL_JOINT_CPU_BACKEND 只能是 numpy/native" >&2; exit 2
 fi
 "$PY" -c 'import torch,sys; print(sys.executable,torch.__version__); assert torch.cuda.is_available() and torch.cuda.is_bf16_supported(), "CUDA/BF16 unavailable"'
+if [[ "$FEATURE_BACKEND" == gpu ]]; then
+  "$PY" -m pytest -q tests/test_column_gpu_sampling.py -k 'actual_cuda or real_adamw'
+fi
 SWFM_COLUMN_CPU_BACKEND=numpy "$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_joint_training_recovery.py tests/test_column_runtime_pipeline.py tests/test_causal_geometry_cache.py
 mkdir -p "$RUN_DIR"
 if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then

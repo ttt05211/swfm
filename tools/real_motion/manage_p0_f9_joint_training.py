@@ -77,7 +77,8 @@ def request_stop(directory, *, timeout=300.):
     return 0
 
 
-def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers=None, profile_every=None, expected_update=None):
+def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers=None, profile_every=None, expected_update=None,
+                   column_feature_backend=None):
     state_path = directory/'runtime_status.json'
     if state_path.is_file() and status(directory)['matching_trainer_running']:
         raise RuntimeError('original trainer is still running; stop it before resume')
@@ -92,6 +93,9 @@ def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers
         if stable_json_fingerprint(ck.get(key)) != stable_json_fingerprint(contract.get(key)):
             raise RuntimeError('checkpoint/original execution contract mismatch at '+key)
     args = dict(contract['arguments'])
+    if column_feature_backend is not None:
+        if column_feature_backend not in ('cpu', 'gpu'): raise ValueError('column feature backend must be cpu or gpu')
+        args['column_feature_backend'] = column_feature_backend
     # Explicit performance-only overrides. No batch/source/epoch/LR/seed/RNG
     # override is accepted; original cache budgets are also preserved.
     if sampling_workers is not None:
@@ -143,6 +147,7 @@ def main():
     p.add_argument('--out-dir',help='NEW root for resume (model subdirectory created by trainer)')
     p.add_argument('--print-command',action='store_true',help='read-only recipe inspection, do not launch')
     p.add_argument('--sampling-workers',type=int,help='performance-only override, 1..8 combined CPU workers')
+    p.add_argument('--column-feature-backend',choices=('cpu','gpu'),help='performance-only byte sampling override; no recipe change')
     p.add_argument('--profile-every',type=int,help='performance-only stage timing interval; 0 disables')
     p.add_argument('--expected-update',type=int,help='refuse a checkpoint other than this committed update')
     p.add_argument('--timeout',type=float,default=300.)
@@ -152,7 +157,8 @@ def main():
         if not 0 < a.timeout <= 3600: p.error('positive bounded stop timeout required')
         return request_stop(directory,timeout=a.timeout)
     command,env,out=resume_command(directory,a.checkpoint,a.out_dir,sampling_workers=a.sampling_workers,
-                                  profile_every=a.profile_every,expected_update=a.expected_update)
+                                  profile_every=a.profile_every,expected_update=a.expected_update,
+                                  column_feature_backend=a.column_feature_backend)
     print(json.dumps({'resume_output':str(out),'command':command,'cpu_backend':env['SWFM_COLUMN_CPU_BACKEND'],
         'cpu_horizon_pipeline':env['SWFM_COLUMN_CPU_HORIZONS'],
         'checkpoint_role':'full optimizer/RNG/cursor, NOT weight-only'},ensure_ascii=False,indent=2),flush=True)

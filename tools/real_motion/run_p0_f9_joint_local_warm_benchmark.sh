@@ -5,10 +5,14 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != OccFM ]]; then echo "请先 conda activate Occ
 ROOT=/root/nas/occ/swfm
 cd "$ROOT"
 PY="$(command -v python)"
-for FLAG in "${LOCAL_WARM_NATIVE:-0}" "${LOCAL_WARM_NATIVE_BUNDLE:-0}"; do
+for FLAG in "${LOCAL_WARM_NATIVE:-0}" "${LOCAL_WARM_NATIVE_BUNDLE:-0}" "${LOCAL_WARM_GPU_FEATURES:-0}"; do
   if [[ "$FLAG" != 0 && "$FLAG" != 1 ]]; then echo "native 开关只能是0或1" >&2; exit 2; fi
 done
 if [[ "${LOCAL_WARM_NATIVE_BUNDLE:-0}" == 1 ]]; then export LOCAL_WARM_NATIVE=1; fi
+if [[ "${LOCAL_WARM_GPU_FEATURES:-0}" == 1 ]]; then
+  if [[ "${LOCAL_WARM_NATIVE_BUNDLE:-0}" == 1 ]]; then echo "GPU与CPU bundle比较不能同时指定" >&2; exit 2; fi
+  export LOCAL_WARM_NATIVE=1
+fi
 if [[ "${LOCAL_WARM_NATIVE:-0}" == 1 && -z "${LOCAL_WARM_COMPARE:-}" ]]; then
   echo "编译CPU对照必须指定 LOCAL_WARM_COMPARE，避免误跑冷缓存或扩容扫描。" >&2; exit 2
 fi
@@ -28,7 +32,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRIT
 export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 echo "仅计时：默认严格4历史→6未来；TRAIN128+8高source压力样本，几何RAM缓存关闭。"
 if [[ -n "${LOCAL_WARM_COMPARE:-}" ]]; then
-  echo "本次复用已冻样本/cache/prior；只做旧/新CPU流水线一次性比较，保留10%显存余量。"
+  echo "本次复用已冻样本/cache/prior；只做一次后端比较，保留10%显存余量。"
 else
   echo "独立子进程测batch4/8/16/32/64/128，OOM即停扩容；source上限同步增大，保留10%显存安全余量。"
   echo "初建缓存、TRAIN16诊断权重与单独cProfile不算稳态吞吐。"
@@ -41,7 +45,12 @@ if [[ -n "${LOCAL_WARM_COMPARE:-}" ]]; then
   fi
   # Tiny synthetic GPU integration gate, not another dataset experiment.
   NATIVE_EXTRA=()
-  if [[ "${LOCAL_WARM_NATIVE:-0}" == 1 ]]; then
+  if [[ "${LOCAL_WARM_GPU_FEATURES:-0}" == 1 ]]; then
+    echo "仅CPU/GPU历史采样配对：batch4/source128/workers6；字节与实际AdamW检查，不重建、不扫batch、不做额外cProfile。"
+    "$PY" -u tools/real_motion/check_column_native_cpu.py
+    "$PY" -m pytest -q tests/test_column_gpu_sampling.py -k 'actual_cuda or real_adamw'
+    NATIVE_EXTRA+=(--gpu-feature-compare)
+  elif [[ "${LOCAL_WARM_NATIVE:-0}" == 1 ]]; then
     echo "仅配对 batch4/source128 对照；编译与一致性检查不计入吞吐，不重建缓存。"
     "$PY" -u tools/real_motion/check_column_native_cpu.py
     SWFM_COLUMN_CPU_BUNDLE=1 "$PY" -m pytest -q tests/test_native_column_cpu.py tests/test_compact_column_pipeline.py

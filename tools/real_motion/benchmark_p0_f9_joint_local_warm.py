@@ -42,9 +42,16 @@ PROTOCOL = 'local_warm_disk_capacity_timing_v1'
 
 def measured_batches(joint, optimizer, provider, source, records, *, windows, sources,
                      workers, persistent=True, io_workers=2, cpu_profiles=None, max_batches=None, progress=None,
-                     optimize_cpu=True, optimize_kernels=True):
+                     optimize_cpu=True, optimize_kernels=True, column_feature_backend='cpu'):
     """Actual current-model forward/backward, strict warm hits, no weights saved."""
     rng = np.random.default_rng(20261003); rows = []
+    if column_feature_backend not in ('cpu','gpu'): raise ValueError('invalid column feature backend')
+    sampler = None
+    if column_feature_backend == 'gpu':
+        from real_motion.column_gpu_sampling import GpuColumnSampler
+        if not hasattr(provider, '_benchmark_gpu_sampler'):
+            provider._benchmark_gpu_sampler = GpuColumnSampler(provider.device)
+        sampler = provider._benchmark_gpu_sampler
     pool = cpu_sampling_pool(workers, horizons=optimize_cpu and optimize_kernels and horizon_pipeline_enabled()) if persistent else None
     iterator = prefetch_column_batches(provider, source, records, windows, sources, io_workers=io_workers)
     tick = time.perf_counter()
@@ -55,7 +62,7 @@ def measured_batches(joint, optimizer, provider, source, records, *, windows, so
                 raise RuntimeError('benchmark requires persisted warm disk hits for EVERY window')
             started = time.perf_counter()
             kwargs = dict(profile=True, sampling_pool=pool, sampling_workers=workers, cpu_profiles=cpu_profiles,
-                optimize_cpu=optimize_cpu, optimize_kernels=optimize_kernels)
+                optimize_cpu=optimize_cpu, optimize_kernels=optimize_kernels, column_feature_sampler=sampler)
             kwargs['patch_resolution'] = getattr(provider, 'patch_resolution_m', .8)
             fn = lambda: train_full_batch(joint, optimizer, provider, source, batch, rng, update, 100000, **kwargs)
             stats = fn()
@@ -129,7 +136,7 @@ def worker(contract_path, phase, trial):
         available, total = torch.cuda.mem_get_info(device)
         t = json.loads(trial); name = t['name']; args = dict(windows=t['window_batch'], sources=t['source_budget'],
             workers=t['workers'], persistent=t['persistent'], io_workers=2, optimize_cpu=t.get('optimize_cpu', True),
-            optimize_kernels=t.get('optimize_kernels', True))
+            optimize_kernels=t.get('optimize_kernels', True), column_feature_backend=t.get('column_feature_backend','cpu'))
         print(f"trial={name} source_budget={t['source_budget']} CUDA warm-up then dense stress (excluded from throughput)", flush=True)
         # Two warm-up minibatches; not included in steady throughput.
         warm_records = data['typical'][:min(len(data['typical']), 2*t['window_batch'])]
@@ -264,7 +271,7 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
         existing_checkpoint_unchanged=(True if not c.get('original_checkpoint') or not error
             else False if 'checkpoint changed' in str(error) else None), geometry_ram_cache_mib=0,
         caution='OS/frame-cache and workload variation remain; ETA excludes full cold prefill/eval/checkpoint; larger batch changes optimizer update count; no automatic full training')
-    if c.get('cpu_comparison') and not c.get('native_comparison') and not c.get('native_bundle_comparison'):
+    if c.get('cpu_comparison') and not c.get('native_comparison') and not c.get('native_bundle_comparison') and not c.get('gpu_feature_comparison'):
         reference = next((t for t in trials if t['name'] == 'reference_b4' and t['status'] == 'ok'), None)
         fastest = next((t for t in trials if t['name'] == decision.get('recommended_trial')), None)
         fixed_batch = next((t for t in trials if t['name'] == 'optimized_b4' and t['status'] == 'ok'), None)
@@ -291,6 +298,21 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
             population_audit=({k:sum(r.get(k,0) for r in new['rows']) for k in ('full_candidate_columns','compact_candidate_columns',
                 'materialized_candidate_columns','compact_descriptor_bytes')} if new else None),
             native_artifact=new['execution']['native_cpu'] if new else None)
+    if c.get('gpu_feature_comparison'):
+        cpu = next((t for t in trials if t['name'] == 'cpu_features_b4' and t['status'] == 'ok'), None)
+        gpu = next((t for t in trials if t['name'] == 'gpu_features_b4' and t['status'] == 'ok'), None)
+        speedup = gpu['measurement']['windows_per_second']/cpu['measurement']['windows_per_second'] if cpu and gpu else None
+        audit = {k:sum(r.get(k,0) for r in gpu['rows']) for k in ('gpu_feature_horizons','gpu_feature_fallback_horizons',
+            'gpu_feature_boundary_horizons','gpu_feature_verified_horizons','gpu_feature_oom_windows','gpu_feature_budget_windows')} if gpu else {}
+        safe = bool(gpu and gpu['capacity_peak_reserved_mib'] <= .9*gpu['total_memory_mib'])
+        passed = bool(status == 'complete' and speedup and speedup >= 1.05 and safe
+            and audit.get('gpu_feature_verified_horizons',0) > 0 and audit.get('gpu_feature_oom_windows',1) == 0
+            and audit.get('gpu_feature_budget_windows',1) == 0
+            and audit.get('gpu_feature_horizons',0) > audit.get('gpu_feature_fallback_horizons',0))
+        summary['gpu_feature_comparison'] = dict(speedup=speedup, cpu_byte_checks_passed=bool(audit.get('gpu_feature_verified_horizons',0)),
+            audit=audit, memory_headroom_ge_10percent=safe, pass_gate=passed,
+            route='gpu_opt_in_resume_available' if passed else 'keep_cpu_no_automatic_resume',
+            scope='same current native CPU candidates/RNG/batch4/source128; actual forward/backward included; no saved scientific updates')
     write_json(out/'summary.json', summary)
     lines = ['===== LOCAL WARM DISK SPEED ONLY =====', 'status='+status,
         f"history_frames={c['history_frames']}, future_frames=6, geometry_RAM=0MiB",
@@ -309,17 +331,19 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
     if summary.get('cpu_comparison'): lines.append('CPU_OPTIMIZATION_COMPARISON='+json.dumps(summary['cpu_comparison']))
     if summary.get('native_comparison'): lines.append('NATIVE_CPU_COMPARISON='+json.dumps(summary['native_comparison']))
     if summary.get('native_bundle_comparison'): lines.append('NATIVE_BUNDLE_COMPARISON='+json.dumps(summary['native_bundle_comparison']))
+    if summary.get('gpu_feature_comparison'): lines.append('GPU_FEATURE_COMPARISON='+json.dumps(summary['gpu_feature_comparison']))
     if error: lines.append('ERROR: '+str(error))
     (out/'summary.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     if print_report: print('\n'.join(lines), flush=True)
     return summary
 
 
-def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None, native_compare=False, native_bundle_compare=False):
+def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None, native_compare=False, native_bundle_compare=False,
+                      gpu_feature_compare=False):
     """Single bounded paired throughput check; no repeated prefill/prior/scan."""
     import shutil
-    if native_compare or native_bundle_compare: max_window_batch = 4
-    if native_compare and native_bundle_compare: raise ValueError('choose only one native comparison')
+    if native_compare or native_bundle_compare or gpu_feature_compare: max_window_batch = 4
+    if sum((native_compare,native_bundle_compare,gpu_feature_compare)) > 1: raise ValueError('choose only one backend comparison')
     source_run, new_out = Path(source_run).resolve(), Path(new_out).resolve()
     if new_out.exists(): raise RuntimeError('NEW CPU comparison output required; never overwrite the old timing report')
     c = validate_continuation(json.loads((source_run/'contract.json').read_text(encoding='utf-8')), source_run)
@@ -328,9 +352,10 @@ def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None, 
     for name in ('records.pt', 'warm_cache.json', 'diagnostic_weights.json'):
         shutil.copyfile(source_run/name, new_out/name)
     c = {**c, 'out': str(new_out), 'cpu_comparison': str(source_run)}
-    for flag in ('native_comparison','native_bundle_comparison'): c.pop(flag,None)
+    for flag in ('native_comparison','native_bundle_comparison','gpu_feature_comparison'): c.pop(flag,None)
     if native_compare: c['native_comparison'] = True
     if native_bundle_compare: c['native_bundle_comparison'] = True
+    if gpu_feature_compare: c['gpu_feature_comparison'] = True
     if c.get('snapshot'):
         shutil.copyfile(c['snapshot'], new_out/'checkpoint_snapshot.pt')
         c['snapshot'] = str(new_out/'checkpoint_snapshot.pt')
@@ -356,12 +381,16 @@ def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None, 
             recipes=[dict(name=name,window_batch=4,source_budget=128,workers=4,persistent=True,
                 optimize_cpu=True,optimize_kernels=True,backend='native',bundle=bundle)
                 for name,bundle in (('previous_native_b4',False),('optimized_native_b4',True))]
+        if gpu_feature_compare:
+            recipes = [dict(name=name,window_batch=4,source_budget=128,workers=6,persistent=True,
+                optimize_cpu=True,optimize_kernels=True,backend='native',bundle=True,column_feature_backend=feature)
+                for name,feature in (('cpu_features_b4','cpu'),('gpu_features_b4','gpu'))]
         for t in recipes:
             launch('trial', t); row = load_completed_trial(new_out, t, c); trials.append(row)
             publish_summary(c, trials, started=started, profile_status=profile_status, status=status)
             if row['status'] == 'oom': break
         decision = recommend_trials([t for t in trials if t.get('optimize_cpu') and t.get('optimize_kernels', True)])
-        if decision['recommended']:
+        if decision['recommended'] and not gpu_feature_compare:
             selected = next(t for t in recipes if t['name'] == decision['recommended_trial'])
             profile_status = 'complete' if launch('profile', selected) == 0 else 'oom_no_automatic_retry'
         if c.get('original_checkpoint') and sha256(c['original_checkpoint']) != c['snapshot_sha']:
@@ -437,6 +466,7 @@ def main():
     p.add_argument('--compare-run', help='reuse existing frozen diagnostic population in a NEW output; compare reference CPU path and all safe optimized batches')
     p.add_argument('--native-compare', action='store_true', help='only paired current NumPy/native batch4; compile outside throughput clock')
     p.add_argument('--native-bundle-compare',action='store_true',help='only previous native vs complete CPU optimization bundle at batch4')
+    p.add_argument('--gpu-feature-compare',action='store_true',help='one paired CPU/GPU feature check, same batch4/source128/workers6; no prefill/profile/capacity scan')
     p.add_argument('--finish-existing', action='store_true', help='only summarize completed trials and run their tiny CPU profile; skip untested larger batches')
     for key in ('config', 'train-cache', 'dev-cache', 'train-info', 'dev-info', 'base-checkpoint', 'dataroot', 'geometry-cache', 'out-dir'):
         p.add_argument('--'+key)
@@ -447,12 +477,12 @@ def main():
     p.add_argument('--cache-gib', type=float, default=48.); p.add_argument('--seed', type=int, default=20261002)
     a = p.parse_args()
     if a.worker_contract: return worker(a.worker_contract, a.phase, a.trial)
-    if a.native_compare and a.native_bundle_compare: p.error('choose only one native comparison')
+    if sum((a.native_compare,a.native_bundle_compare,a.gpu_feature_compare)) > 1: p.error('choose only one backend comparison')
     if a.compare_run:
         if a.continue_run or a.finish_existing or not a.out_dir: p.error('--compare-run requires NEW --out-dir and cannot continue/finish the old report')
         return compare_cpu_paths(a.compare_run,a.out_dir,max_window_batch=min(a.max_window_batch,32),
-            native_compare=a.native_compare,native_bundle_compare=a.native_bundle_compare)
-    if a.native_compare or a.native_bundle_compare: p.error('native comparison requires --compare-run and NEW --out-dir')
+            native_compare=a.native_compare,native_bundle_compare=a.native_bundle_compare,gpu_feature_compare=a.gpu_feature_compare)
+    if a.native_compare or a.native_bundle_compare or a.gpu_feature_compare: p.error('backend comparison requires --compare-run and NEW --out-dir')
     if a.continue_run:
         out = Path(a.continue_run).resolve()
         c = validate_continuation(json.loads((out/'contract.json').read_text(encoding='utf-8')), out)

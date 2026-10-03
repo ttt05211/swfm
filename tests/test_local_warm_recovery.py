@@ -347,3 +347,38 @@ def test_native_bundle_only_two_matched_children_and_does_not_rewrite_previous_a
     assert 'native_comparison' not in summary and 'cpu_comparison' not in summary
     assert (out/'records.pt').read_bytes() == (original/'records.pt').read_bytes()
     assert (out/'diagnostic_weights.json').read_bytes() == (original/'diagnostic_weights.json').read_bytes()
+
+
+@pytest.mark.parametrize('speedup,verified,oom,expected', [(1.2,6,0,True), (1.01,6,0,False),
+    (1.2,0,0,False), (1.2,6,1,False)])
+def test_gpu_compare_reuses_artifacts_only_two_children_and_gate_is_honest(tmp_path, speedup, verified, oom, expected):
+    original = tmp_path/'original'; original.mkdir()
+    c, cfg, pcfg, _ = real_continuation_fixture(original, legacy=True)
+    c['native_bundle_comparison'] = True
+    bench.write_json(original/'contract.json', c)
+    weights = json.loads((original/'diagnostic_weights.json').read_text())
+    before = {p:p.read_bytes() for p in original.rglob('*') if p.is_file()}
+    out = tmp_path/'gpu'; calls = []
+    def launch(phase, t):
+        calls.append((phase,t['column_feature_backend']))
+        assert phase == 'trial' and t['workers'] == 6 and t['window_batch'] == 4 and t['source_budget'] == 128
+        saved = json.loads((out/'contract.json').read_text())
+        save_trial(out, saved, weights, t['name'], 4, workers=6)
+        row = json.loads((out/(t['name']+'.json')).read_text()); row.update(t)
+        row['total_memory_mib'] = 100
+        if t['column_feature_backend'] == 'gpu':
+            for r in row['rows']:
+                r['wall_seconds'] /= speedup
+                r.update(gpu_feature_horizons=24,gpu_feature_fallback_horizons=0,
+                    gpu_feature_verified_horizons=verified,gpu_feature_oom_windows=oom)
+            row['measurement'] = trial_summary(row['rows'])
+        bench.write_json(out/(t['name']+'.json'), row)
+        return 0
+    with patch.object(bench,'load_runtime_config',return_value=cfg), patch.object(bench,'make_prepare_config',return_value=pcfg):
+        bench.compare_cpu_paths(original, out, launch=launch, gpu_feature_compare=True)
+    assert calls == [('trial','cpu'),('trial','gpu')]
+    assert all(p.read_bytes() == data for p,data in before.items())
+    summary = json.loads((out/'summary.json').read_text())
+    assert summary['gpu_feature_comparison']['pass_gate'] == expected
+    assert summary['cpu_profile_status'] == 'not_run'
+    assert 'native_bundle_comparison' not in summary and 'cpu_comparison' not in summary

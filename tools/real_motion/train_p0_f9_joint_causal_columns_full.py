@@ -128,6 +128,8 @@ def _main(stop_event, caches, runtime_state):
     parser.add_argument('--prewarm-causal-cache', action='store_true', help='explicitly persist all TRAIN history geometry before optimization; first build cost is not free')
     parser.add_argument('--profile-every', type=int, default=0, help='opt-in host/CUDA-stream stage clocks every N updates; 0 leaves normal path unchanged')
     parser.add_argument('--sampling-workers', type=int, default=0, help='0 uses 6 combined native horizon workers (legacy 4); horizon path capped at 8')
+    parser.add_argument('--column-feature-backend', choices=('cpu', 'gpu'), default='cpu',
+                        help='performance-only byte sampling; GPU has mandatory CPU checks and floor-boundary fallback')
     parser.add_argument('--persistent-sampling-pool', action='store_true', help='reuse bounded pure-CPU sampler pool across batches; same RNG/order/objective')
     parser.add_argument('--io-workers', type=int, default=2, help='bounded next-batch window loaders')
     parser.add_argument('--reference-cpu-pipeline', action='store_true', help='diagnostic fallback only; disable parallel warm prepare/shared sparse history/batched render readback')
@@ -152,6 +154,10 @@ def _main(stop_event, caches, runtime_state):
         else: args.history_frames = 4
     device = torch.device(args.device)
     if device.type == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()): raise RuntimeError('CUDA/BF16 required')
+    column_feature_sampler = None
+    if args.column_feature_backend == 'gpu':
+        from real_motion.column_gpu_sampling import GpuColumnSampler
+        column_feature_sampler = GpuColumnSampler(device)
     torch.set_num_threads(1); torch.manual_seed(args.seed); random.seed(args.seed); np.random.seed(args.seed)
     if device.type == 'cuda': torch.cuda.manual_seed_all(args.seed)
     cfg = load_runtime_config(args.config, args.override); pcfg = make_prepare_config(cfg); config_sha = stable_json_fingerprint(cfg)
@@ -263,6 +269,7 @@ def _main(stop_event, caches, runtime_state):
         owner = SamplingPoolOwner(cpu_pool_workers, horizons=cpu_horizons)
         caches.append(owner); sampling_pool = owner.pool
     print('CPU_PIPELINE '+json.dumps({'task_granularity': 'horizon' if cpu_horizons else 'window',
+        'column_feature_backend': args.column_feature_backend,
         'combined_workers': cpu_pool_workers, 'io_workers': args.io_workers,
         'candidate_workers': cpu_pool_workers, 'feature_workers': cpu_pool_workers,
         'shared_worker_pool': cpu_horizons,
@@ -355,7 +362,8 @@ def _main(stop_event, caches, runtime_state):
                     probe=updates < 2 or (updates+1) % 128 == 0, patch_resolution=identity['patch_resolution_m'],
                     control=control, control_optimizer=control_optimizer,
                     profile=args.profile_every > 0 and (updates+1) % args.profile_every == 0,
-                    sampling_pool=sampling_pool, sampling_workers=args.sampling_workers, optimize_cpu=not args.reference_cpu_pipeline)
+                    sampling_pool=sampling_pool, sampling_workers=args.sampling_workers, optimize_cpu=not args.reference_cpu_pipeline,
+                    column_feature_sampler=column_feature_sampler)
                 updates += 1; successes += int(stats['optimizer_updated']); executed += stats['windows']; sampled += stats['sampled_columns']
                 link_observed |= (stats['source_query_gradient_norm'] or 0.) > 0
                 cursor_epoch, cursor_batch = e, bi; wall = time.perf_counter()-compute_started+wait

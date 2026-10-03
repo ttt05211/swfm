@@ -12,7 +12,7 @@ from tools.real_motion.joint_column_common import (JointColumnProvider, select_o
     OnlineColumnCandidateBuilder, draw_online_column_indices, materialize_online_column, online_column_history_index)
 from tools.real_motion.causal_column_common import (causal_source_history, FEATURE_KEYS,
     history_grid_footprint_bev_sequence, build_future_static_memory_only, fixed_candidate_geometry,
-    compose_component_replacements_fast_exact, prepare_warm_columns_cpu, DYN, FREE)
+    compose_component_replacements_fast_exact, prepare_warm_columns_cpu, pose_motion, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from real_motion.local_training_profile import StageTimer
 from real_motion.native_column_cpu import backend_name, bundle_enabled
@@ -163,7 +163,8 @@ def materialize_scalar_stats(values):
 
 def train_full_batch(joint, optimizer, provider, source, rows, rng, update, schedule_steps,
                      *, probe=False, patch_resolution=.8, control=None, control_optimizer=None,
-                     profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0, optimize_cpu=True, optimize_kernels=True):
+                     profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0, optimize_cpu=True, optimize_kernels=True,
+                     column_feature_sampler=None):
     """True batching, not repeated optimizer steps or stale feature replay."""
     joint.train(); optimizer.zero_grad(set_to_none=True); set_lr(optimizer, update-1, schedule_steps)
     timer = StageTimer(provider.device, profile)
@@ -187,6 +188,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
     candidate_wait_seconds = candidate_worker_seconds = 0.
     materialize_seconds = index_worker_seconds = 0.
     candidate_jobs = feature_jobs = index_jobs = 0
+    gpu_stats = {}
     candidate_columns=compact_columns=compact_bytes=materialized_columns=0
     workers = sampling_worker_budget(int(getattr(provider, 'workers', 4)), sampling_workers, horizons=horizons)
     def cpu_call(name, fn, *args, **kwargs):
@@ -203,6 +205,15 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         started = time.perf_counter()
         index = cpu_call('history_index_workers', online_column_history_index, prep, draws, provider.pcfg.grid)
         return index, time.perf_counter()-started
+    def pack_gpu_window(prep, selected):
+        # Only NumPy here. All device work and live query gathering remain on
+        # the main/autograd thread; caller RNG has already drawn all IDs.
+        from real_motion.column_gpu_sampling import pack_column_window
+        started = time.perf_counter()
+        materialized = [materialize_online_column(row) for row in selected] if horizons else selected
+        materialize_time = time.perf_counter()-started
+        packed = pack_column_window(prep, materialized, provider.pcfg.grid, joint.columns.config, pose_motion)
+        return materialized, packed, time.perf_counter()-started, materialize_time
     def sample_horizon(prep, draw, index_job):
         # The index was queued BEFORE every dependent job in the feature FIFO.
         # No worker submits children, and even a single worker cannot deadlock.
@@ -289,7 +300,11 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             selection_seconds += time.perf_counter()-tick
             candidate_columns+=sum(len(plan) for _,plan,_ in plans)
             audits.extend(plan for _,plan,_ in plans)
-            if horizons:
+            if column_feature_sampler is not None:
+                jobs = [submit_features(pack_gpu_window, prep, selected)]
+                feature_jobs += len(jobs); index_jobs += int(bool(selected))
+                pending.append((prep, selected, jobs, None))
+            elif horizons:
                 # One immutable membership index per window, no repeated
                 # inversions/tables per horizon and no large process copies.
                 index_job = submit_features(history_index, prep, selected) if selected else None
@@ -302,7 +317,13 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         for prep, selected, jobs, index_job in pending:
             tick = time.perf_counter(); mapped = [job.result() for job in jobs]
             feature_wait_seconds += time.perf_counter()-tick
-            if horizons:
+            if column_feature_sampler is not None:
+                selected, packed, seconds, materialized = mapped[0]
+                worker_seconds += seconds; materialize_seconds += materialized
+                arrays, extra = timer.call('gpu_history_features', column_feature_sampler.sample,
+                    prep, selected, provider.pcfg.grid, joint.columns.config, pose_motion, packed=packed, gpu=True)
+                for k, v in extra.items(): gpu_stats[k] = gpu_stats.get(k, 0)+v
+            elif horizons:
                 if index_job is not None: index_worker_seconds += index_job.result()[1]
                 selected = [row for row, _, _, _ in mapped]
                 arrays = [a for _, a, _, _ in mapped]
@@ -356,7 +377,8 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
     if bundle: scalars=timer.call('diagnostics_readback',materialize_scalar_stats,scalars)
     else: scalars={k:float(v) if isinstance(v,torch.Tensor) else v for k,v in scalars.items()}
     timings = timer.finish()
-    return {**timings,**scalars,'optimizer_updated': bool(updated),
+    return {**timings,**scalars,**gpu_stats,'optimizer_updated': bool(updated),
+        'column_feature_backend': 'gpu' if column_feature_sampler is not None else 'cpu',
         'source_query_gradient_norm': link_grad, 'gradient_probe': probe, 'sampled_columns': sampled,
         'windows': len(rows), 'sources': sum(sizes), 'prepare_main_seconds': prep_seconds,
         'online_sampling_seconds': candidate_wait_seconds+selection_seconds+feature_wait_seconds,
