@@ -9,6 +9,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
+import os
 import subprocess
 import time
 import traceback
@@ -72,6 +73,11 @@ def measured_batches(joint, optimizer, provider, source, records, *, windows, so
 
 def worker(contract_path, phase, trial):
     c = json.loads(Path(contract_path).read_text(encoding='utf-8')); out = Path(c['out'])
+    from real_motion.native_column_cpu import prepare_native, get_native
+    recipe = json.loads(trial) if trial else {}
+    os.environ['SWFM_COLUMN_CPU_BACKEND'] = recipe.get('backend', 'numpy')
+    if recipe.get('backend') == 'native':
+        print('NATIVE_CPU_PREFLIGHT '+json.dumps(prepare_native()), flush=True)
     torch.set_num_threads(1); torch.manual_seed(c['seed']); device = torch.device('cuda')
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(): raise RuntimeError('CUDA/BF16 required')
     torch.cuda.manual_seed_all(c['seed'])
@@ -157,6 +163,7 @@ def worker(contract_path, phase, trial):
                     cpu_pipeline=('deferred_train_context_exact_numpy_v2' if args['optimize_kernels'] else 'window_shared_history_parallel_warm_v1')
                         if args['optimize_cpu'] else 'reference_serial_window_per_horizon_jobs',
                     pipeline_code_sha256=sha256(Path(__file__).resolve().with_name('joint_column_full_common.py'))))
+            result['execution']['native_cpu'] = get_native().info() if get_native() is not None else None
             write_json(out/(name+'.json'), result)
             print(f"{name}: {m['windows_per_second']:.3f} windows/s, mean_batch={m['mean_windows_per_batch']:.2f}, peak_reserved={capacity_peak:.0f}MiB", flush=True)
         return 0
@@ -268,6 +275,12 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
             same_batch4_speedup_vs_previous=(fixed_batch['measurement']['windows_per_second']/previous['measurement']['windows_per_second']
                 if previous and fixed_batch else None),
             note='same records/prior/initialization; timed separately without cProfile; no scientific updates saved')
+    if c.get('native_comparison'):
+        numpy_trial = next((t for t in trials if t['name'] == 'optimized_b4' and t['status'] == 'ok'), None)
+        native_trial = next((t for t in trials if t['name'] == 'native_b4' and t['status'] == 'ok'), None)
+        summary['native_comparison'] = dict(speedup=(native_trial['measurement']['windows_per_second']/numpy_trial['measurement']['windows_per_second']
+            if numpy_trial and native_trial else None), scope='paired batch4/source128, same records/prior/initialization, compilation excluded',
+            native_artifact=native_trial['execution']['native_cpu'] if native_trial else None)
     write_json(out/'summary.json', summary)
     lines = ['===== LOCAL WARM DISK SPEED ONLY =====', 'status='+status,
         f"history_frames={c['history_frames']}, future_frames=6, geometry_RAM=0MiB",
@@ -284,15 +297,17 @@ def publish_summary(c, trials, *, started, profile_status, status, error=None, r
         'reused_trials='+json.dumps(list(reused)),
         'CPU function details: cpu_profile.txt if complete (separate serialized-worker cProfile pass, NOT throughput measurement)', summary['caution']]
     if summary.get('cpu_comparison'): lines.append('CPU_OPTIMIZATION_COMPARISON='+json.dumps(summary['cpu_comparison']))
+    if summary.get('native_comparison'): lines.append('NATIVE_CPU_COMPARISON='+json.dumps(summary['native_comparison']))
     if error: lines.append('ERROR: '+str(error))
     (out/'summary.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     if print_report: print('\n'.join(lines), flush=True)
     return summary
 
 
-def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None):
+def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None, native_compare=False):
     """Single bounded paired throughput check; no repeated prefill/prior/scan."""
     import shutil
+    if native_compare: max_window_batch = 4
     source_run, new_out = Path(source_run).resolve(), Path(new_out).resolve()
     if new_out.exists(): raise RuntimeError('NEW CPU comparison output required; never overwrite the old timing report')
     c = validate_continuation(json.loads((source_run/'contract.json').read_text(encoding='utf-8')), source_run)
@@ -301,6 +316,7 @@ def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None):
     for name in ('records.pt', 'warm_cache.json', 'diagnostic_weights.json'):
         shutil.copyfile(source_run/name, new_out/name)
     c = {**c, 'out': str(new_out), 'cpu_comparison': str(source_run)}
+    if native_compare: c['native_comparison'] = True
     if c.get('snapshot'):
         shutil.copyfile(c['snapshot'], new_out/'checkpoint_snapshot.pt')
         c['snapshot'] = str(new_out/'checkpoint_snapshot.pt')
@@ -318,6 +334,10 @@ def compare_cpu_paths(source_run, new_out, *, max_window_batch=32, launch=None):
             dict(name='previous_b4', window_batch=4, source_budget=128, workers=4, persistent=True, optimize_cpu=True, optimize_kernels=False)]
         recipes += [dict(name=f'optimized_b{w}', window_batch=w, source_budget=32*w, workers=4, persistent=True, optimize_cpu=True, optimize_kernels=True)
             for w in (4, 8, 16, 32) if w <= max_window_batch]
+        if native_compare:
+            recipes = [dict(name=name, window_batch=4, source_budget=128, workers=4, persistent=True,
+                optimize_cpu=True, optimize_kernels=True, backend=backend)
+                for name, backend in (('optimized_b4', 'numpy'), ('native_b4', 'native'))]
         for t in recipes:
             launch('trial', t); row = load_completed_trial(new_out, t, c); trials.append(row)
             publish_summary(c, trials, started=started, profile_status=profile_status, status=status)
@@ -397,6 +417,7 @@ def main():
     p.add_argument('--worker-contract'); p.add_argument('--phase', choices=('warm', 'trial', 'profile')); p.add_argument('--trial')
     p.add_argument('--continue-run', help='existing diagnostic directory; reuse completed cache/prior/trials, NOT a training resume')
     p.add_argument('--compare-run', help='reuse existing frozen diagnostic population in a NEW output; compare reference CPU path and all safe optimized batches')
+    p.add_argument('--native-compare', action='store_true', help='only paired current NumPy/native batch4; compile outside throughput clock')
     p.add_argument('--finish-existing', action='store_true', help='only summarize completed trials and run their tiny CPU profile; skip untested larger batches')
     for key in ('config', 'train-cache', 'dev-cache', 'train-info', 'dev-info', 'base-checkpoint', 'dataroot', 'geometry-cache', 'out-dir'):
         p.add_argument('--'+key)
@@ -409,7 +430,8 @@ def main():
     if a.worker_contract: return worker(a.worker_contract, a.phase, a.trial)
     if a.compare_run:
         if a.continue_run or a.finish_existing or not a.out_dir: p.error('--compare-run requires NEW --out-dir and cannot continue/finish the old report')
-        return compare_cpu_paths(a.compare_run, a.out_dir, max_window_batch=min(a.max_window_batch, 32))
+        return compare_cpu_paths(a.compare_run, a.out_dir, max_window_batch=4 if a.native_compare else min(a.max_window_batch, 32), native_compare=a.native_compare)
+    if a.native_compare: p.error('--native-compare requires --compare-run and NEW --out-dir')
     if a.continue_run:
         out = Path(a.continue_run).resolve()
         c = validate_continuation(json.loads((out/'contract.json').read_text(encoding='utf-8')), out)

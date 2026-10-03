@@ -40,8 +40,15 @@ if [[ "${FULL_JOINT_PERSISTENT_POOL:-1}" == 1 ]]; then EXTRA+=(--persistent-samp
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$FULL_ROOT:$FULL_ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
+export SWFM_COLUMN_CPU_BACKEND="${FULL_JOINT_CPU_BACKEND:-numpy}"
+if [[ "$SWFM_COLUMN_CPU_BACKEND" == native ]]; then
+  "$PY" -u tools/real_motion/check_column_native_cpu.py
+  "$PY" -m pytest -q tests/test_native_column_cpu.py
+elif [[ "$SWFM_COLUMN_CPU_BACKEND" != numpy ]]; then
+  echo "FULL_JOINT_CPU_BACKEND 只能是 numpy/native" >&2; exit 2
+fi
 "$PY" -c 'import torch,sys; print(sys.executable,torch.__version__); assert torch.cuda.is_available() and torch.cuda.is_bf16_supported(), "CUDA/BF16 unavailable"'
-"$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_column_runtime_pipeline.py tests/test_causal_geometry_cache.py
+SWFM_COLUMN_CPU_BACKEND=numpy "$PY" -m pytest -q tests/test_joint_causal_columns_full.py tests/test_column_runtime_pipeline.py tests/test_causal_geometry_cache.py
 mkdir -p "$RUN_DIR"
 if [[ -n "${FULL_JOINT_RESUME:-}" ]]; then
   echo "断点恢复一阶段：$FULL_JOINT_RESUME；原总轮数$EPOCHS，恢复optimizer/RNG/整段余弦，跳过prior。"

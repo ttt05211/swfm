@@ -9,7 +9,7 @@ def inside_xyz(indices, shape):
             & (z >= 0) & (z < shape[2]))
 
 
-def metric_indices_inplace(points, origin, step, shape):
+def metric_indices_inplace(points, origin, step, shape, *, check_bounds=True):
     """Consume a fresh transform output; do NOT pass shared history points.
 
     Keep float64 subtraction, division and floor in the reference order. This
@@ -19,4 +19,5 @@ def metric_indices_inplace(points, origin, step, shape):
     np.divide(points, step, out=points)
     np.floor(points, out=points)
     indices = points.astype(np.int64)
-    return indices, inside_xyz(indices, shape)
+    # Native gather performs the same integer bounds check in its own loop.
+    return indices, inside_xyz(indices, shape) if check_bounds else None

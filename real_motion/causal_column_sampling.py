@@ -68,6 +68,8 @@ class ColumnFeatureSampler:
         self.transforms = {}; self.members = {}
         self.optimized = getattr(prepared, 'cpu_pipeline_optimized', True)
         self.kernels_optimized = self.optimized and getattr(prepared, 'cpu_kernels_optimized', True)
+        from .native_column_cpu import get_native
+        self.native = get_native() if self.kernels_optimized else None
         self.index = getattr(prepared, 'column_history_index', None) if self.optimized else None
         if self.optimized and self.index is None:
             self.index = ColumnHistoryIndex(prepared, grid, actors=np.unique(plan.actor))
@@ -141,10 +143,13 @@ class ColumnFeatureSampler:
                 stop = min(start+65536, len(xyz))
                 pts = transform_points(xyz[start:stop], transform)
                 if self.kernels_optimized:
-                    ijk, valid = metric_indices_inplace(pts, self.origin, self.step, self.shape)
+                    ijk, valid = metric_indices_inplace(pts, self.origin, self.step, self.shape, check_bounds=self.native is None)
                 else:
                     ijk = np.floor((pts-self.origin)/self.step).astype(np.int64)
                     valid = ((ijk >= 0)&(ijk < self.shape)).all(1)
+                if self.native is not None:
+                    labels[start:stop], flags[start:stop] = self._native_gather(actor, f, ijk)
+                    continue
                 at = tuple(ijk[valid].T)
                 labels[start:stop][valid] = self.history[f][at]
                 bits = self.observed[f][at].astype(np.uint8)
@@ -163,6 +168,11 @@ class ColumnFeatureSampler:
         for f in range(self.t):
             if frames[f] is None: frames[f] = (np.full(shape, UNKNOWN, np.uint8), np.zeros(shape, np.uint8))
         return lo, np.stack([v[0] for v in frames]), np.stack([v[1] for v in frames])
+
+    def _native_gather(self, actor, frame, indices):
+        owned = self.members[actor][frame] if actor >= 0 else None
+        table = self.index.tables[actor][frame] if actor >= 0 and self.index is not None else None
+        return self.native.gather(indices, self.history[frame], self.observed[frame], owned, table)
 
     def _sparse(self, plan, actor):
         """Same reference arithmetic, reusing inverses for uncached/small actors."""
@@ -194,18 +204,23 @@ class ColumnFeatureSampler:
             if transform is None: continue
             pts = transform_points(xyz, transform)
             if self.kernels_optimized:
-                ijk, valid = metric_indices_inplace(pts, self.origin, self.step, self.shape)
+                ijk, valid = metric_indices_inplace(pts, self.origin, self.step, self.shape, check_bounds=self.native is None)
             else:
                 ijk = np.floor((pts-self.origin)/self.step).astype(np.int64)
                 valid = ((ijk >= 0)&(ijk < self.shape)).all(1)
-            at = tuple(ijk[valid].T)
-            labels = np.full(len(ijk), UNKNOWN, np.uint8); bits = np.zeros(len(ijk), np.uint8)
-            labels[valid] = self.history[f][at]; bits[valid] = self.observed[f][at].astype(np.uint8)
-            if actor >= 0:
-                flat = np.ravel_multi_index(ijk[valid].T, tuple(self.shape))
-                owned = self.index.contains(actor, f, flat) if self.index is not None else np.isin(flat, self.members[actor][f])
-                bits[valid] |= owned.astype(np.uint8)*2
+            if self.native is not None:
+                labels, bits = self._native_gather(actor, f, ijk)
+            else:
+                at = tuple(ijk[valid].T)
+                labels = np.full(len(ijk), UNKNOWN, np.uint8); bits = np.zeros(len(ijk), np.uint8)
+                labels[valid] = self.history[f][at]; bits[valid] = self.observed[f][at].astype(np.uint8)
+                if actor >= 0:
+                    flat = np.ravel_multi_index(ijk[valid].T, tuple(self.shape))
+                    owned = self.index.contains(actor, f, flat) if self.index is not None else np.isin(flat, self.members[actor][f])
+                    bits[valid] |= owned.astype(np.uint8)*2
             hist[:, f] = labels.reshape(n, p, p, z); flags[:, f] = bits.reshape(n, p, p, z)
+        if self.native is not None:
+            return self.native.expand(hist, flags, inverse.astype(np.int64, copy=False), plan.classes, actor < 0)
         hist, flags = hist[inverse], flags[inverse]
         if actor < 0: flags |= (hist == plan.classes[:, None, None, None, None]).astype(np.uint8)*2
         return hist, flags

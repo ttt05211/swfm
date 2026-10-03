@@ -5,6 +5,9 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != OccFM ]]; then echo "请先 conda activate Occ
 ROOT=/root/nas/occ/swfm
 cd "$ROOT"
 PY="$(command -v python)"
+if [[ "${LOCAL_WARM_NATIVE:-0}" == 1 && -z "${LOCAL_WARM_COMPARE:-}" ]]; then
+  echo "编译CPU对照必须指定 LOCAL_WARM_COMPARE，避免误跑冷缓存或扩容扫描。" >&2; exit 2
+fi
 DATAROOT=/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes
 if pgrep -f '[p]ython.*(train_p0_f9_joint_causal_columns|benchmark_p0_f9_joint_local_warm)' >/dev/null; then
   echo "先安全停止旧联合训练，避免争抢CPU/GPU或改变last.pt；本脚本不会kill进程。" >&2; exit 2
@@ -29,11 +32,21 @@ fi
 echo "不启动15轮。输出 $RUN_DIR"
 if [[ -n "${LOCAL_WARM_COMPARE:-}" ]]; then
   if [[ -n "${LOCAL_WARM_CONTINUE:-}" ]]; then echo "比较模式不能同时接续旧报告" >&2; exit 2; fi
-  echo "复用旧样本/cache/prior：比较reference/上一版/新版batch4；扩容上限=${LOCAL_WARM_MAX_BATCH:-32}，不重扫64/128。"
+  if [[ "${LOCAL_WARM_NATIVE:-0}" != 1 ]]; then
+    echo "复用旧样本/cache/prior：比较reference/上一版/新版batch4；扩容上限=${LOCAL_WARM_MAX_BATCH:-32}，不重扫64/128。"
+  fi
   # Tiny synthetic GPU integration gate, not another dataset experiment.
-  "$PY" -m pytest -q tests/test_local_cpu_pipeline.py -k cuda
+  NATIVE_EXTRA=()
+  if [[ "${LOCAL_WARM_NATIVE:-0}" == 1 ]]; then
+    echo "仅 NumPy/C++ batch4/source128 对照；编译与一致性检查不计入吞吐，不重建缓存。"
+    "$PY" -u tools/real_motion/check_column_native_cpu.py
+    "$PY" -m pytest -q tests/test_native_column_cpu.py
+    NATIVE_EXTRA+=(--native-compare)
+  else
+    "$PY" -m pytest -q tests/test_local_cpu_pipeline.py -k cuda
+  fi
   "$PY" -u tools/real_motion/benchmark_p0_f9_joint_local_warm.py \
-    --compare-run "$LOCAL_WARM_COMPARE" --out-dir "$RUN_DIR" --max-window-batch "${LOCAL_WARM_MAX_BATCH:-32}"
+    --compare-run "$LOCAL_WARM_COMPARE" --out-dir "$RUN_DIR" --max-window-batch "${LOCAL_WARM_MAX_BATCH:-32}" "${NATIVE_EXTRA[@]}"
 elif [[ -n "${LOCAL_WARM_CONTINUE:-}" ]]; then
   if [[ ! -f "$RUN_DIR/contract.json" ]]; then echo "[MISSING] $RUN_DIR/contract.json" >&2; exit 2; fi
   CONTINUE_EXTRA=()

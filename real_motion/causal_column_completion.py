@@ -121,6 +121,10 @@ def _action_targets_validated_plan(plan, future_gt):
     gt = np.asarray(future_gt)
     if gt.size <= int(plan.flat.max(initial=-1)) or not _valid_semantics(gt):
         raise ValueError("invalid future supervision grid")
+    from .native_column_cpu import get_native
+    native = get_native()
+    if native is not None and gt.dtype == np.uint8:
+        return native.targets(plan, gt)
     g = gt.reshape(-1)[plan.flat]
     y = np.zeros_like(plan.base, dtype=np.int64)
     y[plan.legal[..., ADD] & (g == plan.classes[:, None])] = ADD
@@ -210,7 +214,9 @@ def sample_queries(plan, targets, per_kind, rng, *, optimize=False):
     populations = ((np.flatnonzero(plan.kind == GENERATE), per_kind),
                    (np.flatnonzero((plan.kind == REFINE)&(plan.actor < 0)), max(2, per_kind//2)),
                    (np.flatnonzero((plan.kind == REFINE)&(plan.actor >= 0)), max(2, per_kind//2)))
-    changed = (targets != KEEP).any(axis=1) if optimize else None
+    from .native_column_cpu import get_native
+    native = get_native() if optimize else None
+    changed = (native.changed(targets) if native is not None else (targets != KEEP).any(axis=1)) if optimize else None
     for population, budget in populations:
         if optimize:
             positive = changed[population]

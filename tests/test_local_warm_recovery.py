@@ -283,3 +283,29 @@ def test_cpu_comparison_reuses_real_population_prior_cache_but_never_old_report(
     assert summary['cpu_comparison']['same_batch4_speedup_vs_previous'] == 1.0
     assert (out/'diagnostic_weights.json').read_bytes() == (original/'diagnostic_weights.json').read_bytes()
     assert (out/'records.pt').read_bytes() == (original/'records.pt').read_bytes()
+
+
+def test_native_comparison_only_two_batch4_children_no_prefill_or_capacity_sweep(tmp_path):
+    original = tmp_path/'original'; original.mkdir()
+    c, cfg, pcfg, _ = real_continuation_fixture(original, legacy=True)
+    bench.write_json(original/'contract.json', c)
+    weights = json.loads((original/'diagnostic_weights.json').read_text())
+    before = {p: p.read_bytes() for p in original.rglob('*') if p.is_file()}
+    out = tmp_path/'native-comparison'; calls = []
+    def launch(phase, t):
+        calls.append((phase, t['name'], t['backend']))
+        assert phase != 'warm' and t['window_batch'] == 4 and t['source_budget'] == 128
+        if phase == 'trial':
+            saved_c = json.loads((out/'contract.json').read_text())
+            save_trial(out, saved_c, weights, t['name'], t['window_batch'])
+            row = json.loads((out/(t['name']+'.json')).read_text()); row.update(t)
+            row['execution'] = {'native_cpu': {'calls': {'rows': 100}} if t['backend'] == 'native' else None}
+            bench.write_json(out/(t['name']+'.json'), row)
+        return 0
+    with patch.object(bench, 'load_runtime_config', return_value=cfg), patch.object(bench, 'make_prepare_config', return_value=pcfg):
+        bench.compare_cpu_paths(original, out, max_window_batch=32, launch=launch, native_compare=True)
+    assert calls == [('trial', 'optimized_b4', 'numpy'), ('trial', 'native_b4', 'native'), ('profile', 'optimized_b4', 'numpy')]
+    assert all(p.read_bytes() == b for p, b in before.items())
+    summary = json.loads((out/'summary.json').read_text())
+    assert summary['native_comparison']['speedup'] == 1.0
+    assert summary['native_comparison']['native_artifact']['calls']['rows'] == 100

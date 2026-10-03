@@ -120,6 +120,9 @@ def _main(stop_event, caches):
     parser.add_argument('--io-workers', type=int, default=2, help='bounded next-batch window loaders')
     parser.add_argument('--reference-cpu-pipeline', action='store_true', help='diagnostic fallback only; disable parallel warm prepare/shared sparse history/batched render readback')
     args = parser.parse_args(); started = time.perf_counter(); out = Path(args.out_dir)
+    from real_motion.native_column_cpu import backend_name, prepare_native
+    if backend_name() == 'native':
+        print('NATIVE_CPU_PREFLIGHT '+json.dumps(prepare_native()), flush=True)
     if out.exists(): parser.error('NEW output directory required')
     if (min(args.epochs, args.window_batch_size, args.source_budget, args.cpu_workers, args.eval_batch_size, args.checkpoint_every) < 1
             or min(args.frame_cache_mib, args.causal_cache_gib, args.causal_cache_ram_mib) < 0 or not np.isfinite(args.causal_cache_gib)):

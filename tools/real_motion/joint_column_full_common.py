@@ -14,6 +14,7 @@ from tools.real_motion.causal_column_common import (causal_source_history, FEATU
     compose_component_replacements_fast_exact, prepare_warm_columns_cpu, DYN, FREE)
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from real_motion.local_training_profile import StageTimer
+from real_motion.native_column_cpu import backend_name
 from real_motion.v18_motion_gap import numpy
 
 MOTION_KEYS = ('features', 'local_semantic_tube', 'kta_displacement_xy_m',
@@ -285,6 +286,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         'causal_geometry_worker_seconds_sum': sum(float(raw.get('_causal_geometry_seconds', 0.)) for _, raw in rows if raw is not None),
         'cpu_pipeline_optimized': optimize_cpu,
         'cpu_kernels_optimized': optimize_cpu and optimize_kernels,
+        'integer_cpu_backend': backend_name(),
         'parallel_warm_preparations': sum(job is not None for _, _, _, job in preparation),
         'peak_memory_mib': torch.cuda.max_memory_allocated(provider.device)/2**20 if provider.device.type == 'cuda' else None,
         **stats, **column_stats}

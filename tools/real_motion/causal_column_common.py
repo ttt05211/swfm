@@ -340,23 +340,30 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig(), *, defer_context=Fa
     rows = []; descriptors = []; row_count = 0
     fast = getattr(prepared, 'cpu_pipeline_optimized', True)
     kernels = fast and getattr(prepared, 'cpu_kernels_optimized', True)
+    from real_motion.native_column_cpu import get_native
+    native = get_native() if kernels else None
+    support_workspace = None
     relative_pose = None
     def append(xy, kind, actor, classes, allowed_z, ax, ay, age):
         nonlocal relative_pose, row_count
         if not len(xy): return
-        flat = ((xy[:, 0:1]*shape[1]+xy[:, 1:2])*z+np.arange(z)).astype(np.int64)
-        base = b.reshape(-1)[flat]; fall = base.copy()
-        legal = np.zeros((*base.shape, 3), bool); legal[..., KEEP] = True
-        legal[..., ADD] = (base == FREE)&allowed_z
-        if kind == REFINE:
-            if actor >= 0:
-                own = prepared.owners[h].reshape(-1)[flat] == actor
-                restored = prepared.fallbacks[h].reshape(-1)[flat]
-            else:
-                own = base == classes[:, None]; restored = np.full_like(base, FREE)
-            fall[own] = restored[own]
-            legal[..., REMOVE] = own & (base == classes[:, None]) & (fall != base)
-        active = legal[..., 1:].any(axis=(1, 2))
+        if native is not None:
+            flat, base, fall, legal, active = native.rows(xy, classes, allowed_z, b,
+                prepared.owners[h], prepared.fallbacks[h], kind, actor)
+        else:
+            flat = ((xy[:, 0:1]*shape[1]+xy[:, 1:2])*z+np.arange(z)).astype(np.int64)
+            base = b.reshape(-1)[flat]; fall = base.copy()
+            legal = np.zeros((*base.shape, 3), bool); legal[..., KEEP] = True
+            legal[..., ADD] = (base == FREE)&allowed_z
+            if kind == REFINE:
+                if actor >= 0:
+                    own = prepared.owners[h].reshape(-1)[flat] == actor
+                    restored = prepared.fallbacks[h].reshape(-1)[flat]
+                else:
+                    own = base == classes[:, None]; restored = np.full_like(base, FREE)
+                fall[own] = restored[own]
+                legal[..., REMOVE] = own & (base == classes[:, None]) & (fall != base)
+            active = legal[..., 1:].any(axis=(1, 2))
         xy, flat, base, fall, legal, classes, ax, ay = (v[active] for v in (xy, flat, base, fall, legal, classes, ax, ay))
         if (fast or defer_context) and relative_pose is None:
             relative_pose = np.linalg.inv(prepared.state['current_pose'])@prepared.raw['future_poses'][h]
@@ -380,7 +387,7 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig(), *, defer_context=Fa
         # baseline on that support, not every voxel of the entire grid.
         potential = (geometry['generation_xy'] if 'generation_xy' in geometry
             else np.argwhere(frontier.causal_by_width[config.entry_radius_m]))
-        xy = potential[(b[tuple(potential.T)] == FREE).any(1)]
+        xy = native.generation(potential, b) if native is not None else potential[(b[tuple(potential.T)] == FREE).any(1)]
         ax, ay = frontier.nearest_x[tuple(xy.T)], frontier.nearest_y[tuple(xy.T)]
     else:
         entry = frontier.causal_by_width[config.entry_radius_m] & (b == FREE).any(2)
@@ -390,7 +397,10 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig(), *, defer_context=Fa
     # Historical road/sidewalk residuals ONLY inside visited grid; not full-scene
     # refinement. Static occupied edits never touch dynamic/source-owned labels.
     historical = geometry['historical']
-    if kernels:
+    if native is not None:
+        xy = native.static(footprint, historical, m, b)
+        cls = dominant[tuple(xy.T)]; mask = geometry['static_allowed'][tuple(xy.T)]
+    elif kernels:
         potential = geometry.get('static_xy')
         static_support = None if potential is not None else footprint & historical.any(2)
         count = len(potential) if potential is not None else np.count_nonzero(static_support)
@@ -429,10 +439,17 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig(), *, defer_context=Fa
         ids = np.concatenate(all_flat)
         if not fast: ids = np.unique(ids)
         if not len(ids): continue
-        xyz = np.column_stack(np.unravel_index(ids, shape))
-        xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells, optimize=kernels)
-        allowed = np.broadcast_to((np.arange(z) >= max(0, xyz[:, 2].min()-1))
-                                  & (np.arange(z) <= min(z-1, xyz[:, 2].max()+1)), (len(xy), z)).copy()
+        if native is not None and config.boundary_padding_cells == 1:
+            if support_workspace is None:
+                support_workspace = (np.empty(shape[:2], np.uint8),
+                    np.empty((shape[0]*shape[1], 2), np.int64), np.empty(2, np.int64))
+            xy, zlo, zhi = native.support(ids, shape, support_workspace)
+        else:
+            xyz = np.column_stack(np.unravel_index(ids, shape))
+            xy = padded_support_xy(xyz[:, :2], shape[:2], config.boundary_padding_cells, optimize=kernels)
+            zlo, zhi = xyz[:, 2].min(), xyz[:, 2].max()
+        allowed = np.broadcast_to((np.arange(z) >= max(0, zlo-1))
+                                  & (np.arange(z) <= min(z-1, zhi+1)), (len(xy), z)).copy()
         age = .5*(len(registered)-1-min(f for f, reg in enumerate(registered) if reg is not None))
         center = xy.mean(0)
         append(xy, REFINE, i, np.full(len(xy), int(comp["class_id"]), np.uint8), allowed,
