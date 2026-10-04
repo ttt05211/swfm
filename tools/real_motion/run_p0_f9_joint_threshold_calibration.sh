@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixed-weight tuning only. Wait for existing GPU evaluation; never signal it.
+# Fixed-weight tuning only. Optional wait; never signal another evaluation.
 set -euo pipefail
 [[ "${CONDA_DEFAULT_ENV:-}" == OccFM ]] || { echo '请先 conda activate OccFM' >&2; exit 2; }
 [[ $# -le 1 ]] || { echo "用法: bash $0 [checkpoint]" >&2; exit 2; }
@@ -11,10 +11,18 @@ CHECKPOINT="${1:-$ROOT/outputs/p0_f9_joint_causal_columns/checkpoint_selection_2
 if [[ "${JOINT_THRESHOLD_RESUME:-0}" == 1 && -z "${JOINT_THRESHOLD_OUT:-}" ]]; then
   echo '恢复校准必须设置 JOINT_THRESHOLD_OUT 为原校准输出目录。' >&2; exit 2
 fi
-while pgrep -f '[p]ython.*(train_p0_f9_joint_causal_columns_full.py|eval_p0_f9_joint_causal_columns.py|eval_p0_f9_joint_checkpoints.py|calibrate_p0_f9_joint_thresholds.py|eval_p0_f9_joint_zero_shot_long_rollout.py)' >/dev/null; do
-  echo '已有训练/评估在运行；等待15秒，不中断它、不同时抢GPU。'
-  sleep 15
-done
+WAIT="${JOINT_THRESHOLD_WAIT:-1}"
+WORKERS="${JOINT_THRESHOLD_CPU_WORKERS:-8}"
+[[ "$WAIT" == 0 || "$WAIT" == 1 ]] || { echo 'JOINT_THRESHOLD_WAIT 必须为0或1。' >&2; exit 2; }
+[[ "$WORKERS" =~ ^([1-9]|1[0-6])$ ]] || { echo 'JOINT_THRESHOLD_CPU_WORKERS 必须为1到16。' >&2; exit 2; }
+if [[ "$WAIT" == 1 ]]; then
+  while pgrep -f '[p]ython.*(train_p0_f9_joint_causal_columns_full.py|eval_p0_f9_joint_causal_columns.py|eval_p0_f9_joint_checkpoints.py|calibrate_p0_f9_joint_thresholds.py|eval_p0_f9_joint_zero_shot_long_rollout.py)' >/dev/null; do
+    echo '已有训练/评估在运行；等待15秒，不中断它、不同时抢GPU。'
+    sleep 15
+  done
+else
+  echo "并行校准：不等待其他评估；CPU workers=$WORKERS。GPU/CPU争用可能使两个任务变慢；显存与主存需同时容纳两项任务。"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
@@ -33,5 +41,5 @@ echo "输出: $OUT"
   --base-checkpoint "$ROOT/outputs/p0_f9_v18_se2_clean_tail15/epoch_0014.pt" \
   --dataroot /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes \
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
-  --out-dir "$OUT" --cpu-workers 8 --checkpoint-every 8 "${EXTRA[@]}"
+  --out-dir "$OUT" --cpu-workers "$WORKERS" --checkpoint-every 8 "${EXTRA[@]}"
 echo "结果: $OUT/summary.txt；全部组合: calibration.json。这是调参分数，不是独立测试。"

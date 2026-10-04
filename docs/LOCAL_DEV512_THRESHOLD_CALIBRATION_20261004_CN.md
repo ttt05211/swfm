@@ -27,6 +27,16 @@ bash tools/real_motion/run_p0_f9_joint_threshold_calibration.sh \
 
 脚本默认等待本仓库已运行的训练/评估退出，不发终止信号；可在另一终端排队。只新增代码入口，没有修改现有 full evaluator，因此更新代码不会改变该任务正在使用的实现。输出新目录的 `summary.txt`（也打印到终端）、`calibration.json`（所有组合与 provenance）、`progress.jsonl`。
 
+允许与 full 同时运行时，在另一终端显式关闭等待，并降低校准 worker 预算：
+
+```bash
+JOINT_THRESHOLD_WAIT=0 JOINT_THRESHOLD_CPU_WORKERS=2 \
+nice -n 5 bash tools/real_motion/run_p0_f9_joint_threshold_calibration.sh \
+  /root/nas/occ/swfm/outputs/p0_f9_joint_causal_columns/checkpoint_selection_20261004_220555/epoch_0019.pt
+```
+
+两项任务使用独立进程、checkpoint snapshot 和输出目录；不修改正在运行的 full 阈值或权重。CPU/GPU争用可能使两项任务分别变慢，低显存占用不能保证并行更快；主存也需容纳两项任务。worker 数是线程池预算，并非进程的硬 CPU 核数限制。`nice` 只降低校准进程的 CPU 调度优先级，不限制 GPU 占用。无需停止 full。若之前启动了等待中的校准 wrapper，先在该等待终端 Ctrl+C，再启动并行命令，避免重复启动。
+
 SIGINT/SIGTERM 在完整窗口边界保存；每8个完整窗口另存一次。强制 kill 最多丢失未保存的窗口统计，不写源 checkpoint 或 optimizer/RNG。恢复必须指定原校准输出目录：
 
 ```bash
@@ -37,3 +47,5 @@ bash tools/real_motion/run_p0_f9_joint_threshold_calibration.sh \
 ```
 
 恢复校验 snapshot/source SHA、原配置、缓存/info/manifest provenance、ordered population、扫描网格和计数 fingerprint；独立输出 lease 拒绝同目录并发恢复。完成后不允许覆盖重跑。原 full 评估目录与训练文件始终只读、不清理。
+
+并行模式以2 workers启动的校准，恢复时也须设置 `JOINT_THRESHOLD_CPU_WORKERS=2`；CPU预算是恢复合同的一部分，禁止静默切换。若仍需并行，另设置 `JOINT_THRESHOLD_WAIT=0`。等待开关和 nice 优先级不改变统计合同。
