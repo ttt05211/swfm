@@ -30,5 +30,5 @@ echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输�
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
   --population "$POPULATION" --out-dir "$OUT" \
   --cpu-workers "${FULL_JOINT_EVAL_CPU_WORKERS:-8}" --batch-size 256 \
-  --column-feature-backend "${FULL_JOINT_EVAL_FEATURE_BACKEND:-gpu}"
+  --column-feature-backend "${FULL_JOINT_EVAL_FEATURE_BACKEND:-cpu}"
 echo "评估完成：$OUT/summary.txt；可继续恢复原训练，不会重置LR/RNG。"
