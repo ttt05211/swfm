@@ -32,6 +32,8 @@ def main():
         raise RuntimeError('native batch support preflight failed')
     free = np.full(shape, 17, np.uint8); owner = np.full(shape, -1, np.int32)
     truth = free.copy(); truth[1, 1, 2] = 11
+    roi = kernel.static_roi(np.array([[1,1],[0,0]],np.int32),truth == 11,truth,free)
+    if not np.array_equal(roi,[[1,1]]):raise RuntimeError('native sparse static ROI preflight failed')
     args = (np.array([[1, 1]], np.int32), np.array([0], np.uint8), np.array([-3], np.int32),
         np.array([11], np.uint8), np.array([31], np.uint64), free, owner, free, truth)
     active, positive = kernel.compact(*args)

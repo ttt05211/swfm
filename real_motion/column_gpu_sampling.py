@@ -8,6 +8,7 @@ No model, RNG, future labels or persistent learned geometry live here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import time
 import numpy as np
 import torch
@@ -93,6 +94,24 @@ class GpuColumnSampler:
             raise ValueError('positive chunk/budget and mandatory verification required')
         self.chunk_queries = int(chunk_queries); self.max_working_mib = float(max_working_mib)
         self.verify_first = int(verify_first); self.verify_every = int(verify_every); self.windows = 0
+        self._resident = None
+
+    @contextmanager
+    def resident_window(self, prepared, grid, config):
+        """Scoped inference input reuse; never keep data across learned updates."""
+        if self._resident is not None: raise RuntimeError('nested GPU input residency')
+        history = np.ascontiguousarray(prepared.raw['history_occ'])
+        observed = np.ascontiguousarray(prepared.raw['history_observed'], dtype=np.uint8)
+        if history.nbytes+observed.nbytes > self.max_working_mib*2**20:
+            yield False; return
+        try:
+            self._resident = (id(prepared), torch.as_tensor(history, device=self.device).reshape(-1),
+                torch.as_tensor(observed, device=self.device).reshape(-1))
+        except torch.cuda.OutOfMemoryError:
+            self._resident = None
+            yield False; return
+        try: yield True
+        finally: self._resident = None
 
     @staticmethod
     def _cpu(prepared, row, grid, config, motion_factory, index):
@@ -106,9 +125,12 @@ class GpuColumnSampler:
         """FP64 elementary ops: no TF32, interpolation, FMA or ownership collapse."""
         device = self.device; frames = len(prepared.raw['history_occ'])
         shape = tuple(grid.shape_hwd); cells = int(np.prod(shape)); p, z = config.patch, config.z_bins
-        history = torch.as_tensor(np.ascontiguousarray(prepared.raw['history_occ']), device=device)
-        observed = torch.as_tensor(np.ascontiguousarray(prepared.raw['history_observed'], dtype=np.uint8), device=device)
-        history = history.reshape(-1); observed = observed.reshape(-1)
+        if self._resident is not None:
+            if self._resident[0] != id(prepared): raise ValueError('stale resident GPU history')
+            _, history, observed = self._resident
+        else:
+            history = torch.as_tensor(np.ascontiguousarray(prepared.raw['history_occ']), device=device).reshape(-1)
+            observed = torch.as_tensor(np.ascontiguousarray(prepared.raw['history_observed'], dtype=np.uint8), device=device).reshape(-1)
         member = torch.as_tensor(packed.membership, device=device)
         matrices = torch.as_tensor(packed.transforms, device=device)
         valid_frames = torch.as_tensor(packed.valid_frames, device=device)

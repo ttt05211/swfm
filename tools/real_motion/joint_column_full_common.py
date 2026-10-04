@@ -104,6 +104,20 @@ class FullJointColumnProvider(JointColumnProvider):
         return prepared
 
 
+class EvaluationJointColumnProvider(FullJointColumnProvider):
+    """One-window CPU look-ahead of exact FIXED geometry, with no disk writer.
+
+    First main-thread renderer exactness still compares all six horizons with
+    the original device path. Learned predictions/GT are never precomputed.
+    """
+    def load_raw_columns(self, source, record, *, include_gt):
+        from tools.real_motion.causal_column_common import FrozenColumns
+        raw = FrozenColumns.load_raw_columns(self, source, record, include_gt=include_gt)
+        raw['_column_causal_preparation'] = build_fixed_geometry(raw, record, self.pcfg, self.strong,
+            min(self.workers, 3), self.joint.columns.config)
+        return raw
+
+
 def prefetch_column_batches(provider, source, records, batch_size, source_budget=128, *, io_workers=2):
     """One next complete batch, CPU-only; never prefetch entire epoch to RAM."""
     if min(batch_size, source_budget, io_workers) < 1: raise ValueError('positive window/source/I/O budget required')
@@ -192,7 +206,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         cursor = 0
         for size, local in zip(sizes, local_outputs):
             local['_column_render_numpy'] = {k: v[cursor:cursor+size] for k, v in render.items()}; cursor += size
-    batches = []; prep_seconds = selection_seconds = feature_wait_seconds = worker_seconds = 0.
+    batches = []; supervision_parts = []; prep_seconds = selection_seconds = feature_wait_seconds = worker_seconds = 0.
     candidate_wait_seconds = candidate_worker_seconds = 0.
     materialize_seconds = index_worker_seconds = 0.
     candidate_jobs = feature_jobs = index_jobs = 0
@@ -341,7 +355,10 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
                 worker_seconds += sum(seconds for _, seconds in mapped)
                 arrays = mapped[0][0] if optimize_cpu else [a for a, _ in mapped]
             b = timer.call('assemble_transfer', assemble_online_columns, prep, joint.columns, selected, arrays, provider.device)
-            if b is not None: batches.append(b)
+            if b is not None:
+                batches.append(b)
+                for features in arrays:
+                    supervision_parts.append({k: features[k] for k in ('kind','legal','target','weight')})
         # Audit AFTER worker-owned materialization, not at the draw-only stage.
         for plan in audits:
             if hasattr(plan, 'audit'):
@@ -355,9 +372,14 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
         with torch.autocast(device_type=provider.device.type, dtype=torch.bfloat16, enabled=provider.device.type == 'cuda'):
             g, r = timer.call('column_forward', joint.columns,
                 **{k: batch[k] for k in (*FEATURE_KEYS, 'source_features')}, gpu=True)
+        from real_motion.local_supervision_fastpath import enabled, column_indices
+        host_indices = None
+        if bundle and enabled():
+            host_indices = column_indices(**{k: np.concatenate([v[k] for v in supervision_parts])
+                for k in ('kind','legal','target','weight')}, device=provider.device)
         lc, column_stats = timer.call('column_loss', column_loss, joint.columns, g, r,
             batch['kind'], batch['legal'], batch['target'], batch['weight'], materialize_stats=not bundle,
-            distributed=distributed, gpu=True)
+            distributed=distributed, supervision_indices=host_indices, gpu=True)
         if probe and len(output['future_transport_queries']) and output['future_transport_queries'].requires_grad:
             grad = torch.autograd.grad(lc, output['future_transport_queries'], retain_graph=True, allow_unused=True)[0]
             link_grad = float(grad.float().norm()) if grad is not None else 0.

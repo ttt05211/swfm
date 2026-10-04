@@ -67,7 +67,13 @@ class CausalColumnModel(nn.Module):
         invalid = ~valid.any(-1).flatten(1)
         # An all-unknown query gets a ZERO dummy token, never all-masked NaNs.
         empty = invalid.all(1)
-        if empty.any():
+        if x.device.type == 'cuda':
+            # No tiny device->host branch on every full-population inference
+            # chunk. Same zero dummy token and mask, including all-unknown rows.
+            x = x.clone(); invalid = invalid.clone()
+            x[:, 0] = torch.where(empty[:, None], 0., x[:, 0])
+            invalid[:, 0] &= ~empty
+        elif empty.any():
             x = x.clone(); invalid = invalid.clone(); x[empty, 0] = 0; invalid[empty, 0] = False
         q = (self.query(torch.cat((context.float(), self.semantic(base.long()).flatten(1),
                                   self.semantic(fallback.long()).flatten(1)), dim=1))
@@ -83,10 +89,10 @@ class CausalColumnModel(nn.Module):
         return self.generation(q), self.refinement(q).reshape(len(kind), self.config.z_bins, 3)
 
     def calibrated_probabilities(self, generation, refinement, kind, legal):
-        if (not torch.isfinite(generation).all() or not torch.isfinite(refinement).all()
-                or not torch.isfinite(self.generation_pos_weight).all()
-                or not torch.isfinite(self.refine_class_weights).all()
-                or self.generation_pos_weight <= 0 or torch.any(self.refine_class_weights <= 0)):
+        finite = (torch.isfinite(generation).all() & torch.isfinite(refinement).all()
+            & torch.isfinite(self.generation_pos_weight).all() & torch.isfinite(self.refine_class_weights).all()
+            & (self.generation_pos_weight > 0) & (self.refine_class_weights > 0).all())
+        if not finite:
             raise RuntimeError("nonfinite prediction or invalid TRAIN calibration weights")
         g = generation.float()-self.generation_pos_weight.log()
         r = refinement.float()-self.refine_class_weights.log()
@@ -100,7 +106,8 @@ class CausalColumnModel(nn.Module):
     def contract(self): return asdict(self.config)
 
 
-def column_loss(model, generation, refinement, kind, legal, target, weight, *, materialize_stats=True, distributed=None):
+def column_loss(model, generation, refinement, kind, legal, target, weight, *, materialize_stats=True, distributed=None,
+                supervision_indices=None):
     """Two task losses, averaged by type; importance restores query sampling.
 
     Refine target is action utility with KEEP-on-tie, NOT indiscriminate deletion
@@ -108,13 +115,14 @@ def column_loss(model, generation, refinement, kind, legal, target, weight, *, m
     """
     if target.shape != generation.shape or legal.shape != refinement.shape or weight.shape != kind.shape:
         raise ValueError("loss shape mismatch")
-    if not torch.isfinite(weight).all() or torch.any(weight <= 0): raise ValueError("invalid sampling weights")
-    if not torch.gather(legal.bool(), -1, target.long()[..., None]).all(): raise ValueError("illegal target action")
+    if supervision_indices is None:
+        if not torch.isfinite(weight).all() or torch.any(weight <= 0): raise ValueError("invalid sampling weights")
+        if not torch.gather(legal.bool(), -1, target.long()[..., None]).all(): raise ValueError("illegal target action")
     terms, stats = [], {}
     by_task = {}; denominators = generation.new_zeros(2, dtype=torch.float32)
     for task in (0, 1):
-        take = kind == task
-        if not take.any(): continue
+        take = kind == task if supervision_indices is None else supervision_indices.get(task)
+        if take is None or (not take.any() if supervision_indices is None else len(take) == 0): continue
         w = weight[take, None].float()
         if task == GENERATE:
             mask = legal[take, :, ADD].float()
@@ -126,7 +134,7 @@ def column_loss(model, generation, refinement, kind, legal, target, weight, *, m
             loss = F.cross_entropy(logits.flatten(0, 1), target[take].long().flatten(),
                                    weight=model.refine_class_weights, reduction="none").reshape_as(mask)
         denom = (w*mask).sum()
-        if denom <= 0: continue
+        if supervision_indices is None and denom <= 0: continue
         value = (loss*w*mask).sum()/denom
         by_task[task] = value; denominators[task] = denom
         terms.append(value); stats["generation_bce" if task == 0 else "refine_action_ce"] = float(value.detach()) if materialize_stats else value.detach()

@@ -142,6 +142,26 @@ API i64 swfm_static(const u8* footprint, const u8* historical, const u8* memory,
     return count;
 }
 
+// Visit only the immutable history-positive XY population. No GT, learned
+// pose or sampled subset defines this list; output retains its original order.
+API int swfm_static_roi(const i32* xy, i64 n, const u8* historical,
+    const u8* memory, const u8* baseline, i64 xsize, i64 ysize, i64 zsize,
+    u8* active) noexcept {
+    if (n < 0 || cells(xsize, ysize, zsize) < 0) return -1;
+    for (i64 row = 0; row < n; ++row) {
+        const i64 x = xy[row*2], y = xy[row*2+1];
+        if (x < 0 || x >= xsize || y < 0 || y >= ysize) return -2;
+        const i64 start = (x*ysize+y)*zsize;
+        active[row] = 0;
+        for (i64 z = 0; z < zsize; ++z) {
+            if (historical[start+z] && memory[start+z] != baseline[start+z]) {
+                active[row] = 1; break;
+            }
+        }
+    }
+    return 0;
+}
+
 API i64 swfm_support(const i64* flat, i64 n, i64 xsize, i64 ysize, i64 zsize,
     u8* scratch, i64* xy, i64* zbounds) noexcept {
     const i64 total = cells(xsize, ysize, zsize);

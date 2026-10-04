@@ -1,5 +1,5 @@
 """Live geometries, bounded online supervision and fair random-init control."""
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import math
 import numpy as np
 import torch
@@ -19,18 +19,22 @@ class JointColumnProvider(FrozenColumns):
         self.model = joint.transport
         self.latents_checked = True
         self.reference_enabled = False
+        # Small metric COUNTS only, scoped to this provider/source object. No
+        # GT features, predictions or changing learned/control model cached.
+        self.frozen_metric_counts = OrderedDict()
 
     def encode_record(self, record):
         with torch.no_grad(): return self.joint.motion(record, self.device)
 
-    def reference_predictions(self, prep, record):
+    def reference_predictions(self, prep, record, *, skip_frozen=False):
         if not self.reference_enabled: return {}
+        if skip_frozen and self.control is None: return {}
         values = runtime._gpu_inputs(record, self.device)
         result = {}
         for name, model in (('frozen_E14', self.reference), ('paired_scratch_V18_only', self.control)):
-            if model is None: continue
+            if model is None or skip_frozen and name == 'frozen_E14': continue
             output = runtime._model_forward(model, values, self.device)
-            result[name] = render_column_layers(prep.state, record, output, self.pcfg.grid)[0]
+            result[name] = render_column_layers(prep.state, record, output, self.pcfg.grid, baseline_only=True)[0]
         return result
 
 
@@ -184,18 +188,32 @@ def motion_loss(output, record, device, patch_resolution=.8, *, materialize_stat
             return distributed.motion({}, record, pred.new_zeros(()))
         return pred.new_zeros(()), {'translation_smooth_l1': 0., 'existence_bce': 0., 'yaw_periodic_loss': 0., 'se2_shape_loss': 0.}
     get = lambda k: torch.as_tensor(record[k], device=device)
+    from real_motion.local_supervision_fastpath import motion_indices
+    indices = motion_indices(record, device) if not materialize_stats else None
     sup = get('supervised_source').bool()
     valid = get('se2_target_valid').bool() & sup[:, None]
     target = get('target_source_residual_xy_m').float()
-    trans = torch.nn.functional.smooth_l1_loss(pred[valid], target[valid], beta=1.) if valid.any() else pred.sum()*0.
+    if indices is None:
+        trans = torch.nn.functional.smooth_l1_loss(pred[valid], target[valid], beta=1.) if valid.any() else pred.sum()*0.
+    else:
+        at = indices['valid']
+        trans = (torch.nn.functional.smooth_l1_loss(pred.flatten(0, 1).index_select(0, at),
+            target.flatten(0, 1).index_select(0, at), beta=1.) if len(at) else pred.sum()*0.)
     logits = output['existence_logits'].float()
-    exist = torch.nn.functional.binary_cross_entropy_with_logits(logits[sup], get('existence').float()[sup]) if sup.any() else logits.sum()*0.
+    if indices is None:
+        exist = torch.nn.functional.binary_cross_entropy_with_logits(logits[sup], get('existence').float()[sup]) if sup.any() else logits.sum()*0.
+    else:
+        at = indices['supervised']
+        exist = (torch.nn.functional.binary_cross_entropy_with_logits(logits.index_select(0, at),
+            get('existence').float().index_select(0, at)) if len(at) else logits.sum()*0.)
     yaw, _ = periodic_yaw_loss(output['yaw_delta_rad'].float(), get('target_yaw_rad').float(),
-        get('yaw_enabled'), get('yaw_label_valid').bool() & valid, materialize_stats=False)
+        get('yaw_enabled'), get('yaw_label_valid').bool() & valid, materialize_stats=False,
+        usable_indices=indices['yaw'] if indices is not None else None)
     shape, _ = soft_se2_transport_overlap_loss(get('kta_displacement_xy_m').float()+pred,
         get('target_source_displacement_xy_m').float(), output['yaw_delta_rad'].float(), get('target_yaw_rad').float(),
         get('target_source_mask_tube')[:, -1].float(), valid, get('yaw_enabled'), get('yaw_label_valid'),
-        patch_resolution_m=patch_resolution, materialize_stats=False)
+        patch_resolution_m=patch_resolution, materialize_stats=False,
+        usable_indices=indices['shape'] if indices is not None else None)
     values = {'translation_smooth_l1': trans, 'existence_bce': exist, 'yaw_periodic_loss': yaw, 'se2_shape_loss': shape}
     total = trans+exist+19.*yaw+.25*shape
     if distributed is not None: total, values = distributed.motion(values, record, pred.new_zeros(()))

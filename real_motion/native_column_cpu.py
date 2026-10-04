@@ -138,6 +138,7 @@ class NativeColumns:
         self.targets_fn = self._bind('swfm_targets', [P]*6+[I]*3+[P])
         self.generation_fn = self._bind('swfm_generation', [P]*2+[I]*4+[P])
         self.static_fn = self._bind('swfm_static', [P]*4+[I]*3+[P], count=True)
+        self.static_roi_fn = self._bind('swfm_static_roi', [P,I]+[P]*3+[I]*3+[P])
         self.support_fn = self._bind('swfm_support', [P]+[I]*4+[P]*3, count=True)
         self.gather_fn = self._bind('swfm_gather', [P,I,P,P,I,I,I,J,P,I,P,I,I,P,P])
         self.expand_fn = self._bind('swfm_expand', [P]*4+[I]*3+[J]+[P]*2)
@@ -208,6 +209,18 @@ class NativeColumns:
         xy=np.empty((shape[0]*shape[1],2),np.int64)
         count=self._call('static',self.static_fn,*map(_pointer,(footprint,historical,memory,baseline)),*shape,_pointer(xy))
         return xy[:count]
+
+    def static_roi(self, potential, historical, memory, baseline):
+        shape = self._grid(np.asarray(baseline).shape)
+        xy = _array(potential, np.int32)
+        if xy.ndim != 2 or xy.shape[1] != 2: raise ValueError('static ROI must be N,2')
+        historical = _bits(historical, shape)
+        memory = _array(memory, np.uint8, shape)
+        baseline = _array(baseline, np.uint8, shape)
+        active = np.empty(len(xy), np.uint8)
+        self._call('static_roi', self.static_roi_fn, _pointer(xy), len(xy),
+            *map(_pointer, (historical, memory, baseline)), *shape, _pointer(active))
+        return xy[active.astype(bool)]
 
     def support(self, flat, shape, workspace=None):
         shape=self._grid(shape); flat=_array(flat,np.int64)

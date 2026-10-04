@@ -172,7 +172,7 @@ class FrozenColumns(FrozenXYV18):
                                causal.get('fixed_candidate_geometry') if causal is not None else None)
 
 
-def render_column_layers(state, record, outputs, grid, *, capture_backgrounds=False):
+def render_column_layers(state, record, outputs, grid, *, capture_backgrounds=False, baseline_only=False):
     """Model-dependent geometry ONLY; immutable history/registration can be reused."""
     render = outputs.get('_column_render_numpy')
     res, yaw = ((numpy(outputs["residual_xy_m"]), numpy(outputs["yaw_delta_rad"])) if render is None
@@ -193,7 +193,11 @@ def render_column_layers(state, record, outputs, grid, *, capture_backgrounds=Fa
                 dynamic_class_ids=DYN, free_label=FREE, grid=grid,
                 precomputed_clear_flat_indices=state["baseline_clear_flat_by_hi"][h])
         if capture_backgrounds: backgrounds.append(background)
-        b, own, fall = component_layers(background, layers)
+        if baseline_only:
+            b = background.copy(); own = fall = None
+            for layer in layers:
+                if len(layer.voxel_indices): b[tuple(np.asarray(layer.voxel_indices).T)] = layer.class_id
+        else: b, own, fall = component_layers(background, layers)
         baseline.append(b); owners.append(own); fallbacks.append(fall); components.append(layers); targets.append(centers); yaws.append(yy)
     if capture_backgrounds: state['column_backgrounds'] = backgrounds
     return baseline, owners, fallbacks, components, targets, yaws
@@ -398,7 +402,11 @@ def candidate_plan(prepared, h, grid, config=ColumnConfig(), *, defer_context=Fa
     # refinement. Static occupied edits never touch dynamic/source-owned labels.
     historical = geometry['historical']
     if native is not None:
-        xy = native.static(footprint, historical, m, b)
+        from real_motion.local_supervision_fastpath import static_roi_enabled
+        potential = geometry.get('static_xy')
+        xy = (native.static_roi(potential, historical, m, b)
+              if static_roi_enabled() and potential is not None and len(potential)*4 < shape[0]*shape[1]
+              else native.static(footprint, historical, m, b))
         cls = dominant[tuple(xy.T)]; mask = geometry['static_allowed'][tuple(xy.T)]
     elif kernels:
         potential = geometry.get('static_xy')
@@ -516,11 +524,14 @@ def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
             "context": plan.context, "kind": plan.kind, "classes": plan.classes}
 
 
-def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256):
+def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256, *,
+                          feature_backend='cpu', history_index=None, gpu_sampler=None, verify_features=False):
     model.eval(); parts = []
     started = time.perf_counter()
-    sampler = ColumnFeatureSampler(prepared, h, plan, grid, model.config, pose_motion,
-                                   workers=getattr(model, 'column_sampling_workers', 1))
+    from real_motion.column_inference_pipeline import InferenceFeatures
+    sampler = InferenceFeatures(prepared, h, plan, grid, model.config, device, pose_motion,
+        backend=feature_backend, workers=getattr(model, 'column_sampling_workers', 1),
+        history_index=history_index, gpu_sampler=gpu_sampler, verify=verify_features)
     mapped_at = time.perf_counter(); sampled_seconds = 0.
     with torch.inference_mode():
         for start in range(0, len(plan), batch_size):
@@ -539,7 +550,8 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
             parts.append(model.calibrated_probabilities(g, r, b["kind"], legal).cpu().numpy())
     model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,
         'inverse_map_seconds': mapped_at-started, 'patch_gather_seconds': sampled_seconds,
-        'network_transfer_and_other_seconds': time.perf_counter()-mapped_at-sampled_seconds}
+        'network_transfer_and_other_seconds': time.perf_counter()-mapped_at-sampled_seconds,
+        'feature_backend': 'gpu' if sampler.gpu is not None else 'cpu', 'feature_audit': dict(sampler.audit)}
     return np.concatenate(parts) if parts else np.empty((*plan.base.shape, 3), np.float32)
 
 
@@ -557,7 +569,17 @@ def report_states(base, metrics, quality, scenes):
 
 
 def evaluate_columns(provider, source, records, model, thresholds, *, progress=None, batch_size=256, dev64_keys=None,
-                     diagnostic_thresholds=(.50, .50, .50), stop_event=None):
+                     diagnostic_thresholds=(.50, .50, .50), stop_event=None, feature_backend='cpu'):
+    """Bounded persistent CPU candidate pool; GPU and metrics stay caller-owned."""
+    if feature_backend not in ('cpu', 'gpu'): raise ValueError('invalid evaluation feature backend')
+    with ThreadPoolExecutor(max_workers=min(3,provider.workers)) as pool:
+        return _evaluate_columns(provider, source, records, model, thresholds, progress=progress,
+            batch_size=batch_size, dev64_keys=dev64_keys, diagnostic_thresholds=diagnostic_thresholds,
+            stop_event=stop_event, feature_backend=feature_backend, candidate_pool=pool)
+
+
+def _evaluate_columns(provider, source, records, model, thresholds, *, progress=None, batch_size=256, dev64_keys=None,
+                     diagnostic_thresholds=(.50, .50, .50), stop_event=None, feature_backend='cpu', candidate_pool=None):
     """Four-way ablation ONE raw/V18/model probability pass, sparse exact counts."""
     model.column_sampling_workers = provider.workers
     populations = {"all": None}
@@ -580,17 +602,37 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
         print(f"evaluate_columns={wi}/{len(records)} four_way_shared_pass", flush=True)
         prep = (provider.prepare_columns(source, record, include_gt=True, raw_window=raw_window)
                 if raw_window is not None else provider.prepare_columns(source, record, include_gt=True))
-        references = provider.reference_predictions(prep, record) if hasattr(provider, 'reference_predictions') else {}
+        reference_started = time.perf_counter()
+        cache = getattr(provider,'frozen_metric_counts',None) if getattr(provider,'reference_enabled',False) else None
+        reference_key = (id(source),str(record['scene_name']),str(record['t0_token']))
+        cached_reference = cache.get(reference_key) if cache is not None else None
+        if cache is not None:
+            references = provider.reference_predictions(prep, record, skip_frozen=cached_reference is not None)
+        else: references = provider.reference_predictions(prep, record) if hasattr(provider, 'reference_predictions') else {}
+        reference_seconds = time.perf_counter()-reference_started
+        new_reference_counts = {}
         active = [p for p, keys in populations.items() if keys is None or (str(record["scene_name"]), str(record["t0_token"])) in keys]
         for p in active: counts_windows[p] += 1
         for k, v in prep.source_audit.items(): audits[k] += v
         moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
                     tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
-        prediction_profile = {}
-        for ri, h in enumerate(REPORT):
-            plan = candidate_plan(prep, h, provider.pcfg.grid, model.config)
+        prediction_profile = {}; metric_started = time.perf_counter()
+        planning = {h: candidate_pool.submit(candidate_plan, prep, h, provider.pcfg.grid, model.config) for h in REPORT}
+        from real_motion.causal_column_sampling import ColumnHistoryIndex
+        from real_motion.column_inference_pipeline import inference_gpu
+        index = ColumnHistoryIndex(prep, provider.pcfg.grid)
+        prep.column_history_index = index
+        gpu, resident = inference_gpu(provider.device, feature_backend, prep, provider.pcfg.grid, model.config)
+        with resident:
+          for ri, h in enumerate(REPORT):
+            plan = planning[h].result()
             layout = sparse_layout(plan)
-            probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
+            if feature_backend == 'gpu':
+                probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size,
+                    feature_backend=feature_backend, history_index=index, gpu_sampler=gpu,
+                    verify_features=wi <= 3 or wi % 128 == 0)
+            else:
+                probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
             prediction_profile[str(.5*(h+1))] = getattr(model, 'last_prediction_profile', {})
             for label, kind, action in (("generation_ADD", GENERATE, ADD), ("refine_ADD", REFINE, ADD),
                                          ("refine_REMOVE", REFINE, REMOVE)):
@@ -605,10 +647,13 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
             diagnostic = actions_from_probabilities(plan, probability, diagnostic_thresholds) if diagnostic_thresholds is not None else None
             gt = np.asarray(prep.raw["future_gt_occ"][h]); mask = moving[h][0]
             before = Metrics.counts(prep.baseline[h], gt, mask, FREE)
+            reference_counts = {name: Metrics.counts(predictions[h],gt,mask,FREE) for name,predictions in references.items()}
+            if cached_reference is not None: reference_counts['frozen_E14'] = cached_reference[h]
+            if 'frozen_E14' in reference_counts: new_reference_counts[h] = reference_counts['frozen_E14']
             for p in active:
                 bases[p].update(ri, counts=before); scenes[p][prep.window.scene_name]["baseline"].update(ri, counts=before)
-                for name, predictions in references.items():
-                    reference_metrics[p].setdefault(name, Metrics()).update(ri, counts=Metrics.counts(predictions[h], gt, mask, FREE))
+                for name, counts in reference_counts.items():
+                    reference_metrics[p].setdefault(name, Metrics()).update(ri, counts=counts)
             choices = [(n, eg, er, actions) for n, eg, er in (("generation", True, False), ("refine", False, True), ("joint", True, True))]
             if diagnostic is not None:
                 choices += [("diagnostic_"+n, eg, er, diagnostic) for n, eg, er, _ in choices.copy()]
@@ -625,12 +670,17 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
                 for p in active:
                     metrics[p][name].update(ri, counts=current); scenes[p][prep.window.scene_name][name].update(ri, counts=current)
                     for k, v in edits.items(): quality[p][name][k] += v
+        if cache is not None and cached_reference is None and len(new_reference_counts) == len(REPORT):
+            cache[reference_key] = new_reference_counts
+            if len(cache) > 1024: cache.popitem(last=False)
         compute_elapsed = time.perf_counter()-started
         elapsed = compute_elapsed+input_wait
         print(f"evaluate_columns={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)
         if progress: progress({"event": "evaluation", "window": wi, "windows": len(records), "seconds": elapsed,
                                "compute_seconds": compute_elapsed, "input_wait_seconds": input_wait,
                                "prediction_seconds_by_horizon": prediction_profile,
+                               "candidate_inference_metrics_seconds": time.perf_counter()-metric_started,
+                               "reference_seconds": reference_seconds, "frozen_reference_count_cache_hit": cached_reference is not None,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
         previous_end = time.perf_counter()
         if stop_event is not None and stop_event.is_set(): raise InterruptedError('evaluation stopped at window boundary')
@@ -675,7 +725,16 @@ def safe_metrics(row, baseline):
     return all(v is not None and np.isfinite(v) and v >= -1e-10 for v in values)
 
 
-def calibrate_columns(provider, source, records, model, *, progress=None, batch_size=256, stop_event=None):
+def calibrate_columns(provider, source, records, model, *, progress=None, batch_size=256, stop_event=None,
+                      feature_backend='cpu'):
+    if feature_backend not in ('cpu', 'gpu'): raise ValueError('invalid calibration feature backend')
+    with ThreadPoolExecutor(max_workers=min(3,provider.workers)) as pool:
+        return _calibrate_columns(provider, source, records, model, progress=progress,batch_size=batch_size,
+            stop_event=stop_event,feature_backend=feature_backend,candidate_pool=pool)
+
+
+def _calibrate_columns(provider, source, records, model, *, progress=None, batch_size=256, stop_event=None,
+                       feature_backend='cpu',candidate_pool=None):
     """ONE held-out TRAIN pass, predeclared finite grid, NO dev tuning.
 
     4 generation settings, 16 refine settings, 64 joint settings share the same
@@ -701,18 +760,27 @@ def calibrate_columns(provider, source, records, model, *, progress=None, batch_
                 if raw_window is not None else provider.prepare_columns(source, record, include_gt=True))
         moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
                     tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
-        for ri, h in enumerate(REPORT):
-            plan = candidate_plan(prep, h, provider.pcfg.grid, model.config)
-            layout = sparse_layout(plan)
-            p = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
-            gt, mask = np.asarray(prep.raw["future_gt_occ"][h]), moving[h][0]
-            before = Metrics.counts(prep.baseline[h], gt, mask, FREE); base.update(ri, counts=before)
-            for k, (_, gates, eg, er) in enumerate(jobs):
-                acts = actions_from_probabilities(plan, p, gates)
-                ids, b, after = compose_sparse(plan, acts, enable_generation=eg, enable_refine=er, layout=layout)
-                target, mm = gt.reshape(-1)[ids], mask.reshape(-1)[ids]
-                metrics[k].update(ri, counts=sparse_counts(before, b, after, target, mm, DYN))
-                for name, value in edit_quality(b, after, target).items(): quality[k][name] += value
+        planning = {h:candidate_pool.submit(candidate_plan,prep,h,provider.pcfg.grid,model.config) for h in REPORT}
+        from real_motion.causal_column_sampling import ColumnHistoryIndex
+        from real_motion.column_inference_pipeline import inference_gpu
+        index = ColumnHistoryIndex(prep,provider.pcfg.grid);prep.column_history_index = index
+        gpu,resident = inference_gpu(provider.device,feature_backend,prep,provider.pcfg.grid,model.config)
+        with resident:
+            for ri, h in enumerate(REPORT):
+                plan = planning[h].result()
+                layout = sparse_layout(plan)
+                if feature_backend == 'gpu':
+                    p = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size,
+                        feature_backend=feature_backend,history_index=index,gpu_sampler=gpu,verify_features=wi <= 3 or wi % 128 == 0)
+                else: p = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
+                gt, mask = np.asarray(prep.raw["future_gt_occ"][h]), moving[h][0]
+                before = Metrics.counts(prep.baseline[h], gt, mask, FREE); base.update(ri, counts=before)
+                for k, (_, gates, eg, er) in enumerate(jobs):
+                    acts = actions_from_probabilities(plan, p, gates)
+                    ids, b, after = compose_sparse(plan, acts, enable_generation=eg, enable_refine=er, layout=layout)
+                    target, mm = gt.reshape(-1)[ids], mask.reshape(-1)[ids]
+                    metrics[k].update(ri, counts=sparse_counts(before, b, after, target, mm, DYN))
+                    for name, value in edit_quality(b, after, target).items(): quality[k][name] += value
         compute_elapsed = time.perf_counter()-started
         elapsed = compute_elapsed+input_wait
         print(f"calibrate_TRAIN={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)

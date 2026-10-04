@@ -2,14 +2,14 @@
 # Explicit immutable full-joint snapshot; never trains/recalibrates/promotes.
 set -euo pipefail
 if [[ "${CONDA_DEFAULT_ENV:-}" != OccFM ]]; then echo "请先 conda activate OccFM" >&2; exit 2; fi
-if [[ $# -lt 1 || $# -gt 3 ]]; then echo "用法: bash $0 RUN_DIR [dev64|dev512] [CHECKPOINT]" >&2; exit 2; fi
+if [[ $# -lt 1 || $# -gt 3 ]]; then echo "用法: bash $0 RUN_DIR [dev64|dev512|full4369] [CHECKPOINT]" >&2; exit 2; fi
 ROOT=/root/nas/occ/swfm
 cd "$ROOT"
 RUN="$(realpath -e -- "$1")"
 if [[ "$RUN" == */model ]]; then MODEL="$RUN"; RUN="${RUN%/model}"; else MODEL="$RUN/model"; fi
 case "$RUN" in "$ROOT"/outputs/p0_f9_joint_causal_columns/*) ;; *) echo "拒绝非full-joint实验目录" >&2; exit 2 ;; esac
 POPULATION="${2:-dev64}"
-case "$POPULATION" in dev64|dev512) ;; *) echo "只能dev64或dev512，不自动扩到full4369" >&2; exit 2 ;; esac
+case "$POPULATION" in dev64|dev512|full4369) ;; *) echo "必须显式指定dev64/dev512/full4369" >&2; exit 2 ;; esac
 CHECKPOINT="${3:-$MODEL/last.pt}"
 [[ -f "$CHECKPOINT" ]] || { echo "[MISSING] $CHECKPOINT" >&2; exit 2; }
 OUT="${FULL_JOINT_EVAL_OUT:-$RUN/eval_${POPULATION}_$(date +%Y%m%d_%H%M%S)_$$}"
@@ -29,5 +29,6 @@ echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输�
   --dataroot /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes \
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
   --population "$POPULATION" --out-dir "$OUT" \
-  --cpu-workers "${FULL_JOINT_EVAL_CPU_WORKERS:-8}" --batch-size 256
+  --cpu-workers "${FULL_JOINT_EVAL_CPU_WORKERS:-8}" --batch-size 256 \
+  --column-feature-backend "${FULL_JOINT_EVAL_FEATURE_BACKEND:-gpu}"
 echo "评估完成：$OUT/summary.txt；可继续恢复原训练，不会重置LR/RNG。"

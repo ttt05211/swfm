@@ -20,6 +20,7 @@ Thus the observed source shape is never aligned to the absolute GT box centre.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from typing import Mapping, Sequence
 
@@ -274,6 +275,7 @@ def periodic_yaw_loss(
     yaw_label_valid: torch.Tensor,
     *,
     materialize_stats: bool = True,
+    usable_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     if pred_yaw_rad.shape != target_yaw_rad.shape:
         raise ValueError("pred/target yaw shape mismatch")
@@ -292,8 +294,10 @@ def periodic_yaw_loss(
         per = 1.0 - torch.cos(delta)
         count = usable.sum(dtype=torch.int64)
         denominator = count.clamp_min(1).to(per.dtype)
-        loss = per.masked_select(usable).sum() / denominator
-        mae = delta.abs().masked_select(usable).sum() / denominator
+        select = (lambda v: v.masked_select(usable)) if usable_indices is None else (
+            lambda v: v.flatten().index_select(0, usable_indices))
+        loss = select(per).sum() / denominator
+        mae = select(delta.abs()).sum() / denominator
         return loss, {
             "yaw_periodic_loss": loss.detach(),
             "yaw_mae_rad": mae.detach(),
@@ -314,6 +318,17 @@ def periodic_yaw_loss(
         "yaw_mae_rad": float(mae.detach().cpu()),
         "yaw_labels": count,
     }
+
+
+@lru_cache(maxsize=16)
+def _footprint_coordinates(height, width, resolution, device, dtype):
+    """Bounded constant canvas only; never labels, model outputs or gradients."""
+    # A first evaluation may run under inference_mode. Those special tensors
+    # cannot subsequently be saved for training backward, even when constant.
+    with torch.inference_mode(False):
+        row = (torch.arange(height, device=device, dtype=dtype)-(height-1)/2.0)*resolution
+        col = (torch.arange(width, device=device, dtype=dtype)-(width-1)/2.0)*resolution
+        return torch.meshgrid(row, col, indexing='ij')
 
 
 def _warp_footprint_se2(
@@ -349,15 +364,7 @@ def _warp_footprint_se2(
     Hc, Wc = int(canvas.shape[-2]), int(canvas.shape[-1])
     inp = canvas[:, None].expand(B, Fh, 1, Hc, Wc).reshape(B * Fh, 1, Hc, Wc)
 
-    row = (
-        torch.arange(Hc, device=inp.device, dtype=inp.dtype)
-        - (Hc - 1) / 2.0
-    ) * float(patch_resolution_m)
-    col = (
-        torch.arange(Wc, device=inp.device, dtype=inp.dtype)
-        - (Wc - 1) / 2.0
-    ) * float(patch_resolution_m)
-    x_out, y_out = torch.meshgrid(row, col, indexing="ij")
+    x_out, y_out = _footprint_coordinates(Hc, Wc, float(patch_resolution_m), inp.device, inp.dtype)
     x_out = x_out[None].expand(B * Fh, -1, -1)
     y_out = y_out[None].expand(B * Fh, -1, -1)
 
@@ -470,6 +477,7 @@ def soft_se2_transport_overlap_loss(
     patch_resolution_m: float = 0.8,
     eps: float = 1e-6,
     materialize_stats: bool = True,
+    usable_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Soft-IoU loss for predicted vs GT source-centred SE(2) transport."""
     iou, usable, yaw_use = _soft_se2_transport_iou_per_label(
@@ -487,8 +495,10 @@ def soft_se2_transport_overlap_loss(
     if not bool(materialize_stats):
         count = usable.sum(dtype=torch.int64)
         denominator = count.clamp_min(1).to(iou.dtype)
-        loss = (1.0 - iou).masked_select(usable).sum() / denominator
-        mean_iou = iou.masked_select(usable).sum() / denominator
+        select = (lambda v: v.masked_select(usable)) if usable_indices is None else (
+            lambda v: v.flatten().index_select(0, usable_indices))
+        loss = select(1.0 - iou).sum() / denominator
+        mean_iou = select(iou).sum() / denominator
         return loss, {
             "se2_transport_soft_iou": mean_iou.detach(),
             "se2_transport_overlap_labels": count.detach(),

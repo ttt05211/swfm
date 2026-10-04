@@ -30,6 +30,23 @@ def backend(compiled, monkeypatch):
     monkeypatch.setenv('SWFM_COLUMN_CPU_BACKEND', 'native')
 
 
+@pytest.mark.parametrize('shape', [(1, 2, 1), (23, 19, 4)])
+def test_static_roi_matches_full_scan_in_original_order(compiled, shape):
+    rng = np.random.default_rng(452)
+    historical = rng.random(shape) < .17
+    memory = np.where(historical, 11, 17).astype(np.uint8)
+    baseline = np.where(rng.random(shape) < .3, memory, 17).astype(np.uint8)
+    footprint = rng.random(shape[:2]) < .6
+    potential = np.argwhere(footprint & historical.any(2)).astype(np.int32)
+    selected = compiled.static_roi(potential, historical, memory, baseline)
+    assert np.array_equal(selected, compiled.static(footprint, historical, memory, baseline))
+    reverse = potential[::-1].copy()
+    assert np.array_equal(compiled.static_roi(reverse, historical, memory, baseline), selected[::-1])
+    assert compiled.static_roi(np.empty((0, 2), np.int32), historical, memory, baseline).size == 0
+    with pytest.raises(ValueError, match='invalid dimensions/indices'):
+        compiled.static_roi(np.array([[-1, 0]], np.int32), historical, memory, baseline)
+
+
 @pytest.mark.parametrize('sources', [0, 8, 32])
 @pytest.mark.parametrize('legacy', [False, True])
 @pytest.mark.parametrize('narrow', [False, True])

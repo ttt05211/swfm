@@ -461,7 +461,8 @@ def _main(stop_event, caches, runtime_state):
                 try:
                     with preserve_training_rng(rng):
                         report = evaluate_columns(provider, dev_source, align_records(dev, dev64), joint.columns, (.5, .5, None),
-                            progress=progress, batch_size=args.eval_batch_size, diagnostic_thresholds=None, stop_event=stop_event)
+                            progress=progress, batch_size=args.eval_batch_size, diagnostic_thresholds=None,
+                            stop_event=stop_event, feature_backend=args.column_feature_backend)
                 except InterruptedError: interrupted = True
                 if not interrupted:
                     row = report['all']; record = {'epoch': e+1, 'training_seconds_this_invocation': epoch_train_seconds,
@@ -504,7 +505,8 @@ def _main(stop_event, caches, runtime_state):
         try:
             with preserve_training_rng(rng):
                 gates, calibration_report = calibrate_columns(provider, source, calibration, joint.columns,
-                    progress=progress, batch_size=args.eval_batch_size, stop_event=stop_event)
+                    progress=progress, batch_size=args.eval_batch_size, stop_event=stop_event,
+                    feature_backend=args.column_feature_backend)
         except InterruptedError:
             distributed.broadcast('interrupted')
             return stop_safely('during final calibration; training already complete')
@@ -522,7 +524,8 @@ def _main(stop_event, caches, runtime_state):
         try:
             with preserve_training_rng(rng):
                 evaluation = evaluate_columns(provider, dev_source, dev, persisted.columns, tuple(gates), progress=progress,
-                    batch_size=args.eval_batch_size, dev64_keys=dev64, stop_event=stop_event)
+                    batch_size=args.eval_batch_size, dev64_keys=dev64, stop_event=stop_event,
+                    feature_backend=args.column_feature_backend)
         except InterruptedError:
             distributed.broadcast('interrupted')
             return stop_safely('during final dev512; training already complete')

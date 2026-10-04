@@ -149,6 +149,7 @@ def build_compact_candidates(prep,grid,config,*,count_prior=False,horizons=range
     if not np.isclose(grid.voxel_size[0],grid.voxel_size[1],rtol=0,atol=1e-10):
         raise RuntimeError('frontier distance contract requires an isotropic XY lattice')
     native=get_native(); tasks=dynamic_evidence(prep,grid) if tasks is None else tasks; results=[]
+    from real_motion.local_supervision_fastpath import static_roi_enabled
     for h in horizons:
         if not 0 <= h < 6: raise ValueError('future horizon must be 0..5')
         b,m,footprint=prep.baseline[h],prep.memory[h],prep.footprints[h]
@@ -161,7 +162,10 @@ def build_compact_candidates(prep,grid,config,*,count_prior=False,horizons=range
         if xy is None: xy=np.argwhere(frontier.causal_by_width[config.entry_radius_m])
         ax,ay=frontier.nearest_x[tuple(xy.T)],frontier.nearest_y[tuple(xy.T)]
         append(xy,GENERATE,-3,dominant[ax,ay],np.full(len(xy),(1 << z)-1,np.uint64),ax,ay,0.)
-        xy=native.static(footprint,geometry['historical'],m,b)
+        potential=geometry.get('static_xy')
+        xy=(native.static_roi(potential,geometry['historical'],m,b)
+            if static_roi_enabled() and potential is not None and len(potential)*4 < shape[0]*shape[1]
+            else native.static(footprint,geometry['historical'],m,b))
         append(xy,REFINE,-2,dominant[tuple(xy.T)],pack_allowed(geometry['static_allowed'][tuple(xy.T)]),xy[:,0],xy[:,1],0.)
         point_groups=[]
         for actor,comp,points,age in tasks:
