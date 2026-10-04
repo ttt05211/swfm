@@ -175,11 +175,13 @@ def online_columns(prep, model, grid, rng, device):
     return assemble_online_columns(prep, model, selected, arrays, device, grid=grid)
 
 
-def motion_loss(output, record, device, patch_resolution=.8, *, materialize_stats=True):
+def motion_loss(output, record, device, patch_resolution=.8, *, materialize_stats=True, distributed=None):
     """Original V18 objective; future labels enter this function, NOT motion()."""
     pred = output['residual_xy_m'].float()
     if not len(pred):
         # Empty motion output is not connected to parameters; caller still trains columns.
+        if distributed is not None:
+            return distributed.motion({}, record, pred.new_zeros(()))
         return pred.new_zeros(()), {'translation_smooth_l1': 0., 'existence_bce': 0., 'yaw_periodic_loss': 0., 'se2_shape_loss': 0.}
     get = lambda k: torch.as_tensor(record[k], device=device)
     sup = get('supervised_source').bool()
@@ -195,7 +197,9 @@ def motion_loss(output, record, device, patch_resolution=.8, *, materialize_stat
         get('target_source_mask_tube')[:, -1].float(), valid, get('yaw_enabled'), get('yaw_label_valid'),
         patch_resolution_m=patch_resolution, materialize_stats=False)
     values = {'translation_smooth_l1': trans, 'existence_bce': exist, 'yaw_periodic_loss': yaw, 'se2_shape_loss': shape}
-    return trans+exist+19.*yaw+.25*shape, {k: float(v.detach()) if materialize_stats else v.detach() for k, v in values.items()}
+    total = trans+exist+19.*yaw+.25*shape
+    if distributed is not None: total, values = distributed.motion(values, record, pred.new_zeros(()))
+    return total, {k: float(v.detach()) if materialize_stats else v.detach() for k, v in values.items()}
 
 
 def set_lr(optimizer, update, target):

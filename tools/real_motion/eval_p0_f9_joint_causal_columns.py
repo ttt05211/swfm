@@ -7,7 +7,7 @@ import argparse
 import time
 import torch
 
-from real_motion.joint_causal_columns import FULL_PROTOCOL, FULL4_PROTOCOL
+from real_motion.joint_causal_columns import FULL_PROTOCOLS
 from real_motion.column_runtime_pipeline import CachedColumnSource
 from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
@@ -67,7 +67,7 @@ def main(stop_event=None):
     digest=snapshot_checkpoint(a.checkpoint,snapshot)
     cfg=load_runtime_config(a.config,a.override);pcfg=make_prepare_config(cfg)
     ck,joint=load_joint(snapshot,device,reference_sha=CLEAN_SHA256,config_sha=stable_json_fingerprint(cfg),allow_diagnostic=True)
-    if ck['protocol'] not in (FULL_PROTOCOL,FULL4_PROTOCOL):raise RuntimeError('interim evaluator requires FULL Local protocol')
+    if ck['protocol'] not in FULL_PROTOCOLS:raise RuntimeError('interim evaluator requires FULL Local protocol')
     if not ck.get('prior_completed',True):raise RuntimeError('TRAIN prior is incomplete; no training update is ready to evaluate')
     if sha256(a.base_checkpoint) != CLEAN_SHA256:raise RuntimeError('reference E14 changed')
     if sha256(a.dev_info) != ck['info_fingerprints']['dev'] or sha256(a.dev_cache) != ck['cache_fingerprints']['dev']:

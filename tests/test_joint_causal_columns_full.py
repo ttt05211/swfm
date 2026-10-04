@@ -372,12 +372,15 @@ def full_cli_fixture(tmp_path):
         return result
     def run(out, epochs, resume=None, fail_update=None, stop_update=None, stop_prior=None,
             stop_monitor=None, stop_calibration=False, stop_final=False, history_frames=6,
-            causal_cache=None, stop_before_prior=False):
+            causal_cache=None, stop_before_prior=False, extend=False, distributed=False, profile_every=0):
         argv = ['train', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot', str(tmp_path), '--out-dir', str(out), '--epochs', str(epochs), '--device', 'cpu',
             '--window-batch-size', '4', '--source-budget', '128', '--cpu-workers', '1', '--checkpoint-every', '1', '--history-frames', str(history_frames)]
         for k, f in files.items(): argv += ['--'+k, str(f)]
         if resume: argv += ['--resume', str(resume)]
+        if extend: argv += ['--extend-completed-run']
+        if distributed: argv += ['--distributed']
+        if profile_every: argv += ['--profile-every', str(profile_every)]
         if causal_cache: argv += ['--causal-geometry-cache', str(causal_cache)]
         # Reduce only evaluator population/width for this CPU orchestration test.
         actual_eval = columns.evaluate_columns; eval_calls = []
@@ -482,6 +485,36 @@ def test_full_cli_epochs_exact_resume_and_reject_schedule_extension(tmp_path,ful
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'extended', 3, out/'last.pt')
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'short', 1, out/'last.pt')
     with pytest.raises(RuntimeError, match='resume contract'): run(tmp_path/'bad', 2, out/'candidate.pt')
+
+
+def test_explicit_completed_extension_preserves_parent_and_resumes_exactly(tmp_path, full_cli_fixture):
+    run, _, _ = full_cli_fixture
+    parent = tmp_path/'parent'; run(parent, 1, history_frames=4)
+    original = {p.name: p.read_bytes() for p in parent.iterdir() if p.is_file()}
+    baseline = tmp_path/'extended'; run(baseline, 2, parent/'last.pt', history_frames=4, extend=True)
+    a = torch.load(baseline/'last.pt', weights_only=False)
+    assert a['continuation']['original_epochs'] == 1 and a['cursor_epoch'] == 2
+    assert a['executed_windows'] == 80 and a['attempted_updates'] == 20
+    assert a['protocol'].endswith('history4_completed_extension_v1')
+    before = torch.load(parent/'last.pt', weights_only=False)
+    log = [json.loads(line) for line in (baseline/'progress.jsonl').read_text().splitlines()]
+    updates = [row for row in log if row['event'] == 'train_full']
+    assert updates[0]['update'] == 11 and updates[0]['epoch'] == 2
+    assert updates[0]['learning_rates'] == [g['lr'] for g in before['optimizer']['param_groups']]
+    assert np.allclose(updates[-1]['learning_rates'], np.array(updates[0]['learning_rates'])*.1)
+    paused = tmp_path/'paused'; assert run(paused, 2, parent/'last.pt', history_frames=4, extend=True, stop_update=14) == 130
+    resumed = tmp_path/'resumed'; run(resumed, 2, paused/'last.pt', history_frames=4)
+    b = torch.load(resumed/'last.pt', weights_only=False)
+    assert a['sampling_rng_state'] == b['sampling_rng_state'] and torch.equal(a['torch_rng_state'], b['torch_rng_state'])
+    assert a['optimizer']['param_groups'] == b['optimizer']['param_groups']
+    assert all(torch.equal(v, b['state_dict'][k]) for k, v in a['state_dict'].items())
+    for k, value in a['optimizer']['state'].items():
+        assert all(torch.equal(v, b['optimizer']['state'][k][n]) for n, v in value.items())
+    assert original == {p.name: p.read_bytes() for p in parent.iterdir() if p.is_file()}
+    with pytest.raises(RuntimeError, match='completed original'): run(tmp_path/'again', 3, baseline/'last.pt', history_frames=4, extend=True)
+    with pytest.raises(RuntimeError, match='completed original'): run(tmp_path/'candidate', 2, parent/'candidate.pt', history_frames=4, extend=True)
+    unfinished = tmp_path/'unfinished'; assert run(unfinished, 1, history_frames=4, stop_update=2) == 130
+    with pytest.raises(RuntimeError, match='fully completed'): run(tmp_path/'bad_extension', 2, unfinished/'last.pt', history_frames=4, extend=True)
 
 
 @pytest.mark.parametrize('where',['prior','last_batch','monitor','calibration','final_eval'])

@@ -164,9 +164,17 @@ def materialize_scalar_stats(values):
 def train_full_batch(joint, optimizer, provider, source, rows, rng, update, schedule_steps,
                      *, probe=False, patch_resolution=.8, control=None, control_optimizer=None,
                      profile=False, cpu_profiles=None, sampling_pool=None, sampling_workers=0, optimize_cpu=True, optimize_kernels=True,
-                     column_feature_sampler=None):
+                     column_feature_sampler=None, continuation=None, distributed=None):
     """True batching, not repeated optimizer steps or stale feature replay."""
-    joint.train(); optimizer.zero_grad(set_to_none=True); set_lr(optimizer, update-1, schedule_steps)
+    joint.train(); optimizer.zero_grad(set_to_none=True)
+    if continuation is None: set_lr(optimizer, update-1, schedule_steps)
+    else:
+        from tools.real_motion.joint_training_extension import set_extension_lr
+        set_extension_lr(optimizer, update-1, continuation)
+    if not rows:
+        if distributed is None: raise RuntimeError('empty single-rank training batch')
+        from tools.real_motion.joint_training_distributed import distributed_empty_batch
+        return distributed_empty_batch(joint, optimizer, distributed, provider.device, probe=probe)
     timer = StageTimer(provider.device, profile)
     bundle=optimize_cpu and optimize_kernels and bundle_enabled()
     horizons=bundle and horizon_pipeline_enabled()
@@ -285,7 +293,7 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             planning = split_planning
         # GPU motion supervision can overlap queued CPU patch sampling.
         lm, stats = timer.call('motion_loss', motion_loss, output, merged, provider.device, patch_resolution,
-            materialize_stats=not bundle, gpu=True)
+            materialize_stats=not bundle, distributed=distributed, gpu=True)
         audits = []
         for prep, job in planning:
             tick = time.perf_counter()
@@ -348,22 +356,32 @@ def train_full_batch(joint, optimizer, provider, source, rows, rng, update, sche
             g, r = timer.call('column_forward', joint.columns,
                 **{k: batch[k] for k in (*FEATURE_KEYS, 'source_features')}, gpu=True)
         lc, column_stats = timer.call('column_loss', column_loss, joint.columns, g, r,
-            batch['kind'], batch['legal'], batch['target'], batch['weight'], materialize_stats=not bundle, gpu=True)
+            batch['kind'], batch['legal'], batch['target'], batch['weight'], materialize_stats=not bundle,
+            distributed=distributed, gpu=True)
         if probe and len(output['future_transport_queries']) and output['future_transport_queries'].requires_grad:
             grad = torch.autograd.grad(lc, output['future_transport_queries'], retain_graph=True, allow_unused=True)[0]
             link_grad = float(grad.float().norm()) if grad is not None else 0.
+    elif distributed is not None:
+        lc, column_stats = distributed.columns({}, lm.new_zeros(2), lm.new_zeros(()))
     loss = lm+lc
     updated = loss.requires_grad and (bool(batches) or bool(merged['supervised_source'].any()))
     mn = cn = 0.
+    if distributed is not None:
+        if updated: timer.call('backward', loss.backward, gpu=True)
+        updated = timer.call('gradient_sync', distributed.synchronize_gradients, joint, gpu=True)
     if updated:
-        timer.call('backward', loss.backward, gpu=True)
+        if distributed is None: timer.call('backward', loss.backward, gpu=True)
         mn = timer.call('clip_motion', torch.nn.utils.clip_grad_norm_, joint.transport.parameters(), 5., error_if_nonfinite=True, gpu=True)
         cn = timer.call('clip_columns', torch.nn.utils.clip_grad_norm_, joint.columns.parameters(), 1., error_if_nonfinite=True, gpu=True)
         timer.call('optimizer', optimizer.step, gpu=True)
     control_loss = None
     if control is not None:
         if control_optimizer is None: raise ValueError('control optimizer required')
-        control.train(); control_optimizer.zero_grad(set_to_none=True); set_lr(control_optimizer, update-1, schedule_steps)
+        control.train(); control_optimizer.zero_grad(set_to_none=True)
+        if continuation is None: set_lr(control_optimizer, update-1, schedule_steps)
+        else:
+            from tools.real_motion.joint_training_extension import set_extension_lr
+            set_extension_lr(control_optimizer, update-1, {**continuation, 'start_learning_rates': continuation['start_learning_rates'][:1]})
         values = runtime._gpu_inputs(merged, provider.device)
         with torch.autocast(device_type=provider.device.type, dtype=torch.bfloat16, enabled=provider.device.type == 'cuda'):
             co = control(values['features'], values['tube'], values['kta'], values['frame_motion'], values['source_mask'])

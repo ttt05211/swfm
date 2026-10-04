@@ -78,7 +78,7 @@ def request_stop(directory, *, timeout=300.):
 
 
 def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers=None, profile_every=None, expected_update=None,
-                   column_feature_backend=None):
+                   column_feature_backend=None, extend_to=None, gpus=None):
     state_path = directory/'runtime_status.json'
     if state_path.is_file() and status(directory)['matching_trainer_running']:
         raise RuntimeError('original trainer is still running; stop it before resume')
@@ -93,6 +93,24 @@ def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers
         if stable_json_fingerprint(ck.get(key)) != stable_json_fingerprint(contract.get(key)):
             raise RuntimeError('checkpoint/original execution contract mismatch at '+key)
     args = dict(contract['arguments'])
+    world = ck.get('distributed_training', {}).get('world_size', 1)
+    args['extend_completed_run'] = False  # a stopped extension is ordinary exact resume, NOT another extension
+    if extend_to is not None:
+        if (type(extend_to) is not int or extend_to <= ck['epochs']
+                or ck.get('continuation') is not None or ck.get('cursor_epoch') != ck['epochs']
+                or ck.get('cursor_batch') != 0 or ck.get('attempted_updates') != ck.get('target_updates')
+                or not ck.get('prior_completed', True)):
+            raise RuntimeError('extend requires fully completed ORIGINAL run and a larger total epoch count')
+        args.update(epochs=extend_to, extend_completed_run=True)
+    devices = None
+    if gpus is not None:
+        devices = gpus.split(',')
+        if len(devices) not in (1, 2) or len(set(devices)) != len(devices) or any(not s.isdigit() for s in devices):
+            raise ValueError('gpus must be one ID or two distinct IDs, e.g. 0 or 0,1')
+        if extend_to is not None: world = len(devices)
+        elif len(devices) != world: raise RuntimeError('resume cannot change distributed world size')
+    args['distributed'] = world > 1
+    if world > 1 and args.get('paired_control'): raise RuntimeError('two-rank extension does not support paired control')
     if column_feature_backend is not None:
         if column_feature_backend not in ('cpu', 'gpu'): raise ValueError('column feature backend must be cpu or gpu')
         args['column_feature_backend'] = column_feature_backend
@@ -108,12 +126,13 @@ def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers
         args['profile_every'] = profile_every
     root = directory.parent if directory.name == 'model' else directory
     out = Path(new_out).resolve() if new_out else root.parent/(
-        f"full{ck['epochs']}_history{ck['model_configs']['motion']['history_frames']}_resume_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}")
+        f"full{args['epochs']}_history{ck['model_configs']['motion']['history_frames']}_{'extend' if extend_to else 'resume'}_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}")
     if out.exists(): raise RuntimeError('NEW resume output required; original experiment is never overwritten')
     args.update(out_dir=str(out/'model'),resume=str(ck_path),history_frames=ck['model_configs']['motion']['history_frames'],
                 prewarm_causal_cache=False)  # populated geometry is reused, never explicitly re-prefilled
     command = [sys.executable,'-u',str(TRAINER)]
-    booleans = {'paired_control','persistent_sampling_pool','reference_cpu_pipeline','prewarm_causal_cache'}
+    booleans = {'paired_control','persistent_sampling_pool','reference_cpu_pipeline','prewarm_causal_cache',
+                'extend_completed_run','distributed'}
     path_keys = {'config','train_cache','dev_cache','population_manifest','base_checkpoint','dataroot',
         'train_info','dev_info','out_dir','resume','causal_geometry_cache'}
     cwd = Path(contract.get('launch_cwd',Path.cwd()))
@@ -136,12 +155,17 @@ def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers
     repository = TRAINER.parents[2]
     env['PYTHONPATH'] = os.pathsep.join([str(repository),str(repository/'upstream_occfm'),env.get('PYTHONPATH','')])
     env.setdefault('CUDA_VISIBLE_DEVICES','0')
+    if devices is not None: env['CUDA_VISIBLE_DEVICES'] = ','.join(devices)
+    if world > 1:
+        if len(env['CUDA_VISIBLE_DEVICES'].split(',')) != world:
+            raise RuntimeError('dual resume requires two visible GPUs; explicitly use --gpus 0,1')
+        command = [sys.executable, '-u', '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=2', *command[2:]]
     return command, env, out
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',choices=('status','stop','resume'))
+    p.add_argument('action',choices=('status','stop','resume','extend'))
     p.add_argument('--run-dir',required=True)
     p.add_argument('--checkpoint',help='explicit full backup checkpoint; no silent fallback')
     p.add_argument('--out-dir',help='NEW root for resume (model subdirectory created by trainer)')
@@ -150,15 +174,18 @@ def main():
     p.add_argument('--column-feature-backend',choices=('cpu','gpu'),help='performance-only byte sampling override; no recipe change')
     p.add_argument('--profile-every',type=int,help='performance-only stage timing interval; 0 disables')
     p.add_argument('--expected-update',type=int,help='refuse a checkpoint other than this committed update')
+    p.add_argument('--to-epochs',type=int,help='extend only: new TOTAL epochs, not number of added epochs')
+    p.add_argument('--gpus',help='explicit GPU IDs; dual opt-in on completed extension only; resume must retain rank count')
     p.add_argument('--timeout',type=float,default=300.)
     a = p.parse_args(); directory=model_directory(a.run_dir)
     if a.action == 'status': print(json.dumps(status(directory),ensure_ascii=False,indent=2)); return 0
     if a.action == 'stop':
         if not 0 < a.timeout <= 3600: p.error('positive bounded stop timeout required')
         return request_stop(directory,timeout=a.timeout)
+    if (a.action == 'extend') != (a.to_epochs is not None): p.error('--to-epochs is required ONLY for extend')
     command,env,out=resume_command(directory,a.checkpoint,a.out_dir,sampling_workers=a.sampling_workers,
                                   profile_every=a.profile_every,expected_update=a.expected_update,
-                                  column_feature_backend=a.column_feature_backend)
+                                  column_feature_backend=a.column_feature_backend, extend_to=a.to_epochs, gpus=a.gpus)
     print(json.dumps({'resume_output':str(out),'command':command,'cpu_backend':env['SWFM_COLUMN_CPU_BACKEND'],
         'cpu_horizon_pipeline':env['SWFM_COLUMN_CPU_HORIZONS'],
         'checkpoint_role':'full optimizer/RNG/cursor, NOT weight-only'},ensure_ascii=False,indent=2),flush=True)
@@ -170,7 +197,18 @@ def main():
     with (out/'run.log').open('x',encoding='utf-8') as log:
         child = subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT)
         def forward(signum,frame):
-            if child.poll() is None: child.send_signal(signal.SIGTERM)
+            if child.poll() is None:
+                # Signal the verified primary trainer, not torchrun's elastic
+                # agent: the agent interprets TERM as a job failure and kills
+                # peers before a collective safe checkpoint can finish.
+                model = out/'model'; state_file = model/'runtime_status.json'
+                if state_file.is_file():
+                    try:
+                        state = json.loads(state_file.read_text(encoding='utf-8'))
+                        if matching_process(model.resolve(), state):
+                            os.kill(state['pid'], signal.SIGTERM); return
+                    except (OSError, ValueError, RuntimeError): pass
+                child.send_signal(signal.SIGTERM)  # before initialized status: no new training progress exists
         previous = {s:signal.signal(s,forward) for s in (signal.SIGINT,signal.SIGTERM)}
         try:
             output_enabled = True

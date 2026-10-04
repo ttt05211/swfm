@@ -177,3 +177,36 @@ def test_stop_scopes_single_term_and_waits_no_force_kill(tmp_path):
     with patch.object(manage,'matching_process',side_effect=[True,True,False,False]),patch.object(manage.os,'kill') as kill:
         assert manage.request_stop(directory) == 0
         kill.assert_called_once_with(12345,manage.signal.SIGTERM)
+
+
+def test_completed_extension_launcher_is_explicit_dual_and_parent_is_read_only(tmp_path):
+    directory, ck = manager_fixture(tmp_path)
+    ck.update(cursor_epoch=15, cursor_batch=0, attempted_updates=77172, target_updates=77172, prior_completed=True)
+    torch.save(ck, directory/'last.pt')
+    before = {p: p.read_bytes() for p in directory.iterdir()}
+    command, env, out = manage.resume_command(directory, extend_to=20, gpus='0,1', column_feature_backend='gpu')
+    value = lambda key: command[command.index('--'+key)+1]
+    assert '--extend-completed-run' in command and '--distributed' in command
+    assert 'torch.distributed.run' in command and '--nproc_per_node=2' in command
+    assert value('epochs') == '20' and value('window-batch-size') == '4' and value('source-budget') == '128'
+    assert env['CUDA_VISIBLE_DEVICES'] == '0,1' and value('resume') == str(directory/'last.pt')
+    assert not out.exists() and before == {p: p.read_bytes() for p in directory.iterdir()}
+    with pytest.raises(RuntimeError, match='world size'): manage.resume_command(directory, gpus='0,1')
+    for ids in ('0,0', '0,1,2', 'banana', ''):
+        with pytest.raises(ValueError): manage.resume_command(directory, extend_to=20, gpus=ids)
+    ck['cursor_batch'] = 1; torch.save(ck, directory/'last.pt')
+    with pytest.raises(RuntimeError, match='fully completed'): manage.resume_command(directory, extend_to=20, gpus='0,1')
+
+
+def test_stopped_dual_extension_resume_retains_epochs_rank_count_and_recipe(tmp_path):
+    directory, ck = manager_fixture(tmp_path)
+    ck.update(epochs=20, distributed_training={'world_size': 2}, continuation={'parent': 'old'})
+    torch.save(ck, directory/'last.pt')
+    contract = json.loads((directory/'execution_contract.json').read_text())
+    contract.update(epochs=20); contract['arguments'].update(epochs=20, extend_completed_run=True, distributed=True)
+    write_json(directory/'execution_contract.json', contract)
+    command, env, _ = manage.resume_command(directory, gpus='0,1')
+    assert '--extend-completed-run' not in command and '--distributed' in command
+    assert command[command.index('--epochs')+1] == '20' and env['CUDA_VISIBLE_DEVICES'] == '0,1'
+    with pytest.raises(RuntimeError, match='world size'): manage.resume_command(directory, gpus='0')
+    with pytest.raises(RuntimeError, match='ORIGINAL'): manage.resume_command(directory, extend_to=25, gpus='0,1')

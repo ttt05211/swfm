@@ -34,9 +34,13 @@ from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 
 
 def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=False):
+    from real_motion.joint_causal_columns import (FULL_PROTOCOLS, FULL_EXT_PROTOCOL, FULL4_EXT_PROTOCOL,
+                                                 FULL_EXT_CONTRACT, FULL4_EXT_CONTRACT)
     ck = torch.load(path, map_location='cpu', weights_only=False)
-    full_protocol = ck.get('protocol') in (FULL_PROTOCOL, FULL4_PROTOCOL)
-    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT, FULL4_PROTOCOL: FULL4_CONTRACT, CONTEXT_PROTOCOL: CONTEXT_CONTRACT}.get(ck.get('protocol'))
+    full_protocol = ck.get('protocol') in FULL_PROTOCOLS
+    expected_contract = {PROTOCOL: CONTRACT, FULL_PROTOCOL: FULL_CONTRACT, FULL4_PROTOCOL: FULL4_CONTRACT,
+                         FULL_EXT_PROTOCOL: FULL_EXT_CONTRACT, FULL4_EXT_PROTOCOL: FULL4_EXT_CONTRACT,
+                         CONTEXT_PROTOCOL: CONTEXT_CONTRACT}.get(ck.get('protocol'))
     expected_link = CONTEXT_LINK if ck.get('protocol') == CONTEXT_PROTOCOL else LINK_PROTOCOL
     if (expected_contract is None or ck.get('training_contract') != expected_contract or ck.get('source_link') != expected_link
             or ck.get('reference_checkpoint_sha256') != reference_sha or ck.get('runtime_config_fingerprint') != config_sha
@@ -48,7 +52,7 @@ def load_joint(path, device, *, reference_sha, config_sha, allow_diagnostic=Fals
                                  or not ck.get('screen_pass') or ck.get('successful_updates', 0) <= 0):
         raise RuntimeError('failed/smoke/last joint candidate cannot be deployed')
     adaptive = ck['model_configs'].get('adaptive_context')
-    if (ck['protocol'] == FULL4_PROTOCOL) != (ck['model_configs']['motion']['history_frames'] == 4):
+    if (ck['protocol'] in (FULL4_PROTOCOL, FULL4_EXT_PROTOCOL)) != (ck['model_configs']['motion']['history_frames'] == 4):
         raise RuntimeError('four-frame checkpoint/protocol mismatch')
     if (adaptive is not None) != (ck['protocol'] == CONTEXT_PROTOCOL): raise RuntimeError('adaptive model/protocol mismatch')
     extra = {'context_config': AdaptiveContextConfig(**adaptive)} if adaptive is not None else {}

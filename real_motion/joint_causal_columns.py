@@ -38,6 +38,14 @@ FULL4_PROTOCOL = 'p0_f9_joint_causal_columns_full_train_history4_v1'
 FULL4_CONTRACT = {**FULL_CONTRACT, 'observations': 'last4_observations_no_old_slots_no_cross_boundary_velocity_v1',
     'reference': 'legacy_E14_six_history_not_same_input_budget_comparison'}
 
+# Extending a completed cosine run is NOT a retroactive whole-20 cosine run.
+FULL_EXT_PROTOCOL = 'p0_f9_joint_causal_columns_full_completed_extension_v1'
+FULL4_EXT_PROTOCOL = 'p0_f9_joint_causal_columns_full_history4_completed_extension_v1'
+FULL_EXT_CONTRACT = {**FULL_CONTRACT,
+    'schedule': 'completed_original_cosine_then_explicit_endpoint_lr_extension_cosine_floor0p1'}
+FULL4_EXT_CONTRACT = {**FULL4_CONTRACT, 'schedule': FULL_EXT_CONTRACT['schedule']}
+FULL_PROTOCOLS = (FULL_PROTOCOL, FULL4_PROTOCOL, FULL_EXT_PROTOCOL, FULL4_EXT_PROTOCOL)
+
 
 class LinkedColumns(CausalColumnModel):
     extra_input_keys = ('source_features',)

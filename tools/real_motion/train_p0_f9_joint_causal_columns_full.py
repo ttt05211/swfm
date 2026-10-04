@@ -8,6 +8,7 @@ import argparse
 import copy
 import json
 import os
+import io
 import random
 import subprocess
 import time
@@ -37,6 +38,8 @@ from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 from tools.real_motion.joint_training_recovery import (
     save_resume_checkpoint, preserve_training_rng, process_start_token, stop_requested, validate_prior_resume,
 )
+from tools.real_motion.joint_training_extension import extension_identity, validate_extension, EXT_PROTOCOLS
+from tools.real_motion.joint_training_distributed import DistributedTraining, merge_rank_stats
 
 TRAIN_WINDOWS = 20430
 PRIOR_WINDOWS = 1024
@@ -70,7 +73,9 @@ def full_summary(summary):
         f"successful_updates: {summary['successful_updates']}", f"executed_windows: {summary['executed_windows']}",
         f"window_batch_size: {summary['window_batch_size']}", f"source_budget: {summary['source_budget']}",
         f"paired_control: {summary['paired_control']}", 'initialization: RANDOM, E14 reference only',
-        'schedule: whole configured training cycle cosine; NO fixed-LR tail',
+        ('schedule: original completed cosine + explicit endpoint-LR cosine extension; NOT whole-20-from-start'
+         if summary.get('continuation') else 'schedule: whole configured training cycle cosine; NO fixed-LR tail'),
+        f"distributed_world_size: {summary.get('distributed_training', {}).get('world_size', 1)}; GLOBAL batch/source unchanged",
         f"TRAIN-only in-sample thresholds: {summary['thresholds']}",
         f"gradient_link_observed: {summary['gradient_link_observed']}"]
     for population in ('dev64', 'all'):
@@ -125,6 +130,8 @@ def _main(stop_event, caches, runtime_state):
     parser.add_argument('--seed', type=int, default=20261002)
     parser.add_argument('--paired-control', action='store_true', help='also train matched V18-only (off by default)')
     parser.add_argument('--resume', help='full-protocol last.pt into a NEW output directory; epochs/geometry/recipe must match')
+    parser.add_argument('--extend-completed-run', action='store_true', help='explicit NEW experiment: completed original last.pt only; endpoint-LR cosine to --epochs')
+    parser.add_argument('--distributed', action='store_true', help='torchrun two-rank synchronous global-weighted training; GLOBAL batch/source unchanged')
     parser.add_argument('--prewarm-causal-cache', action='store_true', help='explicitly persist all TRAIN history geometry before optimization; first build cost is not free')
     parser.add_argument('--profile-every', type=int, default=0, help='opt-in host/CUDA-stream stage clocks every N updates; 0 leaves normal path unchanged')
     parser.add_argument('--sampling-workers', type=int, default=0, help='0 uses 6 combined native horizon workers (legacy 4); horizon path capped at 8')
@@ -134,6 +141,11 @@ def _main(stop_event, caches, runtime_state):
     parser.add_argument('--io-workers', type=int, default=2, help='bounded next-batch window loaders')
     parser.add_argument('--reference-cpu-pipeline', action='store_true', help='diagnostic fallback only; disable parallel warm prepare/shared sparse history/batched render readback')
     args = parser.parse_args(); started = time.perf_counter(); out = Path(args.out_dir)
+    distributed = DistributedTraining(args.distributed); caches.append(distributed)
+    def should_stop(): return distributed.stop(stop_requested(stop_event))
+    if args.extend_completed_run and not args.resume: parser.error('extension requires --resume original completed last.pt')
+    if distributed.active and (not args.resume or args.paired_control or args.prewarm_causal_cache):
+        parser.error('two-rank backend requires completed/extended resume, no paired-control or explicit prewarm')
     from real_motion.native_column_cpu import backend_name, prepare_native
     if backend_name() == 'native':
         print('NATIVE_CPU_PREFLIGHT '+json.dumps(prepare_native()), flush=True)
@@ -152,7 +164,7 @@ def _main(stop_event, caches, runtime_state):
             metadata = torch.load(args.resume, map_location='cpu', weights_only=False)
             args.history_frames = int(metadata['model_configs']['motion']['history_frames']); del metadata
         else: args.history_frames = 4
-    device = torch.device(args.device)
+    device = distributed.device if distributed.active else torch.device(args.device)
     if device.type == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()): raise RuntimeError('CUDA/BF16 required')
     column_feature_sampler = None
     if args.column_feature_backend == 'gpu':
@@ -219,11 +231,21 @@ def _main(stop_event, caches, runtime_state):
     epoch_totals = {}; epoch_seconds = 0.; epoch_stats_complete = True
     if args.resume:
         ck, restored = load_joint(args.resume, device, reference_sha=base_sha, config_sha=config_sha, allow_diagnostic=True)
+        if args.extend_completed_run:
+            identity = extension_identity(ck, identity, plans, sha256(args.resume))
+        elif ck.get('protocol') in EXT_PROTOCOLS:
+            identity.update(protocol=ck['protocol'], training_contract=ck['training_contract'], continuation=copy.deepcopy(ck['continuation']))
+        validate_extension(identity, plans)
+        previous_world = ck.get('distributed_training', {}).get('world_size', 1)
+        if previous_world != distributed.world_size and not (args.extend_completed_run and previous_world == 1):
+            raise RuntimeError('resume world size changed; only explicit completed-run extension may migrate single to dual')
+        if distributed.active or 'distributed_training' in ck: identity['distributed_training'] = distributed.identity()
+        skipped = {'protocol', 'training_contract', 'epochs', 'target_updates', 'schedule_steps', 'continuation', 'distributed_training'} if args.extend_completed_run else set()
         # Whole-run cosine depends on the declared total epochs. Resume cannot
         # silently change that horizon, batch geometry or initial LR schedule.
         if (ck['checkpoint_role'] != 'resume_last'
                 or any(stable_json_fingerprint(ck.get(k)) != stable_json_fingerprint(v)
-                       for k, v in identity.items())):
+                       for k, v in identity.items() if k not in skipped)):
             raise RuntimeError('full resume contract/population mismatch; screen checkpoint cannot initialize full training')
         joint.load_state_dict(restored.state_dict()); del restored; optimizer.load_state_dict(ck['optimizer'])
         if control is not None:
@@ -239,10 +261,19 @@ def _main(stop_event, caches, runtime_state):
                        or not 0 < v['count'] <= cursor_batch or not np.isfinite(v['sum'])
                        for v in epoch_totals.values())):
             raise RuntimeError('invalid accumulated epoch statistics')
-        rng.bit_generator.state = ck['sampling_rng_state']; torch.set_rng_state(ck['torch_rng_state'])
-        if 'python_rng_state' in ck: random.setstate(ck['python_rng_state'])
-        if 'numpy_global_rng_state' in ck: np.random.set_state(ck['numpy_global_rng_state'])
-        if device.type == 'cuda': torch.cuda.set_rng_state_all(ck['cuda_rng_states'])
+        if distributed.active and previous_world > 1:
+            distributed.restore_rng(ck['distributed_rng_states'], rng)
+        else:
+            rng.bit_generator.state = ck['sampling_rng_state']; torch.set_rng_state(ck['torch_rng_state'])
+            if 'python_rng_state' in ck: random.setstate(ck['python_rng_state'])
+            if 'numpy_global_rng_state' in ck: np.random.set_state(ck['numpy_global_rng_state'])
+            if device.type == 'cuda':
+                if distributed.active: torch.cuda.set_rng_state(ck['cuda_rng_states'][0], device)
+                else: torch.cuda.set_rng_state_all(ck['cuda_rng_states'])
+            if distributed.active and distributed.rank:
+                rng.bit_generator.state = rng.bit_generator.jumped(distributed.rank).state
+                torch.manual_seed(args.seed+104729*distributed.rank)
+                random.seed(args.seed+104729*distributed.rank); np.random.seed(args.seed+104729*distributed.rank)
         if not (0 <= cursor_epoch <= args.epochs and 0 <= updates <= target_updates): raise RuntimeError('invalid resume cursor')
         if cursor_epoch < args.epochs and not 0 <= cursor_batch <= len(plans[cursor_epoch]): raise RuntimeError('invalid batch cursor')
         if cursor_epoch == args.epochs and cursor_batch: raise RuntimeError('completed run cursor must be zero')
@@ -250,9 +281,14 @@ def _main(stop_event, caches, runtime_state):
         expected_windows = cursor_epoch*len(records)+(sum(map(len, plans[cursor_epoch][:cursor_batch])) if cursor_epoch < args.epochs else 0)
         if updates != expected_updates or executed != expected_windows or not 0 <= successes <= updates:
             raise RuntimeError('resume window/update counters inconsistent with epoch order')
-    out.mkdir(parents=True); write_json(out/'execution_contract.json', {**identity, 'arguments': vars(args), 'launch_cwd': str(Path.cwd())})
+        if distributed.active and not prior_completed: raise RuntimeError('two-rank resume requires completed TRAIN prior')
+    distributed.barrier()
+    if distributed.primary:
+        out.mkdir(parents=True); write_json(out/'execution_contract.json', {**identity, 'arguments': vars(args), 'launch_cwd': str(Path.cwd())})
+    distributed.barrier()
     def write_status(phase, **extra):
         runtime_state['phase'] = phase
+        if not distributed.primary: return
         write_json(out/'runtime_status.json', {'phase': phase, 'pid': os.getpid(),
             'process_start_token': process_start_token(os.getpid()), 'out_dir': str(out.resolve()),
             'argv': list(sys.argv), 'updated_utc': datetime.now(timezone.utc).isoformat(),
@@ -261,7 +297,7 @@ def _main(stop_event, caches, runtime_state):
             'prior_completed': prior_completed, 'prior_cursor': prior_cursor, **extra})
     runtime_state['write'] = write_status
     write_status('initializing')
-    print(f'TRAINING_PROCESS pid={os.getpid()} out_dir={out.resolve()} status={out}/runtime_status.json', flush=True)
+    print(f'TRAINING_PROCESS pid={os.getpid()} rank={distributed.rank} out_dir={out.resolve()} status={out}/runtime_status.json', flush=True)
     sampling_pool = None
     cpu_horizons = not args.reference_cpu_pipeline and horizon_pipeline_enabled()
     cpu_pool_workers = sampling_worker_budget(args.cpu_workers, args.sampling_workers, horizons=cpu_horizons)
@@ -276,16 +312,22 @@ def _main(stop_event, caches, runtime_state):
         'sampling_rng': 'caller_window_horizon_order', 'geometry_ram_mib': args.causal_cache_ram_mib,
         'prefetch': 'one_batch_unchanged', 'nested_pools': False}), flush=True)
     stages = {}; tick = time.perf_counter()
-    label = 'FULL RESUME' if args.resume else 'FULL RANDOM INIT'
+    label = 'FULL EXPLICIT EXTENSION' if args.extend_completed_run else ('FULL RESUME' if args.resume else 'FULL RANDOM INIT')
+    schedule_label = (f"extension_cosine_steps={identity['continuation']['extension_updates']}"
+                      if identity.get('continuation') else f'whole_cosine_steps={schedule_steps}')
     print(f'{label}: windows={len(records)} epochs={args.epochs} updates={target_updates} batch<={args.window_batch_size} '
-          f'sources<={args.source_budget} whole_cosine_steps={schedule_steps} paired_control={args.paired_control}', flush=True)
+          f'sources<={args.source_budget} {schedule_label} paired_control={args.paired_control}', flush=True)
     print(f'OBSERVATIONS: {args.history_frames} historical occupancy frames; six futures. Frozen E14 reference is legacy six-frame, NOT a matched four-frame baseline.', flush=True)
+    if identity.get('continuation') and distributed.primary:
+        print('CONTINUATION '+json.dumps(identity['continuation'])+'; original 15 results untouched; no LR rebound', flush=True)
+    if distributed.active and distributed.primary: print('DUAL_GLOBAL_CONTRACT '+json.dumps(distributed.identity()), flush=True)
     if args.resume:
         print(f'RESTORED checkpoint={args.resume} completed_updates={updates} epoch_cursor={cursor_epoch} '
               f'batch_cursor={cursor_batch} next_update={updates+1} optimizer/RNG/cosine_restored '
               f'prior={"complete_skipped" if prior_completed else str(prior_cursor)+"/"+str(PRIOR_WINDOWS)+"_resumed"}', flush=True)
-    with (out/'progress.jsonl').open('x', encoding='utf-8') as handle:
+    with ((out/'progress.jsonl').open('x', encoding='utf-8') if distributed.primary else io.StringIO()) as handle:
         def progress(row):
+            if not distributed.primary: return
             handle.write(json.dumps(finite_json(row), ensure_ascii=False, allow_nan=False)+'\n'); handle.flush()
         if weights is None:
             # A zero-update checkpoint can safely resume an unfinished TRAIN
@@ -302,20 +344,26 @@ def _main(stop_event, caches, runtime_state):
                 'epoch_totals': epoch_totals, 'epoch_seconds': epoch_seconds, 'epoch_stats_complete': epoch_stats_complete,
                 'state_dict': {k: v.detach().cpu().clone() for k, v in joint.state_dict().items()}}
         def save_last():
+            rank_states = distributed.gather(distributed.rng_state(rng)) if distributed.active else None
+            if not distributed.primary: return
             state = {**payload('resume_last'), 'optimizer': optimizer.state_dict(), 'sampling_rng_state': rng.bit_generator.state,
                 'torch_rng_state': torch.get_rng_state(), 'cuda_rng_states': torch.cuda.get_rng_state_all() if device.type == 'cuda' else [],
                 'python_rng_state': random.getstate(), 'numpy_global_rng_state': np.random.get_state()}
+            if rank_states is not None: state['distributed_rng_states'] = rank_states
             if control is not None: state.update(control_state_dict=control.state_dict(), control_optimizer=control_optimizer.state_dict())
             save_resume_checkpoint(out/'last.pt', state)
             write_status(runtime_state['phase'], checkpoint_saved=True)
         def stop_safely(reason):
             save_last()
+            distributed.barrier()  # primary must finish durable publication before either worker exits
             progress({'event': 'stopped_safely', 'update': updates, 'reason': reason, 'checkpoint': str(out/'last.pt')})
             write_status('stopped', reason=reason)
             print(f'STOPPED safely {reason}; completed_update={updates}: {out}/last.pt', flush=True)
-            return 130
+            # An intentional dual stop is not a failed elastic worker. A
+            # nonzero rank exit would make torchrun terminate its healthy peer.
+            return 0 if distributed.active else 130
         save_last()
-        if stop_requested(stop_event): return stop_safely('before prior/training')
+        if should_stop(): return stop_safely('before prior/training')
         if args.prewarm_causal_cache:
             from tools.real_motion.local_warm_cache_common import warm_causal_cache
             print('PREWARM: all TRAIN20430 causal disk entries; no GT/optimizer updates, original Strong device.', flush=True)
@@ -344,26 +392,38 @@ def _main(stop_event, caches, runtime_state):
             joint.columns.generation_pos_weight.fill_(weights['generation_pos_weight'])
             joint.columns.refine_class_weights.copy_(torch.tensor(weights['refine_class_weights'], device=device))
             prior_completed = True
-        write_json(out/'TRAIN_prior_counts.json', weights); stages['TRAIN1024_prior'] = time.perf_counter()-tick
+        if distributed.primary: write_json(out/'TRAIN_prior_counts.json', weights)
+        stages['TRAIN1024_prior'] = time.perf_counter()-tick
         save_last(); training_started = time.perf_counter(); monitor_seconds = 0.
-        if stop_requested(stop_event): return stop_safely('before training')
+        if should_stop(): return stop_safely('before training')
         for e in range(cursor_epoch, args.epochs):
             write_status('training')
             epoch_started = time.perf_counter(); done_batch = cursor_batch if e == cursor_epoch else 0
             scheduled = (records[i] for group in plans[e][done_batch:] for i in group)
+            if distributed.active:
+                # Keep GLOBAL source/window packing and exact epoch order; only
+                # raw CPU preparation for this rank's shard is prefetched.
+                from tools.real_motion.joint_training_distributed import prefetch_distributed_batches
+                batches = prefetch_distributed_batches(provider, source, records, plans[e][done_batch:], distributed,
+                                                        io_workers=args.io_workers)
+            else:
+                batches = prefetch_column_batches(provider, source, scheduled, args.window_batch_size, args.source_budget,
+                                                  io_workers=args.io_workers)
             previous_end = time.perf_counter(); recent_time = []; recent_windows = []; aggregate = {}
-            for bi, rows in enumerate(prefetch_column_batches(provider, source, scheduled, args.window_batch_size, args.source_budget,
-                                                            io_workers=args.io_workers), done_batch+1):
+            for bi, rows in enumerate(batches, done_batch+1):
                 compute_started = time.perf_counter(); wait = compute_started-previous_end
-                if stop_requested(stop_event): return stop_safely('before next update')
-                if tuple((r['scene_name'], r['t0_token']) for r, _ in rows) != tuple((records[i]['scene_name'], records[i]['t0_token']) for i in plans[e][bi-1]):
+                if should_stop(): return stop_safely('before next update')
+                expected = plans[e][bi-1][distributed.rank::distributed.world_size]
+                if tuple((r['scene_name'], r['t0_token']) for r, _ in rows) != tuple((records[i]['scene_name'], records[i]['t0_token']) for i in expected):
                     raise RuntimeError('batch planning/order mismatch')
                 stats = train_full_batch(joint, optimizer, provider, source, rows, rng, updates+1, schedule_steps,
                     probe=updates < 2 or (updates+1) % 128 == 0, patch_resolution=identity['patch_resolution_m'],
                     control=control, control_optimizer=control_optimizer,
                     profile=args.profile_every > 0 and (updates+1) % args.profile_every == 0,
                     sampling_pool=sampling_pool, sampling_workers=args.sampling_workers, optimize_cpu=not args.reference_cpu_pipeline,
-                    column_feature_sampler=column_feature_sampler)
+                    column_feature_sampler=column_feature_sampler, continuation=identity.get('continuation'),
+                    distributed=distributed if distributed.active else None)
+                if distributed.active: stats = merge_rank_stats(distributed.gather(stats))
                 updates += 1; successes += int(stats['optimizer_updated']); executed += stats['windows']; sampled += stats['sampled_columns']
                 link_observed |= (stats['source_query_gradient_norm'] or 0.) > 0
                 cursor_epoch, cursor_batch = e, bi; wall = time.perf_counter()-compute_started+wait
@@ -378,14 +438,14 @@ def _main(stop_event, caches, runtime_state):
                 progress({'event': 'train_full', 'epoch': e+1, 'epoch_batch': bi, 'epoch_batches': len(plans[e]),
                     'update': updates, **stats, 'seconds': wall, 'input_wait_seconds': wait,
                     'learning_rates': [g['lr'] for g in optimizer.param_groups]})
-                if bi == 1 or bi % 32 == 0 or bi == len(plans[e]):
+                if distributed.primary and (bi == 1 or bi % 32 == 0 or bi == len(plans[e])):
                     per_window = sum(recent_time)/max(sum(recent_windows), 1)
                     print(f"epoch={e+1}/{args.epochs} batch={bi}/{len(plans[e])} update={updates}/{target_updates} "
                         f"motion={stats['motion_loss']:.5f} columns={stats['column_loss']:.5f} lr={optimizer.param_groups[0]['lr']:.3g} "
                         f"seconds/window={per_window:.3f} remaining_train_hours_if_current_speed={(args.epochs*len(records)-executed)*per_window/3600:.2f}", flush=True)
                     if hasattr(provider, 'causal_geometry_cache'):
                         print('GEOMETRY_CACHE '+json.dumps(provider.causal_geometry_cache.stats()), flush=True)
-                stopping = stop_event is not None and stop_event.is_set()
+                stopping = should_stop()
                 if updates % args.checkpoint_every == 0 and not stopping: save_last()
                 if stopping:
                     return stop_safely('after completed update')
@@ -396,41 +456,58 @@ def _main(stop_event, caches, runtime_state):
             if control is not None: control.eval()
             provider.reference_enabled = True
             write_status('epoch_monitor')
-            try:
-                with preserve_training_rng(rng):
-                    report = evaluate_columns(provider, dev_source, align_records(dev, dev64), joint.columns, (.5, .5, None),
-                        progress=progress, batch_size=args.eval_batch_size, diagnostic_thresholds=None, stop_event=stop_event)
-            except InterruptedError: return stop_safely('during epoch monitor; completed batches will not replay')
-            finally: provider.reference_enabled = False
+            interrupted = False; record = None
+            if distributed.primary:
+                try:
+                    with preserve_training_rng(rng):
+                        report = evaluate_columns(provider, dev_source, align_records(dev, dev64), joint.columns, (.5, .5, None),
+                            progress=progress, batch_size=args.eval_batch_size, diagnostic_thresholds=None, stop_event=stop_event)
+                except InterruptedError: interrupted = True
+                if not interrupted:
+                    row = report['all']; record = {'epoch': e+1, 'training_seconds_this_invocation': epoch_train_seconds,
+                        'training_means_this_invocation': {k: sum(v)/len(v) for k, v in aggregate.items()},
+                        'training_seconds_accumulated': epoch_seconds,
+                        'training_means_accumulated': {k: v['sum']/v['count'] for k,v in epoch_totals.items() if v['count']},
+                        'training_statistics_complete_epoch': epoch_stats_complete,
+                        'dev64_fixed_gate': row, 'successful_updates': successes, 'attempted_updates': updates}
+                    write_json(out/f'monitor_epoch_{e+1:04d}.json', report)
+            interrupted, record = distributed.broadcast((interrupted, record))
+            provider.reference_enabled = False
+            if interrupted: return stop_safely('during epoch monitor; completed batches will not replay')
             monitor_seconds += time.perf_counter()-monitor_started
-            row = report['all']; record = {'epoch': e+1, 'training_seconds_this_invocation': epoch_train_seconds,
-                'training_means_this_invocation': {k: sum(v)/len(v) for k, v in aggregate.items()},
-                'training_seconds_accumulated': epoch_seconds,
-                'training_means_accumulated': {k: v['sum']/v['count'] for k,v in epoch_totals.items() if v['count']},
-                'training_statistics_complete_epoch': epoch_stats_complete,
-                'dev64_fixed_gate': row, 'successful_updates': successes, 'attempted_updates': updates}
-            history.append(record); write_json(out/f'monitor_epoch_{e+1:04d}.json', report); write_json(out/'epoch_history.json', history)
+            row = record['dev64_fixed_gate']; history.append(record)
+            if distributed.primary: write_json(out/'epoch_history.json', history)
             progress({'event': 'epoch_complete', **record})
             d = row['joint_vs_reference_pp']['frozen_E14']
-            print(f"EPOCH_RESULT {e+1}: transport={row['baseline']['mIoU']:.6f} joint={row['variants']['joint']['metrics']['mIoU']:.6f} "
-                f"vs_E14={d['mIoU']:+.6f} MovingMicro={d['MovingMicro']:+.6f}", flush=True)
+            if distributed.primary:
+                print(f"EPOCH_RESULT {e+1}: transport={row['baseline']['mIoU']:.6f} joint={row['variants']['joint']['metrics']['mIoU']:.6f} "
+                    f"vs_E14={d['mIoU']:+.6f} MovingMicro={d['MovingMicro']:+.6f}", flush=True)
             cursor_epoch, cursor_batch = e+1, 0
             epoch_totals = {}; epoch_seconds = 0.; epoch_stats_complete = True
             # Weight-only snapshots are NOT resumable. Last.pt has optimizer/RNG.
-            atomic_checkpoint(out/f'epoch_{e+1:04d}.pt', payload('epoch_snapshot')); save_last()
+            if distributed.primary: atomic_checkpoint(out/f'epoch_{e+1:04d}.pt', payload('epoch_snapshot'))
+            save_last()
             keep = {10, 14, 15, 20, *range(max(1, e-1), e+2)}
-            for p in out.glob('epoch_*.pt'):
+            if identity.get('continuation'):
+                keep.update(range(identity['continuation']['original_epochs']+1, args.epochs+1))
+            for p in (out.glob('epoch_*.pt') if distributed.primary else []):
                 if int(p.stem.split('_')[-1]) not in keep: p.unlink()
-            if stop_requested(stop_event): return stop_safely('after epoch monitor')
+            if should_stop(): return stop_safely('after epoch monitor')
         stages['training'] = time.perf_counter()-training_started-monitor_seconds; stages['dev64_epoch_monitors'] = monitor_seconds
         if executed != args.epochs*len(records) or updates != target_updates: raise RuntimeError('incomplete full training population')
+        if not distributed.primary:
+            result = distributed.broadcast(None)
+            if result == 'interrupted': return stop_safely('during final diagnostics; training already complete')
+            return 0
         joint.eval(); tick = time.perf_counter()
         write_status('final_TRAIN_calibration')
         try:
             with preserve_training_rng(rng):
                 gates, calibration_report = calibrate_columns(provider, source, calibration, joint.columns,
                     progress=progress, batch_size=args.eval_batch_size, stop_event=stop_event)
-        except InterruptedError: return stop_safely('during final calibration; training already complete')
+        except InterruptedError:
+            distributed.broadcast('interrupted')
+            return stop_safely('during final calibration; training already complete')
         calibration_report.update(population='TRAIN64_in_sample_ALL_train_windows_optimized', held_out=False)
         write_json(out/'TRAIN_calibration.json', calibration_report); stages['TRAIN64_calibration'] = time.perf_counter()-tick
         candidate = {**payload('calibrated_candidate'), 'thresholds': gates, 'calibration': calibration_report}
@@ -446,7 +523,9 @@ def _main(stop_event, caches, runtime_state):
             with preserve_training_rng(rng):
                 evaluation = evaluate_columns(provider, dev_source, dev, persisted.columns, tuple(gates), progress=progress,
                     batch_size=args.eval_batch_size, dev64_keys=dev64, stop_event=stop_event)
-        except InterruptedError: return stop_safely('during final dev512; training already complete')
+        except InterruptedError:
+            distributed.broadcast('interrupted')
+            return stop_safely('during final dev512; training already complete')
         stages['final_dev512'] = time.perf_counter()-tick; checks = {}
         for population in ('dev64', 'all'):
             row = evaluation[population]; jm = row['variants']['joint']['metrics']
@@ -467,6 +546,7 @@ def _main(stop_event, caches, runtime_state):
         write_json(out/'summary.json', summary); (out/'summary.txt').write_text(full_summary(summary), encoding='utf-8')
         print(full_summary(summary), flush=True)
         write_status('finished', summary=str(out/'summary.txt'))
+        distributed.broadcast('finished')
 
 
 if __name__ == '__main__':

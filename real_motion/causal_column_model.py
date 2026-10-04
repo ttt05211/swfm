@@ -100,7 +100,7 @@ class CausalColumnModel(nn.Module):
     def contract(self): return asdict(self.config)
 
 
-def column_loss(model, generation, refinement, kind, legal, target, weight, *, materialize_stats=True):
+def column_loss(model, generation, refinement, kind, legal, target, weight, *, materialize_stats=True, distributed=None):
     """Two task losses, averaged by type; importance restores query sampling.
 
     Refine target is action utility with KEEP-on-tie, NOT indiscriminate deletion
@@ -111,6 +111,7 @@ def column_loss(model, generation, refinement, kind, legal, target, weight, *, m
     if not torch.isfinite(weight).all() or torch.any(weight <= 0): raise ValueError("invalid sampling weights")
     if not torch.gather(legal.bool(), -1, target.long()[..., None]).all(): raise ValueError("illegal target action")
     terms, stats = [], {}
+    by_task = {}; denominators = generation.new_zeros(2, dtype=torch.float32)
     for task in (0, 1):
         take = kind == task
         if not take.any(): continue
@@ -127,7 +128,11 @@ def column_loss(model, generation, refinement, kind, legal, target, weight, *, m
         denom = (w*mask).sum()
         if denom <= 0: continue
         value = (loss*w*mask).sum()/denom
+        by_task[task] = value; denominators[task] = denom
         terms.append(value); stats["generation_bce" if task == 0 else "refine_action_ce"] = float(value.detach()) if materialize_stats else value.detach()
+    if distributed is not None:
+        total, values = distributed.columns(by_task, denominators, generation.new_zeros(()))
+        return total, {k: float(v.detach()) if materialize_stats else v.detach() for k, v in values.items()}
     if not terms: raise RuntimeError("batch has no legal supervised edits")
     total = torch.stack(terms).mean()
     if not torch.isfinite(total): raise RuntimeError("nonfinite completion loss")
