@@ -101,7 +101,7 @@ class PreparedColumns:
 class FrozenColumns(FrozenXYV18):
     def load_raw_columns(self, source, record, *, include_gt):
         return load_nuscenes_window_raw(source, window_from_record(record), self.pcfg,
-            include_gt=include_gt, io_workers=min(self.workers, 4),
+            include_gt=include_gt, io_workers=min(getattr(self, 'raw_io_workers', self.workers), 4),
             active_history_frames=getattr(getattr(getattr(getattr(self, 'joint', None), 'transport', self.model), 'config', None), 'history_frames', 6))
 
     def prepare_columns(self, source, record, *, include_gt, raw_window=None, outputs=None):
@@ -676,11 +676,14 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
         active = [p for p, keys in populations.items() if keys is None or (str(record["scene_name"]), str(record["t0_token"])) in keys]
         for p in active: counts_windows[p] += 1
         for k, v in prep.source_audit.items(): audits[k] += v
+        moving_started = time.perf_counter()
         moving = raw_window.get('_evaluation_moving_support') if raw_window is not None else None
         if moving is None:
             moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
                 tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
+        moving_seconds = time.perf_counter()-moving_started
         prediction_profile = {}; metric_started = time.perf_counter()
+        candidate_wait_seconds = probability_seconds = composition_seconds = 0.
         planning = {h: candidate_pool.submit(candidate_plan, prep, h, provider.pcfg.grid, model.config) for h in REPORT}
         from real_motion.causal_column_sampling import ColumnHistoryIndex
         from real_motion.column_inference_pipeline import inference_gpu
@@ -692,14 +695,19 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
         gpu, resident = inference_gpu(provider.device, feature_backend, prep, provider.pcfg.grid, model.config)
         with resident:
           for ri, h in enumerate(REPORT):
+            plan_wait = time.perf_counter()
             plan = planning[h].result()
             layout = sparse_layout(plan)
+            candidate_wait_seconds += time.perf_counter()-plan_wait
+            prediction_tick = time.perf_counter()
             if feature_backend == 'gpu':
                 probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size,
                     feature_backend=feature_backend, history_index=index, gpu_sampler=gpu,
                     verify_features=wi <= 3 or wi % 128 == 0)
             else:
                 probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
+            probability_seconds += time.perf_counter()-prediction_tick
+            composition_tick = time.perf_counter()
             prediction_profile[str(.5*(h+1))] = getattr(model, 'last_prediction_profile', {})
             for label, kind, action in (("generation_ADD", GENERATE, ADD), ("refine_ADD", REFINE, ADD),
                                          ("refine_REMOVE", REFINE, REMOVE)):
@@ -724,9 +732,10 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
             choices = [(n, eg, er, actions) for n, eg, er in (("generation", True, False), ("refine", False, True), ("joint", True, True))]
             if diagnostic is not None:
                 choices += [("diagnostic_"+n, eg, er, diagnostic) for n, eg, er, _ in choices.copy()]
+            _, ids, _, _ = layout
+            target = gt.reshape(-1)[ids]; mm = mask.reshape(-1)[ids]
             for name, eg, er, acts in choices:
                 ids, b, after = compose_sparse(plan, acts, enable_generation=eg, enable_refine=er, layout=layout)
-                target = gt.reshape(-1)[ids]; mm = mask.reshape(-1)[ids]
                 current = sparse_counts(before, b, after, target, mm, DYN)
                 if wi == 1:
                     full = prep.baseline[h].copy(); full.reshape(-1)[ids] = after
@@ -737,6 +746,7 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
                 for p in active:
                     metrics[p][name].update(ri, counts=current); scenes[p][prep.window.scene_name][name].update(ri, counts=current)
                     for k, v in edits.items(): quality[p][name][k] += v
+            composition_seconds += time.perf_counter()-composition_tick
         if cache is not None and cached_reference is None and len(new_reference_counts) == len(REPORT):
             cache[reference_key] = new_reference_counts
             if len(cache) > 1024: cache.popitem(last=False)
@@ -747,6 +757,11 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
                                "compute_seconds": compute_elapsed, "input_wait_seconds": input_wait,
                                "prediction_seconds_by_horizon": prediction_profile,
                                "candidate_inference_metrics_seconds": time.perf_counter()-metric_started,
+                               "candidate_wait_seconds": candidate_wait_seconds, "column_probability_seconds": probability_seconds,
+                               "composition_metrics_seconds": composition_seconds, "moving_support_seconds": moving_seconds,
+                               "raw_prefetch_worker_seconds": (raw_window or {}).get('_evaluation_raw_prepare_seconds', {}),
+                               "raw_prefetch_workers": getattr(provider, 'raw_prefetch_workers', 1),
+                               "raw_prefetch_depth": getattr(provider, 'raw_prefetch_depth', getattr(provider, 'raw_prefetch_workers', 1)),
                                "reference_seconds": reference_seconds, "frozen_reference_count_cache_hit": cached_reference is not None,
                                "prepare_seconds": getattr(provider, "last_prepare_seconds", {})}
         if progress: progress(event)

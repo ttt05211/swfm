@@ -1,5 +1,5 @@
 """Bounded RAM-only immutable frame reuse and CPU I/O look-ahead; no CUDA worker."""
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 import numpy as np
@@ -58,23 +58,33 @@ class CachedColumnSource:
 
 
 def prefetch_raw_columns(provider, source, records, *, include_gt=True):
-    """At most one NEXT raw window; order/exceptions preserved, GPU stays caller-owned."""
+    """Bounded NEXT raw windows; ordered consumption, never worker-owned CUDA.
+
+    Default remains one next window. Independent evaluation can opt into
+    parallel FIXED CPU geometry via provider.raw_prefetch_workers/depth.
+    """
     if not hasattr(provider, 'load_raw_columns'):
         for record in records: yield record, None
         return
     iterator = iter(records)
-    first = next(iterator, None)
-    if first is None: return
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pending = pool.submit(provider.load_raw_columns, source, first, include_gt=include_gt)
-        record = first
+    workers = getattr(provider, 'raw_prefetch_workers', 1)
+    depth = getattr(provider, 'raw_prefetch_depth', workers)
+    if type(workers) is not int or type(depth) is not int or not 1 <= workers <= depth <= 4:
+        raise ValueError('raw prefetch requires 1 <= workers <= depth <= 4')
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque()
+        def submit_next():
+            record = next(iterator, None)
+            if record is None: return False
+            pending.append((record, pool.submit(provider.load_raw_columns, source, record, include_gt=include_gt)))
+            return True
         try:
-            while record is not None:
-                raw = pending.result()
-                following = next(iterator, None)
-                pending = (pool.submit(provider.load_raw_columns, source, following, include_gt=include_gt)
-                           if following is not None else None)
+            for _ in range(depth):
+                if not submit_next(): break
+            while pending:
+                record, future = pending.popleft()
+                raw = future.result()
+                submit_next()
                 yield record, raw
-                record = following
         finally:
-            if pending is not None: pending.cancel()
+            for _, future in pending: future.cancel()

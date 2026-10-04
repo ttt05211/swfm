@@ -50,14 +50,20 @@ def prepare_causal_evidence(raw, pcfg, strong, workers, *, state=None, column_co
     return result
 
 
-def build_fixed_geometry(raw, record, pcfg, strong, workers, column_config):
+def build_fixed_geometry(raw, record, pcfg, strong, workers, column_config, *, profile=None):
     # Runtime's CPU path contains no model forward/CUDA and uses the frozen
     # bit-exact Strong implementation. First-use exactness still gates it live.
+    started = time.perf_counter()
     state = runtime._prepare_record(record, None, pcfg, strong, 'cpu', raw_window=raw)
+    strong_at = time.perf_counter()
     state['column_backgrounds'] = [compose_component_replacements_fast_exact(a, comps, [],
         dynamic_class_ids=DYN, free_label=FREE, grid=pcfg.grid, precomputed_clear_flat_indices=clear)
         for a, comps, clear in zip(state['anchors'], state['baseline_by_hi'], state['baseline_clear_flat_by_hi'])]
+    background_at = time.perf_counter()
     evidence = prepare_causal_evidence(raw, pcfg, strong, workers, state=state, column_config=column_config)
+    if profile is not None:
+        profile.update(strong_state=strong_at-started, static_backgrounds=background_at-strong_at,
+            history_registration_and_static_memory=time.perf_counter()-background_at)
     # No V18 records/labels, window adapters, GPU inputs or network output may
     # enter persistent artifacts. Reattach the CURRENT record after cache lookup.
     evidence['prepared_state'] = {k: v for k, v in state.items() if k not in ('rec', 'window', 'gpu')}
@@ -105,16 +111,24 @@ class FullJointColumnProvider(JointColumnProvider):
 
 
 class EvaluationJointColumnProvider(FullJointColumnProvider):
-    """One-window CPU look-ahead of exact FIXED geometry, with no disk writer.
+    """Bounded CPU look-ahead of exact FIXED geometry, with no disk writer.
 
     First main-thread renderer exactness still compares all six horizons with
     the original device path. Learned predictions/GT are never precomputed.
     """
     def load_raw_columns(self, source, record, *, include_gt):
         from tools.real_motion.causal_column_common import FrozenColumns
+        started = time.perf_counter()
         raw = FrozenColumns.load_raw_columns(self, source, record, include_gt=include_gt)
+        raw_at = time.perf_counter(); profile = {'raw_io': raw_at-started}
+        # Parallel windows share a CPU quota: do not launch a large nested
+        # geometry pool for EACH prefetched window. Floating-point work stays
+        # unchanged and CUDA/model calls remain exclusively on the caller.
+        geometry_workers = max(1, min(3, self.workers//getattr(self, 'raw_prefetch_workers', 1)))
         raw['_column_causal_preparation'] = build_fixed_geometry(raw, record, self.pcfg, self.strong,
-            min(self.workers, 3), self.joint.columns.config)
+            geometry_workers, self.joint.columns.config, profile=profile)
+        profile.update(total=time.perf_counter()-started, geometry_workers=geometry_workers)
+        raw['_evaluation_raw_prepare_seconds'] = profile
         return raw
 
 

@@ -559,12 +559,13 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
         assert model is provider.joint.columns and provider.reference_enabled
         assert not hasattr(provider, 'causal_geometry_cache')
         return actual_eval(provider, source, records[:2], model, gates, **kwargs)
-    def evaluate(destination, population='dev64', evaluator=small_eval, event=None):
+    def evaluate(destination, population='dev64', evaluator=small_eval, event=None, raw_workers=1):
         argv = ['eval', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--checkpoint', str(checkpoint), '--dev-cache', str(files['dev-cache']),
             '--population-manifest', str(files['population-manifest']), '--base-checkpoint', str(files['base-checkpoint']),
             '--dev-info', str(files['dev-info']), '--dataroot', str(tmp_path), '--out-dir', str(destination),
-            '--population', population, '--device', 'cpu', '--cpu-workers', '1']
+            '--population', population, '--device', 'cpu', '--cpu-workers', str(max(1, raw_workers)),
+            '--raw-prefetch-workers', str(raw_workers), '--raw-prefetch-depth', str(raw_workers)]
         with patch('sys.argv', argv), patch.object(interim, 'CLEAN_SHA256', 'a'*64), \
             patch.object(interim, 'make_prepare_config', return_value=SimpleNamespace(grid=grid)), \
             patch.object(interim, 'load_manifest', return_value=(manifest, keys, None)), \
@@ -582,6 +583,14 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
     assert result['snapshot_sha256'] == trainer.sha256(checkpoint)
     assert (out/'checkpoint_snapshot.pt').read_bytes() == original
     report = result['reports']
+    parallel = tmp_path/'parallel64'
+    assert evaluate(parallel, raw_workers=4) == 0
+    parallel_result = json.loads((parallel/'evaluation.json').read_text())
+    assert parallel_result['raw_prefetch_workers'] == parallel_result['raw_prefetch_depth'] == 4
+    assert parallel_result['reports'] == report
+    text = (parallel/'summary.txt').read_text()
+    assert 'joint: IoU=' in text and 'MovingMacro=' in text and '3.0s joint: IoU=' in text
+    assert checkpoint.read_bytes() == original
     def rotate_and_report(provider, source, records, model, gates, **kwargs):
         assert len(records) == 512 and kwargs['dev64_keys'] == keys
         assert trainer.record_keys(records) == tuple(map(tuple, manifest['parent_keys']))

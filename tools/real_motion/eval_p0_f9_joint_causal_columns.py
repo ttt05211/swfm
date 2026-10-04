@@ -21,6 +21,7 @@ from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import load_manifest, 
 from tools.real_motion.train_p0_f9_causal_columns import record_keys
 from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256,write_json
+from tools.real_motion.joint_evaluation_reporting import summary_text
 
 
 def evaluation_keys(population, dev64, dev512, full_keys, train_keys):
@@ -38,29 +39,6 @@ def evaluation_keys(population, dev64, dev512, full_keys, train_keys):
     return chosen
 
 
-def summary_text(result):
-    row=result['reports']['all']; ref=row['reference_metrics']['frozen_E14']
-    lines=['===== INTERIM FULL LOCAL JOINT (DIAGNOSTIC ONLY) =====',
-        f"population: {result['population']} / {row['windows']} windows / {row['scenes']} scenes",
-        f"update: {result['attempted_updates']}  completed_epochs: {result['cursor_epoch']}  batch_cursor: {result['cursor_batch']}",
-        f"history_frames: {result['history_frames']}; future_frames: 6",
-        f"thresholds: {result['thresholds']}; source: {result['threshold_source']}",
-        f"frozen_E14_mIoU: {ref['mIoU']:.6f} (legacy SIX histories; not a matched four-history budget)"]
-    items={'transport':row['baseline'],**{k:row['variants'][k]['metrics'] for k in ('generation','refine','joint')}}
-    for name,m in items.items():
-        lines.append(f"{name}: mIoU={m['mIoU']:.6f} dMiOU_vs_E14={m['mIoU']-ref['mIoU']:+.6f} "
-            f"dMiOU_vs_transport={m['mIoU']-row['baseline']['mIoU']:+.6f} "
-            f"dMovingMicro_vs_E14={m['MovingMicro']-ref['MovingMicro']:+.6f}")
-    for h in ('1.0','2.0','3.0'):
-        m,r=items['joint']['per_horizon'][h],ref['per_horizon'][h]
-        lines.append(f"{h}s joint_vs_E14 dMiOU={m['mIoU']-r['mIoU']:+.6f} dMovingMicro={m['MovingMicro']-r['MovingMicro']:+.6f}")
-    lines += ['joint addition/removal: '+str(row['variants']['joint']['quality']),
-        'joint scenes: '+str(row['variants']['joint']['scene_delta']),
-        f"seconds: {result['seconds']:.2f}",f"checkpoint_snapshot: {result['snapshot']}",
-        'No optimizer/RNG changes, TRAIN recalibration, dev-selected checkpoint, promotion or source checkpoint writes.']
-    return '\n'.join(lines)+'\n'
-
-
 def main(stop_event=None):
     p=argparse.ArgumentParser(description=__doc__);add_config_args(p)
     for k in ('checkpoint','dev-cache','population-manifest','base-checkpoint','dataroot','dev-info','out-dir'):
@@ -70,12 +48,16 @@ def main(stop_event=None):
     p.add_argument('--batch-size',type=int,default=256)
     p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='cpu')
     p.add_argument('--optimized-inference',action='store_true',help='CPU feature look-ahead + deferred checks; first window probability gate')
+    p.add_argument('--raw-prefetch-workers',type=int,default=1,help='1..4 bounded CPU-only window preparation workers')
+    p.add_argument('--raw-prefetch-depth',type=int,default=1,help='workers <= depth <= 4; original ordering is preserved')
     p.add_argument('--fixed-monitor-thresholds',action='store_true',help='same 0.5/0.5/REMOVE-off for checkpoint comparison')
     a=p.parse_args();out=Path(a.out_dir);started=time.perf_counter()
     if out.exists():p.error('NEW evaluation output required; never overwrite training or another evaluation')
     for k in ('config','checkpoint','dev_cache','population_manifest','base_checkpoint','dev_info'):
         if not str(getattr(a,k) or '').strip() or not Path(getattr(a,k)).is_file():p.error('missing '+k)
     if not Path(a.dataroot).is_dir() or min(a.cpu_workers,a.batch_size)<1:p.error('invalid paths/budgets')
+    if not 1 <= a.raw_prefetch_workers <= a.raw_prefetch_depth <= 4:p.error('raw prefetch requires workers <= depth <= 4')
+    if a.raw_prefetch_workers > a.cpu_workers:p.error('raw prefetch workers must not exceed CPU worker budget')
     device=torch.device(a.device)
     if device.type == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):raise RuntimeError('CUDA/BF16 required')
     torch.set_num_threads(1)
@@ -102,6 +84,8 @@ def main(stop_event=None):
     joint.eval()
     provider=FullJointColumnProvider(a.base_checkpoint,CLEAN_SHA256,pcfg,device,a.cpu_workers,joint,None)
     provider.reference_enabled=True
+    provider.raw_prefetch_workers=a.raw_prefetch_workers;provider.raw_prefetch_depth=a.raw_prefetch_depth
+    provider.raw_io_workers=max(1,min(4,a.cpu_workers//a.raw_prefetch_workers))
     joint.columns.column_inference_optimized=a.optimized_inference
     joint.columns.column_inference_verify_remaining=3 if a.optimized_inference else 0
     source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.dev_info,verbose=False),256)
@@ -126,6 +110,7 @@ def main(stop_event=None):
         'checkpoint_screen_pass_unchanged':ck['screen_pass'],'seconds':time.perf_counter()-started,'reports':report}
     result.update(column_feature_backend=a.column_feature_backend, batch_size=a.batch_size,
         optimized_inference=a.optimized_inference,
+        raw_prefetch_workers=a.raw_prefetch_workers,raw_prefetch_depth=a.raw_prefetch_depth,
         population_key_fingerprint=stable_json_fingerprint(chosen))
     if sha256(snapshot) != digest:raise RuntimeError('immutable evaluation snapshot changed')
     write_json(out/'evaluation.json',result);(out/'summary.txt').write_text(summary_text(result),encoding='utf-8')

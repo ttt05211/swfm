@@ -21,10 +21,15 @@ export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 export SWFM_COLUMN_CPU_BACKEND=native SWFM_COLUMN_CPU_BUNDLE=1
 export SWFM_LOCAL_FAST_SUPERVISION=0 SWFM_LOCAL_STATIC_ROI=0
 EXTRA=()
-if [[ "${FULL_JOINT_EVAL_OPTIMIZED:-0}" == 1 ]]; then EXTRA+=(--optimized-inference); fi
+CPU_WORKERS="${FULL_JOINT_EVAL_CPU_WORKERS:-8}"
+[[ "$CPU_WORKERS" =~ ^([1-9]|1[0-6])$ ]] || { echo 'FULL_JOINT_EVAL_CPU_WORKERS 必须为1到16。' >&2; exit 2; }
+RAW_WORKERS="${FULL_JOINT_EVAL_RAW_WORKERS:-$((CPU_WORKERS < 4 ? CPU_WORKERS : 4))}"
+RAW_DEPTH="${FULL_JOINT_EVAL_RAW_DEPTH:-$RAW_WORKERS}"
+if [[ "${FULL_JOINT_EVAL_OPTIMIZED:-1}" == 1 ]]; then EXTRA+=(--optimized-inference); fi
 if [[ "${FULL_JOINT_EVAL_FIXED_MONITOR:-0}" == 1 ]]; then EXTRA+=(--fixed-monitor-thresholds); fi
 echo "只读快照评估 $POPULATION；last/epoch固定0.5/0.5/REMOVE-off，不用dev调阈值，不改变训练断点。"
 echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输出 $OUT"
+echo 'CPU-only有界窗口预取；网络batch保持256；固定Strong all-6、概率及整数指标exactness检查不变。'
 "$PY" -u tools/real_motion/eval_p0_f9_joint_causal_columns.py \
   --config "$ROOT/configs/real_motion_occfm.yaml" --checkpoint "$CHECKPOINT" \
   --dev-cache "$ROOT/data/p0_f9_v18_se2_val_all_4369.pt" \
@@ -33,6 +38,7 @@ echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输�
   --dataroot /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes \
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
   --population "$POPULATION" --out-dir "$OUT" \
-  --cpu-workers "${FULL_JOINT_EVAL_CPU_WORKERS:-8}" --batch-size 256 \
+  --cpu-workers "$CPU_WORKERS" --batch-size 256 \
+  --raw-prefetch-workers "$RAW_WORKERS" --raw-prefetch-depth "$RAW_DEPTH" \
   --column-feature-backend "${FULL_JOINT_EVAL_FEATURE_BACKEND:-cpu}" "${EXTRA[@]}"
 echo "评估完成：$OUT/summary.txt；可继续恢复原训练，不会重置LR/RNG。"
