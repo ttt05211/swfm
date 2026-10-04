@@ -59,6 +59,8 @@ def summary_text(result):
     for name,row in result.get('evaluation',{}).items():
         lines.append(f"EVAL {name}: windows={row['windows']} seconds/window={row['seconds_per_window']:.6f} full4369_if_representative={row['seconds_per_window']*4369/60:.2f}min")
     if 'train_speedup' in result:lines.append(f"train_speedup={result['train_speedup']:.4f}; eval_speedup={result['eval_speedup']:.4f}")
+    if result.get('gate',{}).get('training',{}).get('pass_gate') is False:
+        lines.append('TRAIN fastpath REJECTED by paired-loss gate; extension/resume must keep FAST_SUPERVISION=0 and STATIC_ROI=0.')
     lines += ['gate='+json.dumps(result.get('gate',{})), 'status='+result['status'],
         'Small-sample estimates only; OS/frame-cache, source/candidate density and order effects remain.',
         'Model/batch/LR/RNG/threshold contracts unchanged; elapsed time is NOT a real training result.']
@@ -74,6 +76,20 @@ def train_equivalence(previous, optimized):
         raise RuntimeError('training sampling/RNG/population changed')
     if not np.allclose(previous['loss_by_update'],optimized['loss_by_update'],rtol=2e-4,atol=1e-5):
         raise RuntimeError('paired CUDA training losses changed outside numerical tolerance')
+
+
+def training_gate(previous, optimized):
+    """Report a rejected TRAIN fastpath without hiding the independent eval gate."""
+    a=np.asarray(previous['loss_by_update'],np.float64);b=np.asarray(optimized['loss_by_update'],np.float64)
+    sampling=(previous['sampling_rng_fingerprint'] == optimized['sampling_rng_fingerprint']
+        and previous['sampled_columns_by_update'] == optimized['sampled_columns_by_update']
+        and all(previous[k] == optimized[k] for k in ('windows','batches','sources')))
+    diff=np.abs(a-b)
+    rel=diff/np.maximum(np.abs(a),1e-12)
+    close=bool(np.allclose(a,b,rtol=2e-4,atol=1e-5))
+    return dict(pass_gate=bool(sampling and close),sampling_rng_population_exact=bool(sampling),
+        training_loss_close=close,training_loss_tolerance=dict(rtol=2e-4,atol=1e-5),
+        max_abs_loss_diff=float(diff.max(initial=0.)),max_rel_loss_diff=float(rel.max(initial=0.)))
 
 
 def main():
@@ -166,7 +182,10 @@ def main():
             name='optimized' if optimized else 'previous'
             print('SPEED_BUNDLE TRAIN '+name,flush=True)
             result['train'][name]=training(optimized);write_json(out/'audit.json',finite_json(result))
-        train_equivalence(result['train']['previous'],result['train']['optimized'])
+        train_gate=training_gate(result['train']['previous'],result['train']['optimized'])
+        result['gate']['training']=train_gate
+        # TRAIN fastpaths are performance-only. A failed gate rejects them but
+        # must not prevent the independent fixed-checkpoint evaluation gate.
         # Fixed checkpoint, NOT the diagnostic training updates above.
         reports={}
         for optimized in (False,True):
@@ -194,16 +213,18 @@ def main():
             write_json(out/'audit.json',finite_json(result))
         equivalent=finite_json(reports['previous']) == finite_json(reports['optimized'])
         if not equivalent:raise RuntimeError('four-way metrics/confidences/edits changed; do not resume optimized run')
-        result.update(status='complete',train_speedup=result['train']['previous']['seconds_per_window']/result['train']['optimized']['seconds_per_window'],
+        result.update(status='complete' if train_gate['pass_gate'] else 'complete_training_fastpath_rejected',
+            train_speedup=result['train']['previous']['seconds_per_window']/result['train']['optimized']['seconds_per_window'],
             eval_speedup=result['evaluation']['previous']['seconds_per_window']/result['evaluation']['optimized']['seconds_per_window'])
-        result['gate']=dict(real_cuda_probability_exact=True,four_way_reports_exact=equivalent,
-            training_sampling_rng_exact=True,training_loss_close=True,
-            training_loss_tolerance=dict(rtol=2e-4,atol=1e-5),no_geometry_cache_writes=True,no_scientific_updates_saved=True)
+        result['gate'].update(real_cuda_probability_exact=True,four_way_reports_exact=equivalent,
+            training_fastpath_approved=train_gate['pass_gate'],
+            no_geometry_cache_writes=True,no_scientific_updates_saved=True)
         if sha256(snapshot) != digest:raise RuntimeError('immutable snapshot changed')
     except BaseException as error:
         result.update(status='failed',error=type(error).__name__+': '+str(error));raise
     finally:
-        switches(True)
+        # Leave diagnostic process in the conservative TRAIN configuration.
+        switches(False)
         write_json(out/'audit.json',finite_json(result));(out/'summary.txt').write_text(summary_text(result),encoding='utf-8')
         print(summary_text(result),flush=True)
     return 0
