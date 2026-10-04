@@ -5,13 +5,13 @@ import torch
 
 
 def enabled():
-    value = os.environ.get('SWFM_LOCAL_FAST_SUPERVISION', '1')
+    value = os.environ.get('SWFM_LOCAL_FAST_SUPERVISION', '0')
     if value not in ('0', '1'): raise ValueError('SWFM_LOCAL_FAST_SUPERVISION must be 0 or 1')
     return value == '1'
 
 
 def static_roi_enabled():
-    value = os.environ.get('SWFM_LOCAL_STATIC_ROI', '1')
+    value = os.environ.get('SWFM_LOCAL_STATIC_ROI', '0')
     if value not in ('0', '1'): raise ValueError('SWFM_LOCAL_STATIC_ROI must be 0 or 1')
     return value == '1'
 

@@ -525,20 +525,46 @@ def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
 
 
 def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256, *,
-                          feature_backend='cpu', history_index=None, gpu_sampler=None, verify_features=False):
+                          feature_backend='cpu', history_index=None, gpu_sampler=None, verify_features=False,
+                          optimized=None):
+    optimized = getattr(model, 'column_inference_optimized', False) if optimized is None else optimized
+    verify = optimized and getattr(model, 'column_inference_verify_remaining', 0) > 0
+    reference = None
+    reference_seconds = None
+    if verify:
+        reference_started = time.perf_counter()
+        reference = predict_probabilities(model, prepared, h, plan, grid, device, batch_size,
+            feature_backend=feature_backend, history_index=history_index, gpu_sampler=gpu_sampler,
+            verify_features=verify_features, optimized=False)
+        reference_seconds = time.perf_counter()-reference_started
     model.eval(); parts = []
     started = time.perf_counter()
     from real_motion.column_inference_pipeline import InferenceFeatures
     sampler = InferenceFeatures(prepared, h, plan, grid, model.config, device, pose_motion,
         backend=feature_backend, workers=getattr(model, 'column_sampling_workers', 1),
         history_index=history_index, gpu_sampler=gpu_sampler, verify=verify_features)
-    mapped_at = time.perf_counter(); sampled_seconds = 0.
-    with torch.inference_mode():
+    mapped_at = time.perf_counter(); sampled_seconds = sampling_wait = 0.
+    pool = ThreadPoolExecutor(max_workers=1) if optimized and feature_backend == 'cpu' else None
+    def sample(start):
+        small = plan.subset(slice(start, start+batch_size))
+        tick = time.perf_counter()
+        arrays = sampler.sample(small, sample_column_features)
+        return small, arrays, time.perf_counter()-tick
+    pending = None
+    from real_motion.causal_column_model import CausalColumnModel
+    defer_checks = bool(optimized and isinstance(model, CausalColumnModel))
+    try:
+      with torch.inference_mode():
+        finite = (torch.isfinite(model.generation_pos_weight).all() & torch.isfinite(model.refine_class_weights).all()
+            & (model.generation_pos_weight > 0) & (model.refine_class_weights > 0).all()) if defer_checks else None
+        if pool is not None and len(plan): pending = pool.submit(sample, 0)
         for start in range(0, len(plan), batch_size):
-            small = plan.subset(slice(start, start+batch_size))
-            sampled_at = time.perf_counter()
-            arrays = sampler.sample(small, sample_column_features)
-            sampled_seconds += time.perf_counter()-sampled_at
+            waiting = time.perf_counter()
+            small, arrays, sample_seconds = pending.result() if pending is not None else sample(start)
+            sampling_wait += time.perf_counter()-waiting
+            sampled_seconds += sample_seconds
+            pending = (pool.submit(sample, start+batch_size)
+                if pool is not None and start+batch_size < len(plan) else None)
             b = {k: torch.as_tensor(v, device=device) for k, v in arrays.items()}
             legal = torch.as_tensor(small.legal, device=device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -547,12 +573,31 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
                 if hasattr(model, 'extra_inputs_for'):
                     b.update(model.extra_inputs_for(prepared, h, small, grid, device))
                 g, r = model(**b)
-            parts.append(model.calibrated_probabilities(g, r, b["kind"], legal).cpu().numpy())
+            if defer_checks:
+                finite = finite & torch.isfinite(g).all() & torch.isfinite(r).all()
+                probability = model.calibrated_probabilities(g, r, b['kind'], legal, validate=False)
+            else: probability = model.calibrated_probabilities(g, r, b['kind'], legal)
+            parts.append(probability.cpu().numpy())
+        if defer_checks and not finite:
+            raise RuntimeError('nonfinite prediction or invalid TRAIN calibration weights')
+    finally:
+        if pool is not None: pool.shutdown(wait=True, cancel_futures=True)
     model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,
         'inverse_map_seconds': mapped_at-started, 'patch_gather_seconds': sampled_seconds,
-        'network_transfer_and_other_seconds': time.perf_counter()-mapped_at-sampled_seconds,
+        'sampling_wait_seconds': sampling_wait,
+        'network_transfer_and_other_seconds': max(0., time.perf_counter()-mapped_at-sampling_wait),
+        'sampling_seconds_are_overlapping_worker_time': pool is not None,
         'feature_backend': 'gpu' if sampler.gpu is not None else 'cpu', 'feature_audit': dict(sampler.audit)}
-    return np.concatenate(parts) if parts else np.empty((*plan.base.shape, 3), np.float32)
+    result = np.concatenate(parts) if parts else np.empty((*plan.base.shape, 3), np.float32)
+    if verify:
+        if not np.array_equal(reference, result):
+            raise RuntimeError('optimized inference probability exactness failed; use reference inference')
+        model.column_inference_verify_remaining -= 1
+        model.last_prediction_profile['probability_exactness_passed'] = True
+        model.last_prediction_profile['verification_timing_seconds'] = {
+            'reference': reference_seconds, 'optimized': time.perf_counter()-started,
+            'note': 'first-use warm/cache effects; not a controlled throughput benchmark'}
+    return result
 
 
 def report_states(base, metrics, quality, scenes):
@@ -580,6 +625,18 @@ def evaluate_columns(provider, source, records, model, thresholds, *, progress=N
 
 def _evaluate_columns(provider, source, records, model, thresholds, *, progress=None, batch_size=256, dev64_keys=None,
                      diagnostic_thresholds=(.50, .50, .50), stop_event=None, feature_backend='cpu', candidate_pool=None):
+    iterator = evaluation_steps(provider, source, records, model, thresholds, progress=progress,
+        batch_size=batch_size, dev64_keys=dev64_keys, diagnostic_thresholds=diagnostic_thresholds,
+        stop_event=stop_event, feature_backend=feature_backend, candidate_pool=candidate_pool)
+    try:
+        while True: next(iterator)
+    except StopIteration as done: return done.value
+    finally: iterator.close()
+
+
+def evaluation_steps(provider, source, records, model, thresholds, *, progress=None, batch_size=256, dev64_keys=None,
+                     diagnostic_thresholds=(.50, .50, .50), stop_event=None, feature_backend='cpu', candidate_pool=None,
+                     window_iter=None, resume_state=None, start_window=0, verbose=True, yield_initial_state=False):
     """Four-way ablation ONE raw/V18/model probability pass, sparse exact counts."""
     model.column_sampling_workers = provider.workers
     populations = {"all": None}
@@ -594,12 +651,17 @@ def _evaluate_columns(provider, source, records, model, thresholds, *, progress=
     audits = defaultdict(int)
     scores = {p: {k: {"legal_query_voxels": 0, "sum": 0., "max": 0., "ge_0_50": 0, "ge_0_75": 0, "ge_0_95": 0}
         for k in ("generation_ADD", "refine_ADD", "refine_REMOVE")} for p in populations}
+    state = dict(bases=bases, metrics=metrics, quality=quality, scenes=scenes, counts_windows=counts_windows,
+        reference_metrics=reference_metrics, audits=audits, scores=scores)
+    if resume_state is not None: restore_evaluation_state(state, resume_state)
+    if yield_initial_state: yield {'event': 'evaluation_state_ready'}, state
     previous_end = time.perf_counter()
-    for wi, (record, raw_window) in enumerate(prefetch_raw_columns(provider, source, records), 1):
+    iterator = prefetch_raw_columns(provider, source, records[start_window:]) if window_iter is None else window_iter
+    for wi, (record, raw_window) in enumerate(iterator, start_window+1):
         if stop_event is not None and stop_event.is_set(): raise InterruptedError('evaluation stopped at window boundary')
         started = time.perf_counter()
-        input_wait = started-previous_end
-        print(f"evaluate_columns={wi}/{len(records)} four_way_shared_pass", flush=True)
+        input_wait = started-previous_end if window_iter is None else 0.
+        if verbose: print(f"evaluate_columns={wi}/{len(records)} four_way_shared_pass", flush=True)
         prep = (provider.prepare_columns(source, record, include_gt=True, raw_window=raw_window)
                 if raw_window is not None else provider.prepare_columns(source, record, include_gt=True))
         reference_started = time.perf_counter()
@@ -614,13 +676,18 @@ def _evaluate_columns(provider, source, records, model, thresholds, *, progress=
         active = [p for p, keys in populations.items() if keys is None or (str(record["scene_name"]), str(record["t0_token"])) in keys]
         for p in active: counts_windows[p] += 1
         for k, v in prep.source_audit.items(): audits[k] += v
-        moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
-                    tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
+        moving = raw_window.get('_evaluation_moving_support') if raw_window is not None else None
+        if moving is None:
+            moving = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
+                tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
         prediction_profile = {}; metric_started = time.perf_counter()
         planning = {h: candidate_pool.submit(candidate_plan, prep, h, provider.pcfg.grid, model.config) for h in REPORT}
         from real_motion.causal_column_sampling import ColumnHistoryIndex
         from real_motion.column_inference_pipeline import inference_gpu
-        index = ColumnHistoryIndex(prep, provider.pcfg.grid)
+        index = raw_window.get('_evaluation_history_index') if raw_window is not None else None
+        if index is None:
+            index = ColumnHistoryIndex(prep, provider.pcfg.grid)
+            if window_iter is not None: raw_window['_evaluation_history_index'] = index
         prep.column_history_index = index
         gpu, resident = inference_gpu(provider.device, feature_backend, prep, provider.pcfg.grid, model.config)
         with resident:
@@ -675,14 +742,23 @@ def _evaluate_columns(provider, source, records, model, thresholds, *, progress=
             if len(cache) > 1024: cache.popitem(last=False)
         compute_elapsed = time.perf_counter()-started
         elapsed = compute_elapsed+input_wait
-        print(f"evaluate_columns={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)
-        if progress: progress({"event": "evaluation", "window": wi, "windows": len(records), "seconds": elapsed,
+        if verbose: print(f"evaluate_columns={wi}/{len(records)} complete seconds={elapsed:.3f}", flush=True)
+        event = {"event": "evaluation", "window": wi, "windows": len(records), "seconds": elapsed,
                                "compute_seconds": compute_elapsed, "input_wait_seconds": input_wait,
                                "prediction_seconds_by_horizon": prediction_profile,
                                "candidate_inference_metrics_seconds": time.perf_counter()-metric_started,
                                "reference_seconds": reference_seconds, "frozen_reference_count_cache_hit": cached_reference is not None,
-                               "prepare_seconds": getattr(provider, "last_prepare_seconds", {})})
+                               "prepare_seconds": getattr(provider, "last_prepare_seconds", {})}
+        if progress: progress(event)
         previous_end = time.perf_counter()
+        if window_iter is not None:
+            # A suspended per-checkpoint generator must retain COUNTS only,
+            # not each model's six dense baselines/owners/features across the
+            # group boundary. Shared immutable raw geometry is caller-owned.
+            del prep, planning, plan, probability, actions, diagnostic, layout, choices, acts
+            del references, gt, mask, ids, b, after, target, mm, index, gpu, resident, raw_window
+            if wi == 1: del full
+        yield event, state
         if stop_event is not None and stop_event.is_set(): raise InterruptedError('evaluation stopped at window boundary')
     result = {}
     for p in populations:
@@ -698,6 +774,44 @@ def _evaluate_columns(provider, source, records, model, thresholds, *, progress=
         result[p]["confidence_audit"] = scores[p]
     result["source_audit"] = dict(audits)
     return result
+
+
+def pack_evaluation_state(state):
+    """Small metric/count state ONLY: no raw/GT volumes, poses or features."""
+    fields = ('oi', 'ou', 'si', 'su', 'mi', 'mu')
+    def metric(value): return {key: getattr(value, key).tolist() for key in fields}
+    return dict(bases={p: metric(v) for p, v in state['bases'].items()},
+        metrics={p: {n: metric(v) for n, v in rows.items()} for p, rows in state['metrics'].items()},
+        scenes={p: {s: {n: metric(v) for n, v in rows.items()} for s, rows in scenes.items()}
+            for p, scenes in state['scenes'].items()},
+        reference_metrics={p: {n: metric(v) for n, v in rows.items()} for p, rows in state['reference_metrics'].items()},
+        quality={p: {n: dict(v) for n, v in rows.items()} for p, rows in state['quality'].items()},
+        counts_windows=dict(state['counts_windows']), audits=dict(state['audits']),
+        scores={p: {k: dict(v) for k, v in rows.items()} for p, rows in state['scores'].items()})
+
+
+def restore_evaluation_state(state, saved):
+    def metric(value):
+        result = Metrics()
+        for key in ('oi', 'ou', 'si', 'su', 'mi', 'mu'):
+            array = np.asarray(value[key])
+            if array.dtype.kind not in 'iu' or array.shape != getattr(result, key).shape or np.any(array < 0):
+                raise RuntimeError('invalid saved metric counts')
+            getattr(result, key)[:] = array
+        return result
+    for key in ('bases', 'metrics', 'scenes', 'reference_metrics', 'quality', 'scores'):
+        if set(saved[key]) != set(state[key]): raise RuntimeError('saved evaluation population changed')
+    for p in state['bases']:
+        state['bases'][p] = metric(saved['bases'][p])
+        if set(saved['metrics'][p]) != set(state['metrics'][p]): raise RuntimeError('saved variants changed')
+        for n in state['metrics'][p]:
+            state['metrics'][p][n] = metric(saved['metrics'][p][n])
+            state['quality'][p][n].update(saved['quality'][p][n])
+        for s, rows in saved['scenes'][p].items():
+            for n, value in rows.items(): state['scenes'][p][s][n] = metric(value)
+        state['reference_metrics'][p].update({n: metric(v) for n, v in saved['reference_metrics'][p].items()})
+        state['scores'][p] = saved['scores'][p]
+    state['counts_windows'].update(saved['counts_windows']); state['audits'].update(saved['audits'])
 
 
 def forecast_columns(provider, source, record, model, thresholds, batch_size=256):

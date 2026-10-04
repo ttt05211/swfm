@@ -88,12 +88,15 @@ class CausalColumnModel(nn.Module):
         q = self.encode_local(history, flags, base, fallback, context, kind, classes, query_extra=query_extra)
         return self.generation(q), self.refinement(q).reshape(len(kind), self.config.z_bins, 3)
 
-    def calibrated_probabilities(self, generation, refinement, kind, legal):
-        finite = (torch.isfinite(generation).all() & torch.isfinite(refinement).all()
-            & torch.isfinite(self.generation_pos_weight).all() & torch.isfinite(self.refine_class_weights).all()
-            & (self.generation_pos_weight > 0) & (self.refine_class_weights > 0).all())
-        if not finite:
-            raise RuntimeError("nonfinite prediction or invalid TRAIN calibration weights")
+    def calibrated_probabilities(self, generation, refinement, kind, legal, *, validate=True):
+        # Optimized INFERENCE accumulates these checks on device and checks once
+        # before returning a horizon. Training/other callers remain unchanged.
+        if validate:
+            finite = (torch.isfinite(generation).all() & torch.isfinite(refinement).all()
+                & torch.isfinite(self.generation_pos_weight).all() & torch.isfinite(self.refine_class_weights).all()
+                & (self.generation_pos_weight > 0) & (self.refine_class_weights > 0).all())
+            if not finite:
+                raise RuntimeError("nonfinite prediction or invalid TRAIN calibration weights")
         g = generation.float()-self.generation_pos_weight.log()
         r = refinement.float()-self.refine_class_weights.log()
         r = r.masked_fill(~legal.bool(), -torch.inf)

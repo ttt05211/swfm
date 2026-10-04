@@ -69,6 +69,8 @@ def main(stop_event=None):
     p.add_argument('--device',default='cuda');p.add_argument('--cpu-workers',type=int,default=8)
     p.add_argument('--batch-size',type=int,default=256)
     p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='cpu')
+    p.add_argument('--optimized-inference',action='store_true',help='CPU feature look-ahead + deferred checks; first window probability gate')
+    p.add_argument('--fixed-monitor-thresholds',action='store_true',help='same 0.5/0.5/REMOVE-off for checkpoint comparison')
     a=p.parse_args();out=Path(a.out_dir);started=time.perf_counter()
     if out.exists():p.error('NEW evaluation output required; never overwrite training or another evaluation')
     for k in ('config','checkpoint','dev_cache','population_manifest','base_checkpoint','dev_info'):
@@ -95,10 +97,13 @@ def main(stop_event=None):
     _,all_records=load_cache(a.dev_cache);full_keys=record_keys(all_records)
     chosen=evaluation_keys(a.population,dev64,manifest['parent_keys'],full_keys,ck['train_keys'])
     records=align_records(all_records,chosen);del all_records
-    gates=tuple(ck['thresholds']) if ck['checkpoint_role'] == 'calibrated_candidate' else (.5,.5,None)
+    calibrated=ck['checkpoint_role'] == 'calibrated_candidate' and not a.fixed_monitor_thresholds
+    gates=tuple(ck['thresholds']) if calibrated else (.5,.5,None)
     joint.eval()
     provider=FullJointColumnProvider(a.base_checkpoint,CLEAN_SHA256,pcfg,device,a.cpu_workers,joint,None)
     provider.reference_enabled=True
+    joint.columns.column_inference_optimized=a.optimized_inference
+    joint.columns.column_inference_verify_remaining=3 if a.optimized_inference else 0
     source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.dev_info,verbose=False),256)
     # No shared persistent geometry writer during an independent evaluation.
     # The immutable checkpoint snapshot can be evaluated even if last.pt rotates.
@@ -117,9 +122,10 @@ def main(stop_event=None):
     result={'status':'complete','source_checkpoint':str(Path(a.checkpoint).resolve()),'snapshot':str(snapshot.resolve()),
         'snapshot_sha256':digest,'population':a.population,'history_frames':ck['model_configs']['motion']['history_frames'],
         'attempted_updates':ck['attempted_updates'],'cursor_epoch':ck['cursor_epoch'],'cursor_batch':ck['cursor_batch'],
-        'thresholds':gates,'threshold_source':'original_TRAIN_calibrated' if ck['checkpoint_role'] == 'calibrated_candidate' else 'fixed_monitor_0.5_0.5_REMOVE_off',
+        'thresholds':gates,'threshold_source':'original_TRAIN_calibrated' if calibrated else 'fixed_monitor_0.5_0.5_REMOVE_off',
         'checkpoint_screen_pass_unchanged':ck['screen_pass'],'seconds':time.perf_counter()-started,'reports':report}
     result.update(column_feature_backend=a.column_feature_backend, batch_size=a.batch_size,
+        optimized_inference=a.optimized_inference,
         population_key_fingerprint=stable_json_fingerprint(chosen))
     if sha256(snapshot) != digest:raise RuntimeError('immutable evaluation snapshot changed')
     write_json(out/'evaluation.json',result);(out/'summary.txt').write_text(summary_text(result),encoding='utf-8')

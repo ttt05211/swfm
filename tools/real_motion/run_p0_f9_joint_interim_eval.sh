@@ -19,6 +19,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 export SWFM_COLUMN_CPU_BACKEND=native SWFM_COLUMN_CPU_BUNDLE=1
+export SWFM_LOCAL_FAST_SUPERVISION=0 SWFM_LOCAL_STATIC_ROI=0
+EXTRA=()
+if [[ "${FULL_JOINT_EVAL_OPTIMIZED:-0}" == 1 ]]; then EXTRA+=(--optimized-inference); fi
+if [[ "${FULL_JOINT_EVAL_FIXED_MONITOR:-0}" == 1 ]]; then EXTRA+=(--fixed-monitor-thresholds); fi
 echo "只读快照评估 $POPULATION；last/epoch固定0.5/0.5/REMOVE-off，不用dev调阈值，不改变训练断点。"
 echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输出 $OUT"
 "$PY" -u tools/real_motion/eval_p0_f9_joint_causal_columns.py \
@@ -30,5 +34,5 @@ echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输�
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
   --population "$POPULATION" --out-dir "$OUT" \
   --cpu-workers "${FULL_JOINT_EVAL_CPU_WORKERS:-8}" --batch-size 256 \
-  --column-feature-backend "${FULL_JOINT_EVAL_FEATURE_BACKEND:-cpu}"
+  --column-feature-backend "${FULL_JOINT_EVAL_FEATURE_BACKEND:-cpu}" "${EXTRA[@]}"
 echo "评估完成：$OUT/summary.txt；可继续恢复原训练，不会重置LR/RNG。"
