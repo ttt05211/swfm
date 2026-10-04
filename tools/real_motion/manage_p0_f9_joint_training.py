@@ -152,6 +152,11 @@ def resume_command(directory, checkpoint=None, new_out=None, *, sampling_workers
     env.update(SWFM_COLUMN_CPU_BACKEND='native',SWFM_COLUMN_CPU_BUNDLE='1',OMP_NUM_THREADS='1',
                MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1')
     env.setdefault('SWFM_COLUMN_CPU_HORIZONS', '1')
+    # Conservative default: the 2026-10-04 paired CUDA gate rejected the
+    # host-supervision/static-ROI TRAIN bundle. Keep scientific resume/extend
+    # on the verified path unless the caller explicitly opts in later.
+    env.setdefault('SWFM_LOCAL_FAST_SUPERVISION', '0')
+    env.setdefault('SWFM_LOCAL_STATIC_ROI', '0')
     repository = TRAINER.parents[2]
     env['PYTHONPATH'] = os.pathsep.join([str(repository),str(repository/'upstream_occfm'),env.get('PYTHONPATH','')])
     env.setdefault('CUDA_VISIBLE_DEVICES','0')
