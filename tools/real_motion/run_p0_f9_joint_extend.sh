@@ -26,10 +26,10 @@ echo '全局batch4/source128不翻倍；复用已有暖缓存；每轮dev64，�
 if [[ "$GPUS" == 0,1 ]]; then
   echo '双卡切换有独立rank RNG，不承诺单卡/双卡逐位一致；仅rank0写checkpoint；不会覆盖15轮结果。'
 else
-  echo '单卡追加；TRAIN监督索引/整数ROI默认关闭（配对loss gate未通过）；GPU流式评估保留。'
+  echo '单卡追加；TRAIN监督索引/整数ROI默认关闭（配对loss gate未通过）；Column特征保持CPU路径。'
 fi
 EXTRA=()
 if [[ -n "${FULL_JOINT_EXTEND_OUT:-}" ]]; then EXTRA+=(--out-dir "$FULL_JOINT_EXTEND_OUT"); fi
 "$PY" -u tools/real_motion/manage_p0_f9_joint_training.py extend \
   --run-dir "$RUN" --to-epochs "$EPOCHS" --gpus "$GPUS" \
-  --column-feature-backend gpu --sampling-workers 6 --profile-every 32 "${EXTRA[@]}"
+  --column-feature-backend cpu --sampling-workers 6 --profile-every 32 "${EXTRA[@]}"
