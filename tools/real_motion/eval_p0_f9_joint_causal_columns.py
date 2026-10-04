@@ -48,9 +48,13 @@ def main(stop_event=None):
     p.add_argument('--batch-size',type=int,default=256)
     p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='cpu')
     p.add_argument('--optimized-inference',action='store_true',help='CPU feature look-ahead + deferred checks; first window probability gate')
+    p.add_argument('--legacy-chunk-io',action='store_true',help='keep original per-field uploads/per-chunk probability readback')
     p.add_argument('--raw-prefetch-workers',type=int,default=1,help='1..4 bounded CPU-only window preparation workers')
     p.add_argument('--raw-prefetch-depth',type=int,default=1,help='workers <= depth <= 4; original ordering is preserved')
     p.add_argument('--fixed-monitor-thresholds',action='store_true',help='same 0.5/0.5/REMOVE-off for checkpoint comparison')
+    p.add_argument('--speed-benchmark',action='store_true',help='read-only controlled speed comparison; no formal evaluation or selection')
+    p.add_argument('--speed-windows',type=int,default=32)
+    p.add_argument('--speed-repeats',type=int,default=2)
     a=p.parse_args();out=Path(a.out_dir);started=time.perf_counter()
     if out.exists():p.error('NEW evaluation output required; never overwrite training or another evaluation')
     for k in ('config','checkpoint','dev_cache','population_manifest','base_checkpoint','dev_info'):
@@ -58,6 +62,8 @@ def main(stop_event=None):
     if not Path(a.dataroot).is_dir() or min(a.cpu_workers,a.batch_size)<1:p.error('invalid paths/budgets')
     if not 1 <= a.raw_prefetch_workers <= a.raw_prefetch_depth <= 4:p.error('raw prefetch requires workers <= depth <= 4')
     if a.raw_prefetch_workers > a.cpu_workers:p.error('raw prefetch workers must not exceed CPU worker budget')
+    if a.speed_benchmark and (a.population != 'dev64' or not 18 <= a.speed_windows <= 64
+            or not 1 <= a.speed_repeats <= 3):p.error('speed benchmark requires dev64, 18..64 windows, 1..3 repeats')
     device=torch.device(a.device)
     if device.type == 'cuda' and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):raise RuntimeError('CUDA/BF16 required')
     torch.set_num_threads(1)
@@ -68,6 +74,9 @@ def main(stop_event=None):
     cfg=load_runtime_config(a.config,a.override);pcfg=make_prepare_config(cfg)
     ck,joint=load_joint(snapshot,device,reference_sha=CLEAN_SHA256,config_sha=stable_json_fingerprint(cfg),allow_diagnostic=True)
     if ck['protocol'] not in FULL_PROTOCOLS:raise RuntimeError('interim evaluator requires FULL Local protocol')
+    if a.speed_benchmark and (ck['model_configs']['motion']['history_frames'] != 4
+            or ck['model_configs'].get('adaptive_context') is not None):
+        raise RuntimeError('speed comparison requires strict-four-history Local checkpoint')
     if not ck.get('prior_completed',True):raise RuntimeError('TRAIN prior is incomplete; no training update is ready to evaluate')
     if sha256(a.base_checkpoint) != CLEAN_SHA256:raise RuntimeError('reference E14 changed')
     if sha256(a.dev_info) != ck['info_fingerprints']['dev'] or sha256(a.dev_cache) != ck['cache_fingerprints']['dev']:
@@ -87,8 +96,28 @@ def main(stop_event=None):
     provider.raw_prefetch_workers=a.raw_prefetch_workers;provider.raw_prefetch_depth=a.raw_prefetch_depth
     provider.raw_io_workers=max(1,min(4,a.cpu_workers//a.raw_prefetch_workers))
     joint.columns.column_inference_optimized=a.optimized_inference
+    joint.columns.column_readback_optimized=not a.legacy_chunk_io
     joint.columns.column_inference_verify_remaining=3 if a.optimized_inference else 0
     source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.dev_info,verbose=False),256)
+    if a.speed_benchmark:
+        from tools.real_motion.joint_eval_speed import benchmark_evaluation
+        try:
+            speed = benchmark_evaluation(provider,source,records,joint.columns,gates,out,
+                windows=a.speed_windows,repeats=a.speed_repeats,batch_size=a.batch_size,stop_event=stop_event)
+        except InterruptedError:
+            write_json(out/'speed_status.json',dict(status='interrupted',snapshot_sha256=digest,
+                source_checkpoint_unchanged=True,no_formal_evaluation=True))
+            print('Speed benchmark interrupted; source checkpoint unchanged; no complete speed result.',flush=True)
+            return 130
+        if sha256(snapshot) != digest:raise RuntimeError('immutable evaluation snapshot changed')
+        speed.update(snapshot=str(snapshot.resolve()),snapshot_sha256=digest,
+            population='scene_balanced_subset_of_frozen_dev64_DIAGNOSTIC_ONLY',
+            history_frames=ck['model_configs']['motion']['history_frames'],future_frames=6,
+            thresholds=gates,seconds_including_load=time.perf_counter()-started)
+        write_json(out/'speed.json',speed)
+        from tools.real_motion.joint_eval_speed import summary_text as speed_summary
+        text=speed_summary(speed);(out/'summary.txt').write_text(text,encoding='utf-8');print(text,flush=True)
+        return 0
     # No shared persistent geometry writer during an independent evaluation.
     # The immutable checkpoint snapshot can be evaluated even if last.pt rotates.
     with (out/'progress.jsonl').open('x',encoding='utf-8') as log:
@@ -109,7 +138,7 @@ def main(stop_event=None):
         'thresholds':gates,'threshold_source':'original_TRAIN_calibrated' if calibrated else 'fixed_monitor_0.5_0.5_REMOVE_off',
         'checkpoint_screen_pass_unchanged':ck['screen_pass'],'seconds':time.perf_counter()-started,'reports':report}
     result.update(column_feature_backend=a.column_feature_backend, batch_size=a.batch_size,
-        optimized_inference=a.optimized_inference,
+        optimized_inference=a.optimized_inference,legacy_chunk_io=a.legacy_chunk_io,
         raw_prefetch_workers=a.raw_prefetch_workers,raw_prefetch_depth=a.raw_prefetch_depth,
         population_key_fingerprint=stable_json_fingerprint(chosen))
     if sha256(snapshot) != digest:raise RuntimeError('immutable evaluation snapshot changed')

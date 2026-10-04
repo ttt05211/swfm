@@ -80,8 +80,11 @@ class LinkedColumns(CausalColumnModel):
             result = result.index_copy(0, rows, q[sources, h])
         return result
 
-    def forward(self, history, flags, base, fallback, context, kind, classes, *, source_features):
-        if source_features.shape != (len(kind), self.source_dim) or not torch.isfinite(source_features).all():
+    def forward(self, history, flags, base, fallback, context, kind, classes, *, source_features, validate_source=True):
+        # INFERENCE may accumulate the finite check on device and check once
+        # before returning a horizon. Training/direct callers still fail here.
+        if (source_features.shape != (len(kind), self.source_dim)
+                or validate_source and not torch.isfinite(source_features).all()):
             raise RuntimeError('invalid continuous source features')
         return super().forward(history, flags, base, fallback, context, kind, classes,
             query_extra=self.source_projection(source_features))

@@ -53,12 +53,14 @@ def pose_motion(center, target, yaw):
     return out
 
 
-def causal_source_history(raw_history, poses, state, grid, strong, workers):
+def causal_source_history(raw_history, poses, state, grid, strong, workers, *, previous_instances=None):
     """Causal same-class association/ICP only. No annotation or future GT."""
     t = len(raw_history)
     if t not in (4, 6) or len(poses) != t: raise ValueError('four or six aligned historical observations required')
-    with ThreadPoolExecutor(max_workers=min(workers, t-1)) as pool:
-        frames = list(pool.map(lambda f: extract_instances_cropped_exact(raw_history[f], poses[f], grid=grid, cfg=strong), range(t-1)))
+    count = t-1 if previous_instances is None else t-2
+    with ThreadPoolExecutor(max_workers=min(workers, count)) as pool:
+        frames = list(pool.map(lambda f: extract_instances_cropped_exact(raw_history[f], poses[f], grid=grid, cfg=strong), range(count)))
+    if previous_instances is not None: frames.append(previous_instances)
     frames.append(state["current"])
     links, audit = associate_backwards(frames, state["current"], state["velocities"], dt=.5)
     points = [[rigid_source_points_world(c["voxel_indices"], pose, grid=grid) for c in frame]
@@ -537,9 +539,11 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
             feature_backend=feature_backend, history_index=history_index, gpu_sampler=gpu_sampler,
             verify_features=verify_features, optimized=False)
         reference_seconds = time.perf_counter()-reference_started
-    model.eval(); parts = []
+    model.eval()
     started = time.perf_counter()
-    from real_motion.column_inference_pipeline import InferenceFeatures
+    from real_motion.column_inference_pipeline import InferenceFeatures, ProbabilityReadback, inference_tensors
+    readback = ProbabilityReadback(buffered=bool(optimized and getattr(model, 'column_readback_optimized', True)))
+    packed_upload = bool(readback.buffered and device.type == 'cuda')
     sampler = InferenceFeatures(prepared, h, plan, grid, model.config, device, pose_motion,
         backend=feature_backend, workers=getattr(model, 'column_sampling_workers', 1),
         history_index=history_index, gpu_sampler=gpu_sampler, verify=verify_features)
@@ -552,7 +556,11 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
         return small, arrays, time.perf_counter()-tick
     pending = None
     from real_motion.causal_column_model import CausalColumnModel
+    from real_motion.joint_causal_columns import LinkedColumns
     defer_checks = bool(optimized and isinstance(model, CausalColumnModel))
+    # Adaptive/custom subclasses have their own checks and remain untouched.
+    defer_source = bool(defer_checks and type(model) is LinkedColumns
+        and getattr(model, 'column_readback_optimized', True))
     try:
       with torch.inference_mode():
         finite = (torch.isfinite(model.generation_pos_weight).all() & torch.isfinite(model.refine_class_weights).all()
@@ -565,11 +573,14 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
             sampled_seconds += sample_seconds
             pending = (pool.submit(sample, start+batch_size)
                 if pool is not None and start+batch_size < len(plan) else None)
-            b = {k: torch.as_tensor(v, device=device) for k, v in arrays.items()}
-            legal = torch.as_tensor(small.legal, device=device)
+            b = inference_tensors(arrays,small.legal,device,packed=packed_upload)
+            legal = b.pop('legal')
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 if hasattr(model, 'source_features_for'):
                     b['source_features'] = model.source_features_for(prepared, h, small, device)
+                    if defer_source:
+                        finite = finite & torch.isfinite(b['source_features']).all()
+                        b['validate_source'] = False
                 if hasattr(model, 'extra_inputs_for'):
                     b.update(model.extra_inputs_for(prepared, h, small, grid, device))
                 g, r = model(**b)
@@ -577,18 +588,21 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
                 finite = finite & torch.isfinite(g).all() & torch.isfinite(r).all()
                 probability = model.calibrated_probabilities(g, r, b['kind'], legal, validate=False)
             else: probability = model.calibrated_probabilities(g, r, b['kind'], legal)
-            parts.append(probability.cpu().numpy())
+            readback.append(probability)
         if defer_checks and not finite:
             raise RuntimeError('nonfinite prediction or invalid TRAIN calibration weights')
     finally:
         if pool is not None: pool.shutdown(wait=True, cancel_futures=True)
+    result = readback.result((*plan.base.shape, 3))
     model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,
         'inverse_map_seconds': mapped_at-started, 'patch_gather_seconds': sampled_seconds,
         'sampling_wait_seconds': sampling_wait,
         'network_transfer_and_other_seconds': max(0., time.perf_counter()-mapped_at-sampling_wait),
         'sampling_seconds_are_overlapping_worker_time': pool is not None,
-        'feature_backend': 'gpu' if sampler.gpu is not None else 'cpu', 'feature_audit': dict(sampler.audit)}
-    result = np.concatenate(parts) if parts else np.empty((*plan.base.shape, 3), np.float32)
+        'feature_backend': 'gpu' if sampler.gpu is not None else 'cpu', 'feature_audit': dict(sampler.audit),
+        'probability_readback_transfers': readback.transfers,
+        'probability_readback_buffer_bytes': readback.peak_bytes,
+        'source_finite_check_deferred': defer_source,'packed_input_upload': packed_upload}
     if verify:
         if not np.array_equal(reference, result):
             raise RuntimeError('optimized inference probability exactness failed; use reference inference')

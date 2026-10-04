@@ -67,7 +67,8 @@ def summarize_progress(path):
             horizon_totals = defaultdict(float)
             for profile in row.get('prediction_seconds_by_horizon', {}).values():
                 for name in ('queries', 'inverse_map_seconds', 'patch_gather_seconds', 'sampling_wait_seconds',
-                             'network_transfer_and_other_seconds'):
+                             'network_transfer_and_other_seconds','probability_readback_transfers',
+                             'probability_readback_buffer_bytes'):
                     value = profile.get(name)
                     if isinstance(value, (int, float)) and math.isfinite(value): horizon_totals[name] += value
             for name, value in horizon_totals.items(): add('all_3_horizons.'+name, value)

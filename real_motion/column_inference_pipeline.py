@@ -7,6 +7,69 @@ from .column_gpu_sampling import GpuColumnSampler, PackedColumnWindow, pack_colu
 from .causal_column_sampling import ColumnFeatureSampler, ColumnHistoryIndex
 
 
+def inference_tensors(arrays, legal, device, *, packed=False):
+    """One host-byte upload instead of one synchronous copy per field.
+
+    Original dtypes/shapes and network query batch are preserved. Already
+    CUDA-resident byte features are not round-tripped. No FP computation.
+    """
+    values = dict(arrays, legal=legal)
+    if not packed: return {k:torch.as_tensor(v,device=device) for k,v in values.items()}
+    result = {}; pieces = []; descriptors = []; offset = 0
+    for key,value in values.items():
+        tensor = torch.as_tensor(value)
+        if tensor.device.type != 'cpu' or tensor.numel() == 0:
+            result[key] = tensor.to(device);continue
+        tensor = tensor.contiguous()
+        alignment = tensor.element_size();padding = (-offset)%alignment
+        if padding:pieces.append(np.zeros(padding,np.uint8));offset+=padding
+        raw = tensor.reshape(-1).view(torch.uint8).numpy()
+        descriptors.append((key,offset,len(raw),tensor.dtype,tuple(tensor.shape)))
+        pieces.append(raw);offset+=len(raw)
+    if descriptors:
+        block = torch.from_numpy(np.concatenate(pieces)).to(device)
+        for key,start,size,dtype,shape in descriptors:
+            result[key]=block[start:start+size].view(dtype).reshape(shape)
+    return result
+
+
+class ProbabilityReadback:
+    """Bounded output-only buffering, not a different network batch/precision.
+
+    CUDA chunks retain only final FP32 probabilities. One contiguous readback
+    replaces many tiny synchronizations. No tensor arithmetic is changed.
+    """
+    def __init__(self, *, buffered=False, max_bytes=8*2**20):
+        if type(max_bytes) is not int or max_bytes < 1: raise ValueError('positive readback byte budget required')
+        self.buffered, self.limit = bool(buffered), max_bytes
+        self.pending, self.parts, self.bytes = [], [], 0
+        self.transfers = self.peak_bytes = 0
+
+    def append(self, probability):
+        size = probability.numel()*probability.element_size()
+        if not self.buffered:
+            self.parts.append(probability.cpu().numpy()); self.transfers += 1
+            return
+        if self.bytes+size > self.limit: self.flush()
+        if size > self.limit:
+            self.parts.append(probability.cpu().numpy()); self.transfers += 1
+            return
+        self.pending.append(probability); self.bytes += size
+        self.peak_bytes = max(self.peak_bytes, self.bytes)
+
+    def flush(self):
+        if self.pending:
+            # cat is a byte copy, not a reduction. Temporarily needs at most
+            # another limit bytes. Concatenation never changes network shape.
+            value = self.pending[0] if len(self.pending) == 1 else torch.cat(self.pending)
+            self.parts.append(value.cpu().numpy()); self.transfers += 1
+            self.pending.clear(); self.bytes = 0
+
+    def result(self, empty_shape):
+        self.flush()
+        return np.concatenate(self.parts) if self.parts else np.empty(empty_shape, np.float32)
+
+
 class InferenceFeatures:
     def __init__(self, prepared, h, plan, grid, config, device, motion_factory, *,
                  backend='cpu', workers=1, history_index=None, gpu_sampler=None, verify=False):

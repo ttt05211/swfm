@@ -559,13 +559,14 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
         assert model is provider.joint.columns and provider.reference_enabled
         assert not hasattr(provider, 'causal_geometry_cache')
         return actual_eval(provider, source, records[:2], model, gates, **kwargs)
-    def evaluate(destination, population='dev64', evaluator=small_eval, event=None, raw_workers=1):
+    def evaluate(destination, population='dev64', evaluator=small_eval, event=None, raw_workers=1, speed=False):
         argv = ['eval', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--checkpoint', str(checkpoint), '--dev-cache', str(files['dev-cache']),
             '--population-manifest', str(files['population-manifest']), '--base-checkpoint', str(files['base-checkpoint']),
             '--dev-info', str(files['dev-info']), '--dataroot', str(tmp_path), '--out-dir', str(destination),
             '--population', population, '--device', 'cpu', '--cpu-workers', str(max(1, raw_workers)),
             '--raw-prefetch-workers', str(raw_workers), '--raw-prefetch-depth', str(raw_workers)]
+        if speed:argv+=['--speed-benchmark','--speed-windows','18','--speed-repeats','1']
         with patch('sys.argv', argv), patch.object(interim, 'CLEAN_SHA256', 'a'*64), \
             patch.object(interim, 'make_prepare_config', return_value=SimpleNamespace(grid=grid)), \
             patch.object(interim, 'load_manifest', return_value=(manifest, keys, None)), \
@@ -591,6 +592,16 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
     text = (parallel/'summary.txt').read_text()
     assert 'joint: IoU=' in text and 'MovingMacro=' in text and '3.0s joint: IoU=' in text
     assert checkpoint.read_bytes() == original
+    speed_out=tmp_path/'speed_only'
+    assert evaluate(speed_out,speed=True,raw_workers=2) == 0
+    speed_result=json.loads((speed_out/'speed.json').read_text())
+    assert speed_result['integer_counts_exact'] and not speed_result['actual_cuda']
+    assert len(speed_result['trials']) == 3 and speed_result['windows'] == 18
+    assert not (speed_out/'evaluation.json').exists() and checkpoint.read_bytes() == original
+    stopped_speed=tmp_path/'stopped_speed';event=Event();event.set()
+    assert evaluate(stopped_speed,event=event,speed=True,raw_workers=2) == 130
+    assert json.loads((stopped_speed/'speed_status.json').read_text())['status'] == 'interrupted'
+    assert not (stopped_speed/'speed.json').exists() and not (stopped_speed/'summary.txt').exists()
     def rotate_and_report(provider, source, records, model, gates, **kwargs):
         assert len(records) == 512 and kwargs['dev64_keys'] == keys
         assert trainer.record_keys(records) == tuple(map(tuple, manifest['parent_keys']))

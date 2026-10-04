@@ -32,10 +32,13 @@ def prepare_causal_evidence(raw, pcfg, strong, workers, *, state=None, column_co
         current = runtime.extract_instances_cropped_exact(raw['history_occ'][-1], raw['history_poses'][-1], grid=grid, cfg=strong)
         previous = runtime.extract_instances_cropped_exact(raw['history_occ'][-2], raw['history_poses'][-2], grid=grid, cfg=strong)
         velocity = runtime.match_instances(previous, current, float(pcfg.frame_dt_s), max_speed_mps=strong.max_match_speed_mps)
-        state = {'current': current, 'velocities': velocity,
+        state = {'current': current, 'previous': previous, 'velocities': velocity,
             'source_world_points': [rigid_source_points_world(c['voxel_indices'], raw['history_poses'][-1], grid=grid) for c in current]}
     current = state['current']
-    registrations, _, _, audit = causal_source_history(raw['history_occ'], raw['history_poses'], state, grid, strong, workers)
+    # Same immediately previous Strong extraction already used for velocity.
+    # Reuse it rather than recomputing its connected components a second time.
+    registrations, _, _, audit = causal_source_history(raw['history_occ'], raw['history_poses'], state, grid, strong, workers,
+        previous_instances=state.get('previous'))
     aligned = [[None if reg is None else transform_points(
         rigid_source_points_world(reg[1], raw['history_poses'][f], grid=grid), reg[0])
         for f, reg in enumerate(row)] for row in registrations]
