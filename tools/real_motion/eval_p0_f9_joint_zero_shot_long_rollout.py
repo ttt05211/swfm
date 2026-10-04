@@ -47,6 +47,8 @@ def summary_text(result):
         lines.append(f"{h:>6}s "+' '.join(f'{number(row[k]):>11}' for k in ('mIoU', 'IoU', 'MovingMicro', 'MovingMacro')))
     for name in ('average_1s_2s_3s', 'average_4s_5s_6s'):
         lines.append(name+': '+json.dumps(finite_json(metrics[name]), ensure_ascii=False))
+    lines += ['horizons: nominal keyframe steps; NO timestamp interpolation/retiming',
+        'timestamp_audit: '+json.dumps(result['timestamp_audit'])]
     lines += [f"first_block_exactness_passed: {result['first_block_exactness_passed']}",
         'block_edit_totals: '+json.dumps(result['edits']),
         'stage_seconds: '+json.dumps(result['stage_seconds']),
@@ -122,7 +124,9 @@ def main(stop_event=None):
         del records
         if {w.scene_name for w, _ in selected} & {s for s, _ in ck['train_keys']}:
             raise RuntimeError('TRAIN/dev scene overlap')
-        for window, _ in selected: rollout.validate_timestamps(source.nusc, window)
+        timestamp_rows = [rollout.validate_timestamps(source.nusc, window) for window, _ in selected]
+        timestamp_audit = rollout.summarize_timestamps(timestamp_rows)
+        print('TIMESTAMP AUDIT: '+json.dumps(timestamp_audit), flush=True)
         contract = dict(protocol=rollout.PROTOCOL, snapshot_sha256=digest, checkpoint_epoch=args.expected_epoch,
             checkpoint_update=ck['attempted_updates'], config_fingerprint=config_sha,
             dev_cache_sha256=cache_sha, dev_info_sha256=info_sha, dev_manifest_fingerprint=manifest['manifest_fingerprint'],
@@ -130,6 +134,7 @@ def main(stop_event=None):
             thresholds=list(rollout.THRESHOLDS), observation_protocol=rollout.OBSERVATION_PROTOCOL,
             feature_backend=args.feature_backend, inference_batch_size=args.batch_size,
             optimized_inference=not args.reference_inference, active_history_frames=4,
+            timestamp_audit=timestamp_audit,
             relative_future_frames=6, future_ego_pose_source='GT_through_6s', future_GT_prediction_inputs=False)
         cursor = 0; raw_counts = rollout.legacy._new_raw(); gate = False
         stages = defaultdict(float); edit_totals = {'first': defaultdict(int), 'second': defaultdict(int)}
@@ -140,6 +145,7 @@ def main(stop_event=None):
             stages.update(saved['stage_seconds'])
             for block in edit_totals: edit_totals[block].update(saved['edits'][block])
         else: write_json(out/'contract.json', contract)
+        write_json(out/'timestamp_audit.json', dict(summary=timestamp_audit, per_window=timestamp_rows))
         joint.eval().requires_grad_(False)
         provider = EvaluationJointColumnProvider(args.base_checkpoint, CLEAN_SHA256, pcfg, device,
             args.cpu_workers, joint, None)
@@ -248,6 +254,7 @@ def main(stop_event=None):
             seconds_this_invocation=time.perf_counter()-started, contract_fingerprint=fingerprint,
             history_frames=4, future_frames_per_block=6, rollout_blocks=2, future_GT_prediction_inputs=False,
             report_horizons_s=list(rollout.REPORT_HORIZONS),
+            timestamp_audit=timestamp_audit,
             future_ego_pose_used_through_s=6, no_training=True, no_dev_threshold_selection=True)
         result = finite_json(result)
         write_json(out/'evaluation.json', result); write_json(out/'evaluation_status.json', dict(status='complete', completed_windows=cursor))

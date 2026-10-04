@@ -63,13 +63,42 @@ def test_timestamps_reject_scene_crossing_gaps_and_rate_change():
         for i, t in enumerate(tokens)}
     nusc = SimpleNamespace(get=lambda table, t: samples[t])
     common.validate_timestamps(nusc, w)
-    samples[tokens[7]]['timestamp'] += 100000
+    samples[tokens[7]]['timestamp'] += 300000
     with pytest.raises(RuntimeError, match='2Hz'): common.validate_timestamps(nusc, w)
-    samples[tokens[7]]['timestamp'] -= 100000
+    samples[tokens[7]]['timestamp'] -= 300000
     samples[tokens[5]]['next'] = tokens[7]
     with pytest.raises(RuntimeError, match='noncontiguous'): common.validate_timestamps(nusc, w)
     samples[tokens[5]]['scene_token'] = 'other'
     with pytest.raises(RuntimeError, match='scene boundary'): common.validate_timestamps(nusc, w)
+
+
+def test_nominal_timestamps_allow_cumulative_jitter_and_audit_actual_horizons():
+    w = window('s', 't'); tokens = w.history_tokens+w.future_tokens
+    samples = {t: dict(timestamp=1532402927647951+i*510000, scene_token='s',
+        next=tokens[i+1] if i < 15 else '') for i, t in enumerate(tokens)}
+    nusc = SimpleNamespace(get=lambda table, t: samples[t])
+    row = common.validate_timestamps(nusc, w)
+    assert row['max_nominal_deviation_s'] == pytest.approx(.12)
+    audit = common.summarize_timestamps([row])
+    assert audit['windows_exceeding_old_60ms_cumulative_check'] == 1
+    assert audit['actual_report_times_s']['6.0']['median'] == pytest.approx(6.12)
+    assert audit['horizons_are_nominal_keyframe_steps']
+    # A local 100ms keyframe jitter also remains legal; not a missing frame.
+    samples[tokens[7]]['timestamp'] += 100000
+    common.validate_timestamps(nusc, w)
+
+
+def test_timestamp_guards_still_reject_wrong_rate_nonmonotonic_and_nonfinite():
+    w = window('s', 't'); tokens = w.history_tokens+w.future_tokens
+    samples = {t: dict(timestamp=i*600000, scene_token='s', next=tokens[i+1] if i < 15 else '')
+        for i, t in enumerate(tokens)}
+    nusc = SimpleNamespace(get=lambda table, t: samples[t])
+    with pytest.raises(RuntimeError, match='2Hz'): common.validate_timestamps(nusc, w)
+    for i, token in enumerate(tokens): samples[token]['timestamp'] = i*500000
+    samples[tokens[7]]['timestamp'] = samples[tokens[6]]['timestamp']
+    with pytest.raises(RuntimeError, match='strictly increasing'): common.validate_timestamps(nusc, w)
+    samples[tokens[7]]['timestamp'] = float('nan')
+    with pytest.raises(RuntimeError, match='nonfinite'): common.validate_timestamps(nusc, w)
 
 
 def test_inherited_visibility_uses_initial_evidence_not_prediction_or_future_mask():
@@ -313,7 +342,8 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     monkeypatch.setattr(cli, 'CachedColumnSource', lambda source, *a: source)
     monkeypatch.setattr(cli, 'EvaluationJointColumnProvider', Provider)
     monkeypatch.setattr(cli, 'prefetch_raw_columns', lambda p, s, rows, **k: ((r, copy.deepcopy(raw)) for r in rows))
-    monkeypatch.setattr(common, 'validate_timestamps', lambda *a: None)
+    monkeypatch.setattr(common, 'validate_timestamps', lambda *a: dict(
+        intervals_s=[.5]*15, relative_times_s=((np.arange(16)-3)*.5).tolist(), max_nominal_deviation_s=0.))
     monkeypatch.setattr(common, 'predict_joint_block', lambda *a: (copy.deepcopy(predictions), {'added': 0}))
     monkeypatch.setattr(common, 'build_four_history_state', lambda *a: {'rec': {}})
     monkeypatch.setattr(common, 'assert_four_inputs_equal', lambda *a: None)

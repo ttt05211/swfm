@@ -16,6 +16,10 @@ PROTOCOL = 'p0_f9_joint_history4_frozen_block_rollout_6s_v1'
 OBSERVATION_PROTOCOL = 'initial_real_history_observation_union_forward_warp_no_future_sensor_v1'
 THRESHOLDS = (.5, .5, None)
 REPORT_HORIZONS = legacy.REPORT_HORIZONS
+TIMESTAMP_PROTOCOL = 'nominal_2hz_contiguous_keyframes_with_measured_time_audit_v2'
+# Conservative corruption/cadence guards, NOT official nuScenes jitter bounds.
+INTERVAL_BOUNDS_S = (.25, .75)
+MEAN_INTERVAL_BOUNDS_S = (.45, .55)
 
 
 def select_long_population(records, windows, parent_keys, population):
@@ -58,7 +62,12 @@ def select_long_population(records, windows, parent_keys, population):
     return [(long[k], by[k]) for k in chosen], audit
 
 
-def validate_timestamps(nusc, window, tolerance_s=.06):
+def validate_timestamps(nusc, window):
+    """Validate frame cadence, not accumulated equality to an ideal 0.5s clock.
+
+    Forecast/metric horizons retain their trained NOMINAL keyframe definition.
+    Real timestamps are diagnostics, never used to retime KTA or Moving support.
+    """
     tokens = tuple(window.history_tokens)+tuple(window.future_tokens)
     if len(tokens) != 16 or len(set(tokens)) != 16:
         raise RuntimeError('nonunique/incomplete four-history plus twelve-future sequence')
@@ -67,10 +76,35 @@ def validate_timestamps(nusc, window, tolerance_s=.06):
         raise RuntimeError('long window crosses a scene boundary')
     for a, b, token in zip(samples, samples[1:], tokens[1:]):
         if str(a['next']) != str(token): raise RuntimeError('noncontiguous sample sequence')
-    relative = (np.asarray([s['timestamp'] for s in samples], np.float64)-samples[3]['timestamp'])/1e6
+    timestamps = np.asarray([s['timestamp'] for s in samples], np.float64)
+    if not np.isfinite(timestamps).all(): raise RuntimeError('nonfinite long sample timestamps')
+    intervals = np.diff(timestamps)/1e6
+    if np.any(intervals <= 0): raise RuntimeError('long sample timestamps must be strictly increasing')
+    bad = np.flatnonzero((intervals < INTERVAL_BOUNDS_S[0]) | (intervals > INTERVAL_BOUNDS_S[1]))
+    average = float(intervals.mean())
+    if len(bad) or not MEAN_INTERVAL_BOUNDS_S[0] <= average <= MEAN_INTERVAL_BOUNDS_S[1]:
+        raise RuntimeError(f'long sample cadence incompatible with nominal 2Hz: '
+            f'scene={window.scene_name} t0={window.t0_token} '
+            f'intervals_s={intervals.tolist()} mean={average:.6f}; '
+            f'interval_guard={INTERVAL_BOUNDS_S} mean_guard={MEAN_INTERVAL_BOUNDS_S}')
+    relative = (timestamps-timestamps[3])/1e6
     expected = (np.arange(16)-3)*.5
-    if not np.allclose(relative, expected, rtol=0, atol=tolerance_s):
-        raise RuntimeError('long sample timestamps do not match the frozen 2Hz horizons')
+    return dict(scene_name=str(window.scene_name), t0_token=str(window.t0_token),
+        intervals_s=intervals.tolist(), relative_times_s=relative.tolist(),
+        max_nominal_deviation_s=float(np.max(np.abs(relative-expected))))
+
+
+def summarize_timestamps(rows):
+    relative = np.asarray([r['relative_times_s'] for r in rows], np.float64)
+    intervals = np.asarray([r['intervals_s'] for r in rows], np.float64)
+    return dict(protocol=TIMESTAMP_PROTOCOL, windows=len(rows), horizons_are_nominal_keyframe_steps=True,
+        interval_guard_s=list(INTERVAL_BOUNDS_S), mean_interval_guard_s=list(MEAN_INTERVAL_BOUNDS_S),
+        interval_min_s=float(intervals.min()), interval_max_s=float(intervals.max()),
+        max_nominal_deviation_s=max(r['max_nominal_deviation_s'] for r in rows),
+        windows_exceeding_old_60ms_cumulative_check=sum(r['max_nominal_deviation_s'] > .06 for r in rows),
+        actual_report_times_s={str(h): dict(min=float(relative[:, idx].min()),
+            median=float(np.median(relative[:, idx])), max=float(relative[:, idx].max()))
+            for h, idx in zip(REPORT_HORIZONS, (5, 7, 9, 11, 13, 15))})
 
 
 def inherited_observation_masks(raw, predicted_poses, grid, workers=1):
