@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from real_motion.column_gpu_sampling import GpuColumnSampler
+from real_motion.native_column_cpu import backend_name, prepare_native
 from real_motion.column_inference_pipeline import InferenceFeatures
 from real_motion.causal_column_sampling import ColumnFeatureSampler, ColumnHistoryIndex
 from real_motion.local_supervision_fastpath import column_indices
@@ -17,6 +18,13 @@ from tools.real_motion.joint_column_common import motion_loss
 from test_causal_column_sampling import fixture as sampling_fixture
 from test_joint_causal_columns import fixture, provider_for, optimizers
 from test_causal_columns import fake_provider, moving_fixture
+
+
+# The native shared library is process-local. The shell preflight runs in a
+# separate Python process, so direct pytest execution under
+# SWFM_COLUMN_CPU_BACKEND=native must load the already-built artifact here too.
+if backend_name() == 'native':
+    prepare_native()
 
 
 @pytest.mark.parametrize('empty', (False, True))
