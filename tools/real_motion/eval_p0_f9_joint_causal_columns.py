@@ -68,7 +68,7 @@ def main(stop_event=None):
     p.add_argument('--population',choices=('dev64','dev512','full4369'),default='dev64')
     p.add_argument('--device',default='cuda');p.add_argument('--cpu-workers',type=int,default=8)
     p.add_argument('--batch-size',type=int,default=256)
-    p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='gpu')
+    p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='cpu')
     a=p.parse_args();out=Path(a.out_dir);started=time.perf_counter()
     if out.exists():p.error('NEW evaluation output required; never overwrite training or another evaluation')
     for k in ('config','checkpoint','dev_cache','population_manifest','base_checkpoint','dev_info'):
