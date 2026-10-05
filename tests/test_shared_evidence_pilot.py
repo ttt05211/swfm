@@ -1,0 +1,141 @@
+"""CPU orchestration emulation; never claims a real-data CUDA/FPS result."""
+import copy
+import json
+from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+import numpy as np
+import pytest
+import torch
+from test_shared_column_evidence import training_fixture,model_fixture
+from real_motion.shared_column_evidence import SharedHistorySession,SharedReadExecution
+from tools.real_motion import shared_evidence_pilot_common as common
+from tools.real_motion import run_p0_f9_shared_evidence_pilot as pilot
+from tools.real_motion import causal_column_common as reference
+from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import sha256
+from tools.real_motion.v18_source_interaction_common import select_population
+
+
+def test_graph_reader_bounded_chunks_match_eager_and_copy_reused_buffers():
+    prep,grid,output,window,teacher,student=model_fixture();student.eval()
+    with torch.inference_mode():
+        plan=window.candidates(1)
+        eager=common.tensor_probability(student,window,1,plan,output,
+            session=SharedHistorySession(student,window.labels,window.visibility),batch_size=8)
+        engine=SharedReadExecution(student)
+        actual=common.tensor_probability(student,window,1,plan,output,
+            session=SharedHistorySession(student,window.labels,window.visibility),batch_size=8,execution=engine)
+        assert torch.equal(eager,actual) and engine.eager_calls>1
+        # Simulate capture output aliasing; the same eight-row allocation is
+        # overwritten on every call. Earlier chunks must remain correct.
+        class Reused:
+            def run(self,batch,legal):
+                p,ok=engine.function(batch,legal)
+                if not hasattr(self,'buffer'):self.buffer=p.new_empty((8,*p.shape[1:]))
+                self.buffer[:len(p)].copy_(p)
+                return self.buffer[:len(p)],ok
+        aliased=common.tensor_probability(student,window,1,plan,output,
+            session=SharedHistorySession(student,window.labels,window.visibility),batch_size=8,execution=Reused())
+        assert torch.equal(eager,aliased)
+
+
+def test_same_class_wrong_source_centres_rejected_before_device_inputs():
+    joint,teacher,provider,rows=training_fixture();record,raw=rows[0]
+    other={**record,'source_centroid_xy_t0_m':record['source_centroid_xy_t0_m']+1}
+    with pytest.raises(RuntimeError,match='centre'):common.causal_template(raw,other)
+
+
+def test_one_bundle_real_evaluation_migration_stop_resume_and_summary(tmp_path,monkeypatch):
+    # Only dataset loading, legacy checkpoint loading and CUDA-only timing are
+    # stubbed. Actual candidate/probe/shared reader, metrics, GT+KD gradients,
+    # optimizer and recovery are exercised through the new CLI orchestrator.
+    joint,teacher,base_provider,rows=training_fixture();template,raw=rows[0]
+    prep,grid,_,window,_,_=model_fixture()
+    train=[{**copy.deepcopy(template),'scene_name':f'train{s}','t0_token':f'{s}:{i}'} for s in range(10) for i in range(4)]
+    dev=[{**copy.deepcopy(template),'scene_name':'dev','t0_token':f'd{i}'} for i in range(512)]
+    keys=lambda records:tuple((r['scene_name'],r['t0_token']) for r in records)
+    manifest=dict(parent_keys=keys(dev),manifest_fingerprint='fixed')
+    paths={k:tmp_path/k for k in ('checkpoint','train-cache','dev-cache','population-manifest','base-checkpoint','train-info','dev-info')}
+    for p in paths.values():p.write_bytes(b'original-input')
+    digests={str(p):sha256(p) for p in paths.values()}
+    ck=dict(cursor_epoch=19,model_configs={},cache_fingerprints=dict(train=digests[str(paths['train-cache'])],dev=digests[str(paths['dev-cache'])]),
+        info_fingerprints=dict(train=digests[str(paths['train-info'])],dev=digests[str(paths['dev-info'])]),
+        dev_manifest_fingerprint='fixed',dev_keys=keys(dev),train_keys=keys(train))
+    def make_provider(checkpoint,digest,pcfg,device,workers,model,control):
+        provider=SimpleNamespace(joint=model,model=model.transport,pcfg=pcfg,device=device,workers=workers)
+        def load(source,record,*,include_gt):
+            data=copy.deepcopy(raw)
+            if not include_gt:data['future_gt_occ']=None
+            return data
+        def prepare(source,record,*,include_gt,raw_window,outputs=None):
+            result=copy.deepcopy(prep);result.raw=raw_window
+            result.state=raw_window['_column_causal_preparation']['prepared_state']
+            result.outputs=outputs if outputs is not None else provider.joint.motion(record,device)
+            result.baseline,result.owners,result.fallbacks,result.components,result.targets,result.yaws=reference.render_column_layers(result.state,record,result.outputs,grid)
+            result.window=SimpleNamespace(scene_name=record['scene_name'],t0_token=record['t0_token'],future_tokens=tuple(f'f{h}' for h in range(6)))
+            return result
+        provider.load_raw_columns=load;provider.prepare_columns=prepare
+        return provider
+    monkeypatch.setattr(pilot,'require_cuda',lambda _:torch.device('cpu'))
+    monkeypatch.setattr(pilot,'TRAIN_WINDOWS',40)
+    monkeypatch.setattr(pilot,'load_joint',lambda *a,**k:(ck,copy.deepcopy(teacher)))
+    monkeypatch.setattr(pilot,'CLEAN_SHA256',digests[str(paths['base-checkpoint'])])
+    monkeypatch.setattr(pilot,'make_prepare_config',lambda cfg:SimpleNamespace(grid=grid))
+    monkeypatch.setattr(pilot,'load_manifest',lambda path:(manifest,keys(dev[:64]),None))
+    monkeypatch.setattr(pilot,'load_cache',lambda path:({},train if str(path)==str(paths['train-cache']) else dev))
+    monkeypatch.setattr(pilot,'select_population',lambda keys,scenes,**kwargs:select_population(keys,scenes,calibration_scenes=2,**kwargs))
+    monkeypatch.setattr(pilot,'PilotProvider',make_provider)
+    monkeypatch.setattr(pilot,'NuScenesWindowSource',lambda *a,**k:SimpleNamespace(nusc=None))
+    monkeypatch.setattr(common,'gt_moving_support_sequence',lambda *a,**k:[np.ones(grid.shape_hwd,bool) for _ in range(6)])
+    monkeypatch.setattr(pilot,'training_speed',lambda *a,**k:dict(trials=[dict(mode=m,seconds_per_window=t) for m,t in
+        (('current_joint',.1),('device_geometry_joint',.08),('shared_auto_joint',.07),('shared_dense_joint',.09),('shared_tiles_joint',.08))]))
+    monkeypatch.setattr(pilot,'fps_speed',lambda *a,**k:dict(trials=[dict(mode=m,six_frame_seconds=t) for m,t in
+        (('current_graph',.9),('device_geometry',.6),('shared_auto',.2))],boundary='TEST_EMULATION',excludes='NO_REAL_FPS'))
+    def run(out,*,resume=None,stop=None):
+        argv=['pilot','--config',str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
+            '--dataroot',str(tmp_path),'--out-dir',str(out),'--eval-windows','2','--fps-windows','1',
+            '--speed-train-windows','4','--speed-repeats','1']
+        for k,v in paths.items():argv+=['--'+k,str(v)]
+        if resume:argv+=['--resume',str(resume)]
+        actual=common.training_step
+        def step(*a,**k):
+            result=actual(*a,**k)
+            if stop is not None:stop.set()
+            return result
+        monkeypatch.setattr(pilot,'training_step',step)
+        monkeypatch.setattr('sys.argv',argv)
+        return pilot.main(stop)
+    whole=tmp_path/'whole';stopped=tmp_path/'stopped';resumed=tmp_path/'resumed'
+    assert run(whole)==0
+    assert run(stopped,stop=Event())==130
+    assert run(resumed,resume=stopped/'migration_last.pt')==0
+    a,b=(torch.load(p/'migration_last.pt',weights_only=False) for p in (whole,resumed))
+    assert a['cursor']==b['cursor']==2 and a['executed_windows']==b['executed_windows']==8
+    assert all(torch.equal(v,b['student'][k]) for k,v in a['student'].items())
+    assert torch.equal(a['sampling_rng'],b['sampling_rng'])
+    report=json.loads((resumed/'bundle.json').read_text(encoding='utf-8'))
+    assert report['status']=='complete' and report['actual_cuda'] is False
+    assert set(report['reused_identical_contract_phases'])=={'probe','training_speed','fps'}
+    assert 'final_dev64' in report and 'fps_initial' in report
+    assert isinstance(report['gate']['actual_joint_training_faster'],bool)
+    assert isinstance(report['gate']['six_frame_latency_le_250ms'],bool)
+    assert 'JOINT_TRAIN' in (resumed/'summary.txt').read_text(encoding='utf-8')
+    assert all(sha256(p)==digests[str(p)] for p in paths.values())
+    assert not a['deployable'] and a['transport_frozen']
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA byte gates execute in server bundle')
+def test_cuda_shared_reader_graph_same_probabilities_and_fresh_native_memory():
+    prep,grid,output,window,teacher,student=model_fixture()
+    student=student.cuda().eval()
+    from real_motion.column_device_geometry import DeviceColumnWindow
+    window=DeviceColumnWindow(prep,grid,student.config,'cuda').render(
+        torch.tensor([[[6.5,6.5]]*6],device='cuda'),torch.zeros(1,6,2,device='cuda'),torch.zeros(1,6,device='cuda'))
+    output={k:v.cuda() for k,v in output.items()}
+    with torch.inference_mode():
+        plan=window.candidates(2);engine=SharedReadExecution(student)
+        expected=common.tensor_probability(student,window,2,plan,output,
+            session=SharedHistorySession(student,window.labels,window.visibility),batch_size=8)
+        result=common.tensor_probability(student,window,2,plan,output,
+            session=SharedHistorySession(student,window.labels,window.visibility),batch_size=8,execution=engine)
+        assert torch.equal(expected,result)
