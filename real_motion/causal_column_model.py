@@ -55,6 +55,14 @@ class CausalColumnModel(nn.Module):
                 or classes.shape != (n,)):
             raise ValueError("column feature shapes differ from checkpoint contract")
         if n == 0: return context.new_empty((0, d))
+        x, invalid = self.encode_history(history, flags)
+        return self.decode_history(x, invalid, base, fallback, context, kind, classes, query_extra=query_extra)
+
+    def encode_history(self, history, flags):
+        """Original patch-local math, split for INFERENCE reuse; no global CNN."""
+        n, t, p, d = len(history), self.history_frames, self.config.patch, self.config.width
+        if history.shape != (n,t,p,p,self.config.z_bins) or flags.shape != history.shape:
+            raise ValueError('history memory shape mismatch')
         # UNKNOWN semantics are zeroed BEFORE spatial convolution; they may not
         # masquerade as free or become learned content through an embedding.
         valid = history != 18
@@ -75,6 +83,13 @@ class CausalColumnModel(nn.Module):
             invalid[:, 0] &= ~empty
         elif empty.any():
             x = x.clone(); invalid = invalid.clone(); x[empty, 0] = 0; invalid[empty, 0] = False
+        return x, invalid
+
+    def decode_history(self, x, invalid, base, fallback, context, kind, classes, *, query_extra=None):
+        """Query-specific context/source/heads are NEVER deduplicated."""
+        n, d = len(kind), self.config.width
+        if x.shape != (n,self.history_frames*self.config.patch**2,d) or invalid.shape != x.shape[:2]:
+            raise ValueError('encoded memory shape mismatch')
         q = (self.query(torch.cat((context.float(), self.semantic(base.long()).flatten(1),
                                   self.semantic(fallback.long()).flatten(1)), dim=1))
              +self.kind(kind.long())+self.classes(classes.long())).unsqueeze(1)
@@ -83,6 +98,10 @@ class CausalColumnModel(nn.Module):
             q = q + query_extra[:, None].to(q.dtype)
         for block in self.decoder: q = block(q, x, invalid)
         return self.norm(q[:, 0])
+
+    def logits_from_history(self, memory, invalid, base, fallback, context, kind, classes, *, query_extra=None):
+        q = self.decode_history(memory, invalid, base, fallback, context, kind, classes, query_extra=query_extra)
+        return self.generation(q), self.refinement(q).reshape(len(kind), self.config.z_bins, 3)
 
     def forward(self, history, flags, base, fallback, context, kind, classes, *, query_extra=None):
         q = self.encode_local(history, flags, base, fallback, context, kind, classes, query_extra=query_extra)

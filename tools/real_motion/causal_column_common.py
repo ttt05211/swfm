@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import time
@@ -544,8 +545,15 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
     model.eval()
     started = time.perf_counter()
     from real_motion.column_inference_pipeline import InferenceFeatures, ProbabilityReadback, HorizonInputs
-    readback = ProbabilityReadback(buffered=bool(optimized and getattr(model, 'column_readback_optimized', True)))
-    packed_upload = bool(readback.buffered and device.type == 'cuda')
+    from real_motion.column_execution import PatchMemory, AsyncProbabilityReadback
+    execution = getattr(model,'column_execution_session',None) if optimized else None
+    async_output = bool(optimized and getattr(model,'column_async_readback',False))
+    readback = (AsyncProbabilityReadback((*plan.base.shape,3),device) if async_output else
+        ProbabilityReadback(buffered=bool(optimized and getattr(model, 'column_readback_optimized', True))))
+    packed_upload = bool(not async_output and readback.buffered and device.type == 'cuda')
+    memory_cache = ((execution.current_memory if execution.current_memory is not None else PatchMemory(execution.patch_bytes))
+        if execution is not None and execution.reuse else None)
+    memory_before = memory_cache.audit() if memory_cache is not None else {}
     if feature_sampler is not None and (not column_fast or feature_backend != 'cpu'
             or feature_sampler.prepared is not prepared or feature_sampler.h != h or feature_sampler.plan is not plan):
         raise ValueError('prefetched feature sampler does not match current horizon/plan')
@@ -566,10 +574,10 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
     defer_checks = bool(optimized and isinstance(model, CausalColumnModel))
     # Adaptive/custom subclasses have their own checks and remain untouched.
     defer_source = bool(defer_checks and type(model) is LinkedColumns
-        and (column_fast or getattr(model, 'column_readback_optimized', True)))
+        and (execution is not None or column_fast or getattr(model, 'column_readback_optimized', True)))
     stages = dict(horizon_inputs=0.,input_upload=0.,source_inputs=0.,network_forward_host=0.,
-        calibration_host=0.,probability_readback=0.,finite_check_wait=0.)
-    inputs = None
+        calibration_host=0.,probability_readback=0.,finite_check_wait=0.,history_encoding=0.)
+    inputs = None; completed = False
     try:
       with torch.inference_mode():
         tick = time.perf_counter()
@@ -602,10 +610,21 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
                     b.update(model.extra_inputs_for(prepared, h, small, grid, device))
                 stages['source_inputs'] += time.perf_counter()-tick
                 tick = time.perf_counter()
-                g, r = model(**b)
+                if execution is None:
+                    g, r = model(**b)
+                else:
+                    actual = {k:v for k,v in b.items() if k != 'validate_source'}
+                    memory = invalid = None
+                    if memory_cache is not None:
+                        encode_tick = time.perf_counter()
+                        memory,invalid = memory_cache.encode(model,arrays,actual)
+                        stages['history_encoding'] += time.perf_counter()-encode_tick
+                    probability,batch_finite = execution.run(actual,legal,memory=memory,invalid=invalid)
             stages['network_forward_host'] += time.perf_counter()-tick
             tick = time.perf_counter()
-            if defer_checks:
+            if execution is not None:
+                finite = finite & batch_finite
+            elif defer_checks:
                 finite = finite & torch.isfinite(g).all() & torch.isfinite(r).all()
                 probability = model.calibrated_probabilities(g, r, b['kind'], legal, validate=False)
             else: probability = model.calibrated_probabilities(g, r, b['kind'], legal)
@@ -617,8 +636,10 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
         if defer_checks and not finite:
             raise RuntimeError('nonfinite prediction or invalid TRAIN calibration weights')
         stages['finite_check_wait'] += time.perf_counter()-tick
+        completed = True
     finally:
         if pool is not None: pool.shutdown(wait=True, cancel_futures=True)
+        if async_output and not completed: readback.close()
     tick = time.perf_counter()
     result = readback.result((*plan.base.shape, 3))
     stages['probability_readback'] += time.perf_counter()-tick
@@ -637,6 +658,14 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
         'horizon_inputs_bytes': inputs.bytes,'horizon_inputs_working_bytes_bound': inputs.working_bytes,
         'horizon_inputs_budget_fallback': inputs.budget_fallback,
         'host_stages_seconds_NOT_cuda_kernel_time': stages}
+    if execution is not None:
+        model.last_prediction_profile.update(execution.audit())
+        model.last_prediction_profile['execution_timing_scope'] = 'network_forward_host includes history_encoding and graph-captured calibration; do not add overlapping sub-stages'
+    if memory_cache is not None:
+        audit = memory_cache.audit()
+        for key in ('patch_cache_hits','patch_cache_misses','encoded_patches'): audit[key] -= memory_before[key]
+        model.last_prediction_profile.update(audit)
+    model.last_prediction_profile['async_probability_readback'] = async_output and readback.stream is not None
     if getattr(model,'column_probability_fingerprint',False):
         model.last_prediction_profile['probability_sha256'] = hashlib.sha256(result.view(np.uint8)).hexdigest()
     if verify:
@@ -743,7 +772,9 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
             if window_iter is not None: raw_window['_evaluation_history_index'] = index
         prep.column_history_index = index
         gpu, resident = inference_gpu(provider.device, feature_backend, prep, provider.pcfg.grid, model.config)
-        with resident, HorizonFeaturePrefetch(prep,REPORT,planning,provider.pcfg.grid,model.config,
+        execution = getattr(model,'column_execution_session',None)
+        memory_window = execution.patch_window() if execution is not None else nullcontext(None)
+        with memory_window, resident, HorizonFeaturePrefetch(prep,REPORT,planning,provider.pcfg.grid,model.config,
                 provider.device,pose_motion,history_index=index,workers=provider.workers,
                 enabled=feature_backend == 'cpu' and getattr(model,'column_inference_optimized',False)
                     and getattr(model,'column_probability_optimized',False)

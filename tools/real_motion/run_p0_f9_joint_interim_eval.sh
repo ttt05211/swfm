@@ -33,9 +33,18 @@ if [[ "${FULL_JOINT_EVAL_COLUMN_OPTIMIZED:-0}" == 1 ]]; then
 fi
 if [[ "${FULL_JOINT_EVAL_COLUMN_MAP_PREFETCH:-1}" == 0 ]]; then EXTRA+=(--no-column-map-prefetch); fi
 if [[ "${FULL_JOINT_EVAL_FIXED_MONITOR:-0}" == 1 ]]; then EXTRA+=(--fixed-monitor-thresholds); fi
+EXECUTION_BACKEND="${FULL_JOINT_EVAL_EXECUTION_BACKEND:-eager}"
+case "$EXECUTION_BACKEND" in eager|async_readback|graph_async|reuse_graph_async) ;; *) echo '无效的FULL_JOINT_EVAL_EXECUTION_BACKEND' >&2; exit 2 ;; esac
+if [[ "$EXECUTION_BACKEND" != eager ]]; then
+  [[ "${FULL_JOINT_EVAL_OPTIMIZED:-1}" == 1 && "${FULL_JOINT_EVAL_IO_OPTIMIZED:-0}" == 0 && "${FULL_JOINT_EVAL_FEATURE_BACKEND:-cpu}" == cpu ]] || {
+    echo 'execution优化需要原分字段上传、CPU byte features和optimized inference；先通过独立测速。' >&2; exit 2;
+  }
+  EXTRA+=(--execution-backend "$EXECUTION_BACKEND")
+fi
 echo "只读快照评估 $POPULATION；last/epoch固定0.5/0.5/REMOVE-off，不用dev调阈值，不改变训练断点。"
 echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输出 $OUT"
 echo 'CPU-only有界窗口预取；网络batch保持256；固定Strong all-6、概率及整数指标exactness检查不变。'
+echo "执行后端 $EXECUTION_BACKEND（默认eager；不根据速度自动晋升）"
 "$PY" -u tools/real_motion/eval_p0_f9_joint_causal_columns.py \
   --config "$ROOT/configs/real_motion_occfm.yaml" --checkpoint "$CHECKPOINT" \
   --dev-cache "$ROOT/data/p0_f9_v18_se2_val_all_4369.pt" \

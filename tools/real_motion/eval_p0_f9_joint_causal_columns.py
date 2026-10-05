@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 if __package__ in (None, ''): sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 import argparse
+from contextlib import nullcontext
 import time
 import torch
 
@@ -47,6 +48,8 @@ def main(stop_event=None):
     p.add_argument('--device',default='cuda');p.add_argument('--cpu-workers',type=int,default=8)
     p.add_argument('--batch-size',type=int,default=256)
     p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='cpu')
+    p.add_argument('--execution-backend',choices=('eager','async_readback','graph_async','reuse_graph_async'),default='eager',
+        help='opt-in only after measured byte/count gate; original eager remains default')
     p.add_argument('--optimized-inference',action='store_true',help='CPU feature look-ahead + deferred checks; first window probability gate')
     io=p.add_mutually_exclusive_group()
     io.add_argument('--legacy-chunk-io',action='store_true',help='original per-field uploads/per-chunk readback (default; faster on measured L40S)')
@@ -59,6 +62,9 @@ def main(stop_event=None):
     p.add_argument('--fixed-monitor-thresholds',action='store_true',help='same 0.5/0.5/REMOVE-off for checkpoint comparison')
     p.add_argument('--speed-benchmark',action='store_true',help='read-only controlled speed comparison; no formal evaluation or selection')
     p.add_argument('--speed-column-probability',action='store_true',help='compare parallel_raw/parallel_columns/parallel_columns_prefetch in ONE speed-only run')
+    p.add_argument('--speed-execution-and-fps',action='store_true',help='ONE exact comparison: eval + ALL SIX finished joint frames, async/graphs/patch reuse')
+    p.add_argument('--fps-windows',type=int,default=18,help='bounded six-frame generation population, within speed-windows')
+    p.add_argument('--thresholds',type=float,nargs=3,help='explicit generation ADD/refine ADD/refine REMOVE; -1 means off; NO search')
     p.add_argument('--speed-windows',type=int,default=32)
     p.add_argument('--speed-repeats',type=int,default=2)
     a=p.parse_args();out=Path(a.out_dir);started=time.perf_counter()
@@ -69,6 +75,13 @@ def main(stop_event=None):
     if not 1 <= a.raw_prefetch_workers <= a.raw_prefetch_depth <= 4:p.error('raw prefetch requires workers <= depth <= 4')
     if a.raw_prefetch_workers > a.cpu_workers:p.error('raw prefetch workers must not exceed CPU worker budget')
     if a.speed_column_probability and not a.speed_benchmark:p.error('column probability suite requires --speed-benchmark')
+    if a.speed_execution_and_fps and (not a.speed_benchmark or a.speed_column_probability):p.error('execution/FPS requires speed benchmark, not old column suite')
+    if a.speed_execution_and_fps and (not 1 <= a.fps_windows <= a.speed_windows or a.column_feature_backend != 'cpu'):
+        p.error('execution/FPS requires CPU reference byte features and fps-windows <= speed-windows')
+    if a.thresholds is not None and any(x != -1 and not 0 <= x <= 1 for x in a.thresholds):p.error('thresholds must be [0,1] or -1(off)')
+    if a.execution_backend != 'eager' and (not a.optimized_inference or not a.legacy_chunk_io or a.speed_benchmark
+            or a.column_feature_backend != 'cpu'):
+        p.error('execution backend requires optimized inference + original chunk upload + CPU byte features, not a comparison suite')
     if a.optimized_column_probability and not a.optimized_inference:p.error('column probability optimization requires --optimized-inference')
     if a.speed_benchmark and (a.population != 'dev64' or not 18 <= a.speed_windows <= 64
             or not 1 <= a.speed_repeats <= 3):p.error('speed benchmark requires dev64, 18..64 windows, 1..3 repeats')
@@ -98,6 +111,7 @@ def main(stop_event=None):
     records=align_records(all_records,chosen);del all_records
     calibrated=ck['checkpoint_role'] == 'calibrated_candidate' and not a.fixed_monitor_thresholds
     gates=tuple(ck['thresholds']) if calibrated else (.5,.5,None)
+    if a.thresholds is not None:gates=tuple(None if x == -1 else x for x in a.thresholds)
     joint.eval()
     provider=FullJointColumnProvider(a.base_checkpoint,CLEAN_SHA256,pcfg,device,a.cpu_workers,joint,None)
     provider.reference_enabled=True
@@ -108,13 +122,20 @@ def main(stop_event=None):
     joint.columns.column_probability_optimized=a.optimized_column_probability
     joint.columns.column_map_prefetch=not a.no_column_map_prefetch
     joint.columns.column_inference_verify_remaining=3 if a.optimized_inference else 0
+    joint.columns.column_async_readback=a.execution_backend != 'eager'
     source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.dev_info,verbose=False),256)
     if a.speed_benchmark:
         from tools.real_motion.joint_eval_speed import benchmark_evaluation
         try:
-            speed = benchmark_evaluation(provider,source,records,joint.columns,gates,out,
-                windows=a.speed_windows,repeats=a.speed_repeats,batch_size=a.batch_size,stop_event=stop_event,
-                column_suite=a.speed_column_probability)
+            if a.speed_execution_and_fps:
+                from tools.real_motion.joint_execution_speed import benchmark_execution
+                speed=benchmark_execution(provider,source,records,joint.columns,gates,out,
+                    windows=a.speed_windows,repeats=a.speed_repeats,batch_size=a.batch_size,
+                    fps_windows=a.fps_windows,stop_event=stop_event)
+            else:
+                speed = benchmark_evaluation(provider,source,records,joint.columns,gates,out,
+                    windows=a.speed_windows,repeats=a.speed_repeats,batch_size=a.batch_size,stop_event=stop_event,
+                    column_suite=a.speed_column_probability)
         except InterruptedError:
             write_json(out/'speed_status.json',dict(status='interrupted',snapshot_sha256=digest,
                 source_checkpoint_unchanged=True,no_formal_evaluation=True))
@@ -126,7 +147,10 @@ def main(stop_event=None):
             history_frames=ck['model_configs']['motion']['history_frames'],future_frames=6,
             thresholds=gates,seconds_including_load=time.perf_counter()-started)
         write_json(out/'speed.json',speed)
-        from tools.real_motion.joint_eval_speed import summary_text as speed_summary
+        if a.speed_execution_and_fps:
+            from tools.real_motion.joint_execution_speed import summary_text as speed_summary
+        else:
+            from tools.real_motion.joint_eval_speed import summary_text as speed_summary
         text=speed_summary(speed);(out/'summary.txt').write_text(text,encoding='utf-8');print(text,flush=True)
         return 0
     # No shared persistent geometry writer during an independent evaluation.
@@ -135,9 +159,13 @@ def main(stop_event=None):
         import json
         def progress(row):log.write(json.dumps(row,ensure_ascii=False)+'\n');log.flush()
         try:
-            report=evaluate_columns(provider,source,records,joint.columns,gates,progress=progress,
-                batch_size=a.batch_size,dev64_keys=dev64 if a.population != 'dev64' else None,
-                diagnostic_thresholds=None,stop_event=stop_event,feature_backend=a.column_feature_backend)
+            from real_motion.column_execution import execution_session
+            execution=(execution_session(joint.columns,graphs=True,reuse=a.execution_backend=='reuse_graph_async')
+                if a.execution_backend in ('graph_async','reuse_graph_async') else nullcontext(None))
+            with execution:
+                report=evaluate_columns(provider,source,records,joint.columns,gates,progress=progress,
+                    batch_size=a.batch_size,dev64_keys=dev64 if a.population != 'dev64' else None,
+                    diagnostic_thresholds=None,stop_event=stop_event,feature_backend=a.column_feature_backend)
         except InterruptedError:
             write_json(out/'evaluation_status.json',{'status':'interrupted','source_checkpoint_unchanged':True,
                 'snapshot':str(snapshot),'snapshot_sha256':digest,'population':a.population})
@@ -146,9 +174,11 @@ def main(stop_event=None):
     result={'status':'complete','source_checkpoint':str(Path(a.checkpoint).resolve()),'snapshot':str(snapshot.resolve()),
         'snapshot_sha256':digest,'population':a.population,'history_frames':ck['model_configs']['motion']['history_frames'],
         'attempted_updates':ck['attempted_updates'],'cursor_epoch':ck['cursor_epoch'],'cursor_batch':ck['cursor_batch'],
-        'thresholds':gates,'threshold_source':'original_TRAIN_calibrated' if calibrated else 'fixed_monitor_0.5_0.5_REMOVE_off',
+        'thresholds':gates,'threshold_source':'explicit_fixed_NO_search' if a.thresholds is not None else
+            'original_TRAIN_calibrated' if calibrated else 'fixed_monitor_0.5_0.5_REMOVE_off',
         'checkpoint_screen_pass_unchanged':ck['screen_pass'],'seconds':time.perf_counter()-started,'reports':report}
     result.update(column_feature_backend=a.column_feature_backend, batch_size=a.batch_size,
+        execution_backend=a.execution_backend,
         optimized_inference=a.optimized_inference,legacy_chunk_io=a.legacy_chunk_io,
         optimized_column_probability=a.optimized_column_probability,column_map_prefetch=not a.no_column_map_prefetch,
         raw_prefetch_workers=a.raw_prefetch_workers,raw_prefetch_depth=a.raw_prefetch_depth,
