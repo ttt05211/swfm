@@ -65,6 +65,12 @@ bash tools/real_motion/run_p0_f9_shared_evidence_pilot.sh
 若原目录已有完整探针/测速结果且合同完全一致，则只读复用，避免重复前置实验；仍做当前进程renderer预检。
 SIGINT/SIGTERM完成当前优化步并保存；硬杀/崩溃只保证上一次32步周期断点。速度报告标明哪些阶段来自此前已完成结果。
 
+Moving support 每个 horizon 使用原 adapter 的 `(boolean_mask, moving_records, excluded)`
+三元组中的第一项，并在进入统计前验证六帧数量、布尔类型和完整网格尺寸；不把实例/排除元数据当作 mask，
+也不允许广播或回退到全网格，从而保持 frozen Moving 指标不变。
+若失败在首个 probe、尚无 `migration_last.pt`，没有可恢复的迁移更新；更新修复代码后重新运行脚本，
+保留失败目录作诊断，不设置 `SHARED_PILOT_RESUME` 或复用旧输出路径。
+
 只读复用原因果几何缓存；RAM配额256MiB，新增磁盘缓存配额0，保留原完整性检查。
 `summary.txt`可直接发回；`bundle.json`含详细时钟和guards，`progress.jsonl`含迁移更新与实际采样。
 

@@ -110,6 +110,24 @@ def check_geometry(prep,window,*,horizons=range(6),features=True):
         near_floor_points=int(window.rounding_boundary_points))
 
 
+def moving_support_masks(rows,shape):
+    """Unpack the frozen adapter's (mask, instance records, exclusions) rows.
+
+    Reject malformed support rather than broadcasting a sliced/raw array and
+    silently changing the Moving metric's population.
+    """
+    if len(rows)!=6:raise ValueError('Moving support must contain all six horizons')
+    masks=[]
+    for h,row in enumerate(rows):
+        if not isinstance(row,(tuple,list)) or len(row)!=3:
+            raise ValueError(f'Moving support row must be (mask, records, exclusions), horizon={h}')
+        mask=np.asarray(row[0])
+        if mask.dtype!=np.dtype(bool) or mask.shape!=tuple(shape):
+            raise ValueError(f'Moving support mask must be boolean with shape {tuple(shape)}, horizon={h}; got {mask.dtype} {mask.shape}')
+        masks.append(mask)
+    return masks
+
+
 def evaluate(provider,source,records,teacher,student,*,probe=False,audit=False,batch_size=256,progress=None,stop_event=None):
     teacher.eval();student.eval()
     names=('teacher','probe','student') if probe else ('teacher','student')
@@ -128,6 +146,7 @@ def evaluate(provider,source,records,teacher,student,*,probe=False,audit=False,b
             diagnostics.append(check_geometry(prep,window,horizons=range(6) if wi<=2 else columns.REPORT,features=wi<=2))
         moving=gt_moving_support_sequence(source.nusc,prep.window.t0_token,prep.window.future_tokens,
             tuple(.5*(h+1) for h in range(6)),grid=provider.pcfg.grid,workers=provider.workers)
+        moving=moving_support_masks(moving,provider.pcfg.grid.shape_hwd)
         session=SharedHistorySession(student,window.labels,window.visibility)
         for ri,h in enumerate(columns.REPORT):
             plan=columns.candidate_plan(prep,h,provider.pcfg.grid,teacher.columns.config)

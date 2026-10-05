@@ -9,11 +9,58 @@ import pytest
 import torch
 from test_shared_column_evidence import training_fixture,model_fixture
 from real_motion.shared_column_evidence import SharedHistorySession,SharedReadExecution
+from real_motion.nuscenes_adapter import gt_moving_support_sequence,gt_moving_support_for_horizon
 from tools.real_motion import shared_evidence_pilot_common as common
 from tools.real_motion import run_p0_f9_shared_evidence_pilot as pilot
 from tools.real_motion import causal_column_common as reference
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import sha256
 from tools.real_motion.v18_source_interaction_common import select_population
+
+
+class MetricNuScenes:
+    """Small annotation API, using the REAL frozen support builder, not a stub."""
+    def get(self,table,token):
+        if table=='sample':
+            anns=['moving:'+token,'static:'+token]
+            if token.startswith('f'):anns.append('birth:'+token)
+            return dict(anns=anns,data=dict(LIDAR_TOP=token))
+        if table=='sample_data':return dict(ego_pose_token=token)
+        if table=='ego_pose':return dict(translation=[0.,0.,0.],rotation=[1.,0.,0.,0.])
+        if table=='sample_annotation':
+            actor,frame=token.split(':');dt=.5*(int(frame[1:])+1) if frame.startswith('f') else 0.
+            center=[6.5+dt,6.5,.5] if actor=='moving' else [1.5,1.5,.5]
+            return dict(instance_token=actor,category_name='vehicle.car',translation=center,
+                rotation=[1.,0.,0.,0.],size=[1.,2.,1.])
+        raise KeyError((table,token))
+
+
+@pytest.mark.parametrize('workers',[1,3])
+def test_real_moving_support_metadata_is_unpacked_without_changing_frozen_counts(workers):
+    prep,grid,_,_,_,_=model_fixture();nusc=MetricNuScenes()
+    future=tuple(f'f{h}' for h in range(6));horizons=tuple(.5*(h+1) for h in range(6))
+    rows=gt_moving_support_sequence(nusc,'t0',future,horizons,grid=grid,workers=workers)
+    assert all(len(row)==3 and row[1] and row[2]['birth_dynamic']==1 for row in rows)
+    masks=common.moving_support_masks(rows,grid.shape_hwd)
+    actual,expected=common.Metrics(),common.Metrics()
+    for ri,h in enumerate(reference.REPORT):
+        old=gt_moving_support_for_horizon(nusc,'t0',future[h],horizons[h],grid=grid)[0]
+        assert masks[h] is rows[h][0] and np.array_equal(masks[h],old)
+        actual.update(ri,prep.baseline[h],prep.raw['future_gt_occ'][h],masks[h])
+        expected.update(ri,prep.baseline[h],prep.raw['future_gt_occ'][h],old)
+    for name in ('oi','ou','si','su','mi','mu'):
+        assert np.array_equal(getattr(actual,name),getattr(expected,name))
+    assert actual.mu.sum()>0
+
+
+@pytest.mark.parametrize('malformed', ['bare_masks','short_sequence','short_row','wrong_shape','wrong_dtype'])
+def test_moving_support_rejects_bad_contract_instead_of_broadcasting(malformed):
+    shape=(4,3,2);rows=[(np.ones(shape,bool),[],{}) for _ in range(6)]
+    if malformed=='bare_masks':rows=[row[0] for row in rows]
+    elif malformed=='short_sequence':rows=rows[:-1]
+    elif malformed=='short_row':rows[0]=rows[0][:2]
+    elif malformed=='wrong_shape':rows[0]=(np.ones(shape[1:],bool),[],{})
+    elif malformed=='wrong_dtype':rows[0]=(np.ones(shape,np.uint8),[],{})
+    with pytest.raises(ValueError,match='Moving support'):common.moving_support_masks(rows,shape)
 
 
 def test_graph_reader_bounded_chunks_match_eager_and_copy_reused_buffers():
@@ -85,8 +132,7 @@ def test_one_bundle_real_evaluation_migration_stop_resume_and_summary(tmp_path,m
     monkeypatch.setattr(pilot,'load_cache',lambda path:({},train if str(path)==str(paths['train-cache']) else dev))
     monkeypatch.setattr(pilot,'select_population',lambda keys,scenes,**kwargs:select_population(keys,scenes,calibration_scenes=2,**kwargs))
     monkeypatch.setattr(pilot,'PilotProvider',make_provider)
-    monkeypatch.setattr(pilot,'NuScenesWindowSource',lambda *a,**k:SimpleNamespace(nusc=None))
-    monkeypatch.setattr(common,'gt_moving_support_sequence',lambda *a,**k:[np.ones(grid.shape_hwd,bool) for _ in range(6)])
+    monkeypatch.setattr(pilot,'NuScenesWindowSource',lambda *a,**k:SimpleNamespace(nusc=MetricNuScenes()))
     monkeypatch.setattr(pilot,'training_speed',lambda *a,**k:dict(trials=[dict(mode=m,seconds_per_window=t) for m,t in
         (('current_joint',.1),('device_geometry_joint',.08),('shared_auto_joint',.07),('shared_dense_joint',.09),('shared_tiles_joint',.08))]))
     monkeypatch.setattr(pilot,'fps_speed',lambda *a,**k:dict(trials=[dict(mode=m,six_frame_seconds=t) for m,t in
