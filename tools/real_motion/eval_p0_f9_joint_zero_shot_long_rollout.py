@@ -28,6 +28,7 @@ from tools.real_motion import joint_long_rollout_common as rollout
 from tools.real_motion import causal_column_common as columns
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 from real_motion.causal_rollout_handoff import handoff_from_prepared, PROTOCOL as HANDOFF_PROTOCOL
+from tools.real_motion import geniedrive_eval_alignment as genie
 
 HANDOFF_MODES = ('redetect', 'reconciled', 'transport_history')
 
@@ -119,6 +120,20 @@ def summary_text(result):
         lines += ['handoff_audit: '+json.dumps(result.get('handoff_audit', {})),
             'NO GT-based source assignment, parameter search or automatic winning-route deployment.',
             'These are achievable frozen-inference candidates, NOT a mathematical prediction upper bound.']
+    if 'geniedrive_code_compatibility' in result:
+        lines += ['', '===== GENIEDRIVE PUBLIC CODE COMPATIBILITY (NOT STANDARD mIoU) =====',
+            'Selection requires 4 history + 20 future keyframes; model forecasts ONLY 12 future frames.',
+            'Exact-zero class IoUs are excluded; per-horizon mIoU/IoU rounded to 2 decimals, as in their code.',
+            'Standard metrics above KEEP zero classes. Neither score uses future sensor masks.',
+            f"Early starts absent from six-history cache: {len(result['population']['missing_six_history_cache_keys'])}",
+            'route             horizon      mIoU       IoU']
+        for mode, metrics in result['geniedrive_code_compatibility'].items():
+            for h, row in metrics['per_horizon'].items():
+                lines.append(f"{mode:17} {h:>6}s {number(row['mIoU']):>11} {number(row['IoU']):>11}")
+            row = metrics['average_4s_5s_6s']
+            lines.append(f"{mode:17} avg4-6s {number(row['mIoU']):>11} {number(row['IoU']):>11}")
+        lines += ['Paper Table-2 population has NOT been independently verified; public long config has a model-type inconsistency.',
+            'Compare as public-code-aligned results, not a verified reproduction of published GenieDrive scores.']
     return '\n'.join(lines)+'\n'
 
 
@@ -135,7 +150,16 @@ def main(stop_event=None):
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--handoff-modes', type=parse_handoff_modes, default=('redetect',))
     parser.add_argument('--compare-e14', action='store_true', help='same selected keys, original six-history E14 rollout')
+    parser.add_argument('--population-alignment', choices=('legacy_cache6s', 'geniedrive_code10s'), default='legacy_cache6s')
+    parser.add_argument('--geniedrive-info', help='pinned official world-nuscenes_infos_val.pkl; authenticated before loading')
     args = parser.parse_args(); out = Path(args.out_dir).resolve(); started = time.perf_counter()
+    aligned = args.population_alignment == 'geniedrive_code10s'
+    if aligned and (args.population != 'all' or args.compare_e14):
+        parser.error('GenieDrive alignment requires --population all and forbids unmatched six-history E14 comparison')
+    if aligned and (not args.geniedrive_info or not Path(args.geniedrive_info).is_file()):
+        parser.error('GenieDrive alignment requires the pinned official --geniedrive-info file')
+    if not aligned and args.geniedrive_info: parser.error('--geniedrive-info requires geniedrive_code10s alignment')
+    if aligned: genie.verify_info(args.geniedrive_info)
     if min(args.cpu_workers, args.batch_size, args.expected_epoch) < 1 or args.cpu_workers > 16:
         parser.error('positive budgets/epoch and at most 16 CPU workers required')
     for key in ('config', 'checkpoint', 'dev_cache', 'population_manifest', 'base_checkpoint', 'dev_info'):
@@ -164,6 +188,7 @@ def main(stop_event=None):
                 raise RuntimeError('frozen source/snapshot checkpoint changed')
         else: digest = snapshot_checkpoint(args.checkpoint, snapshot)
         cfg = load_runtime_config(args.config, args.override); pcfg = make_prepare_config(cfg)
+        if aligned: genie.validate_grid(pcfg)
         if (pcfg.future_frames != 6 or pcfg.free_label != 17
                 or not np.isclose(pcfg.frame_dt_s, .5, rtol=0, atol=1e-12)):
             raise RuntimeError('frozen six-future/2Hz/nuScenes semantic contract required')
@@ -186,8 +211,11 @@ def main(stop_event=None):
             raise RuntimeError('frozen dev64/dev512 identity/order changed')
         _, records = load_cache(args.dev_cache)
         source = CachedColumnSource(NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False), 256)
-        selected, population = rollout.select_long_population(records,
-            source.iter_windows(history=4, future=12), manifest['parent_keys'], args.population)
+        if aligned:
+            selected, population = genie.select_population(args.geniedrive_info, source, records)
+        else:
+            selected, population = rollout.select_long_population(records,
+                source.iter_windows(history=4, future=12), manifest['parent_keys'], args.population)
         del records
         if {w.scene_name for w, _ in selected} & {s for s, _ in ck['train_keys']}:
             raise RuntimeError('TRAIN/dev scene overlap')
@@ -203,6 +231,11 @@ def main(stop_event=None):
             optimized_inference=not args.reference_inference, active_history_frames=4,
             timestamp_audit=timestamp_audit,
             relative_future_frames=6, future_ego_pose_source='GT_through_6s', future_GT_prediction_inputs=False)
+        # No new field in LEGACY contracts: existing resumable runs stay valid.
+        if aligned:
+            contract.update(population_alignment=genie.POPULATION_PROTOCOL,
+                geniedrive_metric_protocol=genie.METRIC_PROTOCOL, official_info_sha256=genie.INFO_SHA256,
+                geniedrive_code_commit=genie.CODE_COMMIT)
         comparison_enabled = args.handoff_modes != ('redetect',) or args.compare_e14
         modes = list(args.handoff_modes)+(['clean_E14_native6'] if args.compare_e14 else [])
         if comparison_enabled:
@@ -228,7 +261,8 @@ def main(stop_event=None):
         else: write_json(out/'contract.json', contract)
         write_json(out/'timestamp_audit.json', dict(summary=timestamp_audit, per_window=timestamp_rows))
         joint.eval().requires_grad_(False)
-        provider = EvaluationJointColumnProvider(args.base_checkpoint, CLEAN_SHA256, pcfg, device,
+        provider_class = genie.AlignedColumnProvider if aligned else EvaluationJointColumnProvider
+        provider = provider_class(args.base_checkpoint, CLEAN_SHA256, pcfg, device,
             args.cpu_workers, joint, None)
         model = joint.columns
         model.column_inference_optimized = not args.reference_inference
@@ -259,6 +293,7 @@ def main(stop_event=None):
                 window = long_by_key[(str(record['scene_name']), str(record['t0_token']))]
                 t = time.perf_counter()
                 prep1 = provider.prepare_columns(source, record, include_gt=False, raw_window=raw)
+                if aligned: record = prep1.state['rec']  # Early starts now have real four-history motion tensors.
                 first = prep1.raw
                 if len(first['history_occ']) != 4 or first.get('future_gt_occ') is not None:
                     raise RuntimeError('first-block four-history/GT-free contract violated')
@@ -386,6 +421,10 @@ def main(stop_event=None):
                 history_frames=6 if mode == 'clean_E14_native6' else 4) for mode, counts in all_counts.items()},
                 handoff_audit=audit,
                 comparison_protocol=contract['comparison_protocol'], no_automatic_route_selection=True)
+        if aligned:
+            result.update(geniedrive_code_compatibility={mode: genie.compatibility_metrics(counts)
+                for mode, counts in {'redetect': raw_counts, **comparison_counts}.items()},
+                paper_table_population_verified=False, public_code_alignment_only=True)
         result = finite_json(result)
         write_json(out/'evaluation.json', result); write_json(out/'evaluation_status.json', dict(status='complete', completed_windows=cursor))
         (out/'summary.txt').write_text(summary_text(result), encoding='utf-8')

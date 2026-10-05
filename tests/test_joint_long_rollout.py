@@ -305,7 +305,8 @@ def test_resume_contract_counts_and_exactness_fail_closed():
 
 
 @pytest.mark.parametrize('comparison', (False, True))
-def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_path, monkeypatch, comparison):
+@pytest.mark.parametrize('aligned', (False, True))
+def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_path, monkeypatch, comparison, aligned):
     # Real CLI orchestration/serialization; model/nuScenes math tested separately.
     files = {}
     for k in ('config', 'checkpoint', 'dev-cache', 'population-manifest', 'base-checkpoint', 'dev-info'):
@@ -341,7 +342,7 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
         def __init__(self, *args): self.strong = StrongW2DetConfig(); self.workers = 1; self.pcfg = pcfg; self.device = torch.device('cpu')
         def prepare_columns(self, source, record, *, include_gt, raw_window):
             assert not include_gt and raw_window.get('future_gt_occ') is None
-            return SimpleNamespace(raw=raw_window, baseline=predictions, state={'current': [], 'components_by_frame': []})
+            return SimpleNamespace(raw=raw_window, baseline=predictions, state={'current': [], 'components_by_frame': [], 'rec': record})
     event = Event(); resumed = [False]; supports = []
     monkeypatch.setattr(cli, 'sha256', digest)
     monkeypatch.setattr(cli, 'load_runtime_config', lambda *a: cfg)
@@ -353,6 +354,14 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     monkeypatch.setattr(cli, 'NuScenesWindowSource', lambda *a, **k: Source())
     monkeypatch.setattr(cli, 'CachedColumnSource', lambda source, *a: source)
     monkeypatch.setattr(cli, 'EvaluationJointColumnProvider', Provider)
+    if aligned:
+        official = tmp_path/'official.pkl'; official.write_bytes(b'official')
+        monkeypatch.setattr(cli.genie, 'verify_info', lambda *a: cli.genie.INFO_SHA256)
+        monkeypatch.setattr(cli.genie, 'validate_grid', lambda *a: None)
+        monkeypatch.setattr(cli.genie, 'AlignedColumnProvider', Provider)
+        monkeypatch.setattr(cli.genie, 'select_population', lambda *a: (list(zip(windows, records)), dict(
+            population='all', selected_keys=parent, eligible_windows=2, requested_parent_windows=48,
+            scenes=1, missing_six_history_cache_keys=[list(parent[0])], alignment=cli.genie.POPULATION_PROTOCOL)))
     monkeypatch.setattr(cli, 'prefetch_raw_columns', lambda p, s, rows, **k: ((r, copy.deepcopy(raw)) for r in rows))
     monkeypatch.setattr(common, 'validate_timestamps', lambda *a: dict(
         intervals_s=[.5]*15, relative_times_s=((np.arange(16)-3)*.5).tolist(), max_nominal_deviation_s=0.))
@@ -373,13 +382,17 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     monkeypatch.setattr(cli, 'gt_moving_support_sequence', support)
     argv = ['eval']+[x for k, path in files.items() for x in ('--'+k, str(path))]
     argv += ['--dataroot', str(tmp_path), '--out-dir', str(out), '--population', 'dev512', '--device', 'cpu']
-    if comparison: argv += ['--handoff-modes', 'redetect,reconciled,transport_history', '--compare-e14']
+    if aligned:
+        argv += ['--population', 'all', '--population-alignment', 'geniedrive_code10s', '--geniedrive-info', str(official)]
+    if comparison:
+        argv += ['--handoff-modes', 'redetect,reconciled,transport_history']
+        if not aligned: argv += ['--compare-e14']
     monkeypatch.setattr('sys.argv', argv)
     assert cli.main(event) == 130
     saved = json.loads((out/'evaluation_state.json').read_text())
     assert saved['completed_windows'] == 1 and not (out/'evaluation.json').exists()
     if comparison:
-        assert set(saved['comparison_raw_counts']) == {'reconciled', 'transport_history', 'clean_E14_native6'}
+        assert set(saved['comparison_raw_counts']) == {'reconciled', 'transport_history'} | (set() if aligned else {'clean_E14_native6'})
     resumed[0] = True; event.clear(); monkeypatch.setattr('sys.argv', argv+['--resume'])
     assert cli.main(event) == 0
     result = json.loads((out/'evaluation.json').read_text())
@@ -388,6 +401,10 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     assert files['checkpoint'].read_bytes() == original
     assert 'average_4s_5s_6s' in (out/'summary.txt').read_text()
     if comparison:
-        assert set(result['handoff_comparison']) == set(cli.HANDOFF_MODES)|{'clean_E14_native6'}
+        assert set(result['handoff_comparison']) == set(cli.HANDOFF_MODES) | (set() if aligned else {'clean_E14_native6'})
         assert result['no_automatic_route_selection']
-        assert result['handoff_comparison']['clean_E14_native6']['history_frames'] == 6
+        if not aligned: assert result['handoff_comparison']['clean_E14_native6']['history_frames'] == 6
+    if aligned:
+        assert result['public_code_alignment_only'] and not result['paper_table_population_verified']
+        assert set(result['geniedrive_code_compatibility']) == (set(cli.HANDOFF_MODES) if comparison else {'redetect'})
+        assert 'GENIEDRIVE PUBLIC CODE COMPATIBILITY' in (out/'summary.txt').read_text()

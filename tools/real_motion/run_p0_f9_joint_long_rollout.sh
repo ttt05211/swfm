@@ -10,6 +10,18 @@ case "$POPULATION" in dev64|dev512|all) ;; *) echo 'population须为dev64/dev512
 CHECKPOINT="$ROOT/outputs/p0_f9_joint_causal_columns/checkpoint_selection_20261004_220555/epoch_0019.pt"
 OUT="${2:-$ROOT/outputs/p0_f9_joint_causal_columns/long6s_epoch19_${POPULATION}_$(date +%Y%m%d_%H%M%S)_$$}"
 EXTRA=()
+ALIGNMENT="${LONG_POPULATION_ALIGNMENT:-legacy_cache6s}"
+case "$ALIGNMENT" in
+  legacy_cache6s) ;;
+  geniedrive_code10s)
+    [[ "$POPULATION" == all && "${LONG_COMPARE_E14:-0}" == 0 ]] || {
+      echo 'GenieDrive对齐只允许all，不能混入需要六历史的E14对照' >&2; exit 2;
+    }
+    GENIE_INFO="${GENIEDRIVE_INFO:-$ROOT/data/geniedrive/world-nuscenes_infos_val.pkl}"
+    EXTRA+=(--population-alignment geniedrive_code10s --geniedrive-info "$GENIE_INFO")
+    ;;
+  *) echo '未知LONG_POPULATION_ALIGNMENT' >&2; exit 2 ;;
+esac
 if [[ -n "${LONG_HANDOFF_MODES:-}" ]]; then EXTRA+=(--handoff-modes "$LONG_HANDOFF_MODES"); fi
 case "${LONG_COMPARE_E14:-0}" in
   0) ;; 1) EXTRA+=(--compare-e14) ;; *) echo 'LONG_COMPARE_E14须为0或1' >&2; exit 2 ;;
@@ -24,6 +36,9 @@ for path in "$CHECKPOINT" "$ROOT/data/p0_f9_v18_se2_val_all_4369.pt" "$ROOT/data
   [[ -f "$path" ]] || { echo "[MISSING] $path" >&2; exit 2; }
 done
 PY="$(command -v python)"
+if [[ "$ALIGNMENT" == geniedrive_code10s ]]; then
+  "$PY" -u tools/real_motion/download_geniedrive_eval_info.py --out "$GENIE_INFO"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
@@ -31,6 +46,10 @@ export SWFM_COLUMN_CPU_BACKEND="${SWFM_COLUMN_CPU_BACKEND:-native}" SWFM_COLUMN_
 export SWFM_LOCAL_FAST_SUPERVISION=0 SWFM_LOCAL_STATIC_ROI=0
 echo "冻结epoch19：严格4历史→预测6帧→取最后4张预测→继续预测6帧；报告1–6s，不训练。"
 echo "population=$POPULATION；dev512/all只评完整6秒窗口，不补短序列。输出：$OUT"
+if [[ "$ALIGNMENT" == geniedrive_code10s ]]; then
+  echo '本次按官方metadata的4历史+20未来起点集合筛选（官方索引2569窗口/150场景）；只预测到6秒。'
+  echo '同时报告标准mIoU和公开代码兼容口径；不宣称已复现论文Table 2。'
+fi
 "$PY" -u tools/real_motion/eval_p0_f9_joint_zero_shot_long_rollout.py \
   --config "$ROOT/configs/real_motion_occfm.yaml" --checkpoint "$CHECKPOINT" --expected-epoch 19 \
   --dev-cache "$ROOT/data/p0_f9_v18_se2_val_all_4369.pt" \
