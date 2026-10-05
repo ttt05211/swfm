@@ -27,6 +27,59 @@ from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
 from tools.real_motion import joint_long_rollout_common as rollout
 from tools.real_motion import causal_column_common as columns
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
+from real_motion.causal_rollout_handoff import handoff_from_prepared, PROTOCOL as HANDOFF_PROTOCOL
+
+HANDOFF_MODES = ('redetect', 'reconciled', 'transport_history')
+
+
+def parse_handoff_modes(value):
+    modes = tuple(value.split(','))
+    if not modes or modes[0] != 'redetect' or len(set(modes)) != len(modes) or set(modes)-set(HANDOFF_MODES):
+        raise argparse.ArgumentTypeError('start with redetect, then optional reconciled,transport_history; no duplicates')
+    return modes
+
+
+def forecast_clean_reference(provider, source, record, first_raw, poses):
+    """Matched-population E14, native SIX history, no future sensor/label input.
+
+    Only the two older real input frames are loaded here. The second block uses
+    all six E14 predictions, reproducing its original inference history budget.
+    """
+    tokens = tuple(record['history_tokens'])
+    if len(tokens) != 6: raise RuntimeError('native E14 comparison requires six initial history tokens')
+    # The joint population checks only its last four input keys. Validate the
+    # two extra reference keys independently BEFORE loading their occupancy.
+    samples = [source.nusc.get('sample', str(t)) for t in tokens]
+    if len(set(tokens)) != 6 or len({s['scene_token'] for s in samples}) != 1:
+        raise RuntimeError('native E14 history identity/scene mismatch')
+    for a, b, token in zip(samples, samples[1:], tokens[1:]):
+        gap = (float(b['timestamp'])-float(a['timestamp']))/1e6
+        if str(a['next']) != str(token) or not rollout.INTERVAL_BOUNDS_S[0] <= gap <= rollout.INTERVAL_BOUNDS_S[1]:
+            raise RuntimeError('native E14 inputs must be contiguous PAST keyframes')
+    older = [source.load_semantics(str(record['scene_name']), str(t)) for t in tokens[:2]]
+    hist = older+list(first_raw['history_occ'])
+    hist_poses = [source.pose(str(t)) for t in tokens[:2]]+list(first_raw['history_poses'])
+    def block(history, history_poses, future_poses):
+        state = rollout.legacy._build_block_state(history, history_poses, future_poses,
+            provider.pcfg, provider.strong, provider.device)
+        runtime._stage_gpu_inputs(state, provider.device)
+        try: return runtime._forecast_once(provider.reference, state, provider.pcfg, provider.strong, provider.device)
+        finally: runtime._release_gpu_inputs(state)
+    pred1 = block(hist, hist_poses, poses[:6])
+    if not getattr(provider, 'clean_rollout_checked', False):
+        # Match the ORIGINAL cached native-six forward/renderer once, not just
+        # an internally self-consistent reconstructed reference.
+        cached_raw = dict(history_occ=np.stack(hist), history_poses=hist_poses,
+            future_poses=poses[:6], future_gt_occ=None)
+        state = runtime._prepare_record(record, None, provider.pcfg, provider.strong,
+            provider.device, raw_window=cached_raw)
+        runtime._stage_gpu_inputs(state, provider.device)
+        try:
+            exact = runtime._forecast_once(provider.reference, state, provider.pcfg, provider.strong, provider.device)
+        finally: runtime._release_gpu_inputs(state)
+        rollout.assert_dense_equal(exact, pred1)
+        provider.clean_rollout_checked = True
+    return pred1+block(pred1, poses[:6], poses[6:])
 
 
 def summary_text(result):
@@ -54,6 +107,18 @@ def summary_text(result):
         'stage_seconds: '+json.dumps(result['stage_seconds']),
         f"seconds/window: {result['accumulated_window_seconds']/result['windows']:.4f}",
         'No automatic checkpoint selection, retry, promotion, or changes to the 1--3s main table.']
+    if 'handoff_comparison' in result:
+        lines += ['', '===== MATCHED POPULATION CAUSAL HANDOFF =====',
+            'Shared first joint block, frozen thresholds/weights. E14 (if present) retains SIX histories.',
+            'route             horizon      mIoU MovingMicro']
+        for mode, entry in result['handoff_comparison'].items():
+            for h, row in entry['metrics']['per_horizon'].items():
+                lines.append(f"{mode:17} {h:>6}s {number(row['mIoU']):>11} {number(row['MovingMicro']):>11}")
+            row = entry['metrics']['average_4s_5s_6s']
+            lines.append(f"{mode:17} avg4-6s {number(row['mIoU']):>11} {number(row['MovingMicro']):>11}")
+        lines += ['handoff_audit: '+json.dumps(result.get('handoff_audit', {})),
+            'NO GT-based source assignment, parameter search or automatic winning-route deployment.',
+            'These are achievable frozen-inference candidates, NOT a mathematical prediction upper bound.']
     return '\n'.join(lines)+'\n'
 
 
@@ -68,6 +133,8 @@ def main(stop_event=None):
     parser.add_argument('--feature-backend', choices=('cpu', 'gpu'), default='cpu')
     parser.add_argument('--reference-inference', action='store_true')
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--handoff-modes', type=parse_handoff_modes, default=('redetect',))
+    parser.add_argument('--compare-e14', action='store_true', help='same selected keys, original six-history E14 rollout')
     args = parser.parse_args(); out = Path(args.out_dir).resolve(); started = time.perf_counter()
     if min(args.cpu_workers, args.batch_size, args.expected_epoch) < 1 or args.cpu_workers > 16:
         parser.error('positive budgets/epoch and at most 16 CPU workers required')
@@ -136,14 +203,28 @@ def main(stop_event=None):
             optimized_inference=not args.reference_inference, active_history_frames=4,
             timestamp_audit=timestamp_audit,
             relative_future_frames=6, future_ego_pose_source='GT_through_6s', future_GT_prediction_inputs=False)
+        comparison_enabled = args.handoff_modes != ('redetect',) or args.compare_e14
+        modes = list(args.handoff_modes)+(['clean_E14_native6'] if args.compare_e14 else [])
+        if comparison_enabled:
+            contract.update(handoff_modes=modes, handoff_protocol=HANDOFF_PROTOCOL,
+                comparison_protocol='shared_first_block_causal_motion_handoff_comparison_v1')
         cursor = 0; raw_counts = rollout.legacy._new_raw(); gate = False
         stages = defaultdict(float); edit_totals = {'first': defaultdict(int), 'second': defaultdict(int)}
+        comparison_counts = {mode: rollout.legacy._new_raw() for mode in modes if mode != 'redetect'}
+        handoff_totals = defaultdict(float)
         if args.resume:
             saved = json.loads((out/'evaluation_state.json').read_text(encoding='utf-8'))
             cursor, raw_counts = rollout.validate_resume_state(saved, contract, len(selected))
             gate = bool(saved['first_block_exactness_passed'])
             stages.update(saved['stage_seconds'])
             for block in edit_totals: edit_totals[block].update(saved['edits'][block])
+            if comparison_enabled:
+                stored = saved.get('comparison_raw_counts', {})
+                if set(stored) != set(comparison_counts): raise RuntimeError('incomplete handoff resume routes')
+                for mode in comparison_counts:
+                    checked = {**saved, 'raw_counts': stored[mode]}
+                    _, comparison_counts[mode] = rollout.validate_resume_state(checked, contract, len(selected))
+                handoff_totals.update(saved.get('handoff_audit_totals', {}))
         else: write_json(out/'contract.json', contract)
         write_json(out/'timestamp_audit.json', dict(summary=timestamp_audit, per_window=timestamp_rows))
         joint.eval().requires_grad_(False)
@@ -154,14 +235,19 @@ def main(stop_event=None):
         model.column_inference_verify_remaining = 3 if not args.reference_inference else 0
         fingerprint = stable_json_fingerprint(contract)
         def save():
-            write_json(out/'evaluation_state.json', dict(protocol=rollout.PROTOCOL, contract_fingerprint=fingerprint,
+            value = dict(protocol=rollout.PROTOCOL, contract_fingerprint=fingerprint,
                 completed_windows=cursor, raw_counts={k: v.tolist() for k, v in raw_counts.items()},
                 first_block_exactness_passed=gate, stage_seconds=dict(stages),
-                edits={k: dict(v) for k, v in edit_totals.items()}))
+                edits={k: dict(v) for k, v in edit_totals.items()})
+            if comparison_enabled:
+                value.update(comparison_raw_counts={mode: {k: v.tolist() for k, v in counts.items()}
+                    for mode, counts in comparison_counts.items()}, handoff_audit_totals=dict(handoff_totals))
+            write_json(out/'evaluation_state.json', value)
         if not args.resume: save()
         print(f'FROZEN JOINT LONG: epoch={args.expected_epoch} windows={len(selected)} '
               f'parent_eligible={population["eligible_windows"]}/{population["requested_parent_windows"]} '
               f'completed={cursor}; strict4 -> six + six; thresholds=0.5/0.5/REMOVE-off', flush=True)
+        if comparison_enabled: print('FIXED HANDOFF ROUTES: '+','.join(modes)+'; first joint block shared; no GT-based tuning', flush=True)
         long_by_key = {(w.scene_name, w.t0_token): w for w, _ in selected}
         iterator = prefetch_raw_columns(provider, source, [r for _, r in selected[cursor:]], include_gt=False)
         try:
@@ -210,6 +296,34 @@ def main(stop_event=None):
                 pred2, edits2 = rollout.predict_joint_block(prep2, model, pcfg.grid, device,
                     args.batch_size, args.feature_backend, pool)
                 second_forecast = time.perf_counter()-t
+                # Bounded to this window; never cache learned poses or handoff
+                # features across windows/checkpoints. Compute all routes BEFORE
+                # fetching future labels/annotation supports for metrics.
+                comparison_predictions = {}; handoff_audit = None
+                for mode in args.handoff_modes[1:]:
+                    t = time.perf_counter()
+                    if mode == 'reconciled':
+                        handoff = handoff_from_prepared(prep1, pred1[-1], dt_s=pcfg.frame_dt_s,
+                            max_speed_mps=provider.strong.max_match_speed_mps)
+                        alternate = rollout.synthetic_preparation(pred1, first, poses, window, provider,
+                            motion_handoff=handoff, component_frames=prep2.state['components_by_frame'])
+                        handoff_audit = alternate.state['motion_handoff_audit']
+                        for key, value in handoff_audit.items():
+                            if isinstance(value, (int, float)): handoff_totals[key] += value
+                    else:
+                        # Mechanism ablation: exclude ALL column additions from
+                        # second-block input. This is not an equivalent full
+                        # history method and is explicitly reported separately.
+                        alternate = rollout.synthetic_preparation(prep1.baseline, first, poses, window, provider)
+                    future, _ = rollout.predict_joint_block(alternate, model, pcfg.grid, device,
+                        args.batch_size, args.feature_backend, pool)
+                    comparison_predictions[mode] = pred1+future
+                    stages[mode+'_second_block'] += time.perf_counter()-t
+                    del alternate, future
+                if args.compare_e14:
+                    t = time.perf_counter()
+                    comparison_predictions['clean_E14_native6'] = forecast_clean_reference(provider, source, record, first, poses)
+                    stages['clean_E14_native6'] += time.perf_counter()-t
                 # Metric-only future labels and instance annotations are requested
                 # AFTER the full open-loop forecast. Moving uses ORIGINAL t0.
                 t = time.perf_counter()
@@ -220,6 +334,8 @@ def main(stop_event=None):
                 for hi, (idx, tok) in enumerate(zip((1, 3, 5, 7, 9, 11), report_tokens)):
                     gt = source.load_semantics(window.scene_name, tok)
                     rollout.update_metrics(raw_counts, hi, predictions[idx], gt, moving[hi][0], pcfg.free_label)
+                    for mode, value in comparison_predictions.items():
+                        rollout.update_metrics(comparison_counts[mode], hi, value[idx], gt, moving[hi][0], pcfg.free_label)
                 metric_seconds = time.perf_counter()-t
                 for block, edits in (('first', edits1), ('second', edits2)):
                     for key, value in edits.items(): edit_totals[block][key] += value
@@ -231,10 +347,12 @@ def main(stop_event=None):
                 row = dict(event='long_rollout_window_complete', window=cursor, windows=len(selected),
                     scene_name=window.scene_name, t0_token=window.t0_token, seconds=times,
                     second_block_sources=len(prep2.state['current']), first_edits=edits1, second_edits=edits2)
+                if comparison_enabled: row.update(handoff_audit=handoff_audit, compared_routes=modes)
                 log.write(json.dumps(row)+'\n'); log.flush()
                 print(f'joint_long_rollout={cursor}/{len(selected)} seconds={times["total_window"]:.3f} '
-                      f'block2_sources={len(prep2.state["current"])}', flush=True)
-                del prep1, prep2, pred1, pred2, predictions, first, raw
+                      f'block2_sources={len(prep2.state["current"])}'
+                      +(f' linked={handoff_audit["matched_sources"]}' if handoff_audit else ''), flush=True)
+                del prep1, prep2, pred1, pred2, predictions, comparison_predictions, first, raw
                 if stop_event is not None and stop_event.is_set(): raise InterruptedError('stopped at completed window')
                 previous_end = time.perf_counter()
         except InterruptedError:
@@ -256,6 +374,18 @@ def main(stop_event=None):
             report_horizons_s=list(rollout.REPORT_HORIZONS),
             timestamp_audit=timestamp_audit,
             future_ego_pose_used_through_s=6, no_training=True, no_dev_threshold_selection=True)
+        if comparison_enabled:
+            all_counts = {'redetect': raw_counts, **comparison_counts}
+            total_matched = handoff_totals.get('matched_sources', 0)
+            audit = dict(protocol=HANDOFF_PROTOCOL, **dict(handoff_totals))
+            audit.update(matched_fraction=total_matched/max(handoff_totals.get('current_sources', 0), 1),
+                mean_velocity_correction_mps=handoff_totals.get('velocity_correction_mps_sum', 0)/max(total_matched, 1),
+                mean_shape_origin_offset_m=handoff_totals.get('centroid_shape_offset_m_sum', 0)/max(total_matched, 1))
+            result.update(handoff_comparison={mode: dict(metrics=rollout.finalize_metrics(counts),
+                raw_counts={k: v.tolist() for k, v in counts.items()},
+                history_frames=6 if mode == 'clean_E14_native6' else 4) for mode, counts in all_counts.items()},
+                handoff_audit=audit,
+                comparison_protocol=contract['comparison_protocol'], no_automatic_route_selection=True)
         result = finite_json(result)
         write_json(out/'evaluation.json', result); write_json(out/'evaluation_status.json', dict(status='complete', completed_windows=cursor))
         (out/'summary.txt').write_text(summary_text(result), encoding='utf-8')

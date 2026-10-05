@@ -270,6 +270,17 @@ def test_real_joint_network_renderer_and_both_blocks_no_gt_or_weight_changes(emp
             second = common.synthetic_preparation(pred1, raw, future_poses, w, provider)
             pred2, _ = common.predict_joint_block(second, joint.columns, pcfg.grid, provider.device,
                 batch_size=256, candidate_pool=pool)
+            from real_motion.causal_rollout_handoff import handoff_from_prepared
+            carry = handoff_from_prepared(first, pred1[-1])
+            linked = common.synthetic_preparation(pred1, raw, future_poses, w, provider,
+                motion_handoff=carry, component_frames=second.state['components_by_frame'])
+            linked_pred, _ = common.predict_joint_block(linked, joint.columns, pcfg.grid, provider.device,
+                batch_size=256, candidate_pool=pool)
+            assert len(linked_pred) == 6 and linked.state['motion_handoff_audit']['memory_only_sources_added'] == 0
+            assert linked.state['current'] is second.state['current']
+            assert np.array_equal(linked.raw['history_occ'], second.raw['history_occ'])
+            assert linked.raw['future_gt_occ'] is None
+            if empty: assert linked.state['motion_handoff_audit']['matched_sources'] == 0
         assert provider.columns_checked and joint.columns.column_inference_verify_remaining == 0
         assert np.array_equal(second.raw['history_occ'], np.stack(pred1[-4:]))
         assert second.raw['future_gt_occ'] is None and len(second.raw['history_occ']) == 4
@@ -293,7 +304,8 @@ def test_resume_contract_counts_and_exactness_fail_closed():
     with pytest.raises(RuntimeError, match='exactness'): common.validate_resume_state(bad, contract, 2)
 
 
-def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize('comparison', (False, True))
+def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_path, monkeypatch, comparison):
     # Real CLI orchestration/serialization; model/nuScenes math tested separately.
     files = {}
     for k in ('config', 'checkpoint', 'dev-cache', 'population-manifest', 'base-checkpoint', 'dev-info'):
@@ -326,10 +338,10 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
             if not resumed[0]: event.set()  # interrupt only AFTER predictions, while scoring first window
             return predictions[0]
     class Provider:
-        def __init__(self, *args): self.strong = None; self.workers = 1; self.pcfg = pcfg; self.device = torch.device('cpu')
+        def __init__(self, *args): self.strong = StrongW2DetConfig(); self.workers = 1; self.pcfg = pcfg; self.device = torch.device('cpu')
         def prepare_columns(self, source, record, *, include_gt, raw_window):
             assert not include_gt and raw_window.get('future_gt_occ') is None
-            return SimpleNamespace(raw=raw_window, baseline=predictions, state={'current': []})
+            return SimpleNamespace(raw=raw_window, baseline=predictions, state={'current': [], 'components_by_frame': []})
     event = Event(); resumed = [False]; supports = []
     monkeypatch.setattr(cli, 'sha256', digest)
     monkeypatch.setattr(cli, 'load_runtime_config', lambda *a: cfg)
@@ -347,7 +359,10 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     monkeypatch.setattr(common, 'predict_joint_block', lambda *a: (copy.deepcopy(predictions), {'added': 0}))
     monkeypatch.setattr(common, 'build_four_history_state', lambda *a: {'rec': {}})
     monkeypatch.setattr(common, 'assert_four_inputs_equal', lambda *a: None)
-    monkeypatch.setattr(common, 'synthetic_preparation', lambda *a: SimpleNamespace(state={'current': []}))
+    monkeypatch.setattr(common, 'synthetic_preparation', lambda *a, **k: SimpleNamespace(state={
+        'current': [], 'components_by_frame': [], 'motion_handoff_audit': {'matched_sources': 0}}))
+    monkeypatch.setattr(cli, 'handoff_from_prepared', lambda *a, **k: object())
+    monkeypatch.setattr(cli, 'forecast_clean_reference', lambda *a: copy.deepcopy(predictions+predictions))
     monkeypatch.setattr(cli.runtime, '_stage_gpu_inputs', lambda *a: None)
     monkeypatch.setattr(cli.runtime, '_release_gpu_inputs', lambda *a: None)
     monkeypatch.setattr(cli.runtime, '_forecast_once', lambda *a: predictions)
@@ -358,10 +373,13 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     monkeypatch.setattr(cli, 'gt_moving_support_sequence', support)
     argv = ['eval']+[x for k, path in files.items() for x in ('--'+k, str(path))]
     argv += ['--dataroot', str(tmp_path), '--out-dir', str(out), '--population', 'dev512', '--device', 'cpu']
+    if comparison: argv += ['--handoff-modes', 'redetect,reconciled,transport_history', '--compare-e14']
     monkeypatch.setattr('sys.argv', argv)
     assert cli.main(event) == 130
     saved = json.loads((out/'evaluation_state.json').read_text())
     assert saved['completed_windows'] == 1 and not (out/'evaluation.json').exists()
+    if comparison:
+        assert set(saved['comparison_raw_counts']) == {'reconciled', 'transport_history', 'clean_E14_native6'}
     resumed[0] = True; event.clear(); monkeypatch.setattr('sys.argv', argv+['--resume'])
     assert cli.main(event) == 0
     result = json.loads((out/'evaluation.json').read_text())
@@ -369,3 +387,7 @@ def test_cli_interrupt_resume_counts_original_t0_and_readonly_checkpoint(tmp_pat
     assert supports == [('a', common.REPORT_HORIZONS), ('b', common.REPORT_HORIZONS)]
     assert files['checkpoint'].read_bytes() == original
     assert 'average_4s_5s_6s' in (out/'summary.txt').read_text()
+    if comparison:
+        assert set(result['handoff_comparison']) == set(cli.HANDOFF_MODES)|{'clean_E14_native6'}
+        assert result['no_automatic_route_selection']
+        assert result['handoff_comparison']['clean_E14_native6']['history_frames'] == 6

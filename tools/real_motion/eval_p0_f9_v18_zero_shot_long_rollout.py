@@ -232,6 +232,9 @@ def _build_block_state(
     strong_cfg,
     device,
     profile=None,
+    *,
+    motion_override=None,
+    components_by_frame=None,
 ):
     if len(history_occ) != HISTORY_FRAMES or len(history_poses) != HISTORY_FRAMES:
         raise ValueError("block history must contain six frames")
@@ -246,12 +249,13 @@ def _build_block_state(
     # Runtime-proven exact fast path: class-local cropped connected components.
     # It preserves the frozen component order, voxel indices and centroid values
     # while avoiding eight full-grid scipy label passes per semantic class.
-    components_by_frame = [
-        extract_instances_cropped_exact(
-            sem, pose, grid=pcfg.grid, cfg=strong_cfg
-        )
-        for sem, pose in zip(history_occ, history_poses)
-    ]
+    if components_by_frame is None:
+        components_by_frame = [
+            extract_instances_cropped_exact(sem, pose, grid=pcfg.grid, cfg=strong_cfg)
+            for sem, pose in zip(history_occ, history_poses)
+        ]
+    elif len(components_by_frame) != HISTORY_FRAMES:
+        raise ValueError('reused component history must contain six frames')
     if profile is not None:
         profile["component_extract_ms"] = (
             profile.get("component_extract_ms", 0.0)
@@ -272,6 +276,12 @@ def _build_block_state(
         frame_dt_s=float(pcfg.frame_dt_s),
         max_speed_mps=float(strong_cfg.max_match_speed_mps),
     )
+    # Optional causal inference-only reconciliation, before ALL motion-dependent
+    # features, tubes, KTA and Strong rendering are built. Default is unchanged.
+    motion_audit = None
+    if motion_override is not None:
+        velocities, tracks, track_valid, motion_audit = motion_override(
+            current, velocities, tracks, track_valid)
     features_np = build_source_features(
         current,
         velocities,
@@ -391,6 +401,8 @@ def _build_block_state(
         "current": current,
         "previous": previous,
         "velocities": velocities,
+        "components_by_frame": components_by_frame,
+        "motion_handoff_audit": motion_audit,
         "source_world_points": source_world_points,
         "source_rel_xy": source_rel_xy,
         "source_z_t0": source_z_t0,

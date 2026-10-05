@@ -126,7 +126,8 @@ def inherited_observation_masks(raw, predicted_poses, grid, workers=1):
         return np.stack(list(pool.map(one, predicted_poses)))
 
 
-def build_four_history_state(history_occ, history_poses, future_poses, pcfg, strong, device):
+def build_four_history_state(history_occ, history_poses, future_poses, pcfg, strong, device,
+                             *, motion_handoff=None, component_frames=None):
     """Reuse the proven V18 ABI with TWO EMPTY slots, not extra observations.
 
     The transport encoder slices to last4; columns see ONLY the actual four.
@@ -138,8 +139,11 @@ def build_four_history_state(history_occ, history_poses, future_poses, pcfg, str
     if any(x.shape != tuple(pcfg.grid.shape_hwd) or not np.isin(x, np.arange(18)).all() for x in history):
         raise ValueError('invalid predicted semantic grid')
     empty = np.full(pcfg.grid.shape_hwd, pcfg.free_label, np.uint8)
+    optional = {}
+    if motion_handoff is not None: optional['motion_override'] = motion_handoff.reconcile
+    if component_frames is not None: optional['components_by_frame'] = component_frames
     state = legacy._build_block_state([empty, empty, *history],
-        [history_poses[0], history_poses[0], *history_poses], future_poses, pcfg, strong, device)
+        [history_poses[0], history_poses[0], *history_poses], future_poses, pcfg, strong, device, **optional)
     rec = state['rec']
     # Compute directly to avoid subtraction-induced float32 ULPs.
     rec['source_centroid_xy_t0_m'] = torch.from_numpy(legacy._kta_tensors(
@@ -156,14 +160,18 @@ def assert_four_inputs_equal(reference, rebuilt):
         legacy._assert_tensor_close(f'four-history input {i}', a, b)
 
 
-def synthetic_preparation(first_predictions, first_raw, future_poses, window, provider):
+def synthetic_preparation(first_predictions, first_raw, future_poses, window, provider,
+                          *, motion_handoff=None, component_frames=None):
     """Whitelist-only predicted-history preparation: no NuScenes source access."""
     if len(first_predictions) != 6 or len(future_poses) != 12:
         raise ValueError('rollout requires six first predictions/twelve future ego poses')
     history = [np.asarray(x, np.uint8).copy() for x in first_predictions[-4:]]
     poses = list(future_poses[2:6])
+    optional = {}
+    if motion_handoff is not None: optional['motion_handoff'] = motion_handoff
+    if component_frames is not None: optional['component_frames'] = component_frames
     state = build_four_history_state(history, poses, future_poses[6:],
-        provider.pcfg, provider.strong, provider.device)
+        provider.pcfg, provider.strong, provider.device, **optional)
     record = state['rec']
     record.update(scene_name=str(window.scene_name), t0_token=str(window.future_tokens[5]),
         history_tokens=tuple(map(str, window.future_tokens[:6])),

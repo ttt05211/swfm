@@ -10,6 +10,10 @@ case "$POPULATION" in dev64|dev512|all) ;; *) echo 'population须为dev64/dev512
 CHECKPOINT="$ROOT/outputs/p0_f9_joint_causal_columns/checkpoint_selection_20261004_220555/epoch_0019.pt"
 OUT="${2:-$ROOT/outputs/p0_f9_joint_causal_columns/long6s_epoch19_${POPULATION}_$(date +%Y%m%d_%H%M%S)_$$}"
 EXTRA=()
+if [[ -n "${LONG_HANDOFF_MODES:-}" ]]; then EXTRA+=(--handoff-modes "$LONG_HANDOFF_MODES"); fi
+case "${LONG_COMPARE_E14:-0}" in
+  0) ;; 1) EXTRA+=(--compare-e14) ;; *) echo 'LONG_COMPARE_E14须为0或1' >&2; exit 2 ;;
+esac
 if [[ $# == 3 ]]; then
   [[ "$3" == --resume ]] || { echo '第三个参数只允许--resume' >&2; exit 2; }
   EXTRA+=(--resume)
@@ -35,5 +39,5 @@ echo "population=$POPULATION；dev512/all只评完整6秒窗口，不补短序�
   --dataroot /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes \
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
   --out-dir "$OUT" --population "$POPULATION" --cpu-workers "${LONG_EVAL_CPU_WORKERS:-8}" \
-  --batch-size 256 --feature-backend cpu "${EXTRA[@]}"
+  --batch-size "${LONG_EVAL_BATCH_SIZE:-256}" --feature-backend "${LONG_FEATURE_BACKEND:-cpu}" "${EXTRA[@]}"
 echo "完成：$OUT/summary.txt；完整指标、原始计数与审计：$OUT/evaluation.json"
