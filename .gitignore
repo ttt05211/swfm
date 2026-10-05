@@ -10,3 +10,4 @@ outputs/
 *.pkl
 wandb/
 .venv-selector-check/
+.venv-cuda-check/

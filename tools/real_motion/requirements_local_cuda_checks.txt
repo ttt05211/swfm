@@ -1,0 +1,5 @@
+# Small project-only additions. Torch/CUDA are inherited from existing yoloe.
+pytest==9.1.1
+einops==0.8.2
+einops-exts==0.0.4
+easydict==1.13
