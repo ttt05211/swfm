@@ -30,7 +30,7 @@ from tools.real_motion.v18_source_interaction_common import select_population
 from tools.real_motion.joint_training_recovery import snapshot_checkpoint
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256,write_json,atomic_checkpoint
 from tools.real_motion.shared_evidence_pilot_common import (evaluate,training_speed,fps_speed,training_step,make_optimizer,sync,GATES)
-from tools.real_motion.shared_evidence_recovery import migration_payload,restore_migration,validate_migration
+from tools.real_motion.shared_evidence_recovery import migration_payload,restore_migration,prepare_migration_resume
 
 TRAIN_WINDOWS=20430
 
@@ -93,6 +93,9 @@ def brief(result):
     if 'training' in result:lines.append('MIGRATION '+json.dumps(result['training'],ensure_ascii=False))
     if result.get('reused_identical_contract_phases'):
         lines.append('RESUME reused completed identical-contract phases: '+','.join(result['reused_identical_contract_phases']))
+    if result.get('memory_fix_resume'):
+        lines.append('MEMORY_FIX_RESUME '+json.dumps(result['memory_fix_resume'],ensure_ascii=False))
+        lines.append('Only completed accuracy/geometry probe reused across this audited execution-only fix; new speed/FPS measured again.')
     if 'gate' in result:lines.append('PILOT_GATE '+json.dumps(result['gate'],ensure_ascii=False))
     lines.append('route: '+result.get('route','incomplete_no_recommendation'))
     if 'error' in result:lines.append('error: '+result['error'])
@@ -111,6 +114,7 @@ def main(stop_event=None):
     p.add_argument('--train-fraction',type=float,default=.2);p.add_argument('--train-epochs',type=int,default=1)
     p.add_argument('--max-updates',type=int,default=0,help='0=one complete configured population pass; explicit smoke bound otherwise')
     p.add_argument('--kd-weight',type=float,default=.25);p.add_argument('--resume',help='ONLY this new migration protocol into a NEW output')
+    p.add_argument('--resume-memory-fix',action='store_true',help='explicit audited 1e44288 memory-ownership fix; all other contracts stay strict')
     p.add_argument('--final-dev512',action='store_true',help='optional one final selection-population evaluation, not independent test')
     p.add_argument('--no-train',action='store_true',help='same bundled probes/speed, no migration updates')
     a=p.parse_args();out=Path(a.out_dir)
@@ -118,6 +122,7 @@ def main(stop_event=None):
     for key in ('config','checkpoint','train_cache','dev_cache','population_manifest','base_checkpoint','train_info','dev_info'):
         if not Path(getattr(a,key) or '').is_file():p.error('missing '+key)
     if a.resume and not Path(a.resume).is_file():p.error('missing migration checkpoint')
+    if a.resume_memory_fix and not a.resume:p.error('--resume-memory-fix requires --resume')
     if (not Path(a.dataroot).is_dir() or not 0<a.train_fraction<1 or not 1<=a.eval_windows<=64
             or min(a.cpu_workers,a.fps_windows,a.speed_train_windows,a.speed_repeats,a.train_epochs)<1
             or a.fps_windows>a.eval_windows or a.max_updates<0 or a.kd_weight<0):p.error('invalid budgets')
@@ -171,10 +176,11 @@ def main(stop_event=None):
             schedule='whole_pilot_cosine_no_tail',transport='epoch19_frozen_migration_NOT_scratch_joint',
             sampler='torch_generator_GPU_six_strata_importance_NOT_old_numpy_RNG')
         write_json(out/'contract.json',contract)
-        saved=None;reused={}
+        saved=None;reused={};memory_fix_resume=None
         if a.resume:
             saved=torch.load(a.resume,map_location='cpu',weights_only=False)
-            validate_migration(saved,contract)  # Fail BEFORE expensive probes.
+            original_contract=saved.get('contract')
+            saved,memory_fix_resume=prepare_migration_resume(saved,contract,allow_memory_fix=a.resume_memory_fix)
             parent=Path(a.resume).resolve().parent
             if (parent/'contract.json').is_file() and (parent/'bundle.json').is_file():
                 prior_contract=json.loads((parent/'contract.json').read_text(encoding='utf-8'))
@@ -183,9 +189,16 @@ def main(stop_event=None):
                     reused={k:prior_result[k] for k in ('probe','training_speed') if k in prior_result}
                     if 'fps_initial' in prior_result:reused['fps']=prior_result['fps_initial']
                     elif 'fps' in prior_result:reused['fps']=prior_result['fps']
+                elif memory_fix_resume and stable_json_fingerprint(prior_contract)==stable_json_fingerprint(original_contract):
+                    if 'probe' in prior_result:reused['probe']=prior_result['probe']
+                    result['historical_execution_diagnostics_not_current_speed']={
+                        k:prior_result[k] for k in ('training_speed','fps') if k in prior_result}
+        if memory_fix_resume:result['memory_fix_resume']=memory_fix_resume
         result.update(teacher_sha256=digest,teacher_snapshot=str(snapshot),teacher_epoch=ck['cursor_epoch'],
             migration=student.migration_audit,training_population=len(train),dev_selection_population=len(dev),
-            history_frames=4,future_frames=6,thresholds=GATES,reused_identical_contract_phases=list(reused))
+            history_frames=4,future_frames=6,thresholds=GATES,
+            reused_identical_contract_phases=list(reused) if memory_fix_resume is None else [],
+            reused_verified_accuracy_phases=list(reused) if memory_fix_resume else [])
         result.update(reused)
         provider=PilotProvider(a.base_checkpoint,CLEAN_SHA256,pcfg,device,a.cpu_workers,teacher,None)
         provider.raw_prefetch_workers=provider.raw_prefetch_depth=min(2,a.cpu_workers)
@@ -224,6 +237,7 @@ def main(stop_event=None):
         teacher.eval();generator=torch.Generator(device=device).manual_seed(a.seed+1)
         if a.resume:
             cursor,successful,executed=restore_migration(saved,student,optimizer,generator,contract)
+            print(f'SHARED_RESTORED cursor={cursor}/{target} next_update={cursor+1}; optimizer/RNG/order/cosine preserved',flush=True)
         def save_migration(role):
             atomic_checkpoint(out/'migration_last.pt',migration_payload(student,optimizer,generator,contract,
                 role=role,cursor=cursor,successful=successful,executed=executed))
@@ -245,9 +259,17 @@ def main(stop_event=None):
             step=time.perf_counter()
             stat=training_step(joint,optimizer,provider,rows,generator,frozen=True,teacher=teacher.columns,kd_weight=a.kd_weight,
                 profile=cursor%32==0)
+            if device.type=='cuda':
+                # Read AFTER the helper returned: its windows/graphs must have
+                # been released, unlike peak or nvidia-smi reserved memory.
+                stat['cuda_allocated_after_step_mib']=torch.cuda.memory_allocated(device)/2**20
+                stat['cuda_reserved_after_step_mib']=torch.cuda.memory_reserved(device)/2**20
             cursor+=1;successful+=stat['optimizer_updated'];executed+=len(rows)
             progress(dict(event='shared_migration',cursor=cursor,target=target,seconds=time.perf_counter()-step,**stat))
-            if cursor==1 or cursor%32==0:print(f'SHARED_MIGRATION {cursor}/{target} loss={stat["loss"]:.6f} GT={stat["column_loss"]:.6f} KD={stat["kd_loss"]:.6f}',flush=True)
+            if cursor==1 or cursor%32==0:
+                memory=(f' allocated_after={stat["cuda_allocated_after_step_mib"]:.1f}MiB peak={stat["cuda_peak_allocated_mib"]:.1f}MiB'
+                    if device.type=='cuda' else '')
+                print(f'SHARED_MIGRATION {cursor}/{target} loss={stat["loss"]:.6f} GT={stat["column_loss"]:.6f} KD={stat["kd_loss"]:.6f}'+memory,flush=True)
             if cursor%32==0:save_migration('periodic_diagnostic')
         save_migration('complete_diagnostic' if cursor>=target else 'stopped_diagnostic')
         if any(not torch.equal(v,teacher.transport.state_dict()[k]) for k,v in joint.transport.state_dict().items()):

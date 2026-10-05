@@ -47,7 +47,6 @@ class DeviceColumnWindow:
         if config.patch!=7 or config.boundary_padding_cells!=1:
             raise ValueError('device pilot requires frozen seven-cell patch / one-cell cross support')
         if len(prepared.raw['history_occ']) != 4:raise ValueError('device pilot requires four histories')
-        self.tensor=lambda x,dtype=None:torch.as_tensor(np.asarray(x),device=self.device,dtype=dtype)
         self.origin=self.tensor((grid.x_min,grid.y_min,grid.z_min),torch.float64)
         self.step=self.tensor(grid.voxel_size,torch.float64)
         self.limit=self.tensor(self.shape,torch.int64)
@@ -111,6 +110,12 @@ class DeviceColumnWindow:
         self.rounding_boundary_points=torch.zeros((),device=self.device,dtype=torch.long)
         self.targets=self.yaws=None
         self.lookup_matrices={}
+
+    def tensor(self,x,dtype=None):
+        # Do not store a lambda closing over self on this GPU-heavy object:
+        # window -> lambda -> window delays ALL tensor frees until cyclic GC.
+        # A class method has no such per-instance ownership cycle.
+        return torch.as_tensor(np.asarray(x),device=self.device,dtype=dtype)
 
     def _lookup_tables(self):
         static=self.history_inverse[None]@self.future_poses[:,None]

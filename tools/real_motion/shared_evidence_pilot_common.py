@@ -189,6 +189,10 @@ def training_step(joint,optimizer,provider,rows,generator,*,frozen=False,teacher
     Teacher only evaluates selected TRAIN queries. GT labels/sampling are not
     part of history encoding. KD cost is measured separately from joint speed.
     """
+    cuda_memory={}
+    if provider.device.type=='cuda':
+        cuda_memory['cuda_allocated_before_step_mib']=torch.cuda.memory_allocated(provider.device)/2**20
+        torch.cuda.reset_peak_memory_stats(provider.device)
     timer=StageTimer(provider.device,profile);optimizer.zero_grad(set_to_none=True)
     joint.train();joint.transport.eval() if frozen else joint.transport.train()
     records=[r for r,_ in rows];sizes=[len(r['features']) for r in records]
@@ -274,9 +278,12 @@ def training_step(joint,optimizer,provider,rows,generator,*,frozen=False,teacher
     profile_result=timer.finish()
     scalar=torch.stack((loss.detach().float(),lm.detach().float(),lc.detach().float(),kd.detach().float())).cpu().tolist()
     if not np.isfinite(scalar).all():raise RuntimeError('nonfinite shared migration objective')
+    if provider.device.type=='cuda':
+        cuda_memory.update(cuda_peak_allocated_mib=torch.cuda.max_memory_allocated(provider.device)/2**20,
+            cuda_peak_reserved_mib=torch.cuda.max_memory_reserved(provider.device)/2**20)
     return dict(loss=scalar[0],motion_loss=scalar[1],column_loss=scalar[2],kd_loss=scalar[3],
         windows=len(rows),sources=sum(sizes),sampled_columns=counts,optimizer_updated=updated,
-        frozen_transport=frozen,teacher_sampled_queries_only=teacher is not None,memory=audits,**profile_result)
+        frozen_transport=frozen,teacher_sampled_queries_only=teacher is not None,memory=audits,**cuda_memory,**profile_result)
 
 
 def make_optimizer(joint,*,frozen=False):

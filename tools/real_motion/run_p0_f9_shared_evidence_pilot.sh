@@ -35,6 +35,10 @@ if [[ -n "${SHARED_PILOT_RESUME:-}" ]]; then
   [[ -f "$SHARED_PILOT_RESUME" ]] || { echo "[MISSING] $SHARED_PILOT_RESUME" >&2; exit 2; }
   EXTRA+=(--resume "$SHARED_PILOT_RESUME")
 fi
+if [[ "${SHARED_PILOT_MEMORY_FIX_RESUME:-0}" == 1 ]]; then
+  [[ -n "${SHARED_PILOT_RESUME:-}" ]] || { echo 'memory-fix resume requires SHARED_PILOT_RESUME' >&2; exit 2; }
+  EXTRA+=(--resume-memory-fix)
+fi
 echo "一次完成：epoch19稀疏36-token探针、完整GPU整数/采样检查、真实联合反传测速、六帧FPS、20%人口短程迁移及最终评估。"
 echo "固定4历史→6未来；原epoch19和旧optimizer不动；只复用已有因果缓存，磁盘新增缓存配额为0。输出 $OUT"
 echo '短程迁移冻结motion；正式联合训练速度单独实测且不冻结；不自动启动15/20轮，不调整阈值，不部署。'

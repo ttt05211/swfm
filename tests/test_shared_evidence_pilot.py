@@ -15,6 +15,7 @@ from tools.real_motion import run_p0_f9_shared_evidence_pilot as pilot
 from tools.real_motion import causal_column_common as reference
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import sha256
 from tools.real_motion.v18_source_interaction_common import select_population
+from tools.real_motion.shared_evidence_recovery import prepare_migration_resume,PRE_MEMORY_FIX_IMPLEMENTATION
 
 
 class MetricNuScenes:
@@ -137,12 +138,13 @@ def test_one_bundle_real_evaluation_migration_stop_resume_and_summary(tmp_path,m
         (('current_joint',.1),('device_geometry_joint',.08),('shared_auto_joint',.07),('shared_dense_joint',.09),('shared_tiles_joint',.08))]))
     monkeypatch.setattr(pilot,'fps_speed',lambda *a,**k:dict(trials=[dict(mode=m,six_frame_seconds=t) for m,t in
         (('current_graph',.9),('device_geometry',.6),('shared_auto',.2))],boundary='TEST_EMULATION',excludes='NO_REAL_FPS'))
-    def run(out,*,resume=None,stop=None):
+    def run(out,*,resume=None,stop=None,memory_fix=False):
         argv=['pilot','--config',str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--dataroot',str(tmp_path),'--out-dir',str(out),'--eval-windows','2','--fps-windows','1',
             '--speed-train-windows','4','--speed-repeats','1']
         for k,v in paths.items():argv+=['--'+k,str(v)]
         if resume:argv+=['--resume',str(resume)]
+        if memory_fix:argv+=['--resume-memory-fix']
         actual=common.training_step
         def step(*a,**k):
             result=actual(*a,**k)
@@ -168,6 +170,48 @@ def test_one_bundle_real_evaluation_migration_stop_resume_and_summary(tmp_path,m
     assert 'JOINT_TRAIN' in (resumed/'summary.txt').read_text(encoding='utf-8')
     assert all(sha256(p)==digests[str(p)] for p in paths.values())
     assert not a['deployable'] and a['transport_frozen']
+
+    # Emulate the server's immutable 1e44288 checkpoint. Only its execution
+    # fingerprint differs; actual model/optimizer/RNG/data recipe is identical.
+    legacy=tmp_path/'legacy';legacy.mkdir()
+    old=torch.load(stopped/'migration_last.pt',weights_only=False)
+    old['contract']={**old['contract'],'implementation_fingerprint':PRE_MEMORY_FIX_IMPLEMENTATION}
+    torch.save(old,legacy/'migration_last.pt')
+    (legacy/'contract.json').write_text(json.dumps(old['contract']),encoding='utf-8')
+    (legacy/'bundle.json').write_bytes((stopped/'bundle.json').read_bytes())
+    digest=sha256(legacy/'migration_last.pt')
+    fixed=tmp_path/'memory_fixed'
+    assert run(fixed,resume=legacy/'migration_last.pt',memory_fix=True)==0
+    repaired=torch.load(fixed/'migration_last.pt',weights_only=False)
+    assert repaired['cursor']==a['cursor'] and repaired['executed_windows']==a['executed_windows']
+    assert all(torch.equal(v,repaired['student'][k]) for k,v in a['student'].items())
+    assert torch.equal(a['sampling_rng'],repaired['sampling_rng'])
+    repaired_report=json.loads((fixed/'bundle.json').read_text(encoding='utf-8'))
+    assert repaired_report['reused_identical_contract_phases']==[]
+    assert repaired_report['reused_verified_accuracy_phases']==['probe']
+    assert repaired_report['memory_fix_resume']['optimizer_RNG_schedule_population_preserved']
+    assert 'historical_execution_diagnostics_not_current_speed' in repaired_report
+    assert sha256(legacy/'migration_last.pt')==digest
+
+
+def test_memory_fix_resume_requires_exact_whitelist_and_explicit_opt_in():
+    contract=dict(schedule_steps=1029,teacher='frozen',window_batch=4,source_budget=128,
+        implementation_fingerprint='patched',diagnostic_budgets=dict(final_dev512=True))
+    old=dict(protocol=pilot.PROTOCOL,transport_frozen=True,deployable=False,cursor=672,
+        successful_updates=672,executed_windows=2688,
+        contract={**contract,'implementation_fingerprint':PRE_MEMORY_FIX_IMPLEMENTATION})
+    with pytest.raises(RuntimeError,match='identical'):prepare_migration_resume(old,contract)
+    adjusted,audit=prepare_migration_resume(old,contract,allow_memory_fix=True)
+    assert adjusted['contract']==contract and adjusted['cursor']==672 and audit['math_and_architecture_unchanged']
+    assert old['contract']['implementation_fingerprint']==PRE_MEMORY_FIX_IMPLEMENTATION
+    with pytest.raises(RuntimeError,match='identical'):
+        prepare_migration_resume({**old,'contract':{**old['contract'],'implementation_fingerprint':'unknown'}},contract,allow_memory_fix=True)
+    for changed in ({**contract,'window_batch':8},{**contract,'schedule_steps':2048},
+            {**contract,'diagnostic_budgets':dict(final_dev512=False)},
+            {**contract,'teacher':'other'}):
+        with pytest.raises(RuntimeError,match='cannot change'):prepare_migration_resume(old,changed,allow_memory_fix=True)
+    with pytest.raises(RuntimeError,match='identical'):
+        prepare_migration_resume({**old,'protocol':'old_full'},contract,allow_memory_fix=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA byte gates execute in server bundle')

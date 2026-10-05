@@ -3,6 +3,29 @@ import torch
 from real_motion.shared_column_evidence import PROTOCOL
 from real_motion.v21_source_induction import stable_json_fingerprint
 
+# Exact LF source-content fingerprint of the five implementation files at
+# 1e44288. The exception is explicit and ONLY removes a window ownership cycle
+# / adds diagnostic clocks; weights, math, sampler and recipe remain identical.
+PRE_MEMORY_FIX_IMPLEMENTATION='27dd149f9b2f9a0e9e4c992aabd9156abc3fb32a55b5fac7f25acd39876440ae'
+
+
+def prepare_migration_resume(saved,contract,*,allow_memory_fix=False):
+    previous=saved.get('contract',{})
+    if stable_json_fingerprint(previous)==stable_json_fingerprint(contract):
+        validate_migration(saved,contract);return saved,None
+    if not allow_memory_fix or previous.get('implementation_fingerprint')!=PRE_MEMORY_FIX_IMPLEMENTATION:
+        raise RuntimeError('ONLY identical new migration contract can resume; use explicit memory-fix resume ONLY for audited 1e44288')
+    adjusted={**previous,'implementation_fingerprint':contract['implementation_fingerprint']}
+    if stable_json_fingerprint(adjusted)!=stable_json_fingerprint(contract):
+        raise RuntimeError('memory-fix resume cannot change model/data/population/budgets/schedule/precision or training recipe')
+    # New dictionary only: never edit the source file, tensors, optimizer or RNG.
+    migrated={**saved,'contract':contract}
+    validate_migration(migrated,contract)
+    audit=dict(kind='explicit_1e44288_device_window_ownership_cycle_fix',
+        source_implementation=previous['implementation_fingerprint'],target_implementation=contract['implementation_fingerprint'],
+        optimizer_RNG_schedule_population_preserved=True,math_and_architecture_unchanged=True)
+    return migrated,audit
+
 
 def migration_payload(student,optimizer,generator,contract,*,role,cursor,successful,executed):
     return dict(protocol=PROTOCOL,contract=contract,role=role,

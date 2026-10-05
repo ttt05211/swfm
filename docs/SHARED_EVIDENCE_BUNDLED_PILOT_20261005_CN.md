@@ -71,6 +71,28 @@ Moving support 每个 horizon 使用原 adapter 的 `(boolean_mask, moving_recor
 若失败在首个 probe、尚无 `migration_last.pt`，没有可恢复的迁移更新；更新修复代码后重新运行脚本，
 保留失败目录作诊断，不设置 `SHARED_PILOT_RESUME` 或复用旧输出路径。
 
+### 1e44288 运行中 OOM 的显式兼容恢复
+
+已修复 `DeviceColumnWindow` 把捕获 `self` 的 lambda 存在实例上造成的引用环：
+窗口结束后 GPU 张量不能即时释放，须等待 Python 循环 GC。现在使用类方法，
+窗口及张量直接释放；连续训练测试在禁用循环 GC 时也必须通过。不降低Z/采样预算、不detach训练特征，
+不使用每步 `empty_cache()` 或缩减batch来掩盖问题。
+日志增加每步峰值allocated/reserved和函数返回后的allocated/reserved；reserved不等于仍被占用的活跃张量。
+CUDA平台的长期allocator测试在无GPU环境跳过，服务器上的实际显存走势仍须确认。
+
+旧实现内容指纹只对白名单中的 `1e44288` 开放如下显式转换；模型结构、数据人口、
+预算、精度、schedule、optimizer与RNG全部保留，拒绝任意实现或训练配方变更：
+
+```bash
+SHARED_PILOT_RESUME=/此次实际/shared_pilot目录/migration_last.pt \
+SHARED_PILOT_MEMORY_FIX_RESUME=1 SHARED_PILOT_DEV512=1 \
+  bash tools/real_motion/run_p0_f9_shared_evidence_pilot.sh
+```
+
+只读复用已完成的准确性/几何probe，修复后速度/FPS重新实测，不把旧版测速当成新版收益。
+输出到新目录、checkpoint记录新实现指纹；原断点不改写。OOM只恢复最近32步周期断点，
+失败更新中消耗的RNG/梯度不会被保存成已完成更新。
+
 只读复用原因果几何缓存；RAM配额256MiB，新增磁盘缓存配额0，保留原完整性检查。
 `summary.txt`可直接发回；`bundle.json`含详细时钟和guards，`progress.jsonl`含迁移更新与实际采样。
 

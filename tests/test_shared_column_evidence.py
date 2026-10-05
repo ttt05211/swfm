@@ -1,4 +1,6 @@
 import copy
+import gc
+import weakref
 from dataclasses import fields
 import numpy as np
 import pytest
@@ -72,6 +74,47 @@ def model_fixture():
     student=SharedEvidenceColumns.from_teacher(teacher,shared_config=SharedEvidenceConfig(tile=4,tile_chunk=3))
     torch.nn.init.normal_(student.native.spatial[-1].weight,std=.03)
     return prep,grid,output,window,teacher,student
+
+
+def test_abandoned_device_windows_release_tensors_without_cyclic_gc():
+    prep,grid,cfg,output,original=device_fixture()
+    refs=[];gc.collect();enabled=gc.isenabled();gc.disable()
+    try:
+        for _ in range(24):
+            window=DeviceColumnWindow(prep,grid,cfg,'cpu').render(
+                torch.tensor([[[6.5,6.5]]*6]),output['residual_xy_m'],output['yaw_delta_rad'])
+            refs.extend(weakref.ref(v) for v in (window,window.labels,window.owners[0]))
+            del window
+        assert all(ref() is None for ref in refs), 'finished windows must not wait for cyclic GC to release device memory'
+    finally:
+        if enabled:gc.enable()
+        gc.collect()
+
+
+@pytest.mark.parametrize('device',['cpu','cuda'])
+def test_repeated_training_steps_release_all_device_windows(device,monkeypatch):
+    if device=='cuda' and not torch.cuda.is_available():pytest.skip('CUDA allocator plateau check requires server GPU')
+    from tools.real_motion import shared_evidence_pilot_common as common
+    joint,teacher,provider,rows=training_fixture()
+    joint=joint.to(device);teacher=teacher.to(device);provider.device=torch.device(device)
+    optimizer=common.make_optimizer(joint,frozen=True);rng=torch.Generator(device=device).manual_seed(71)
+    original=common.DeviceColumnWindow;refs=[]
+    def tracked(*args,**kwargs):
+        window=original(*args,**kwargs);refs.extend(weakref.ref(v) for v in (window,window.labels))
+        return window
+    monkeypatch.setattr(common,'DeviceColumnWindow',tracked)
+    allocations=[];gc.collect();enabled=gc.isenabled();gc.disable()
+    try:
+        for i in range(20):
+            stat=common.training_step(joint,optimizer,provider,rows,rng,frozen=True,teacher=teacher.columns)
+            assert stat['optimizer_updated']
+            assert all(ref() is None for ref in refs), f'GPU window from earlier steps retained at step {i}'
+            if device=='cuda':
+                torch.cuda.synchronize();allocations.append(torch.cuda.memory_allocated())
+        if allocations:assert max(allocations[4:])-min(allocations[4:])<16*2**20
+    finally:
+        if enabled:gc.enable()
+        gc.collect()
 
 
 def test_native_dense_tiles_same_full_z_features_and_gradients():
