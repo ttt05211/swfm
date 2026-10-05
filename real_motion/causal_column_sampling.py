@@ -54,7 +54,8 @@ class ColumnHistoryIndex:
 
 
 class ColumnFeatureSampler:
-    def __init__(self, prepared, h, plan, grid, config, motion_factory, *, workers=1, max_cache_mib=64, history_index=None):
+    def __init__(self, prepared, h, plan, grid, config, motion_factory, *, workers=1, max_cache_mib=64, history_index=None,
+                 compiled_patches=False):
         self.prepared, self.h, self.grid, self.config = prepared, h, grid, config
         self.maps = {}; self.windows = {}; self.cache_bytes = 0
         self.history = np.asarray(prepared.raw['history_occ'])
@@ -72,6 +73,7 @@ class ColumnFeatureSampler:
         self.native = get_native() if self.kernels_optimized else None
         from .native_column_cpu import bundle_enabled
         self.bundle = self.native is not None and getattr(prepared,'cpu_bundle_optimized',True) and bundle_enabled()
+        self.compiled_patches = bool(compiled_patches and self.native is not None)
         self.index = ((history_index if history_index is not None else getattr(prepared, 'column_history_index', None))
                       if self.optimized else None)
         if self.optimized and self.index is None:
@@ -265,6 +267,10 @@ class ColumnFeatureSampler:
                 hist[take], flags[take] = self._sparse(plan.subset(take), actor); continue
             lo, labels, bits = self.maps[actor]
             starts = plan.evidence_xy[take]-lo-p//2
+            if self.compiled_patches:
+                self.native.patch_rows(labels,bits,starts.astype(np.int64,copy=False),take,
+                    plan.classes[take],actor < 0,hist,flags)
+                continue
             lw, fw = self.windows[actor]
             if np.any(starts < 0) or np.any(starts >= np.asarray(lw.shape[1:3])):
                 raise RuntimeError('patch cache does not cover supplied actor/anchor queries')

@@ -17,7 +17,7 @@ from threading import Lock
 
 import numpy as np
 
-ABI = 3
+ABI = 4
 SOURCE = Path(__file__).resolve().parent/'native'/'column_cpu.cpp'
 _loaded = None
 _load_lock = Lock()
@@ -142,6 +142,7 @@ class NativeColumns:
         self.support_fn = self._bind('swfm_support', [P]+[I]*4+[P]*3, count=True)
         self.gather_fn = self._bind('swfm_gather', [P,I,P,P,I,I,I,J,P,I,P,I,I,P,P])
         self.expand_fn = self._bind('swfm_expand', [P]*4+[I]*3+[J]+[P]*2)
+        self.patch_rows_fn = self._bind('swfm_patch_rows', [P]*5+[I]*7+[J]+[P]*2)
         self.changed_fn = self._bind('swfm_changed', [P,I,I,P])
         self.strata_fn = self._bind('swfm_sampling_strata', [P,P,P,I,P,P])
         self.compact_fn = self._bind('swfm_compact_columns', [P]*9+[I]*4+[J]+[P]*8)
@@ -265,6 +266,27 @@ class NativeColumns:
         n,z=targets.shape; changed=np.empty(n,bool)
         self._call('changed',self.changed_fn,_pointer(targets),n,z,_pointer(changed))
         return changed
+
+    def patch_rows(self, history, flags, starts, rows, classes, static_actor, out, out_flags):
+        history = _array(history,np.uint8)
+        if history.ndim != 4: raise ValueError('patch map must be F,X,Y,Z')
+        frames,xs,ys,zs = history.shape
+        flags = _array(flags,np.uint8,history.shape)
+        rows = _array(rows,np.int64)
+        if rows.ndim != 1: raise ValueError('patch rows must be one dimensional')
+        n = len(rows); starts = _array(starts,np.int64,(n,2)); classes = _array(classes,np.uint8,(n,))
+        # Outputs must be the ORIGINAL buffers, never an implicit aligned copy.
+        for value in (out,out_flags):
+            if (not isinstance(value,np.ndarray) or value.dtype != np.uint8 or value.ndim != 5
+                    or not value.flags.c_contiguous or not value.flags.aligned or not value.flags.writeable):
+                raise ValueError('patch output must be a writable contiguous byte batch')
+        batch,ff,p,pp,z = out.shape
+        if out_flags.shape != out.shape or ff != frames or p != pp or z != zs:
+            raise ValueError('patch output shape mismatch')
+        if any(np.shares_memory(value,src) for value in (out,out_flags) for src in (history,flags,starts,rows,classes)) or np.shares_memory(out,out_flags):
+            raise ValueError('patch input/output buffers must not alias')
+        self._call('patch_rows',self.patch_rows_fn,*map(_pointer,(history,flags,starts,rows,classes)),
+            n,batch,frames,xs,ys,zs,p,int(static_actor),_pointer(out),_pointer(out_flags))
 
     def sampling_strata(self, kinds, actors, positive):
         """One packed row buffer; exact original sorted six TRAIN buckets."""

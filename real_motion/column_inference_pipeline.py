@@ -1,5 +1,7 @@
 """Full-population streaming byte features. No GT, query cap or model cache."""
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+import time
 import numpy as np
 import torch
 
@@ -72,10 +74,12 @@ class ProbabilityReadback:
 
 class InferenceFeatures:
     def __init__(self, prepared, h, plan, grid, config, device, motion_factory, *,
-                 backend='cpu', workers=1, history_index=None, gpu_sampler=None, verify=False):
+                 backend='cpu', workers=1, history_index=None, gpu_sampler=None, verify=False,
+                 compiled_patches=False):
         if backend not in ('cpu', 'gpu'): raise ValueError('invalid inference feature backend')
         self.prepared, self.h, self.plan, self.grid, self.config = prepared, h, plan, grid, config
         self.device, self.motion_factory, self.workers = torch.device(device), motion_factory, workers
+        self.compiled_patches = bool(compiled_patches)
         self.index = history_index or getattr(prepared,'column_history_index',None) or ColumnHistoryIndex(
             prepared, grid, actors=np.unique(plan.actor))
         self.gpu = gpu_sampler if backend == 'gpu' else None
@@ -91,7 +95,8 @@ class InferenceFeatures:
             # Build from the WHOLE original horizon. A boundary fallback must
             # preserve NumPy BLAS/map shapes, not build a differently sized ROI.
             self.cpu = ColumnFeatureSampler(self.prepared, self.h, self.plan, self.grid, self.config,
-                self.motion_factory, workers=self.workers, history_index=self.index)
+                self.motion_factory, workers=self.workers, history_index=self.index,
+                compiled_patches=self.compiled_patches)
         return self.cpu
 
     def sample(self, small, reference_sampler):
@@ -162,6 +167,91 @@ class InferenceFeatures:
     @property
     def cache_bytes(self):
         return self.cpu.cache_bytes if self.cpu is not None else 0
+
+
+class HorizonInputs:
+    """Upload immutable CURRENT horizon metadata once, then slice original batches.
+
+    Only byte/index copies and source gathers are hoisted, not projection/NN math.
+    No learned tensor survives this prediction call. The byte budget includes the
+    live source query copies; oversize/custom models keep the old per-chunk path.
+    """
+    def __init__(self, model, prepared, h, plan, device, *, enabled=False, max_bytes=64*2**20):
+        from .causal_column_model import CausalColumnModel
+        from .joint_causal_columns import LinkedColumns
+        if type(max_bytes) is not int or max_bytes < 1: raise ValueError('positive input byte budget required')
+        self.values = None; self.source = None; self.bytes = self.working_bytes = 0
+        self.budget_fallback = False
+        if not enabled or type(model) not in (CausalColumnModel,LinkedColumns): return
+        fields = {k:getattr(plan,k) for k in ('base','fallback','context','kind','classes','legal')}
+        resident = estimate = sum(v.nbytes for v in fields.values())
+        if type(model) is LinkedColumns and len(plan):
+            if prepared.outputs is None: raise RuntimeError('current live transport latents required')
+            q = prepared.outputs['future_transport_queries']
+            if not isinstance(q,torch.Tensor) or q.shape[1:] != (6,model.source_dim):
+                raise RuntimeError('source feature protocol mismatch')
+            source_bytes = len(plan)*model.source_dim*q.element_size()
+            resident += source_bytes
+            # Conservative temporary bound for zeros + gather + index_copy,
+            # row/source int64 indices and the source finite-check byte mask.
+            estimate += 3*source_bytes+len(plan)*16+len(plan)*model.source_dim
+        if estimate > max_bytes:
+            self.budget_fallback = True; return
+        self.values = {k:torch.as_tensor(v,device=device) for k,v in fields.items()}
+        if type(model) is LinkedColumns and len(plan):
+            self.source = model.source_features_for(prepared,h,plan,device)
+        self.bytes,self.working_bytes = resident,estimate
+
+    def batch(self, arrays, legal, device, start, stop, *, packed=False):
+        if self.values is None: return inference_tensors(arrays,legal,device,packed=packed)
+        values = {k:torch.as_tensor(arrays[k],device=device) for k in ('history','flags')}
+        values.update({k:v[start:stop] for k,v in self.values.items()})
+        if self.source is not None: values['source_features'] = self.source[start:stop]
+        return values
+
+
+class HorizonFeaturePrefetch:
+    """One CPU-only future horizon map overlaps caller-owned CUDA inference.
+
+    At most CURRENT + NEXT maps (each bounded 64MiB). Plans remain GT-free;
+    transforms are from this window's current prediction. Nothing is persisted.
+    Frame mapping is capped at two workers to avoid nesting six mapping threads
+    into the four-window raw prefetch on a ten-core server.
+    """
+    def __init__(self, prepared, horizons, planning, grid, config, device, motion_factory, *,
+                 history_index, workers=1, enabled=False):
+        self.pool = ThreadPoolExecutor(max_workers=1) if enabled else None
+        self.pending = None; self.cursor = 0
+        self.prepared,self.horizons,self.planning = prepared,tuple(horizons),planning
+        self.grid,self.config,self.device,self.motion_factory = grid,config,device,motion_factory
+        self.index,self.workers = history_index,min(2,max(1,int(workers)))
+
+    def _build(self,h):
+        plan = self.planning[h].result()
+        tick = time.perf_counter()
+        features = InferenceFeatures(self.prepared,h,plan,self.grid,self.config,self.device,self.motion_factory,
+            workers=self.workers,history_index=self.index,compiled_patches=True)
+        return features,time.perf_counter()-tick
+
+    def __enter__(self):
+        if self.pool is not None and self.horizons: self.pending = self.pool.submit(self._build,self.horizons[0])
+        return self
+
+    def get(self,h):
+        if self.pool is None: return None,0.,0.
+        if self.cursor >= len(self.horizons) or h != self.horizons[self.cursor]:
+            raise ValueError('horizon prefetch must be consumed in original order')
+        tick = time.perf_counter()
+        features,worker_seconds = self.pending.result()
+        wait = time.perf_counter()-tick
+        self.pending = None; self.cursor += 1
+        if self.cursor < len(self.horizons): self.pending = self.pool.submit(self._build,self.horizons[self.cursor])
+        return features,wait,worker_seconds
+
+    def __exit__(self,*exc):
+        if self.pending is not None: self.pending.cancel()
+        if self.pool is not None: self.pool.shutdown(wait=True,cancel_futures=True)
+        self.pending = None
 
 
 def inference_gpu(device, backend, prepared, grid, config):

@@ -559,7 +559,7 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
         assert model is provider.joint.columns and provider.reference_enabled
         assert not hasattr(provider, 'causal_geometry_cache')
         return actual_eval(provider, source, records[:2], model, gates, **kwargs)
-    def evaluate(destination, population='dev64', evaluator=small_eval, event=None, raw_workers=1, speed=False):
+    def evaluate(destination, population='dev64', evaluator=small_eval, event=None, raw_workers=1, speed=False, column_suite=False):
         argv = ['eval', '--config', str(Path(__file__).resolve().parents[1]/'configs/real_motion_occfm.yaml'),
             '--checkpoint', str(checkpoint), '--dev-cache', str(files['dev-cache']),
             '--population-manifest', str(files['population-manifest']), '--base-checkpoint', str(files['base-checkpoint']),
@@ -567,6 +567,7 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
             '--population', population, '--device', 'cpu', '--cpu-workers', str(max(1, raw_workers)),
             '--raw-prefetch-workers', str(raw_workers), '--raw-prefetch-depth', str(raw_workers)]
         if speed:argv+=['--speed-benchmark','--speed-windows','18','--speed-repeats','1']
+        if column_suite:argv+=['--speed-column-probability']
         with patch('sys.argv', argv), patch.object(interim, 'CLEAN_SHA256', 'a'*64), \
             patch.object(interim, 'make_prepare_config', return_value=SimpleNamespace(grid=grid)), \
             patch.object(interim, 'load_manifest', return_value=(manifest, keys, None)), \
@@ -598,6 +599,12 @@ def test_interim_full_evaluation_uses_joint_snapshot_fixed_gates_and_frozen_popu
     assert speed_result['integer_counts_exact'] and not speed_result['actual_cuda']
     assert len(speed_result['trials']) == 3 and speed_result['windows'] == 18
     assert not (speed_out/'evaluation.json').exists() and checkpoint.read_bytes() == original
+    column_out=tmp_path/'column_speed_only'
+    assert evaluate(column_out,speed=True,raw_workers=2,column_suite=True) == 0
+    column_result=json.loads((column_out/'speed.json').read_text())
+    assert column_result['column_probability_suite'] and column_result['integer_counts_exact']
+    assert [t['name'] for t in column_result['trials']] == ['parallel_raw','parallel_columns','parallel_columns_prefetch']
+    assert column_result['no_automatic_backend_promotion'] and checkpoint.read_bytes() == original
     stopped_speed=tmp_path/'stopped_speed';event=Event();event.set()
     assert evaluate(stopped_speed,event=event,speed=True,raw_workers=2) == 130
     assert json.loads((stopped_speed/'speed_status.json').read_text())['status'] == 'interrupted'

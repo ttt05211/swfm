@@ -32,7 +32,7 @@ extern "C" void* memcpy(void* dst, const void* src, decltype(sizeof(0)) n) {
 }
 #endif
 
-API int swfm_column_cpu_abi() noexcept { return 3; }
+API int swfm_column_cpu_abi() noexcept { return 4; }
 
 // Original six TRAIN strata, each retaining ascending candidate-row order.
 // Counts/fill are integer-only; random draws ALWAYS remain on the caller.
@@ -229,6 +229,39 @@ API int swfm_expand(const u8* history, const u8* flags, const i64* inverse,
             const u8 value = history[from*row_size+j];
             out_history[row*row_size+j] = value;
             out_flags[row*row_size+j] = flags[from*row_size+j] | (static_actor && value == classes[row] ? 2 : 0);
+        }
+    }
+    return 0;
+}
+
+// Cached inverse maps are F,X,Y,Z. Copy directly to the original N,F,P,P,Z
+// batch rows, fusing static class membership. No FP geometry or model math.
+// Validate ALL indices before writing anything; duplicate/reordered anchors
+// are legal and must not be merged into a different network batch.
+API int swfm_patch_rows(const u8* history, const u8* flags, const i64* starts,
+    const i64* rows, const u8* classes, i64 n, i64 out_n, i64 frames,
+    i64 xs, i64 ys, i64 zs, i64 patch, i32 static_actor,
+    u8* out_history, u8* out_flags) noexcept {
+    const i64 map_cells = cells(xs, ys, zs), patch_cells = cells(patch, patch, zs);
+    if (n < 0 || out_n < 0 || frames < 1 || map_cells < 0 || patch_cells < 0
+        || cells(frames, map_cells, 1) < 0 || cells(out_n+1, frames, patch_cells) < 0
+        || patch > xs || patch > ys) return -1;
+    for (i64 i = 0; i < n; ++i) {
+        if (rows[i] < 0 || rows[i] >= out_n || starts[i*2] < 0 || starts[i*2] > xs-patch
+            || starts[i*2+1] < 0 || starts[i*2+1] > ys-patch) return -2;
+    }
+    for (i64 i = 0; i < n; ++i) {
+        for (i64 f = 0; f < frames; ++f) {
+            const i64 dst = (rows[i]*frames+f)*patch_cells;
+            for (i64 x = 0; x < patch; ++x) {
+                const i64 src = f*map_cells+((starts[i*2]+x)*ys+starts[i*2+1])*zs;
+                for (i64 j = 0; j < patch*zs; ++j) {
+                    const u8 value = history[src+j];
+                    out_history[dst+x*patch*zs+j] = value;
+                    out_flags[dst+x*patch*zs+j] = flags[src+j]
+                        | (static_actor && value == classes[i] ? 2 : 0);
+                }
+            }
         }
     }
     return 0;

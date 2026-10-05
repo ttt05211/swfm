@@ -48,11 +48,17 @@ def main(stop_event=None):
     p.add_argument('--batch-size',type=int,default=256)
     p.add_argument('--column-feature-backend',choices=('cpu','gpu'),default='cpu')
     p.add_argument('--optimized-inference',action='store_true',help='CPU feature look-ahead + deferred checks; first window probability gate')
-    p.add_argument('--legacy-chunk-io',action='store_true',help='keep original per-field uploads/per-chunk probability readback')
+    io=p.add_mutually_exclusive_group()
+    io.add_argument('--legacy-chunk-io',action='store_true',help='original per-field uploads/per-chunk readback (default; faster on measured L40S)')
+    io.add_argument('--buffered-chunk-io',action='store_false',dest='legacy_chunk_io',help='experimental packed upload/buffered readback, not the measured faster default')
+    p.set_defaults(legacy_chunk_io=True)
+    p.add_argument('--optimized-column-probability',action='store_true',help='inference-only compiled patches + horizon inputs + bounded NEXT map; requires --optimized-inference')
+    p.add_argument('--no-column-map-prefetch',action='store_true',help='keep serial maps with optimized column inputs (diagnostic)')
     p.add_argument('--raw-prefetch-workers',type=int,default=1,help='1..4 bounded CPU-only window preparation workers')
     p.add_argument('--raw-prefetch-depth',type=int,default=1,help='workers <= depth <= 4; original ordering is preserved')
     p.add_argument('--fixed-monitor-thresholds',action='store_true',help='same 0.5/0.5/REMOVE-off for checkpoint comparison')
     p.add_argument('--speed-benchmark',action='store_true',help='read-only controlled speed comparison; no formal evaluation or selection')
+    p.add_argument('--speed-column-probability',action='store_true',help='compare parallel_raw/parallel_columns/parallel_columns_prefetch in ONE speed-only run')
     p.add_argument('--speed-windows',type=int,default=32)
     p.add_argument('--speed-repeats',type=int,default=2)
     a=p.parse_args();out=Path(a.out_dir);started=time.perf_counter()
@@ -62,6 +68,8 @@ def main(stop_event=None):
     if not Path(a.dataroot).is_dir() or min(a.cpu_workers,a.batch_size)<1:p.error('invalid paths/budgets')
     if not 1 <= a.raw_prefetch_workers <= a.raw_prefetch_depth <= 4:p.error('raw prefetch requires workers <= depth <= 4')
     if a.raw_prefetch_workers > a.cpu_workers:p.error('raw prefetch workers must not exceed CPU worker budget')
+    if a.speed_column_probability and not a.speed_benchmark:p.error('column probability suite requires --speed-benchmark')
+    if a.optimized_column_probability and not a.optimized_inference:p.error('column probability optimization requires --optimized-inference')
     if a.speed_benchmark and (a.population != 'dev64' or not 18 <= a.speed_windows <= 64
             or not 1 <= a.speed_repeats <= 3):p.error('speed benchmark requires dev64, 18..64 windows, 1..3 repeats')
     device=torch.device(a.device)
@@ -97,13 +105,16 @@ def main(stop_event=None):
     provider.raw_io_workers=max(1,min(4,a.cpu_workers//a.raw_prefetch_workers))
     joint.columns.column_inference_optimized=a.optimized_inference
     joint.columns.column_readback_optimized=not a.legacy_chunk_io
+    joint.columns.column_probability_optimized=a.optimized_column_probability
+    joint.columns.column_map_prefetch=not a.no_column_map_prefetch
     joint.columns.column_inference_verify_remaining=3 if a.optimized_inference else 0
     source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.dev_info,verbose=False),256)
     if a.speed_benchmark:
         from tools.real_motion.joint_eval_speed import benchmark_evaluation
         try:
             speed = benchmark_evaluation(provider,source,records,joint.columns,gates,out,
-                windows=a.speed_windows,repeats=a.speed_repeats,batch_size=a.batch_size,stop_event=stop_event)
+                windows=a.speed_windows,repeats=a.speed_repeats,batch_size=a.batch_size,stop_event=stop_event,
+                column_suite=a.speed_column_probability)
         except InterruptedError:
             write_json(out/'speed_status.json',dict(status='interrupted',snapshot_sha256=digest,
                 source_checkpoint_unchanged=True,no_formal_evaluation=True))
@@ -139,6 +150,7 @@ def main(stop_event=None):
         'checkpoint_screen_pass_unchanged':ck['screen_pass'],'seconds':time.perf_counter()-started,'reports':report}
     result.update(column_feature_backend=a.column_feature_backend, batch_size=a.batch_size,
         optimized_inference=a.optimized_inference,legacy_chunk_io=a.legacy_chunk_io,
+        optimized_column_probability=a.optimized_column_probability,column_map_prefetch=not a.no_column_map_prefetch,
         raw_prefetch_workers=a.raw_prefetch_workers,raw_prefetch_depth=a.raw_prefetch_depth,
         population_key_fingerprint=stable_json_fingerprint(chosen))
     if sha256(snapshot) != digest:raise RuntimeError('immutable evaluation snapshot changed')

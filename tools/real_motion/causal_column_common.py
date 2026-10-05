@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import time
 import numpy as np
 import torch
@@ -528,8 +529,9 @@ def sample_column_features(prepared, h, plan, grid, config=ColumnConfig()):
 
 def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256, *,
                           feature_backend='cpu', history_index=None, gpu_sampler=None, verify_features=False,
-                          optimized=None):
+                          optimized=None, feature_sampler=None, map_wait_seconds=0., map_worker_seconds=0.):
     optimized = getattr(model, 'column_inference_optimized', False) if optimized is None else optimized
+    column_fast = bool(optimized and getattr(model,'column_probability_optimized',False))
     verify = optimized and getattr(model, 'column_inference_verify_remaining', 0) > 0
     reference = None
     reference_seconds = None
@@ -541,12 +543,16 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
         reference_seconds = time.perf_counter()-reference_started
     model.eval()
     started = time.perf_counter()
-    from real_motion.column_inference_pipeline import InferenceFeatures, ProbabilityReadback, inference_tensors
+    from real_motion.column_inference_pipeline import InferenceFeatures, ProbabilityReadback, HorizonInputs
     readback = ProbabilityReadback(buffered=bool(optimized and getattr(model, 'column_readback_optimized', True)))
     packed_upload = bool(readback.buffered and device.type == 'cuda')
-    sampler = InferenceFeatures(prepared, h, plan, grid, model.config, device, pose_motion,
-        backend=feature_backend, workers=getattr(model, 'column_sampling_workers', 1),
-        history_index=history_index, gpu_sampler=gpu_sampler, verify=verify_features)
+    if feature_sampler is not None and (not column_fast or feature_backend != 'cpu'
+            or feature_sampler.prepared is not prepared or feature_sampler.h != h or feature_sampler.plan is not plan):
+        raise ValueError('prefetched feature sampler does not match current horizon/plan')
+    sampler = feature_sampler or InferenceFeatures(prepared, h, plan, grid, model.config, device, pose_motion,
+        backend=feature_backend, workers=min(2,getattr(model,'column_sampling_workers',1)) if column_fast
+            else getattr(model, 'column_sampling_workers', 1),
+        history_index=history_index, gpu_sampler=gpu_sampler, verify=verify_features,compiled_patches=column_fast)
     mapped_at = time.perf_counter(); sampled_seconds = sampling_wait = 0.
     pool = ThreadPoolExecutor(max_workers=1) if optimized and feature_backend == 'cpu' else None
     def sample(start):
@@ -560,11 +566,19 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
     defer_checks = bool(optimized and isinstance(model, CausalColumnModel))
     # Adaptive/custom subclasses have their own checks and remain untouched.
     defer_source = bool(defer_checks and type(model) is LinkedColumns
-        and getattr(model, 'column_readback_optimized', True))
+        and (column_fast or getattr(model, 'column_readback_optimized', True)))
+    stages = dict(horizon_inputs=0.,input_upload=0.,source_inputs=0.,network_forward_host=0.,
+        calibration_host=0.,probability_readback=0.,finite_check_wait=0.)
+    inputs = None
     try:
       with torch.inference_mode():
+        tick = time.perf_counter()
+        inputs = HorizonInputs(model,prepared,h,plan,device,enabled=column_fast)
+        packed_upload = bool(packed_upload and inputs.values is None)
+        stages['horizon_inputs'] = time.perf_counter()-tick
         finite = (torch.isfinite(model.generation_pos_weight).all() & torch.isfinite(model.refine_class_weights).all()
             & (model.generation_pos_weight > 0) & (model.refine_class_weights > 0).all()) if defer_checks else None
+        if defer_source and inputs.source is not None: finite = finite & torch.isfinite(inputs.source).all()
         if pool is not None and len(plan): pending = pool.submit(sample, 0)
         for start in range(0, len(plan), batch_size):
             waiting = time.perf_counter()
@@ -573,36 +587,58 @@ def predict_probabilities(model, prepared, h, plan, grid, device, batch_size=256
             sampled_seconds += sample_seconds
             pending = (pool.submit(sample, start+batch_size)
                 if pool is not None and start+batch_size < len(plan) else None)
-            b = inference_tensors(arrays,small.legal,device,packed=packed_upload)
+            tick = time.perf_counter()
+            b = inputs.batch(arrays,small.legal,device,start,start+len(small),packed=packed_upload)
             legal = b.pop('legal')
+            stages['input_upload'] += time.perf_counter()-tick
+            tick = time.perf_counter()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 if hasattr(model, 'source_features_for'):
-                    b['source_features'] = model.source_features_for(prepared, h, small, device)
+                    if 'source_features' not in b: b['source_features'] = model.source_features_for(prepared, h, small, device)
                     if defer_source:
-                        finite = finite & torch.isfinite(b['source_features']).all()
+                        if inputs.source is None: finite = finite & torch.isfinite(b['source_features']).all()
                         b['validate_source'] = False
                 if hasattr(model, 'extra_inputs_for'):
                     b.update(model.extra_inputs_for(prepared, h, small, grid, device))
+                stages['source_inputs'] += time.perf_counter()-tick
+                tick = time.perf_counter()
                 g, r = model(**b)
+            stages['network_forward_host'] += time.perf_counter()-tick
+            tick = time.perf_counter()
             if defer_checks:
                 finite = finite & torch.isfinite(g).all() & torch.isfinite(r).all()
                 probability = model.calibrated_probabilities(g, r, b['kind'], legal, validate=False)
             else: probability = model.calibrated_probabilities(g, r, b['kind'], legal)
+            stages['calibration_host'] += time.perf_counter()-tick
+            tick = time.perf_counter()
             readback.append(probability)
+            stages['probability_readback'] += time.perf_counter()-tick
+        tick = time.perf_counter()
         if defer_checks and not finite:
             raise RuntimeError('nonfinite prediction or invalid TRAIN calibration weights')
+        stages['finite_check_wait'] += time.perf_counter()-tick
     finally:
         if pool is not None: pool.shutdown(wait=True, cancel_futures=True)
+    tick = time.perf_counter()
     result = readback.result((*plan.base.shape, 3))
+    stages['probability_readback'] += time.perf_counter()-tick
     model.last_prediction_profile = {'queries': len(plan), 'cache_mib': sampler.cache_bytes/2**20,
-        'inverse_map_seconds': mapped_at-started, 'patch_gather_seconds': sampled_seconds,
+        'inverse_map_seconds': mapped_at-started+map_wait_seconds, 'patch_gather_seconds': sampled_seconds,
+        'inverse_map_worker_seconds': map_worker_seconds or mapped_at-started,
+        'inverse_map_overlaps_previous_horizon': feature_sampler is not None,
         'sampling_wait_seconds': sampling_wait,
         'network_transfer_and_other_seconds': max(0., time.perf_counter()-mapped_at-sampling_wait),
         'sampling_seconds_are_overlapping_worker_time': pool is not None,
         'feature_backend': 'gpu' if sampler.gpu is not None else 'cpu', 'feature_audit': dict(sampler.audit),
         'probability_readback_transfers': readback.transfers,
         'probability_readback_buffer_bytes': readback.peak_bytes,
-        'source_finite_check_deferred': defer_source,'packed_input_upload': packed_upload}
+        'source_finite_check_deferred': defer_source,'packed_input_upload': packed_upload,
+        'column_probability_optimized':column_fast,'compiled_patch_gather': bool(sampler.cpu and sampler.cpu.compiled_patches),
+        'horizon_inputs_bytes': inputs.bytes,'horizon_inputs_working_bytes_bound': inputs.working_bytes,
+        'horizon_inputs_budget_fallback': inputs.budget_fallback,
+        'host_stages_seconds_NOT_cuda_kernel_time': stages}
+    if getattr(model,'column_probability_fingerprint',False):
+        model.last_prediction_profile['probability_sha256'] = hashlib.sha256(result.view(np.uint8)).hexdigest()
     if verify:
         if not np.array_equal(reference, result):
             raise RuntimeError('optimized inference probability exactness failed; use reference inference')
@@ -700,24 +736,32 @@ def evaluation_steps(provider, source, records, model, thresholds, *, progress=N
         candidate_wait_seconds = probability_seconds = composition_seconds = 0.
         planning = {h: candidate_pool.submit(candidate_plan, prep, h, provider.pcfg.grid, model.config) for h in REPORT}
         from real_motion.causal_column_sampling import ColumnHistoryIndex
-        from real_motion.column_inference_pipeline import inference_gpu
+        from real_motion.column_inference_pipeline import inference_gpu, HorizonFeaturePrefetch
         index = raw_window.get('_evaluation_history_index') if raw_window is not None else None
         if index is None:
             index = ColumnHistoryIndex(prep, provider.pcfg.grid)
             if window_iter is not None: raw_window['_evaluation_history_index'] = index
         prep.column_history_index = index
         gpu, resident = inference_gpu(provider.device, feature_backend, prep, provider.pcfg.grid, model.config)
-        with resident:
+        with resident, HorizonFeaturePrefetch(prep,REPORT,planning,provider.pcfg.grid,model.config,
+                provider.device,pose_motion,history_index=index,workers=provider.workers,
+                enabled=feature_backend == 'cpu' and getattr(model,'column_inference_optimized',False)
+                    and getattr(model,'column_probability_optimized',False)
+                    and getattr(model,'column_map_prefetch',True)) as feature_prefetch:
           for ri, h in enumerate(REPORT):
             plan_wait = time.perf_counter()
             plan = planning[h].result()
             layout = sparse_layout(plan)
             candidate_wait_seconds += time.perf_counter()-plan_wait
             prediction_tick = time.perf_counter()
+            feature_sampler,map_wait,map_worker = feature_prefetch.get(h)
             if feature_backend == 'gpu':
                 probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size,
                     feature_backend=feature_backend, history_index=index, gpu_sampler=gpu,
                     verify_features=wi <= 3 or wi % 128 == 0)
+            elif feature_sampler is not None:
+                probability = predict_probabilities(model,prep,h,plan,provider.pcfg.grid,provider.device,batch_size,
+                    feature_sampler=feature_sampler,map_wait_seconds=map_wait,map_worker_seconds=map_worker)
             else:
                 probability = predict_probabilities(model, prep, h, plan, provider.pcfg.grid, provider.device, batch_size)
             probability_seconds += time.perf_counter()-prediction_tick

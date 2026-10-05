@@ -26,7 +26,12 @@ CPU_WORKERS="${FULL_JOINT_EVAL_CPU_WORKERS:-8}"
 RAW_WORKERS="${FULL_JOINT_EVAL_RAW_WORKERS:-$((CPU_WORKERS < 4 ? CPU_WORKERS : 4))}"
 RAW_DEPTH="${FULL_JOINT_EVAL_RAW_DEPTH:-$RAW_WORKERS}"
 if [[ "${FULL_JOINT_EVAL_OPTIMIZED:-1}" == 1 ]]; then EXTRA+=(--optimized-inference); fi
-if [[ "${FULL_JOINT_EVAL_IO_OPTIMIZED:-1}" == 0 ]]; then EXTRA+=(--legacy-chunk-io); fi
+if [[ "${FULL_JOINT_EVAL_IO_OPTIMIZED:-0}" == 1 ]]; then EXTRA+=(--buffered-chunk-io); fi
+if [[ "${FULL_JOINT_EVAL_COLUMN_OPTIMIZED:-0}" == 1 ]]; then
+  [[ "${FULL_JOINT_EVAL_OPTIMIZED:-1}" == 1 ]] || { echo 'column优化需要开启FULL_JOINT_EVAL_OPTIMIZED' >&2; exit 2; }
+  EXTRA+=(--optimized-column-probability)
+fi
+if [[ "${FULL_JOINT_EVAL_COLUMN_MAP_PREFETCH:-1}" == 0 ]]; then EXTRA+=(--no-column-map-prefetch); fi
 if [[ "${FULL_JOINT_EVAL_FIXED_MONITOR:-0}" == 1 ]]; then EXTRA+=(--fixed-monitor-thresholds); fi
 echo "只读快照评估 $POPULATION；last/epoch固定0.5/0.5/REMOVE-off，不用dev调阈值，不改变训练断点。"
 echo "评估会使用CPU/GPU；大范围dev512建议先安全暂停训练。输出 $OUT"

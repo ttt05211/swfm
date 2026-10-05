@@ -19,7 +19,9 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRIT
 export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 export SWFM_COLUMN_CPU_BACKEND=native SWFM_COLUMN_CPU_BUNDLE=1
 export SWFM_LOCAL_FAST_SUPERVISION=0 SWFM_LOCAL_STATIC_ROI=0
-echo "只计时：同epoch19、同scene-balanced dev64子集、同batch256；三种模式正反序各测一次。输出 $OUT"
+SUITE=()
+if [[ "${JOINT_EVAL_SPEED_COLUMN_SUITE:-0}" == 1 ]]; then SUITE+=(--speed-column-probability); fi
+echo "只计时：同epoch19、同scene-balanced dev64子集、同batch256；三种模式正反序各测一次。column suite=${JOINT_EVAL_SPEED_COLUMN_SUITE:-0} 输出 $OUT"
 "$PY" -u tools/real_motion/eval_p0_f9_joint_causal_columns.py \
   --config "$ROOT/configs/real_motion_occfm.yaml" --checkpoint "$CHECKPOINT" \
   --dev-cache "$ROOT/data/p0_f9_v18_se2_val_all_4369.pt" \
@@ -29,5 +31,5 @@ echo "只计时：同epoch19、同scene-balanced dev64子集、同batch256；三
   --dev-info /root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl \
   --population dev64 --fixed-monitor-thresholds --out-dir "$OUT" \
   --cpu-workers 8 --batch-size 256 --column-feature-backend cpu \
-  --speed-benchmark --speed-windows "${JOINT_EVAL_SPEED_WINDOWS:-32}" --speed-repeats 2
+  --speed-benchmark --speed-windows "${JOINT_EVAL_SPEED_WINDOWS:-32}" --speed-repeats 2 "${SUITE[@]}"
 echo "测速完成：$OUT/summary.txt；分段详细数据：$OUT/speed.json"
