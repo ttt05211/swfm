@@ -75,7 +75,7 @@ def make_head(teacher, device):
     return CanonicalRepairHead(source_dim=teacher.columns.source_dim).to(device)
 
 
-def warm_start_head(head, path, *, teacher_sha256, config_fingerprint):
+def warm_start_head(head, path, *, teacher_sha256, config_fingerprint, dev_manifest_fingerprint=None):
     """Load only Point-CCR weights/calibration; never optimizer/RNG/cursor.
 
     This is a new full-data continuation experiment, not an exact resume of the
@@ -87,6 +87,7 @@ def warm_start_head(head, path, *, teacher_sha256, config_fingerprint):
             or saved.get('transport_frozen') is not True
             or c.get('teacher_sha256')!=teacher_sha256
             or c.get('config_fingerprint')!=config_fingerprint
+            or (dev_manifest_fingerprint is not None and c.get('dev_manifest_fingerprint')!=dev_manifest_fingerprint)
             or c.get('model')!=model_contract(head)):
         raise RuntimeError('warm-start Point CCR checkpoint/teacher/config/model mismatch')
     state=saved.get('head')
@@ -99,6 +100,16 @@ def warm_start_head(head, path, *, teacher_sha256, config_fingerprint):
     prior=saved.get('reports',{}).get('train_prior')
     if not prior or 'positive_weights' not in prior:
         raise RuntimeError('warm-start Point CCR lacks persisted TRAIN-only positive weights')
+    initial=saved.get('reports',{}).get('initial_dev64')
+    reusable_old=None
+    if initial and initial.get('variants',{}).get('old_joint'):
+        reusable_old={
+            'baseline':initial.get('baseline'),
+            'variants':{'old_joint':initial['variants']['old_joint']},
+            'windows':initial.get('windows',64),
+            'reused_reference_only':True,
+            'source_checkpoint_sha256':sha256(path),
+        }
     return dict(
         checkpoint_sha256=sha256(path),
         source_epoch=int(saved.get('epoch',0)),
@@ -107,6 +118,7 @@ def warm_start_head(head, path, *, teacher_sha256, config_fingerprint):
         positive_weights=np.asarray(head.positive_weight.detach().cpu()).tolist(),
         train_prior={**prior,'reused_for_full_data_warm_start':True,
                      'note':'kept fixed to isolate training/data coverage; not recalibrated on DEV'},
+        reusable_initial_dev64_old=reusable_old,
     )
 
 
