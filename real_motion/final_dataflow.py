@@ -449,8 +449,14 @@ def forecast_six(
     }
 
 
-def batch_frozen_motion(teacher, rows, device):
-    """One frozen V18 forward for a multi-window batch, split by source count."""
+def batch_frozen_motion(teacher, rows, device, *, render_readback=True):
+    """One frozen V18 forward for a multi-window batch, split by source count.
+
+    Frozen motion is source-row independent: V18's first dimension is a batch
+    dimension throughout Conv/GroupNorm/LayerNorm/MHA.  When requested, the two
+    renderer tensors are copied to CPU ONCE for the whole packed batch and
+    sliced afterwards.  This avoids two CUDA synchronizing readbacks per window.
+    """
     if not rows:
         raise ValueError("non-empty training rows required")
     keys = (
@@ -463,9 +469,24 @@ def batch_frozen_motion(teacher, rows, device):
     sizes = [int(r["features"].shape[0]) for r, _ in rows]
     merged = {key: torch.cat([torch.as_tensor(r[key]) for r, _ in rows], dim=0) for key in keys}
     output = teacher.motion(merged, device)
+    tensor_items = [(k, v) for k, v in output.items() if isinstance(v, torch.Tensor)]
+    by_key = {k: v.split(sizes) for k, v in tensor_items}
+    render = None
+    if render_readback:
+        required = ("residual_xy_m", "yaw_delta_rad")
+        if all(k in output for k in required):
+            render = {
+                k: output[k].detach().cpu().numpy()
+                for k in required
+            }
     split = []
-    for values in zip(*(v.split(sizes) for v in output.values())):
-        split.append({k: v for k, v in zip(output, values)})
+    offsets = np.cumsum([0, *sizes])
+    for i in range(len(rows)):
+        local = {k: parts[i] for k, parts in by_key.items()}
+        if render is not None:
+            a, b = int(offsets[i]), int(offsets[i+1])
+            local["_column_render_numpy"] = {k: v[a:b] for k, v in render.items()}
+        split.append(local)
     if len(split) != len(rows):
         raise RuntimeError("batched frozen motion split mismatch")
     return split
