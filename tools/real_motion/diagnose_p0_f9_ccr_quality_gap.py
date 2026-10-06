@@ -304,42 +304,72 @@ def _decision(metrics):
 
 
 def _summary(result):
-    lines = [
-        "===== POINT CCR QUALITY GAP / RESTRICTED ORACLE =====",
-        "status=" + result["status"],
-        "protocol=" + PROTOCOL,
-        "GT is diagnostic-only and cannot change CCR support/legality/motion.",
-    ]
-    if result.get("metrics"):
-        m = result["metrics"]
-        for name in ("baseline", "current_joint", "old_local", "restricted_oracle",
-                     "current_static", "current_dynamic", "current_add_only", "current_remove_only",
-                     "oracle_static", "oracle_dynamic", "oracle_add_only", "oracle_remove_only"):
+    """Compact terminal summary; full diagnostics stay in quality_gap.json."""
+    lines = ["===== CCR QUALITY GAP =====", "status=" + result["status"]]
+    m = result.get("metrics")
+    if m:
+        for name, label in (
+            ("current_joint", "CURRENT"),
+            ("old_local", "OLD_LOCAL"),
+            ("restricted_oracle", "ORACLE"),
+        ):
             x = m[name]
             lines.append(
-                f'{name}: IoU={x["IoU"]:.6f} mIoU={x["mIoU"]:.6f} '
-                f'MovingMacro={x["MovingMacro"]:.6f} MovingMicro={x["MovingMicro"]:.6f}'
+                f'{label:9s} mIoU={x["mIoU"]:.4f}  MovingMicro={x["MovingMicro"]:.4f}'
             )
-    if result.get("decision"):
-        d = result["decision"]
-        lines.append("current_vs_old=" + json.dumps(d["current_vs_old_pp"], ensure_ascii=False))
-        lines.append("oracle_vs_current=" + json.dumps(d["oracle_vs_current_pp"], ensure_ascii=False))
-        lines.append("oracle_vs_old=" + json.dumps(d["oracle_vs_old_pp"], ensure_ascii=False))
-        lines.append("restricted_oracle_gate=" + json.dumps(d["restricted_oracle_gate"]))
-        lines.append("ROUTE=" + d["route"])
+    d = result.get("decision")
+    if d:
+        cv = d["current_vs_old_pp"]
+        ov = d["oracle_vs_old_pp"]
+        gate = d["restricted_oracle_gate"]
+        lines.append(
+            f'GAP current-old: mIoU={cv["mIoU"]:+.4f}  Moving={cv["MovingMicro"]:+.4f}'
+        )
+        lines.append(
+            f'ORACLE-old:      mIoU={ov["mIoU"]:+.4f}  Moving={ov["MovingMicro"]:+.4f}'
+        )
+        lines.append("ORACLE_GATE=" + ("PASS" if gate["pass"] else "FAIL"))
     if result.get("old_helpful_coverage"):
         c = result["old_helpful_coverage"]["all_report_horizons"]
+        frac = c["reachable_fraction"]
+        text = "n/a" if frac is None else f"{100*frac:.1f}%"
         lines.append(
-            "old Local helpful voxel reachability: "
-            f'{c["old_helpful_reachable_by_exact_CCR_action"]}/{c["old_helpful"]} '
-            f'= {c["reachable_fraction"]}'
+            f'Local helpful edits reachable by CCR: '
+            f'{c["old_helpful_reachable_by_exact_CCR_action"]}/{c["old_helpful"]} ({text})'
         )
-    if result.get("training_curve"):
-        lines.append("checkpoint_training_curve=" + json.dumps(result["training_curve"], ensure_ascii=False))
-    if result.get("action_learning"):
-        lines.append("action_learning=" + json.dumps(result["action_learning"], ensure_ascii=False))
+    curve = result.get("training_curve", {}).get("epochs", [])
+    if curve:
+        compact = "  ".join(
+            f'E{x["epoch"]}:mIoU={x["mIoU"]:.3f}/Mov={x["MovingMicro"]:.3f}'
+            for x in curve
+        )
+        lines.append("DEV64 TRAIN CURVE  " + compact)
+        last = result["training_curve"].get("last_epoch_delta")
+        if last:
+            lines.append(
+                f'LAST EPOCH DELTA: mIoU={last["mIoU_pp"]:+.4f}  '
+                f'Moving={last["MovingMicro_pp"]:+.4f}'
+            )
+    action = result.get("action_learning", {})
+    if action:
+        parts = []
+        for key, label in (
+            ("static/ADD/all", "sADD"),
+            ("static/REMOVE/all", "sREM"),
+            ("dynamic/ADD/all", "dADD"),
+            ("dynamic/REMOVE/all", "dREM"),
+        ):
+            row = action.get(key)
+            if row:
+                r = row.get("recall")
+                parts.append(f'{label}R=' + ("n/a" if r is None else f"{100*r:.1f}%"))
+        if parts:
+            lines.append("ACTION RECALL  " + "  ".join(parts))
+    if d:
+        lines.append("ROUTE=" + d["route"])
     if "error" in result:
         lines.append("error=" + result["error"])
+    lines.append("full details: quality_gap.json")
     return "\n".join(lines) + "\n"
 
 
