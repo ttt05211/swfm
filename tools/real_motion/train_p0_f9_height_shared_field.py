@@ -33,7 +33,7 @@ from tools.real_motion.train_p0_f9_causal_columns import record_keys
 from tools.real_motion.v18_source_interaction_common import select_population
 from tools.real_motion.joint_training_recovery import snapshot_checkpoint, save_resume_checkpoint, preserve_training_rng
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256, write_json, finite_json
-from tools.real_motion.joint_column_full_common import prefetch_column_batches
+from tools.real_motion.joint_column_full_common import prefetch_column_batches, prefetch_logical_superbatches
 from tools.real_motion.height_field_screen_common import (
     PROTOCOL, epoch_groups, learning_rate, train_step, calibrate_train, evaluate, six_frame_speed,
 )
@@ -281,6 +281,37 @@ def main(stop_event=None, argv=None, *, backend=None):
                           f"sADD_R={recall('static/ADD')} dADD_R={recall('dynamic/ADD')} dREM_R={recall('dynamic/REMOVE')}", flush=True)
                     save(); persist()
             with ThreadPoolExecutor(max_workers=min(3, a.cpu_workers)) as pool:
+                def run_step(rows, waited, frozen_outputs=None, motion_share=0.):
+                    nonlocal updates, batch, executed
+                    if (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
+                        return False
+                    lr = learning_rate(updates, steps, a.lr)
+                    optimizer.param_groups[0]['lr'] = lr
+                    if frozen_outputs is None:
+                        stat = train_fn(provider, rows, teacher, head, optimizer, rng, candidate_pool=pool)
+                    else:
+                        stat = train_fn(provider, rows, teacher, head, optimizer, rng,
+                                        candidate_pool=pool, frozen_outputs=frozen_outputs)
+                    updates += 1; batch += 1; executed += len(rows)
+                    effective_seconds=stat['seconds']+float(motion_share)
+                    reports['train_seconds'] = reports.get('train_seconds', 0.)+effective_seconds
+                    reports['input_wait_seconds'] = reports.get('input_wait_seconds', 0.)+waited
+                    reports['frozen_motion_superbatch_seconds'] = reports.get('frozen_motion_superbatch_seconds', 0.)+float(motion_share)
+                    progress(dict(event='ccr_train' if backend is not None else 'height_field_train',
+                                  epoch=epoch+1, epoch_batch=batch, epoch_batches=counts[epoch],
+                                  update=updates, target=steps, lr=lr, input_wait_seconds=waited,
+                                  amortized_frozen_motion_seconds=float(motion_share), **stat))
+                    if updates == 1 or updates % 32 == 0:
+                        details = (f"sampled_points={stat['sampled_points']} canonical_points={stat['canonical_points']}" if backend is not None else
+                                   f"dynamic_columns={stat.get('dynamic_refine_columns', 0)}")
+                        print(f"{label}_TRAIN epoch={epoch+1}/{a.epochs} batch={batch}/{counts[epoch]} update={updates}/{steps} "
+                              f"loss={stat['loss']:.6f} train_s/window={effective_seconds/len(rows):.4f} "
+                              f"wait_s/window={waited/len(rows):.4f} {details} "
+                              f"allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
+                    if updates % checkpoint_every == 0 or stop_event is not None and stop_event.is_set():
+                        save(); persist()
+                    return True
+
                 while epoch < a.epochs:
                     monitor_pending()
                     if a.stop_after_epoch and epoch >= a.stop_after_epoch:
@@ -288,34 +319,47 @@ def main(stop_event=None, argv=None, *, backend=None):
                         break
                     if stop_event is not None and stop_event.is_set():
                         break
-                    ordered = [r for g in groups[epoch][batch:] for r in g]
-                    previous_end = time.perf_counter()
-                    for rows in prefetch_column_batches(
-                            provider, train_source, ordered, 4, 128,
-                            io_workers=getattr(provider,'train_io_workers',min(2,a.cpu_workers))):
-                        waited = time.perf_counter()-previous_end
-                        if (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
-                            break
-                        lr = learning_rate(updates, steps, a.lr)
-                        optimizer.param_groups[0]['lr'] = lr
-                        stat = train_fn(provider, rows, teacher, head, optimizer, rng, candidate_pool=pool)
-                        updates += 1; batch += 1; executed += len(rows)
-                        reports['train_seconds'] = reports.get('train_seconds', 0.)+stat['seconds']
-                        reports['input_wait_seconds'] = reports.get('input_wait_seconds', 0.)+waited
-                        progress(dict(event='ccr_train' if backend is not None else 'height_field_train', epoch=epoch+1, epoch_batch=batch, epoch_batches=counts[epoch],
-                                      update=updates, target=steps, lr=lr, input_wait_seconds=waited, **stat))
-                        if updates == 1 or updates % 32 == 0:
-                            details = (f"sampled_points={stat['sampled_points']} canonical_points={stat['canonical_points']}" if backend is not None else
-                                       f"dynamic_columns={stat.get('dynamic_refine_columns', 0)}")
-                            print(f"{label}_TRAIN epoch={epoch+1}/{a.epochs} batch={batch}/{counts[epoch]} update={updates}/{steps} "
-                                  f"loss={stat['loss']:.6f} train_s/window={stat['seconds']/len(rows):.4f} "
-                                  f"wait_s/window={waited/len(rows):.4f} {details} "
-                                  f"allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
-                        if batch == counts[epoch]:
-                            epoch += 1; batch = 0; save(); persist(); break
-                        if updates % checkpoint_every == 0 or stop_event is not None and stop_event.is_set():
-                            save(); persist()
-                        previous_end = time.perf_counter()
+
+                    logical_groups=groups[epoch][batch:]
+                    super_updates=(getattr(provider,'ccr_motion_superbatch_updates',1)
+                                   if backend is not None else 1)
+                    previous_end=time.perf_counter()
+
+                    if backend is not None and super_updates>1:
+                        bundles=prefetch_logical_superbatches(
+                            provider,train_source,logical_groups,super_updates,
+                            io_workers=getattr(provider,'train_io_workers',min(2,a.cpu_workers)))
+                        epoch_done=False
+                        for logical_rows in bundles:
+                            waited=time.perf_counter()-previous_end
+                            flat=[row for rows in logical_rows for row in rows]
+                            tick=time.perf_counter()
+                            frozen=backend.prepare_frozen_superbatch(provider,flat,teacher)
+                            motion_seconds=time.perf_counter()-tick
+                            cursor=0
+                            total_windows=max(1,len(flat))
+                            for gi,rows in enumerate(logical_rows):
+                                n=len(rows);local=frozen[cursor:cursor+n];cursor+=n
+                                share=motion_seconds*n/total_windows
+                                if not run_step(rows, waited if gi==0 else 0., local, share):
+                                    break
+                                if batch == counts[epoch]:
+                                    epoch += 1; batch = 0; save(); persist(); epoch_done=True; break
+                            if epoch_done or (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
+                                break
+                            previous_end=time.perf_counter()
+                    else:
+                        ordered=[r for g in logical_groups for r in g]
+                        for rows in prefetch_column_batches(
+                                provider, train_source, ordered, 4, 128,
+                                io_workers=getattr(provider,'train_io_workers',min(2,a.cpu_workers))):
+                            waited=time.perf_counter()-previous_end
+                            if not run_step(rows,waited):
+                                break
+                            if batch == counts[epoch]:
+                                epoch += 1; batch = 0; save(); persist(); break
+                            previous_end=time.perf_counter()
+
                     if (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
                         break
             save(); persist()
