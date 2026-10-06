@@ -10,8 +10,28 @@ import torch
 from real_motion.canonical_causal_repair import CanonicalRepairHead
 from tools.real_motion.point_ccr_v18_fps_common import (
     ARMS, POINT_PROTOCOL, select_population, load_point_head,
-    assert_prior_exact, aggregate, forecast, rebuild_prior,
+    assert_prior_exact, aggregate, forecast, rebuild_prior, resolve_arm_models,
 )
+
+
+def test_resolver_uses_saved_reference_not_provider_live_four_history_model():
+    clean = SimpleNamespace(config=SimpleNamespace(history_frames=6))
+    live = SimpleNamespace(config=SimpleNamespace(history_frames=4))
+    teacher = SimpleNamespace(transport=live)
+    provider = SimpleNamespace(reference=clean, model=live, joint=teacher)
+    models = resolve_arm_models(provider, teacher)
+    assert models['clean_e14_6h_original'] is clean
+    assert models['clean_e14_6h_native'] is clean
+    assert all(models[k] is live for k in ARMS if not k.startswith('clean'))
+    assert provider.model is live  # Never break the CCR renderer/preparation.
+    provider.reference = live
+    with pytest.raises(RuntimeError, match='distinct'): resolve_arm_models(provider, teacher)
+    provider.reference = clean; clean.config.history_frames = 4
+    with pytest.raises(RuntimeError, match='identity'): resolve_arm_models(provider, teacher)
+    clean.config.history_frames = 6; live.config.history_frames = 6
+    with pytest.raises(RuntimeError, match='identity'): resolve_arm_models(provider, teacher)
+    live.config.history_frames = 4; provider.model = clean
+    with pytest.raises(RuntimeError, match='live'): resolve_arm_models(provider, teacher)
 
 
 def records():
@@ -124,7 +144,11 @@ def test_real_cuda_replay_all_six_outputs_and_probabilities_exact(tmp_path, monk
                                 config_sha=bundle.manifest['config_fingerprint'], allow_diagnostic=True)
         teacher.eval().requires_grad_(False)
         provider = PilotProvider(paths['clean_e14.pt'], CLEAN_SHA256, make_prepare_config(cfg), device, 2, teacher, None)
-        provider.model.eval().requires_grad_(False)
+        models = resolve_arm_models(provider, teacher)
+        assert models['clean_e14_6h_original'] is provider.reference
+        assert provider.reference.config.history_frames == 6
+        assert provider.model is teacher.transport and provider.model.config.history_frames == 4
+        provider.reference.eval().requires_grad_(False)
         head = CanonicalRepairHead(teacher.columns.source_dim).to(device).eval().requires_grad_(False)
         point_path = Path(os.environ['SWFM_CCR_POINT_HEAD'])
         saved = torch.load(point_path, map_location='cpu', weights_only=True)
@@ -150,15 +174,15 @@ def test_real_cuda_replay_all_six_outputs_and_probabilities_exact(tmp_path, monk
             before = {k: v.clone() for k, v in teacher.transport.state_dict().items()}
             expected = {}
             for boundary in ('fresh_prior', 'cached_prior'):
-                for family in ('clean', 'transport', 'point'):
-                    model = provider.model if family == 'clean' else teacher.transport
-                    for optimized in (False, True):
-                        result = forecast(case, provider, model, head if family == 'point' else None,
-                                          native=optimized, boundary=boundary)
-                        if family in expected: assert result['signature'] == expected[family]
-                        else: expected[family] = result['signature']
-                        assert result['six_complete_dense'] and result['seconds'] > 0
-                        assert ('fresh_strong_prior' in result['stages_seconds']) == (boundary == 'fresh_prior')
+                for arm in ARMS:
+                    family = arm.rsplit('_', 1)[0]
+                    result = forecast(case, provider, models[arm], head if arm.startswith('point') else None,
+                                      native=arm.endswith('native'), boundary=boundary)
+                    if family in expected: assert result['signature'] == expected[family]
+                    else: expected[family] = result['signature']
+                    assert result['six_complete_dense'] and result['seconds'] > 0
+                    assert ('fresh_strong_prior' in result['stages_seconds']) == (boundary == 'fresh_prior')
+            assert expected['clean_e14_6h']['motion'] != expected['epoch19_v18_4h']['motion']
             assert all(torch.equal(before[k], v) for k, v in teacher.transport.state_dict().items())
         assert len(seen) == 2
         assert file_digest(point_path) == digest

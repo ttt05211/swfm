@@ -45,4 +45,6 @@ bash tools/real_motion/run_p0_f9_point_ccr_v18_fps.sh
 
 ## 本地验收
 
-健康 CUDA 项目环境、RTX 3050 实际 replay：普通 TRAIN 窗口和高 source DEV 压力窗口；六个 arm × 两种边界，全部运动/概率/六帧结果相等。66 项相关测试通过，包括 native 阈值/平票/边缘、历史输入与 V18 回归。此验收证明这些已测路径的无损一致性，**不声称已经得到 L40S FPS**；服务器每个窗口仍强制相同检查。
+健康 CUDA 项目环境、RTX 3050 实际 replay：普通 TRAIN 窗口和高 source DEV 压力窗口；六个 arm × 两种边界，同权重原始/优化路径的运动/概率/六帧结果相等。67 项相关测试通过，包括模型身份、native 阈值/平票/边缘、历史输入与 V18 回归。此验收证明这些已测路径的无损一致性，**不声称已经得到 L40S FPS**；服务器每个窗口仍强制相同检查。
+
+初版测速入口错误使用了 `provider.model` 作为 E14，服务器在六历史检查处提前停止，未产生有效 FPS。`JointColumnProvider` 的构造函数实际把 E14 存到 `provider.reference`，再把 `provider.model` 切换到 epoch19 transport。修正版通过同一个 `resolve_arm_models` 绑定入口与真实 replay 测试：E14 两个 arm 必须引用独立的六历史 reference，epoch19/CCR 四个 arm 必须引用四历史 transport；不改变 provider 的 live 模型。日志和 `speed.json` 打印每个 arm 的实际 checkpoint SHA、历史预算。新增测试拒绝 alias、错历史预算和破坏 live provider 的情况，真实 replay 还确认 E14/epoch19 的运动输出确实不同，避免不同标签共用同一个模型而让无损检查虚假通过。

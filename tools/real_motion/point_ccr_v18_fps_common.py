@@ -31,6 +31,26 @@ ARMS = ('clean_e14_6h_original', 'clean_e14_6h_native',
         'point_ccr_4h_original', 'point_ccr_4h_native')
 
 
+def resolve_arm_models(provider, teacher):
+    """Resolve the SAVED reference, not the provider's live joint model.
+
+    JointColumnProvider.__init__ moves Clean-E14 to ``reference`` then assigns
+    ``model = joint.transport``. Keep that live model for CCR preparation; do
+    not mutate it to repair a benchmark label. Validate BOTH weight owners and
+    history budgets before collecting any timing.
+    """
+    reference = getattr(provider, 'reference', None)
+    transport = teacher.transport
+    if reference is None or reference is transport:
+        raise RuntimeError('distinct saved Clean-E14 reference required, not the live epoch19 transport')
+    if (getattr(getattr(reference, 'config', None), 'history_frames', None) != 6
+            or getattr(getattr(transport, 'config', None), 'history_frames', None) != 4):
+        raise RuntimeError('Clean-E14 SIX-history / epoch19 FOUR-history model identity mismatch')
+    if provider.model is not transport or provider.joint is not teacher:
+        raise RuntimeError('CCR provider must retain its live epoch19 transport')
+    return {arm:reference if arm.startswith('clean_e14_6h_') else transport for arm in ARMS}
+
+
 def select_population(records, frozen_keys, *, windows=20, stress_windows=2):
     """Scene round-robin, then highest source-count stress keys; never GT/error."""
     if (type(windows) is not int or type(stress_windows) is not int

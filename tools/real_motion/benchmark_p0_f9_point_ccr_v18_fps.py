@@ -27,7 +27,7 @@ from tools.real_motion.train_p0_f9_causal_columns import record_keys
 from tools.real_motion.train_p0_f9_joint_causal_columns import load_joint
 from tools.real_motion.point_ccr_v18_fps_common import (
     PROTOCOL, ARMS, BOUNDARIES, select_population, load_point_head,
-    rebuild_prior, assert_prior_exact, forecast, aggregate,
+    rebuild_prior, assert_prior_exact, forecast, aggregate, resolve_arm_models,
 )
 from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 
@@ -54,6 +54,8 @@ def brief(result):
         lines.append('population='+json.dumps(result['population'], ensure_ascii=False))
     if 'exactness' in result:
         lines.append('exactness='+json.dumps(result['exactness']))
+    if 'arm_models' in result:
+        lines.append('actual_arm_models='+json.dumps(result['arm_models'], sort_keys=True))
     prepare = result.get('preparation_seconds_excluded', [])
     if prepare:
         lines.append(f'raw_fixed_preparation_seconds/window={sum(prepare)/len(prepare):.6f} (separate, excluded from FPS)')
@@ -137,8 +139,13 @@ def main(stop_event=None, argv=None):
         write_json(out/'fps_manifest.json', dict(protocol=PROTOCOL, **result['population'], keys=population))
         provider = PilotProvider(snapshots['clean_e14'], CLEAN_SHA256, make_prepare_config(cfg),
                                  device, a.cpu_workers, teacher, None)
-        provider.model.eval().requires_grad_(False)
-        if provider.model.config.history_frames != 6: raise RuntimeError('legacy Clean-E14 SIX-history reference required')
+        models = resolve_arm_models(provider, teacher)
+        provider.reference.eval().requires_grad_(False)
+        result['arm_models'] = {arm:dict(history_frames=model.config.history_frames,
+            checkpoint_sha256=digests['clean_e14' if arm.startswith('clean') else 'epoch19'])
+            for arm,model in models.items()}
+        print('FPS_MODEL_IDENTITY '+json.dumps(result['arm_models'], sort_keys=True), flush=True)
+        persist()
         source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info, verbose=False), 128)
         result['preparation_seconds_excluded'] = []
         exact_windows = 0
@@ -161,7 +168,7 @@ def main(stop_event=None, argv=None):
                 refs = {}
                 for boundary in BOUNDARIES:
                     for arm in ARMS:
-                        model = provider.model if arm.startswith('clean') else teacher.transport
+                        model = models[arm]
                         point = head if arm.startswith('point') else None
                         row = forecast(case, provider, model, point, native=arm.endswith('native'), boundary=boundary)
                         family = arm.rsplit('_', 1)[0]
@@ -173,7 +180,7 @@ def main(stop_event=None, argv=None):
                     order = [(b, arm) for b in BOUNDARIES for arm in ARMS]
                     if (repeat+index) % 2: order.reverse()
                     for boundary, arm in order:
-                        model = provider.model if arm.startswith('clean') else teacher.transport
+                        model = models[arm]
                         row = forecast(case, provider, model, head if arm.startswith('point') else None,
                                        native=arm.endswith('native'), boundary=boundary)
                         if refs[arm.rsplit('_', 1)[0]] != row['signature']:
