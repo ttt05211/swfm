@@ -110,6 +110,8 @@ def fixed_bytes(value):
     arrays = [evidence.features, evidence.labels, evidence.actor, evidence.classes,
               evidence.world, evidence.presence, graph]
     arrays += [a for pair in getattr(evidence,'causal_strata',()) for a in pair]
+    for layout in getattr(evidence,'layouts',()) or ():
+        arrays += [v for v in layout.values() if isinstance(v,np.ndarray)]
     return sum(a.nbytes for a in arrays if a is not None)
 
 
