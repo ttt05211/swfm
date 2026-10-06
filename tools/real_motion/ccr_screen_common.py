@@ -220,13 +220,41 @@ def _evaluation_geometry(provider, include_old):
 
 
 def prepare_frozen_superbatch(provider, rows, teacher):
-    """Prepare several logical updates while preserving per-window V18 shapes."""
+    """Prepare several logical updates while preserving per-window V18 shapes.
+
+    First use is strictly compared with the original sequential per-window
+    execution. Any mismatch disables stream concurrency and reuses the exact
+    sequential references instead of aborting or relaxing parity.
+    """
     if not rows:
         raise ValueError('empty frozen-motion superbatch')
-    return parallel_frozen_motion(
-        teacher,rows,provider.device,
-        streams=getattr(provider,'ccr_motion_streams',1),
-        render_readback=True)
+    streams=getattr(provider,'ccr_motion_streams',1)
+    actual=parallel_frozen_motion(
+        teacher,rows,provider.device,streams=streams,render_readback=True)
+    if getattr(provider,'ccr_verify_batched_motion_remaining',0)>0:
+        reference=parallel_frozen_motion(
+            teacher,rows,provider.device,streams=1,render_readback=True)
+        mismatch=None
+        for wi,(got,ref) in enumerate(zip(actual,reference)):
+            for key,value in ref.items():
+                if key=="_column_render_numpy":
+                    for name,array in value.items():
+                        if not np.array_equal(got[key][name],array):
+                            mismatch=f"window={wi} renderer={name}"
+                            break
+                elif isinstance(value,torch.Tensor) and not torch.equal(got[key],value):
+                    diff=float((got[key].float()-value.float()).abs().max().detach().cpu())
+                    mismatch=f"window={wi} tensor={key} max_abs={diff}"
+                if mismatch is not None:break
+            if mismatch is not None:break
+        if mismatch is not None:
+            print(f'CCR_MOTION_STREAM_FALLBACK {mismatch}; using exact sequential frozen V18',flush=True)
+            provider.ccr_motion_streams=1
+            actual=reference
+        else:
+            print(f'CCR_MOTION_STREAM_PARITY PASS windows={len(rows)} streams={streams}',flush=True)
+        provider.ccr_verify_batched_motion_remaining=0
+    return actual
 
 
 def _independent_sample_loss(head, sample, plan, output, target, weight, device):
