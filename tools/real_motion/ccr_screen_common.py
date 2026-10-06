@@ -77,14 +77,18 @@ def contract_extra(args, root):
              'tools/real_motion/ccr_screen_common.py', 'tools/real_motion/train_p0_f9_point_ccr.py',
              'tools/real_motion/pilot_p0_f9_canonical_causal_repair.py','real_motion/canonical_repair_execution.py',
              'real_motion/canonical_repair_batch.py','real_motion/native/column_cpu.cpp')
-    return dict(objective='equal_window_role_action_BCE_causal_MC_GT_only',
+    result = dict(objective='equal_window_role_action_BCE_causal_MC_GT_only',
                 thresholds=dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95)),
                 samples_per_role=args.samples_per_role, remove_loss_weight=.25,
                 cpu_execution=getattr(args,'ccr_cpu_execution','numpy'),cpu_workers=getattr(args,'ccr_cpu_workers',4),
                 batched_head=getattr(args,'ccr_batched_head',False),
-                batched_motion=getattr(args,'ccr_batched_motion',False),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
+    # Preserve old checkpoint identity when the new execution-only batching is
+    # disabled. Enabling it creates an explicit new training execution contract.
+    if getattr(args,'ccr_batched_motion',False):
+        result['batched_motion'] = True
+    return result
 
 
 def setup(provider, args):
