@@ -30,6 +30,7 @@ from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics, sha256
 from tools.real_motion.shared_evidence_pilot_common import moving_support_masks, GATES
 from tools.real_motion.height_field_screen_common import sync
 from real_motion.causal_column_completion import actions_from_probabilities, compose_dense
+from tools.real_motion.final_dataflow import batched_frozen_motion
 
 PROTOCOL = 'p0_f9_point_ccr_gt_screen_v1'
 SUPPORT_NOTE = 'canonical historical static/dynamic support; NOT equivalent to old frontier GEN'
@@ -152,12 +153,14 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
     head.train(); teacher.eval(); optimizer.zero_grad(set_to_none=True)
     stages = defaultdict(float); losses = []; sampled = total = 0
     packed=[];outputs=[];sizes=[]
-    for record, raw in rows:
+    tick = time.perf_counter()
+    motion_outputs = batched_frozen_motion(teacher, [record for record, _ in rows], device)
+    stages['batched_frozen_motion'] += time.perf_counter()-tick
+    for (record, raw), output in zip(rows, motion_outputs):
         tick = time.perf_counter()
         with torch.no_grad():
-            output = teacher.motion(record, device)
             prep = provider.prepare_columns(None, record, include_gt=True, raw_window=raw, outputs=output)
-        stages['live_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
+        stages['live_transport_render'] += time.perf_counter()-tick; tick = time.perf_counter()
         evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
         conflicts = provider.ccr_cache.static_conflicts(evidence, prep, provider.pcfg.grid)
         stages['fixed_input_hash_cache_conflicts'] += time.perf_counter()-tick; tick = time.perf_counter()
