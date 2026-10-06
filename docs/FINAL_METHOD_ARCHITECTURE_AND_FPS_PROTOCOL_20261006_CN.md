@@ -653,3 +653,86 @@ elapsed = time.perf_counter() - start
 中文：
 
 > **将因果历史组织为可搬运的 source 状态与可复用的 canonical 几何证据；预测 source-centric 运动以保留已有几何，再从共享因果表示中生成六个未来时刻各自的占据修正。**
+
+
+---
+
+# 14. 实现状态（2026-10-06 晚）
+
+当前实现分支：
+
+- `feature/v22-final-dataflow-fps`
+- Draft PR: #78
+
+已实现：
+
+- `real_motion/final_dataflow.py`
+  - `CausalHistoryState`
+  - `prepare_history()`
+  - `build_causal_motion_prior()`
+  - `forecast_six()`
+  - `batch_frozen_motion()`
+- `tools/real_motion/benchmark_p0_f9_dense_forecast_fps.py`
+  - 唯一正式 `Dense Forecast FPS` 入口；
+  - history-only representation 在 timer 外；
+  - KTA 与 Strong 在 timer 内重新构建；
+  - V18 motion / SE(2) transport / CCR / composition 全部计时；
+  - batch=1；
+  - CUDA 前后同步；
+  - 固定 20-window population；
+  - 默认 3 repeats；
+  - 旧路径与新路径同窗 byte-parity gate。
+- `tools/real_motion/ccr_screen_common.py`
+  - 新增可选 `--ccr-batched-motion`；
+  - 一个 packed window batch 只执行一次 frozen V18 motion forward；
+  - 默认关闭以保持旧 checkpoint / training execution contract；
+  - 只有显式开启时才形成新的训练执行合同。
+- `tests/test_final_dataflow.py`
+  - live KTA 重建；
+  - history state 不携带 KTA / future GT / target；
+  - batched frozen motion 与逐窗 CPU reference 等价。
+
+## 14.1 正式服务器 FPS 命令
+
+沿用之前 Point CCR FPS 实验的真实路径，只把脚本换成：
+
+```bash
+python tools/real_motion/benchmark_p0_f9_dense_forecast_fps.py \
+  --config "$CONFIG" \
+  --checkpoint "$EPOCH19" \
+  --ccr-checkpoint "$POINT_CCR" \
+  --base-checkpoint "$CLEAN_E14" \
+  --dev-cache "$DEV_CACHE" \
+  --population-manifest "$POP_MANIFEST" \
+  --dataroot "$DATAROOT" \
+  --dev-info "$DEV_INFO" \
+  --out-dir "$OUT/dense_forecast_fps_final" \
+  --device cuda \
+  --windows 20 \
+  --stress-windows 2 \
+  --repeats 3 \
+  --cpu-workers 8 \
+  --ccr-cpu-workers 4 \
+  --parity-windows 20
+```
+
+如果配置需要 override，继续使用现有 `add_config_args` 支持的 `--override` 参数。
+
+## 14.2 服务器验收顺序
+
+1. dependency-light CI / py_compile / unit tests；
+2. 1-window GPU smoke：`--windows 1 --stress-windows 0 --parity-windows 1`；
+3. 4-window parity smoke；
+4. 正式 20-window × 3 repeats；
+5. 只有 old/new parity 全过后，才接受新的 Dense Forecast FPS；
+6. FPS 验收不会改变 Point CCR 的精度状态。
+
+## 14.3 训练数据流开关
+
+本轮只把 batched frozen V18 motion 做成**显式 opt-in**：
+
+```text
+--ccr-batched-motion
+```
+
+在真实 GPU 上完成 batched-vs-per-window latent/output parity 前，不把它静默写进旧训练合同，也不要求因本次数据流清理重训现有 checkpoint。
