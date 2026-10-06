@@ -67,6 +67,8 @@ def add_args(parser):
                         help='max execution-only speed: batched frozen motion/head, lazy sampled features, minimal prefetched geometry')
     parser.add_argument('--ccr-prefetch-workers',type=int,default=4,
                         help='CPU window look-ahead workers for --ccr-fast-train (bounded to 4)')
+    parser.add_argument('--ccr-motion-superbatch-updates',type=int,default=1,
+                        help='pack this many logical 4-window updates into one frozen V18 forward; optimizer batch stays unchanged')
     parser.add_argument('--warm-start-head',
                         help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
 
@@ -142,6 +144,8 @@ def contract_extra(args, root):
                 lazy_sampled_features=bool(getattr(args,'ccr_fast_train',False)),
                 prefetch_workers=(min(4,max(1,getattr(args,'ccr_prefetch_workers',4)))
                                   if getattr(args,'ccr_fast_train',False) else None),
+                motion_superbatch_updates=(max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
+                                           if getattr(args,'ccr_fast_train',False) else 1),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
     # Preserve old checkpoint identity when the new execution-only batching is
@@ -232,6 +236,9 @@ def setup(provider, args):
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
     fast=bool(getattr(args,'ccr_fast_train',False))
     prefetch=min(4,max(1,int(getattr(args,'ccr_prefetch_workers',4))))
+    super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
+    if super_updates>8:
+        raise ValueError('CCR frozen-motion superbatch is capped at 8 logical updates (32 windows / <=1024 sources)')
     if fast and prefetch>max(1,args.cpu_workers):
         prefetch=max(1,args.cpu_workers)
     if args.descriptor_cache and args.descriptor_disk_mib:
@@ -245,6 +252,7 @@ def setup(provider, args):
     provider.ccr_batched_head=bool(getattr(args,'ccr_batched_head',False) or fast)
     provider.ccr_batched_motion=bool(getattr(args,'ccr_batched_motion',False) or fast)
     provider.ccr_verify_batched_motion_remaining=1 if fast else 0
+    provider.ccr_motion_superbatch_updates=super_updates if fast else 1
     provider.ccr_verify_batched_head_remaining=1 if fast else 0
     provider.ccr_fast_train=fast
     if fast:
@@ -261,7 +269,9 @@ def setup(provider, args):
     provider.ccr_samples_per_role = args.samples_per_role
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
     if fast:
-        print(f'CCR_FAST_TRAIN batched_motion=1 batched_head=1 lazy_sampled=1 minimal_geometry=1 prefetch_workers={prefetch}',flush=True)
+        print(f'CCR_FAST_TRAIN batched_motion=1 batched_head=1 lazy_sampled=1 minimal_geometry=1 '
+              f'prefetch_workers={prefetch} motion_superbatch_updates={super_updates} '
+              f'(logical optimizer batch remains 4 windows)',flush=True)
 
 
 def close(provider, result):
@@ -303,15 +313,19 @@ def calibrate_train(provider, source, records, teacher, head, *, progress=None, 
     return report
 
 
-def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=None):
+def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=None, frozen_outputs=None):
     if not rows or any(p.requires_grad for p in teacher.parameters()):
         raise RuntimeError('nonempty whole-window batch and frozen epoch19 motion required')
     device = provider.device; sync(device); started = time.perf_counter()
     head.train(); teacher.eval(); optimizer.zero_grad(set_to_none=True)
     stages = defaultdict(float); losses = []; sampled = total = 0
     packed=[];outputs=[];sizes=[];pending=[]
-    batched_motion = None; motion_refs = None
-    if getattr(provider,'ccr_batched_motion',False):
+    batched_motion = frozen_outputs; motion_refs = None
+    if batched_motion is not None:
+        if len(batched_motion)!=len(rows):
+            raise RuntimeError('precomputed frozen V18 output/window count mismatch')
+        stages['precomputed_batched_motion'] += 0.0
+    elif getattr(provider,'ccr_batched_motion',False):
         tick = time.perf_counter()
         with torch.no_grad():
             batched_motion = batch_frozen_motion(teacher, rows, device, render_readback=True)
