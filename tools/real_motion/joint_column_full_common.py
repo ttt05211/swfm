@@ -73,6 +73,40 @@ def build_fixed_geometry(raw, record, pcfg, strong, workers, column_config, *, p
     return evidence
 
 
+def build_ccr_training_geometry(raw, record, pcfg, strong, workers, *, profile=None):
+    """Minimal exact fixed geometry required by Point CCR training.
+
+    Unlike legacy Local-column preparation, Point CCR never reads future static
+    memory, ego footprints or old frontier candidate geometry.  Keep only the
+    exact Strong transport state, backgrounds, causal registrations and audit.
+    This removes a large deterministic CPU branch without changing the CCR
+    support, labels, loss, motion, renderer or compositor.
+    """
+    started=time.perf_counter();grid=pcfg.grid
+    state=runtime._prepare_record(record,None,pcfg,strong,'cpu',raw_window=raw)
+    strong_at=time.perf_counter()
+    state['column_backgrounds']=[compose_component_replacements_fast_exact(
+        a,comps,[],dynamic_class_ids=DYN,free_label=FREE,grid=grid,
+        precomputed_clear_flat_indices=clear)
+        for a,comps,clear in zip(state['anchors'],state['baseline_by_hi'],state['baseline_clear_flat_by_hi'])]
+    background_at=time.perf_counter()
+    registrations,_,_,audit=causal_source_history(
+        raw['history_occ'],raw['history_poses'],state,grid,strong,workers,
+        previous_instances=state.get('previous'))
+    history_at=time.perf_counter()
+    result=dict(
+        current=state['current'],registrations=registrations,audit=audit,
+        footprints=None,memory=None,
+        prepared_state={k:v for k,v in state.items() if k not in ('rec','window','gpu')})
+    if profile is not None:
+        profile.update(strong_state=strong_at-started,
+                       static_backgrounds=background_at-strong_at,
+                       history_registration=history_at-background_at,
+                       skipped_old_static_memory_and_frontier=True,
+                       total=history_at-started)
+    return result
+
+
 class FullJointColumnProvider(JointColumnProvider):
     def can_prepare_cpu(self, raw):
         causal = (raw or {}).get('_column_causal_preparation')
