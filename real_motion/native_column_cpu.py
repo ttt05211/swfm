@@ -17,7 +17,7 @@ from threading import Lock
 
 import numpy as np
 
-ABI = 4
+ABI = 5
 SOURCE = Path(__file__).resolve().parent/'native'/'column_cpu.cpp'
 _loaded = None
 _load_lock = Lock()
@@ -86,25 +86,42 @@ def prepare_native(build_dir=None):
         manifest_path = directory/'build.json'
         if not target.exists():
             if manifest_path.exists(): raise RuntimeError('incomplete native build cache; use a NEW build directory')
-            with tempfile.TemporaryDirectory(prefix='build-', dir=directory) as temp:
+            # MSVC also creates internal temporary files relative to cwd. Keep
+            # its scratch path short even when the requested artifact cache is
+            # deeply nested (e.g. pytest). Publish on the repository's volume.
+            scratch = SOURCE.parents[2]/'outputs' if msvc else directory
+            scratch.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='native-build-', dir=scratch) as temp:
                 temp = Path(temp); output = temp/target.name
                 env = os.environ.copy()
                 if msvc:
-                    # Pure C ABI integer code, no CRT/DllMain/SDK dependency.
+                    # No CRT/DllMain/SDK dependency. Relative outputs avoid
+                    # MSVC's legacy MAX_PATH limit in deep pytest/cache roots.
                     env['PATH'] = str(Path(compiler).parent)+os.pathsep+env.get('PATH', '')
-                    command = [compiler, *flags, str(SOURCE), '/Fo:'+str(temp/'column_cpu.obj'), '/Fe:'+str(output),
-                        '/link', '/NOENTRY', '/NODEFAULTLIB', '/IMPLIB:'+str(temp/'column_cpu.lib')]
+                    command = [compiler, *flags, str(SOURCE), '/Fo:column_cpu.obj', '/Fe:column_cpu.dll',
+                        '/link', '/NOENTRY', '/NODEFAULTLIB', '/IMPLIB:column_cpu.lib']
                 else: command = [compiler, *flags, str(SOURCE), '-o', str(output)]
-                result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                result = subprocess.run(command, env=env, cwd=temp if msvc else None,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding='mbcs' if os.name == 'nt' else 'utf-8', errors='replace', timeout=120)
                 if result.returncode or not output.is_file():
                     raise RuntimeError('native CPU compilation failed; NumPy backend remains available:\n'+result.stdout[-12000:])
                 manifest = dict(**contract, fingerprint=key, library_sha256=_sha(output))
                 # Publish before loading: Windows cannot rename an in-use DLL.
                 # Manifest is published only after the ABI has been checked.
-                os.replace(output, target)
+                if output.drive.lower() != target.drive.lower():
+                    # Short MSVC scratch and caller cache may be on different
+                    # Windows volumes. Copy to private destination scratch,
+                    # then publish by same-volume atomic rename.
+                    with tempfile.TemporaryDirectory(prefix='publish-', dir=directory) as publication:
+                        draft_library = Path(publication)/target.name
+                        shutil.copyfile(output, draft_library)
+                        os.replace(draft_library, target)
+                else:
+                    os.replace(output, target)
                 loaded = NativeColumns(target, manifest)
-                draft = temp/'build.json'; draft.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+                draft = directory/(temp.name+'.json')
+                draft.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
                 os.replace(draft, manifest_path)
         if not manifest_path.is_file(): raise RuntimeError('native build manifest missing; use a NEW build directory')
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
@@ -154,6 +171,10 @@ class NativeColumns:
         self.support_many_fn = self._bind('swfm_support_many', [P]*2+[I]*5+[P,I]+[P]*3, count=True)
         self.gather_many_fn = self._bind('swfm_gather_many', [P]+[I]*3+[P]*2+[I]*3+[P]*9)
         self.v18_majority_fn = self._bind('swfm_v18_majority', [P]*2+[I]*3+[P]*2)
+        self.ccr_lattice_fn = self._bind('swfm_ccr_lattice', [P]*2+[I]*4+[J]+[P]*3)
+        self.ccr_features_fn = self._bind('swfm_ccr_features', [P]*7+[I]*5+[J,P])
+        self.ccr_history_fn = self._bind('swfm_ccr_history', [P]*3+[I]*5+[P]*3)
+        self.ccr_plan_fn = self._bind('swfm_ccr_plan', [P]*6+[I]*5+[P]*6)
         self.lock = Lock(); self.calls = {}
 
     def _bind(self, name, args, count=False):
@@ -181,6 +202,50 @@ class NativeColumns:
                    _pointer(sem), _pointer(unknown), *shape,
                    _pointer(output), _pointer(ambiguous))
         return output, ambiguous
+
+    def ccr_lattice(self, packed, times, shape, halo):
+        shape = self._grid(shape); n = len(packed); volume = int(np.prod(shape))
+        packed = _array(packed, np.int64, (n,)); times = np.asarray(times, np.uint8)
+        times = _array(times, np.uint8, (n,))
+        bits = np.empty(volume, np.uint8); grown = np.empty(volume, np.uint8); last = np.empty(volume, np.int64)
+        self._call('ccr_lattice', self.ccr_lattice_fn, *map(_pointer,(packed,times)), n,*shape,int(halo),
+                   *map(_pointer,(bits,grown,last)))
+        keys = np.flatnonzero(grown)
+        return bits, keys, last[keys]
+
+    def ccr_history(self, indices, occ, vis, frame, labels, observed, inside):
+        shape = self._grid(np.asarray(occ).shape); n = len(indices)
+        if any(not np.asarray(a).flags.c_contiguous or not np.asarray(a).flags.aligned
+               or not np.asarray(a).flags.writeable for a in (labels,observed,inside)):
+            raise ValueError('CCR output arrays must be writable aligned C-contiguous')
+        arrays = (_array(indices,np.int64,(n,3)), _array(occ,np.uint8,shape), _bits(vis,shape),
+                  _array(labels,np.uint8,(n,4)), _bits(observed,(n,4)), _bits(inside,(n,4)))
+        self._call('ccr_history', self.ccr_history_fn, *map(_pointer,arrays[:3]), n,*shape,int(frame),
+                   *map(_pointer,arrays[3:]))
+
+    def ccr_features(self, keys, flags, bits, shape, relative, presence, observed, inside):
+        shape=self._grid(shape); n=len(keys); dense=bits is not None
+        arrays=(_array(keys,np.int64,(n,)), _array(flags,np.uint8,(n,)),
+                _array(bits,np.uint8,(int(np.prod(shape)),)) if dense else np.empty(0,np.uint8),
+                np.require(relative,dtype=np.float32,requirements=['C','A']),
+                _bits(presence,(n,4)),_bits(observed,(n,4)),_bits(inside,(n,4)))
+        if arrays[3].shape!=(n,3): raise ValueError('CCR relative coordinates must be N,3')
+        output=np.empty((n,27),np.float32)
+        self._call('ccr_features',self.ccr_features_fn,*map(_pointer,arrays),n,n,*shape,int(dense),_pointer(output))
+        return output
+
+    def ccr_plan(self, indices, actors, classes, baseline, owners, restored, horizon, plan, context):
+        shape=self._grid(np.asarray(baseline).shape); n=len(actors)
+        if any(not np.asarray(a).flags.c_contiguous or not np.asarray(a).flags.aligned
+               or not np.asarray(a).flags.writeable for a in (plan.flat,plan.base,plan.fallback,plan.legal,context)):
+            raise ValueError('CCR output arrays must be writable aligned C-contiguous')
+        arrays=(_array(indices,np.int64,(n,3)),_array(actors,np.int32,(n,)),_array(classes,np.uint8,(n,)),
+                _array(baseline,np.uint8,shape),_array(owners,np.int32,shape),_array(restored,np.uint8,shape))
+        outputs=(_array(plan.flat,np.int64,(n,6)),_array(plan.base,np.uint8,(n,6)),
+                 _array(plan.fallback,np.uint8,(n,6)),_bits(plan.legal,(n,6,2)),_array(context,np.float32,(n,6,8)))
+        scratch=np.empty(int(np.prod(shape)),np.uint8)
+        self._call('ccr_plan',self.ccr_plan_fn,*map(_pointer,arrays),n,*shape,int(horizon),
+                   *map(_pointer,outputs),_pointer(scratch))
 
     @staticmethod
     def _grid(value):

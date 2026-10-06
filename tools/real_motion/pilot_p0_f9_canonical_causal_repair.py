@@ -87,10 +87,10 @@ def loss_for(head,evidence,plan,output,target,valid,rng,device,*,per_group=768,r
     return loss,len(ids)
 
 
-def loss_for_causal(head,evidence,output,prepared,grid,gt,rng,device,conflicts,*,per_role=1024,remove_weight=.25):
+def loss_for_causal(head,evidence,output,prepared,grid,gt,rng,device,conflicts,*,per_role=1024,remove_weight=.25,kernels=None):
     from real_motion.canonical_repair_context import sample_causal_points,map_sampled_canonical
     ids,importance=sample_causal_points(evidence,rng,per_role=per_role)
-    sampled,plan=map_sampled_canonical(evidence,ids,prepared,grid,conflicts)
+    sampled,plan=map_sampled_canonical(evidence,ids,prepared,grid,conflicts,kernels=kernels)
     target,valid=repair_targets(sampled,plan,gt)
     weight=importance[:,None,None]*valid
     actor=tensor(evidence.actor[ids],device)
@@ -191,7 +191,7 @@ def fit(head,cases,device,passes,progress,remove_weight,*,causal_sampling=False)
         timing_boundary='mini-fit sampled head backward/AdamW; cached CAUSAL evidence/poses, NOT complete online training')
 
 
-def timed_full(case,teacher,provider,head,*,old=False,profile_stages=False,verify_outputs=False):
+def timed_full(case,teacher,provider,head,*,old=False,profile_stages=False,verify_outputs=False,execution=None):
     device=provider.device;stages={}
     def call(name,fn):
         if profile_stages:synchronize(device)
@@ -215,8 +215,10 @@ def timed_full(case,teacher,provider,head,*,old=False,profile_stages=False,verif
                 return dense
             dense=call('old_all_candidates_reader_composition',predict)
         else:
-            evidence=call('canonical_evidence_neighbours',lambda:build_canonical_evidence(prep,provider.pcfg.grid))
-            plan=call('all_six_geometry_legality',lambda:map_canonical_evidence(evidence,prep,provider.pcfg.grid))
+            evidence=call('canonical_evidence_neighbours',lambda:build_canonical_evidence(prep,provider.pcfg.grid)
+                          if execution is None else execution.build(prep,provider.pcfg.grid))
+            plan=call('all_six_geometry_legality',lambda:map_canonical_evidence(evidence,prep,provider.pcfg.grid)
+                      if execution is None else execution.map(evidence,prep,provider.pcfg.grid))
             p=call('once_encode_six_readout',lambda:probabilities(head,evidence,plan,output,device))
             dense=call('six_dense_composition',lambda:compose_canonical(prep.baseline,evidence,plan,p[...,0],p[...,1]))
         synchronize(device);seconds=time.perf_counter()-tick

@@ -23,12 +23,13 @@ from tools.real_motion.height_field_screen_recovery import validate_cursor
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import align_records
 from tools.real_motion.pilot_p0_f9_canonical_causal_repair import probabilities
 
-PROTOCOL = 'p0_f9_point_ccr_v18_paired_fps_v1'
+PROTOCOL = 'p0_f9_point_ccr_v18_paired_fps_v2_ccr_cpu'
 POINT_PROTOCOL = 'p0_f9_point_ccr_gt_screen_v1'
 BOUNDARIES = ('fresh_prior', 'cached_prior')
 ARMS = ('clean_e14_6h_original', 'clean_e14_6h_native',
         'epoch19_v18_4h_original', 'epoch19_v18_4h_native',
-        'point_ccr_4h_original', 'point_ccr_4h_native')
+        'point_ccr_4h_original', 'point_ccr_4h_native',
+        'point_ccr_4h_fused', 'point_ccr_4h_parallel')
 
 
 def resolve_arm_models(provider, teacher):
@@ -160,7 +161,7 @@ def result_signature(dense, probability, output):
 
 
 @torch.no_grad()
-def forecast(case, provider, model, head, *, native, boundary):
+def forecast(case, provider, model, head, *, native, boundary, kernels=None, executor=None):
     if boundary not in BOUNDARIES or case['raw'].get('future_gt_occ') is not None:
         raise RuntimeError('unknown FPS boundary or future occupancy in causal forecast')
     if model.training or any(p.requires_grad for p in model.parameters()):
@@ -189,8 +190,8 @@ def forecast(case, provider, model, head, *, native, boundary):
             **case['raw']['_column_causal_preparation'], 'prepared_state': state}}
         prep = call('live_render_source_history', lambda: provider.prepare_columns(
             None,case['record'],include_gt=False,raw_window=raw,outputs=output))
-        evidence = call('fresh_full_canonical_inputs', lambda: build_canonical_evidence(prep,provider.pcfg.grid))
-        plan = call('six_live_projection_legality', lambda: map_canonical_evidence(evidence,prep,provider.pcfg.grid))
+        evidence = call('fresh_full_canonical_inputs', lambda: build_canonical_evidence(prep,provider.pcfg.grid,kernels=kernels,executor=executor))
+        plan = call('six_live_projection_legality', lambda: map_canonical_evidence(evidence,prep,provider.pcfg.grid,kernels=kernels,executor=executor))
         probability = call('full_point_encoding_six_readouts', lambda: probabilities(head,evidence,plan,output,device))
         dense = call('six_dense_composition', lambda: compose_canonical(
             prep.baseline,evidence,plan,probability[...,0],probability[...,1],thresholds=(.5,.95)))

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from concurrent.futures import ThreadPoolExecutor
 
 from real_motion.canonical_causal_repair import CanonicalRepairHead
 from tools.real_motion.point_ccr_v18_fps_common import (
@@ -123,7 +124,7 @@ def test_no_future_gt_allowed_even_before_timer():
 def test_real_cuda_replay_all_six_outputs_and_probabilities_exact(tmp_path, monkeypatch):
     if not torch.cuda.is_available(): pytest.skip('actual CUDA required')
     from real_motion.local_replay_bundle import ReplayBundle, file_digest
-    from real_motion.native_column_cpu import prepare_native
+    from real_motion.native_column_cpu import prepare_native,get_prepared_native
     from real_motion.runtime_config import make_prepare_config
     from tools.real_motion.pilot_p0_f9_canonical_causal_repair import load_exported_config
     from tools.real_motion.run_p0_f9_shared_evidence_pilot import PilotProvider
@@ -133,7 +134,7 @@ def test_real_cuda_replay_all_six_outputs_and_probabilities_exact(tmp_path, monk
     from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
     torch.set_num_threads(1); device = torch.device('cuda')
     monkeypatch.setenv('SWFM_COLUMN_CPU_BACKEND', 'numpy')
-    bundle = ReplayBundle(os.environ['SWFM_CCR_REPLAY'])
+    bundle = ReplayBundle(os.environ['SWFM_CCR_REPLAY']);pool=ThreadPoolExecutor(max_workers=4)
     try:
         paths = {}
         for member in ('runtime.yaml', 'checkpoints/epoch_0019.pt', 'checkpoints/clean_e14.pt'):
@@ -177,7 +178,9 @@ def test_real_cuda_replay_all_six_outputs_and_probabilities_exact(tmp_path, monk
                 for arm in ARMS:
                     family = arm.rsplit('_', 1)[0]
                     result = forecast(case, provider, models[arm], head if arm.startswith('point') else None,
-                                      native=arm.endswith('native'), boundary=boundary)
+                                      native=arm.endswith('native'), boundary=boundary,
+                                      kernels=get_prepared_native() if arm in ('point_ccr_4h_fused','point_ccr_4h_parallel') else None,
+                                      executor=pool if arm=='point_ccr_4h_parallel' else None)
                     if family in expected: assert result['signature'] == expected[family]
                     else: expected[family] = result['signature']
                     assert result['six_complete_dense'] and result['seconds'] > 0
@@ -186,4 +189,4 @@ def test_real_cuda_replay_all_six_outputs_and_probabilities_exact(tmp_path, monk
             assert all(torch.equal(before[k], v) for k, v in teacher.transport.state_dict().items())
         assert len(seen) == 2
         assert file_digest(point_path) == digest
-    finally: bundle.close()
+    finally: bundle.close();pool.shutdown(wait=True)

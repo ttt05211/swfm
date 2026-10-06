@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Same-window, complete-six-frame FPS; no training, GT scoring or promotion."""
+"""Same-window six-frame FPS and optional disposable joint-training throughput.
+
+No scientific updates saved, GT quality scoring or deployment promotion.
+"""
 import sys
 from pathlib import Path
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import json
 import os
@@ -33,12 +37,13 @@ from tools.real_motion import benchmark_p0_f9_v18_runtime as runtime
 
 
 def brief(result):
-    lines = ['===== SAME-WINDOW V18 + POINT CCR / SIX-FRAME FPS ONLY =====',
+    lines = ['===== SAME-WINDOW V18 + POINT CCR / FPS + OPTIONAL JOINT SPEED =====',
              'status='+result['status'], 'protocol='+PROTOCOL,
              'Clean-E14=legacy SIX histories; epoch19 V18/point CCR=FOUR histories.',
-             'FPS=6/mean SIX-frame latency, not mean of per-window FPS. No GT/metrics/training.',
+             'FPS=6/mean SIX-frame latency, not mean of per-window FPS. FPS excludes GT/metrics; no saved scientific updates.',
              'Native arm: exact Strong integer vote + redundant motion projection/LayerNorm reuse; NO motion CUDA Graph.',
              'Same weights, full support, fixed CCR ADD=0.5 / REMOVE=0.95; fresh point features in EVERY arm.']
+    lines+=['CCR fused/parallel arms isolate exact CCR CPU kernels; use ORIGINAL Strong/motion. No architecture/weight changes.']
     for boundary, rows in result.get('aggregate', {}).items():
         lines.append('\n===== '+boundary+' =====')
         for arm in ARMS:
@@ -50,6 +55,9 @@ def brief(result):
             lines.append(f'{family} paired_speedup={speedup:.3f}')
         stages = rows['point_ccr_4h_native']['stage_mean_ms']
         lines.append('point_ccr_native host_stage_ms_NOT_GPU_utilization='+json.dumps(stages, sort_keys=True))
+        for arm in ('point_ccr_4h_fused','point_ccr_4h_parallel'):
+            lines.append(arm+' speedup_vs_original='+str(rows['point_ccr_4h_original']['mean_six_ms']/rows[arm]['mean_six_ms']))
+            lines.append(arm+' host_stage_ms='+json.dumps(rows[arm]['stage_mean_ms'],sort_keys=True))
     if 'population' in result:
         lines.append('population='+json.dumps(result['population'], ensure_ascii=False))
     if 'exactness' in result:
@@ -59,6 +67,13 @@ def brief(result):
     prepare = result.get('preparation_seconds_excluded', [])
     if prepare:
         lines.append(f'raw_fixed_preparation_seconds/window={sum(prepare)/len(prepare):.6f} (separate, excluded from FPS)')
+    for key,stat in result.get('joint_training',{}).items():
+        lines.append(f'JOINT_TRAIN {key}: seconds/window={stat["seconds_per_window"]:.6f} windows={stat["windows"]} peak={stat["peak_allocated_mib"]:.1f}MiB')
+        lines.append('  stages_seconds/window='+json.dumps(stat['stage_seconds_per_window'],sort_keys=True))
+    if result.get('joint_training'):
+        lines+=['Joint-speed probe uses eight separate TRAIN windows, actual motion+repair backward/AdamW on disposable clones.',
+                'Cold/warm immutable input construction reported separately; original head/optimizer/RNG/checkpoints never restored or edited.',
+                'Batched point MLP preserves the per-window objective, but BF16/GEMM rounding and CUDA nondeterminism need not produce bit-identical updates.']
     lines += ['fresh_prior: resident source tensors + registered history -> fresh ALL-six Strong/KTA + live model + SIX dense outputs.',
               'cached_prior: SAME boundary except immutable Strong/KTA is precomputed; CCR candidates/features/readouts remain fresh.',
               'Both EXCLUDE disk I/O, initial source tensor extraction/history registration, compilation/warmup, GT, metrics and correctness hashes.',
@@ -80,10 +95,16 @@ def main(stop_event=None, argv=None):
     p.add_argument('--stress-windows', type=int, default=2)
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--cpu-workers', type=int, default=8)
+    p.add_argument('--ccr-cpu-workers',type=int,default=4)
+    p.add_argument('--joint-speed',action='store_true',help='disposable actual joint backward on eight TRAIN windows, no saved updates')
+    p.add_argument('--train-cache');p.add_argument('--train-info')
+    p.add_argument('--train-repeats',type=int,default=8)
     a = p.parse_args(argv); out = Path(a.out_dir)
+    if a.joint_speed and (not a.train_cache or not a.train_info or a.train_repeats<1):
+        p.error('--joint-speed requires --train-cache / --train-info and positive --train-repeats')
     if out.exists(): p.error('fresh output required; no experiment overwrite')
     for key in ('config', 'checkpoint', 'ccr_checkpoint', 'base_checkpoint', 'dev_cache',
-                'population_manifest', 'dev_info'):
+                'population_manifest', 'dev_info',*(('train_cache','train_info') if a.joint_speed else ())):
         if not Path(getattr(a, key) or '').is_file(): p.error('missing '+key)
     if (not Path(a.dataroot).is_dir() or not 1 <= a.windows <= 64 or a.repeats < 2
             or not 0 <= a.stress_windows < a.windows or not 1 <= a.cpu_workers <= 16):
@@ -92,15 +113,18 @@ def main(stop_event=None, argv=None):
     out.mkdir(parents=True); started = time.perf_counter()
     result = dict(status='running', protocol=PROTOCOL, actual_cuda=True, trials=[],
                   GPU=torch.cuda.get_device_name(device), torch_version=str(torch.__version__),
-                  cpu_workers=a.cpu_workers, repeats=a.repeats, no_training=True)
+                  cpu_workers=a.cpu_workers, repeats=a.repeats, no_training=not a.joint_speed,
+                  no_saved_scientific_updates=True)
     def persist():
         write_json(out/'speed.json', result)
         (out/'summary.txt').write_text(brief(result), encoding='utf-8')
     persist()
     original_backend = os.environ.get('SWFM_COLUMN_CPU_BACKEND')
+    if not 1<=a.ccr_cpu_workers<=8:p.error('CCR workers must be 1..8')
+    execution_pool=ThreadPoolExecutor(max_workers=a.ccr_cpu_workers)
     try:
-        # Only the native arm's Strong voter changes. All CCR domain/feature
-        # code follows the same NumPy path in BOTH arms, isolating V18 changes.
+        # Existing original/native isolate V18. New fused/parallel isolate CCR
+        # kernels with ORIGINAL Strong/motion; no retrospective relabelling.
         os.environ['SWFM_COLUMN_CPU_BACKEND'] = 'numpy'
         tick = time.perf_counter(); result['native_preflight'] = prepare_native(out/'native_build')
         result['compile_seconds_excluded'] = time.perf_counter()-tick
@@ -170,7 +194,9 @@ def main(stop_event=None, argv=None):
                     for arm in ARMS:
                         model = models[arm]
                         point = head if arm.startswith('point') else None
-                        row = forecast(case, provider, model, point, native=arm.endswith('native'), boundary=boundary)
+                        row = forecast(case,provider,model,point,native=arm.endswith('native'),boundary=boundary,
+                                       kernels=get_prepared_native() if arm in ('point_ccr_4h_fused','point_ccr_4h_parallel') else None,
+                                       executor=execution_pool if arm=='point_ccr_4h_parallel' else None)
                         family = arm.rsplit('_', 1)[0]
                         if family in refs and refs[family] != row['signature']:
                             raise RuntimeError('ALL-six motion/probability/dense byte mismatch: '+arm+'/'+boundary)
@@ -182,7 +208,9 @@ def main(stop_event=None, argv=None):
                     for boundary, arm in order:
                         model = models[arm]
                         row = forecast(case, provider, model, head if arm.startswith('point') else None,
-                                       native=arm.endswith('native'), boundary=boundary)
+                                       native=arm.endswith('native'), boundary=boundary,
+                                       kernels=get_prepared_native() if arm in ('point_ccr_4h_fused','point_ccr_4h_parallel') else None,
+                                       executor=execution_pool if arm=='point_ccr_4h_parallel' else None)
                         if refs[arm.rsplit('_', 1)[0]] != row['signature']:
                             raise RuntimeError('repeated forecast byte mismatch: '+arm+'/'+boundary)
                         row.update(boundary=boundary, arm=arm, repeat=repeat+1,
@@ -197,6 +225,38 @@ def main(stop_event=None, argv=None):
             if sha256(path) != digests[name]:
                 raise RuntimeError('source checkpoint replaced during read-only benchmark: '+name)
         complete = exact_windows == len(chosen)
+        if complete and a.joint_speed:
+            from tools.real_motion.benchmark_p0_f9_ccr_execution import train_trial
+            if sha256(a.train_cache)!=ck['cache_fingerprints']['train'] or sha256(a.train_info)!=ck['info_fingerprints']['train']:
+                raise RuntimeError('TRAIN checkpoint/data provenance mismatch')
+            _,train_records=load_cache(a.train_cache)
+            train_keys=record_keys(train_records)
+            train_records,train_meta=select_population(train_records,train_keys,windows=8,stress_windows=2)
+            train_source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.train_info,verbose=False),64)
+            train_cases=[];prepare_tick=time.perf_counter()
+            for rec,meta in zip(train_records,train_meta):
+                if stop_event is not None and stop_event.is_set():raise InterruptedError('stopped before disposable TRAIN speed probe')
+                raw=provider.load_raw_columns(train_source,rec,include_gt=True)
+                gt=raw['future_gt_occ'];causal={**raw,'future_gt_occ':None}
+                with torch.no_grad():
+                    output=teacher.motion(rec,device)
+                    prep=provider.prepare_columns(None,rec,include_gt=False,raw_window=causal,outputs=output)
+                train_cases.append(dict(record=rec,causal=causal,prep=prep,gt=gt,meta=meta))
+            result['TRAIN_probe_preparation_seconds_excluded']=time.perf_counter()-prepare_tick
+            result['joint_training']={}
+            for warm in (False,True):
+                for mode in ('reference','native_parallel','native_parallel_batched'):
+                    if stop_event is not None and stop_event.is_set():raise InterruptedError('stopped between disposable TRAIN probes')
+                    key=mode+('_warm' if warm else '_cold')
+                    stat=train_trial(train_cases,teacher,provider,head,get_prepared_native() if mode!='reference' else None,
+                                     warm=warm,repeats=a.train_repeats,executor=execution_pool if mode!='reference' else None,
+                                     batched=mode.endswith('batched'))
+                    result['joint_training'][key]=stat
+                    print(f'CCR_TRAIN_SPEED {key} seconds/window={stat["seconds_per_window"]:.6f}',flush=True);persist()
+            result['TRAIN_probe_population']=train_meta
+            del train_cases,train_source,train_records
+            for name,path in sources.items():
+                if sha256(path)!=digests[name]:raise RuntimeError('source checkpoint changed during TRAIN diagnostic: '+name)
         result.update(status='complete' if complete else 'stopped',
             aggregate=aggregate(result['trials']) if result['trials'] else {},
             exactness=dict(windows=exact_windows, all_six_strong_sources_and_clear_exact=True,
@@ -209,6 +269,7 @@ def main(stop_event=None, argv=None):
         result.update(status='failed', error=str(exc), elapsed_seconds=time.perf_counter()-started)
         persist(); raise
     finally:
+        execution_pool.shutdown(wait=True)
         if original_backend is None: os.environ.pop('SWFM_COLUMN_CPU_BACKEND', None)
         else: os.environ['SWFM_COLUMN_CPU_BACKEND'] = original_backend
 

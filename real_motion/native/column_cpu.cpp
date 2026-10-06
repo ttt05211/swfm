@@ -1,4 +1,5 @@
-// Header-free C ABI: no Python/Torch/CUDA dependency, no floating-point math.
+// Header-free C ABI: no Python/Torch/CUDA dependency or floating coordinate
+// geometry. CCR copies/assembles finite FP32 descriptors in reference order.
 // Buffers belong to the caller; no global scratch, internal threads or RNG.
 #ifdef _WIN32
 #define API extern "C" __declspec(dllexport)
@@ -13,7 +14,7 @@ using u32 = unsigned int;
 static_assert(sizeof(i64) == 8 && sizeof(i32) == 4 && sizeof(u8) == 1, "unsupported ABI");
 
 #ifdef _WIN32
-// This integer-only library needs neither the MSVC CRT nor a Windows SDK.
+// This header-free library needs neither the MSVC CRT nor a Windows SDK.
 // Volatile loops prevent the compiler from turning these implementations into
 // recursive calls to the very intrinsics they implement. Linux uses libc.
 extern "C" void* memset(void*, int, decltype(sizeof(0)));
@@ -32,7 +33,117 @@ extern "C" void* memcpy(void* dst, const void* src, decltype(sizeof(0)) n) {
 }
 #endif
 
-API int swfm_column_cpu_abi() noexcept { return 4; }
+API int swfm_column_cpu_abi() noexcept { return 5; }
+
+#ifdef _WIN32
+extern "C" { int _fltused = 0; }
+#endif
+
+// Canonical CCR: preserve point order/latest observation, full face halo and
+// exact NumPy float64 transforms. These loops only consume integer cells.
+API int swfm_ccr_lattice(const i64* packed, const u8* time, i64 n,
+    i64 sx, i64 sy, i64 sz, int halo, u8* bits, u8* grown, i64* last) noexcept {
+    constexpr i64 limit = 0x7fffffffffffffffLL;
+    if (n < 0 || sx < 1 || sy < 1 || sz < 1 || sx > limit/sy || sx*sy > limit/sz) return -1;
+    const i64 volume = sx*sy*sz;
+    for (i64 k=0; k<volume; ++k) { bits[k]=grown[k]=0; last[k]=-1; }
+    for (i64 i=0; i<n; ++i) {
+        const i64 k=packed[i];
+        if (k<0 || k>=volume || time[i]>3) return -2;
+        bits[k] |= static_cast<u8>(1<<time[i]); grown[k]=1; last[k]=i;
+        if (!halo) continue;
+        const i64 x=k/(sy*sz), y=k/sz%sy, z=k%sz;
+        if (x+1<sx) grown[k+sy*sz]=1;
+        if (x>0) grown[k-sy*sz]=1;
+        if (y+1<sy) grown[k+sz]=1;
+        if (y>0) grown[k-sz]=1;
+        if (z+1<sz) grown[k+1]=1;
+        if (z>0) grown[k-1]=1;
+    }
+    return 0;
+}
+
+static i64 ccr_lower(const i64* keys, i64 n, i64 key) noexcept {
+    i64 lo=0, hi=n;
+    while (lo<hi) { const i64 m=lo+(hi-lo)/2; if (keys[m]<key) lo=m+1; else hi=m; }
+    return lo;
+}
+
+// relative xyz retains Python/NumPy rounding; only finite FP32 descriptors
+// are assembled here. Neighbour density adds 1/6 in the SAME face order.
+API int swfm_ccr_features(const i64* keys, const u8* flags, const u8* bits,
+    const float* relative, const u8* presence, const u8* observed, const u8* inside,
+    i64 n, i64 key_count, i64 sx, i64 sy, i64 sz, int dense, float* output) noexcept {
+    if (n<0 || key_count<n || sx<1 || sy<1 || sz<1) return -1;
+    const i64 volume=sx*sy*sz;
+    const i64 offsets[6]={sy*sz,-sy*sz,sz,-sz,1,-1};
+    for (i64 i=0; i<n; ++i) {
+        const i64 k=keys[i]; if (k<0 || k>=volume) return -2;
+        const i64 x=k/(sy*sz), y=k/sz%sy, z=k%sz;
+        const bool ok[6]={x+1<sx,x>0,y+1<sy,y>0,z+1<sz,z>0};
+        float* f=output+i*27;
+        for (int j=0; j<3; ++j) f[j]=relative[i*3+j];
+        bool real=false; int age=3;
+        for (int t=0; t<4; ++t) {
+            f[3+t]=presence[i*4+t]; f[7+t]=observed[i*4+t]; f[11+t]=inside[i*4+t]; f[22+t]=0;
+            if (presence[i*4+t]) { real=true; age=3-t; }
+        }
+        for (int d=0; d<6; ++d) {
+            u8 b=0;
+            if (ok[d]) {
+                const i64 neighbor=k+offsets[d];
+                if (dense) b=bits[neighbor];
+                else { const i64 p=ccr_lower(keys,key_count,neighbor); if (p<key_count && keys[p]==neighbor) b=flags[p]; }
+            }
+            f[15+d]=b!=0;
+            for (int t=0; t<4; ++t) f[22+t]+=static_cast<float>((b>>t)&1)/6.0f;
+        }
+        f[21]=real ? static_cast<float>(age)/3.0f : 1.0f; f[26]=presence[i*4+3];
+    }
+    return 0;
+}
+
+API int swfm_ccr_history(const i64* ijk, const u8* occ, const u8* vis,
+    i64 n, i64 sx, i64 sy, i64 sz, i64 frame, u8* labels, u8* observed, u8* inside) noexcept {
+    if (n<0 || sx<1 || sy<1 || sz<1 || frame<0 || frame>=4) return -1;
+    for (i64 i=0; i<n; ++i) {
+        const i64 x=ijk[3*i], y=ijk[3*i+1], z=ijk[3*i+2], row=i*4+frame;
+        const bool valid=x>=0 && x<sx && y>=0 && y<sy && z>=0 && z<sz;
+        inside[row]=valid; observed[row]=0; labels[row]=18;
+        if (valid) { const i64 k=(x*sy+y)*sz+z; observed[row]=vis[k]; labels[row]=occ[k]; }
+    }
+    return 0;
+}
+
+// One pass per horizon for integer raster ownership/actions. A bounded grid
+// bitmask replaces sort/intersect/isin for the two static semantic classes.
+API int swfm_ccr_plan(const i64* ijk, const i32* actors, const u8* classes,
+    const u8* baseline, const i32* owners, const u8* restored,
+    i64 n, i64 sx, i64 sy, i64 sz, i64 horizon,
+    i64* flat, u8* base, u8* fallback, u8* legal, float* context, u8* conflict) noexcept {
+    if (n<0 || sx<1 || sy<1 || sz<1 || horizon<0 || horizon>=6) return -1;
+    const i64 volume=sx*sy*sz;
+    for (i64 k=0; k<volume; ++k) conflict[k]=0;
+    for (i64 i=0; i<n; ++i) {
+        const i64 x=ijk[3*i], y=ijk[3*i+1], z=ijk[3*i+2], row=i*6+horizon;
+        flat[row]=-1; base[row]=fallback[row]=17; legal[row*2]=legal[row*2+1]=0;
+        if (x<0 || x>=sx || y<0 || y>=sy || z<0 || z>=sz) continue;
+        const i64 k=(x*sy+y)*sz+z; flat[row]=k;
+        const int a=actors[i]; const u8 cls=classes[i], b=baseline[k];
+        const int owner=owners[k]; const bool dynamic=a>=0;
+        const bool own=dynamic ? owner==a : owner<0 && b==cls;
+        const u8 r=dynamic ? restored[k] : 17;
+        base[row]=b; fallback[row]=own?r:b;
+        legal[row*2]=b==17; legal[row*2+1]=own && b==cls && r!=b;
+        context[row*8+7]=dynamic ? owner==a : owner<0;
+        if (!dynamic && (cls==11 || cls==13)) conflict[k]|=cls==11?1:2;
+    }
+    for (i64 i=0; i<n; ++i) {
+        const i64 row=i*6+horizon, k=flat[row];
+        if (actors[i]<0 && k>=0 && conflict[k]==3) legal[row*2]=0;
+    }
+    return 0;
+}
 
 // Frozen Strong 5x5x1 majority: every unknown voxel, integer counts only.
 // Threshold and tied winners are flagged for scipy float32 replay by Python.

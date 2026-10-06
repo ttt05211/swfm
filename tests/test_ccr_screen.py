@@ -74,6 +74,39 @@ def test_ccr_resume_next_actual_update_is_bit_exact_and_rejects_height_checkpoin
         restore(saved, other, other_opt, other_rng, {**contract(), 'samples_per_role': 33}, protocol=screen.PROTOCOL)
 
 
+@pytest.mark.parametrize('device',['cpu','cuda'])
+def test_batched_ccr_head_actual_updates_release_graph_and_preserve_teacher(device):
+    if device=='cuda' and not torch.cuda.is_available():pytest.skip('actual CUDA required')
+    teacher,provider,rows,head=fixture(device)
+    provider.ccr_batched_head=True
+    before=copy.deepcopy(teacher.state_dict());initial=copy.deepcopy(head.state_dict())
+    opt=torch.optim.AdamW(head.parameters(),lr=.001);rng=np.random.default_rng(12)
+    memory=[]
+    for _ in range(4):
+        stat=screen.train_step(provider,rows*4,teacher,head,opt,rng)
+        assert stat['optimizer_updated'] and stat['windows']==4 and np.isfinite(stat['loss'])
+        memory.append(stat['allocated_after_mib'])
+        assert all(p.grad is None for p in head.parameters())
+    assert not torch.equal(initial['encoder.0.weight'],head.encoder[0].weight)
+    assert_nested_equal(before,teacher.state_dict())
+    assert max(memory[1:])-min(memory[1:])<1
+    provider.ccr_cache.close()
+
+
+def test_batched_ccr_next_update_restores_optimizer_and_rng_exactly():
+    teacher,provider,rows,head=fixture();provider.ccr_batched_head=True
+    opt=torch.optim.AdamW(head.parameters(),lr=.001);rng=np.random.default_rng(14)
+    screen.train_step(provider,rows*2,teacher,head,opt,rng)
+    c={**contract(),'batched_head':True,'epoch_batch_sizes':[[2,2],[2,2]]}
+    saved=copy.deepcopy(payload(head,opt,rng,c,epoch=0,batch=1,updates=1,executed=2,
+        reports={'train_prior':{'TRAIN_only':True}},protocol=screen.PROTOCOL))
+    other=copy.deepcopy(head);other_opt=torch.optim.AdamW(other.parameters(),lr=99);other_rng=np.random.default_rng(9)
+    screen.train_step(provider,rows*2,teacher,head,opt,rng)
+    restore(saved,other,other_opt,other_rng,c,protocol=screen.PROTOCOL)
+    screen.train_step(provider,rows*2,teacher,other,other_opt,other_rng)
+    assert_nested_equal(head.state_dict(),other.state_dict());assert_nested_equal(opt.state_dict(),other_opt.state_dict())
+
+
 def test_train_prior_is_unsampled_train_only_and_stop_fail_closed(monkeypatch):
     teacher, provider, rows, head = fixture()
     monkeypatch.setattr(screen, 'prefetch_raw_columns', lambda *args, **kwargs: iter(rows))

@@ -44,7 +44,7 @@ def grid_arrays(grid):
     return np.array([grid.x_min,grid.y_min,grid.z_min]),np.asarray(grid.voxel_size),np.asarray(grid.shape_hwd)
 
 
-def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_lattice_cells, materialize_features=True):
+def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_lattice_cells, materialize_features=True, kernels=None):
     """Bounded per-entity lattice. Large sparse extents use scalar-key lookup.
 
     No source/grid crop or resolution change. The temporary dense budget is a
@@ -61,7 +61,12 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
     strides=np.array([int(shape[1])*int(shape[2]),int(shape[2]),1],np.int64)
     packed=(cells-lo)@strides
     dense=volume<=max_lattice_cells
-    if dense:
+    native_last=None
+    if dense and kernels is not None:
+        bits,keys,native_last=kernels.ccr_lattice(packed,times,shape,halo)
+        flags=bits[keys]
+        at=np.stack(np.unravel_index(keys,tuple(shape)),axis=1)+lo
+    elif dense:
         bits=np.zeros(volume,np.uint8)
         np.bitwise_or.at(bits,packed,(1<<times).astype(np.uint8))
         view=bits.reshape(tuple(shape)); candidates=view!=0
@@ -87,7 +92,9 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
     presence=((flags[:,None]>>np.arange(4))&1).astype(bool)
     # Frame concatenation is chronological; latest metric sample wins. t0 is
     # last, so observed t0 source coordinates are always preserved exactly.
-    last=np.full(len(keys),-1,np.int64);np.maximum.at(last,point_ids,np.arange(len(points)))
+    if native_last is not None:last=native_last
+    else:
+        last=np.full(len(keys),-1,np.int64);np.maximum.at(last,point_ids,np.arange(len(points)))
     world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
     real=last>=0;world[real]=points[last[real]]
     if not materialize_features:
@@ -101,10 +108,22 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
         reg=np.eye(4) if actor==STATIC else registration[0]
         inverse=np.linalg.inv(prepared.raw['history_poses'][f])@np.linalg.inv(reg)
         ijk=np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
+        if kernels is not None:
+            kernels.ccr_history(ijk,prepared.raw['history_occ'][f],prepared.raw['history_observed'][f],
+                                f,labels,observed,inside)
+            continue
         valid=((ijk>=0)&(ijk<np.asarray(grid.shape_hwd))).all(1)
         inside[:,f]=valid
         observed[valid,f]=np.asarray(prepared.raw['history_observed'][f],bool)[tuple(ijk[valid].T)]
         labels[valid,f]=np.asarray(prepared.raw['history_occ'][f])[tuple(ijk[valid].T)]
+    if actor>=0:
+        center=transform_points(np.asarray(prepared.state['current'][actor]['centroid_world'])[None],
+                                np.linalg.inv(prepared.state['current_pose']))[0]
+        relative=(origin+(at+.5)*step-center)/8
+    else:relative=(origin+(at+.5)*step)/40
+    if kernels is not None:
+        features=kernels.ccr_features(keys,flags,bits if dense else None,shape,relative,presence,observed,inside)
+        return features,labels,world,presence,dense,volume,None
     neighbours=np.zeros((len(keys),6),np.float32)
     density=np.zeros((len(keys),4),np.float32)
     for d,delta in enumerate(FACE):
@@ -119,13 +138,6 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
         neighbour_flags=np.where(valid,neighbour_flags,0)
         neighbours[:,d]=(neighbour_flags!=0)
         density+=((neighbour_flags[:,None]>>np.arange(4))&1).astype(np.float32)/6
-    if actor>=0:
-        center=transform_points(np.asarray(prepared.state['current'][actor]['centroid_world'])[None],
-                                np.linalg.inv(prepared.state['current_pose']))[0]
-        relative=(origin+(at+.5)*step-center)/8
-    else:
-        # Window-local ego axes, not absolute world coordinates/map identity.
-        relative=(origin+(at+.5)*step)/40
     age=np.argmax(presence[:,::-1],axis=1).astype(np.float32)/3
     age[~real]=1.
     features=np.concatenate([relative,presence,observed,inside,neighbours,age[:,None],density,
@@ -133,7 +145,7 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
     return features,labels,world,presence,dense,volume,None
 
 
-def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_000_000, materialize_features=True):
+def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_000_000, materialize_features=True, kernels=None, executor=None):
     """Causal union of existing source geometry and observed road/sidewalk.
 
     Every t0 source is included, even without an accepted earlier association.
@@ -146,6 +158,10 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
     if max_lattice_cells<1: raise ValueError('positive temporary lattice budget required')
     origin,step,_=grid_arrays(grid);pose=np.asarray(state['current_pose']);inverse=np.linalg.inv(pose)
     groups=[];actors=[];classes=[];counts={'dense_entities':0,'sparse_entities':0,'max_lattice_cells':0}
+    def entity(actor,cls,pts,cells):
+        options=dict(halo=halo,max_lattice_cells=max_lattice_cells,materialize_features=materialize_features,kernels=kernels)
+        return (_entity(actor,cls,pts,cells,prepared,grid,**options) if executor is None else
+                executor.submit(_entity,actor,cls,pts,cells,prepared,grid,**options))
     for actor,comp in enumerate(state['current']):
         pts=[];cells=[]
         for f,reg in enumerate(prepared.registrations[actor]):
@@ -159,8 +175,7 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
             # after a floating-point roundtrip through the world transform.
             cell=ijk.copy() if f==3 else np.floor((transform_points(aligned,inverse)-origin)/step).astype(np.int64)
             pts.append(aligned);cells.append(cell)
-        groups.append(_entity(actor,int(comp['class_id']),pts,cells,prepared,grid,
-                              halo=halo,max_lattice_cells=max_lattice_cells,materialize_features=materialize_features))
+        groups.append(entity(actor,int(comp['class_id']),pts,cells))
         actors.append(actor);classes.append(int(comp['class_id']))
     for cls in (11,13):
         pts=[];cells=[]
@@ -170,11 +185,11 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
             world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
             cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
             pts.append(world);cells.append(cell)
-        groups.append(_entity(STATIC,cls,pts,cells,prepared,grid,halo=halo,max_lattice_cells=max_lattice_cells,
-                              materialize_features=materialize_features))
+        groups.append(entity(STATIC,cls,pts,cells))
         actors.append(STATIC);classes.append(cls)
     data=[];labels=[];worlds=[];presence=[];aa=[];cc=[];layouts=[];cursor=0
     for group,actor,cls in zip(groups,actors,classes):
+        if executor is not None:group=group.result()
         if group is None:continue
         feature,lab,world,pres,dense,volume,layout=group
         if materialize_features:data.append(feature);labels.append(lab)
@@ -294,7 +309,7 @@ def map_canonical_reference(evidence, prepared, grid):
     return RepairPlan(flat,base,fallback,legal,context)
 
 
-def map_canonical_evidence(evidence, prepared, grid):
+def map_canonical_evidence(evidence, prepared, grid, *, kernels=None, executor=None):
     """Vectorized whole-population ego projection and ownership gather.
 
     Source-local planar_move arithmetic remains reference float64. Only the
@@ -307,7 +322,7 @@ def map_canonical_evidence(evidence, prepared, grid):
     actors=evidence.actor;dynamic=actors>=0
     rows=[(a,np.flatnonzero(actors==a)) for a in np.unique(actors[dynamic])]
     inverse=np.linalg.inv(prepared.state['current_pose'])
-    for h in range(6):
+    def horizon(h):
         points=evidence.world.copy()
         for actor,ids in rows:
             points[ids]=planar_move(points[ids],prepared.state['current'][actor]['centroid_world'],
@@ -315,6 +330,13 @@ def map_canonical_evidence(evidence, prepared, grid):
             context[ids,h,6]=prepared.yaws[h][actor]/np.pi
         mapped=transform_points(points,prepared.state['world_to_future'][h])
         ijk=np.floor((mapped-origin)/step).astype(np.int64)
+        if kernels is not None:
+            rel=inverse@prepared.raw['future_poses'][h]
+            context[:,h,:2]=mapped[:,:2]/40;context[:,h,2]=.5*(h+1)/3
+            context[:,h,3:6]=(rel[0,3]/40,rel[1,3]/40,np.arctan2(rel[1,0],rel[0,0])/np.pi)
+            kernels.ccr_plan(ijk,actors,evidence.classes,prepared.baseline[h],prepared.owners[h],
+                             prepared.fallbacks[h],h,RepairPlan(flat,base,fallback,legal,context),context)
+            return
         good=((ijk>=0)&(ijk<shape)).all(1);ids=np.flatnonzero(good)
         at=(ijk[good,0]*shape[1]+ijk[good,1])*shape[2]+ijk[good,2]
         flat[ids,h]=at;labels=np.asarray(prepared.baseline[h]).ravel()[at]
@@ -335,6 +357,9 @@ def map_canonical_evidence(evidence, prepared, grid):
             right=np.unique(flat[static[evidence.classes[static]==13],h])
             conflicts=np.intersect1d(left,right,assume_unique=True)
             legal[static[np.isin(flat[static,h],conflicts)],h,0]=False
+    if executor is None or n<16384:
+        for h in range(6):horizon(h)
+    else:list(executor.map(horizon,range(6)))
     return RepairPlan(flat,base,fallback,legal,context)
 
 

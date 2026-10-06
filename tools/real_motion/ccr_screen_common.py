@@ -17,6 +17,8 @@ from real_motion.canonical_causal_repair import (
     repair_targets, compose_canonical,
 )
 from real_motion.canonical_repair_context import FixedCanonicalCache
+from real_motion.canonical_repair_execution import CanonicalCpuExecution
+from real_motion.canonical_repair_batch import batched_repair_losses
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
 from real_motion.column_execution import execution_session
 from real_motion.nuscenes_adapter import gt_moving_support_sequence
@@ -33,11 +35,28 @@ PROTOCOL = 'p0_f9_point_ccr_gt_screen_v1'
 SUPPORT_NOTE = 'canonical historical static/dynamic support; NOT equivalent to old frontier GEN'
 
 
+def execution_kernels(provider):
+    return getattr(getattr(provider,'ccr_execution',None),'kernels',None)
+
+
+def build_inputs(provider,prep):
+    execution=getattr(provider,'ccr_execution',None)
+    return build_canonical_evidence(prep,provider.pcfg.grid) if execution is None else execution.build(prep,provider.pcfg.grid)
+
+
+def map_inputs(provider,evidence,prep):
+    execution=getattr(provider,'ccr_execution',None)
+    return map_canonical_evidence(evidence,prep,provider.pcfg.grid) if execution is None else execution.map(evidence,prep,provider.pcfg.grid)
+
+
 def add_args(parser):
     parser.add_argument('--descriptor-cache')
     parser.add_argument('--descriptor-disk-mib', type=int, default=16384)
     parser.add_argument('--descriptor-ram-mib', type=int, default=1024)
     parser.add_argument('--samples-per-role', type=int, default=1024)
+    parser.add_argument('--ccr-cpu-execution',choices=('numpy','native','native_parallel'),default='numpy')
+    parser.add_argument('--ccr-cpu-workers',type=int,default=4)
+    parser.add_argument('--ccr-batched-head',action='store_true',help='same window-wise loss, batched point MLP; FP rounding may differ')
 
 
 def make_head(teacher, device):
@@ -53,10 +72,13 @@ def contract_extra(args, root):
         raise ValueError('invalid finite CCR cache/sampling budget')
     files = ('real_motion/canonical_causal_repair.py', 'real_motion/canonical_repair_context.py',
              'tools/real_motion/ccr_screen_common.py', 'tools/real_motion/train_p0_f9_point_ccr.py',
-             'tools/real_motion/pilot_p0_f9_canonical_causal_repair.py')
+             'tools/real_motion/pilot_p0_f9_canonical_causal_repair.py','real_motion/canonical_repair_execution.py',
+             'real_motion/canonical_repair_batch.py','real_motion/native/column_cpu.cpp')
     return dict(objective='equal_window_role_action_BCE_causal_MC_GT_only',
                 thresholds=dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95)),
                 samples_per_role=args.samples_per_role, remove_loss_weight=.25,
+                cpu_execution=getattr(args,'ccr_cpu_execution','numpy'),cpu_workers=getattr(args,'ccr_cpu_workers',4),
+                batched_head=getattr(args,'ccr_batched_head',False),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
 
@@ -73,8 +95,11 @@ def setup(provider, args):
             parent = parent.parent
         if shutil.disk_usage(parent).free < 2*2**30:
             raise RuntimeError('less than 2GiB free: disable descriptor disk writes or free space first')
+    provider.ccr_execution=CanonicalCpuExecution(getattr(args,'ccr_cpu_execution','numpy'),getattr(args,'ccr_cpu_workers',4))
+    provider.ccr_batched_head=getattr(args,'ccr_batched_head',False)
     provider.ccr_cache = FixedCanonicalCache(args.descriptor_ram_mib, neighbors=False,
-        disk_root=args.descriptor_cache, max_disk_mib=args.descriptor_disk_mib, async_writes=True)
+        disk_root=args.descriptor_cache, max_disk_mib=args.descriptor_disk_mib, async_writes=True,
+        kernels=provider.ccr_execution.kernels,executor=provider.ccr_execution.pool)
     if provider.ccr_cache.disk is not None:
         provider.ccr_cache.disk.reserve = 2*2**30
     provider.ccr_samples_per_role = args.samples_per_role
@@ -87,6 +112,8 @@ def close(provider, result):
         if cache.disk is not None:
             cache.disk.flush()
         result['descriptor_cache'] = cache.stats(); cache.close()
+    execution=getattr(provider,'ccr_execution',None)
+    if execution is not None:execution.close()
 
 
 @torch.no_grad()
@@ -99,7 +126,7 @@ def calibrate_train(provider, source, records, teacher, head, *, progress=None, 
         output = teacher.motion(record, provider.device)
         prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw, outputs=output)
         evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
-        plan = map_canonical_evidence(evidence, prep, provider.pcfg.grid)
+        plan = map_inputs(provider,evidence,prep)
         targets, valid = repair_targets(evidence, plan, raw['future_gt_occ'])
         for role in range(2):
             for action in range(2):
@@ -124,6 +151,7 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
     device = provider.device; sync(device); started = time.perf_counter()
     head.train(); teacher.eval(); optimizer.zero_grad(set_to_none=True)
     stages = defaultdict(float); losses = []; sampled = total = 0
+    packed=[];outputs=[];sizes=[]
     for record, raw in rows:
         tick = time.perf_counter()
         with torch.no_grad():
@@ -135,8 +163,18 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         stages['fixed_input_hash_cache_conflicts'] += time.perf_counter()-tick; tick = time.perf_counter()
         # Sample BEFORE future projection/GT labels. Every class/source/history
         # stratum has positive inclusion probability; N/k restores sums.
+        if getattr(provider,'ccr_batched_head',False):
+            from real_motion.canonical_repair_context import sample_causal_points,map_sampled_canonical
+            ids,importance=sample_causal_points(evidence,rng,per_role=provider.ccr_samples_per_role)
+            sample,plan=map_sampled_canonical(evidence,ids,prep,provider.pcfg.grid,conflicts,kernels=execution_kernels(provider))
+            y,valid=repair_targets(sample,plan,raw['future_gt_occ']);weight=importance[:,None,None]*valid
+            packed.append((sample,plan,y,weight));outputs.append(output);sizes.append(len(output['history_source_context']))
+            sampled+=len(ids);total+=len(evidence)
+            stages['sample_live_projection_encoder_loss']+=time.perf_counter()-tick
+            continue
         loss, n = loss_for_causal(head, evidence, output, prep, provider.pcfg.grid,
-            raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role)
+            raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role,
+            kernels=execution_kernels(provider))
         if not torch.isfinite(loss):
             raise RuntimeError('nonfinite CCR loss; previous completed checkpoint preserved')
         stages['sample_live_projection_encoder_loss'] += time.perf_counter()-tick; tick = time.perf_counter()
@@ -144,6 +182,16 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         stages['backward'] += time.perf_counter()-tick
         losses.append(loss.detach()); sampled += n; total += len(evidence)
         del loss, evidence, prep, output, conflicts
+    if packed:
+        tick=time.perf_counter();fields=list(zip(*packed))
+        merged={k:torch.cat([o[k] for o in outputs],0) for k in outputs[0]}
+        batch_losses=batched_repair_losses(head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
+        loss=sum(batch_losses)/len(rows)
+        if not torch.isfinite(loss):raise RuntimeError('nonfinite batched CCR loss')
+        stages['sample_live_projection_encoder_loss']+=time.perf_counter()-tick;tick=time.perf_counter()
+        loss.backward();stages['backward']+=time.perf_counter()-tick
+        losses=[v.detach() for v in batch_losses]
+        del batch_losses,loss,merged,fields,packed,outputs,evidence,prep,output,conflicts
     tick = time.perf_counter(); norm = torch.nn.utils.clip_grad_norm_(head.parameters(), 5.)
     if not torch.isfinite(norm):
         raise RuntimeError('nonfinite CCR gradient; previous completed checkpoint preserved')
@@ -181,8 +229,8 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
             stages['prepare_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
             # Fresh complete causal domain. Evaluation never samples by GT or
             # reuses TRAIN sampled plans/learned features.
-            evidence = build_canonical_evidence(prep, provider.pcfg.grid)
-            plan = map_canonical_evidence(evidence, prep, provider.pcfg.grid)
+            evidence = build_inputs(provider,prep)
+            plan = map_inputs(provider,evidence,prep)
             p = probabilities(head, evidence, plan, output, provider.device)
             predictions = {name: compose_canonical(prep.baseline, evidence, plan, p[..., 0], p[..., 1],
                 role={'static_repair': 'static', 'dynamic_repair': 'dynamic', 'joint': 'all'}[name])
@@ -221,12 +269,12 @@ def six_frame_speed(provider, source, records, teacher, head, *, repeats=2, stop
             if raw.get('future_gt_occ') is not None:
                 raise RuntimeError('FPS cannot load future GT')
             case = dict(record=record, causal=raw)
-            expected = {old: timed_full(case, teacher, provider, head, old=old, verify_outputs=True) for old in (True, False)}
+            expected = {old: timed_full(case, teacher, provider, head, old=old, verify_outputs=True,execution=getattr(provider,'ccr_execution',None)) for old in (True, False)}
             for repeat in range(repeats):
                 for old in ((True, False) if repeat % 2 == 0 else (False, True)):
                     if stop_event is not None and stop_event.is_set():
                         raise InterruptedError('CCR FPS stopped; training checkpoint preserved')
-                    row = timed_full(case, teacher, provider, head, old=old, verify_outputs=True)
+                    row = timed_full(case, teacher, provider, head, old=old, verify_outputs=True,execution=getattr(provider,'ccr_execution',None))
                     if row['dense_sha256'] != expected[old]['dense_sha256']:
                         raise RuntimeError('six-frame execution repeated dense outputs changed')
                     row.update(window=wi, repeat=repeat+1); trials.append(row)

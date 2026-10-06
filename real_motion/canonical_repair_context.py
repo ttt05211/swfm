@@ -77,7 +77,13 @@ def fixed_history_digest(prepared, grid):
     return h.hexdigest()
 
 
-def build_fixed_canonical(prepared, grid, *, neighbors=True):
+def build_fixed_canonical(prepared, grid, *, neighbors=True, kernels=None, executor=None):
+    if kernels is not None and not neighbors:
+        full=build_canonical_evidence(prepared,grid,kernels=kernels,executor=executor)
+        full.causal_strata=build_causal_strata(full)
+        full.audit={**full.audit,'shared_neighbors':False,'fixed_raw_history_descriptors':True,
+                    'learned_features_cached':False,'features_materialized':True}
+        return full,None
     lazy = build_canonical_evidence(prepared, grid, materialize_features=False)
     full = materialize_canonical_features(lazy, prepared, grid, np.arange(len(lazy)))
     # Lookup layouts are needed only while constructing the immutable graph.
@@ -118,9 +124,11 @@ class FixedCanonicalCache:
     are inputs, not future supervision. They may be reused. Entries are keyed
     by their actual causal contents plus neighbour configuration.
     """
-    def __init__(self, max_mib=256, *, neighbors=True, disk_root=None, max_disk_mib=0, async_writes=False):
+    def __init__(self, max_mib=256, *, neighbors=True, disk_root=None, max_disk_mib=0, async_writes=False, kernels=None, executor=None):
         if not np.isfinite(max_mib) or max_mib < 0: raise ValueError('invalid cache budget')
         self.limit = int(max_mib*2**20); self.neighbors = bool(neighbors)
+        self.kernels=kernels
+        self.executor=executor
         self.values = OrderedDict(); self.bytes = 0; self.lock = RLock()
         self.hits = self.misses = self.evictions = 0
         self.hash_seconds = self.build_seconds = 0.
@@ -129,6 +137,9 @@ class FixedCanonicalCache:
         self.disk = None; self.disk_io_seconds = 0.; self.async_writes = bool(async_writes)
         if disk_root is not None:
             sources = (Path(__file__),Path(__file__).with_name('canonical_causal_repair.py'))
+            if kernels is not None:
+                sources += (Path(__file__).with_name('native_column_cpu.py'),
+                            Path(__file__).parent/'native'/'column_cpu.cpp')
             code = hashlib.sha256(b''.join(p.read_bytes() for p in sources)).hexdigest()
             self.disk = _CanonicalDiskStore(disk_root,PROTOCOL+str(self.neighbors)+code,
                 max_bytes=int(max_disk_mib*2**20),ram_bytes=0,reserve_bytes=128*2**20)
@@ -143,7 +154,8 @@ class FixedCanonicalCache:
                 return value
             self.misses += 1
         def builder():
-            tick = time.perf_counter(); value = build_fixed_canonical(prepared, grid, neighbors=self.neighbors)
+            tick = time.perf_counter(); value = build_fixed_canonical(prepared, grid, neighbors=self.neighbors,
+                                                                   kernels=self.kernels,executor=self.executor)
             value[0].fixed_history_sha256 = digest
             with self.lock: self.build_seconds += time.perf_counter()-tick
             return value
@@ -320,10 +332,10 @@ def sample_causal_points(evidence, rng, *, per_role=1024):
     return ids[order], importance[order]
 
 
-def map_sampled_canonical(evidence, ids, prepared, grid, static_conflicts):
+def map_sampled_canonical(evidence, ids, prepared, grid, static_conflicts, *, kernels=None):
     """Live selected-point projection, with FULL static conflict protection."""
     sampled = materialize_canonical_features(evidence, prepared, grid, ids)
-    plan = map_canonical_evidence(sampled, prepared, grid)
+    plan = map_canonical_evidence(sampled, prepared, grid,kernels=kernels)
     static = sampled.actor < 0
     for h in range(6):
         plan.legal[static & np.isin(plan.flat[:,h], static_conflicts[h]), h, 0] = False
