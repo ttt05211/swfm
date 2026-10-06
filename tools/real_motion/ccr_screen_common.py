@@ -249,6 +249,7 @@ def setup(provider, args):
     provider.ccr_fast_train=fast
     if fast:
         provider.raw_prefetch_workers=provider.raw_prefetch_depth=prefetch
+        provider.raw_io_workers=min(2,max(1,args.cpu_workers))
         provider.train_io_workers=prefetch
         provider.fixed_geometry_builder=_ccr_fast_fixed_geometry
     provider.ccr_cache = FixedCanonicalCache(args.descriptor_ram_mib, neighbors=False,
