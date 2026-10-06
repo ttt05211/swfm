@@ -190,7 +190,10 @@ def prefetch_column_batches(provider, source, records, batch_size, source_budget
         return [(r, provider.load_raw_columns(source, r, include_gt=True)) for r in rows]
     rows = group()
     if not rows: return
-    if getattr(provider, 'causal_geometry_cache', None) is not None:
+    # Raw occupancy loading + fixed geometry are CPU-only and immutable.  They
+    # may be prepared in parallel even when disk caching is disabled.  The old
+    # cache-gated condition accidentally serialized cold Point-CCR training.
+    if io_workers > 1:
         io = ThreadPoolExecutor(max_workers=io_workers)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
