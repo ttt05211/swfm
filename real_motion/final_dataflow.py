@@ -449,6 +449,51 @@ def forecast_six(
     }
 
 
+def parallel_frozen_motion(teacher, rows, device, *, streams=4, render_readback=True):
+    """Run independent frozen V18 window forwards concurrently on CUDA streams.
+
+    Crucially, this does NOT concatenate unrelated windows along V18's source
+    dimension.  Every window retains the exact first-dimension shape used by
+    the reference path, avoiding BF16 kernel/accumulation changes caused by a
+    much larger concatenated batch.  Only execution overlaps.
+    """
+    if not rows:
+        raise ValueError("non-empty training rows required")
+    device=torch.device(device)
+    if device.type!="cuda" or streams<=1:
+        result=[]
+        with torch.no_grad():
+            for record,_ in rows:
+                out=teacher.motion(record,device)
+                if render_readback:
+                    out={**out,"_column_render_numpy":{
+                        k:out[k].detach().to(torch.float32).cpu().numpy()
+                        for k in ("residual_xy_m","yaw_delta_rad")}}
+                result.append(out)
+        return result
+    count=min(int(streams),len(rows))
+    pool=[torch.cuda.Stream(device=device) for _ in range(count)]
+    current=torch.cuda.current_stream(device)
+    outputs=[None]*len(rows)
+    with torch.no_grad():
+        for stream in pool:
+            stream.wait_stream(current)
+        for i,(record,_) in enumerate(rows):
+            stream=pool[i%count]
+            with torch.cuda.stream(stream):
+                outputs[i]=teacher.motion(record,device)
+        for stream in pool:
+            current.wait_stream(stream)
+    # The current stream now owns all consumers. D2H readback happens only
+    # after the independent forward kernels have completed.
+    if render_readback:
+        for i,out in enumerate(outputs):
+            outputs[i]={**out,"_column_render_numpy":{
+                k:out[k].detach().to(torch.float32).cpu().numpy()
+                for k in ("residual_xy_m","yaw_delta_rad")}}
+    return outputs
+
+
 def batch_frozen_motion(teacher, rows, device, *, render_readback=False):
     """One frozen V18 forward for a multi-window batch, split by source count.
 
