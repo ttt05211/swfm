@@ -156,17 +156,23 @@ def _source_core(raw_history, record, provider):
         - np.asarray(comp["centroid_world"], np.float64)[None, :2]
         for points, comp in zip(source_world_points, current)
     ]
-    centers_world = np.asarray(
-        [np.asarray(c["centroid_world"], np.float64) for c in current],
-        dtype=np.float64,
-    ).reshape(-1, 3)
+    # Preserve the frozen runtime's per-source homogeneous transform order.
+    # Vectorizing this matmul can change the last floating bit on some BLASes,
+    # which is unnecessary risk for the byte-exact parity gate.
+    centers_t0_full = [
+        world_points_to_t0(
+            np.asarray(comp["centroid_world"], dtype=np.float64)[None],
+            current_pose,
+        )[0]
+        for comp in current
+    ]
     centers_t0 = (
-        world_points_to_t0(centers_world, current_pose)[:, :2]
-        if len(centers_world) else np.empty((0, 2), np.float64)
+        np.asarray([p[:2] for p in centers_t0_full], dtype=np.float64)
+        if centers_t0_full else np.empty((0, 2), np.float64)
     )
     source_z_t0 = (
-        world_points_to_t0(centers_world, current_pose)[:, 2].astype(np.float64)
-        if len(centers_world) else np.empty((0,), np.float64)
+        np.asarray([p[2] for p in centers_t0_full], dtype=np.float64)
+        if centers_t0_full else np.empty((0,), np.float64)
     )
     state = dict(
         current=current,
