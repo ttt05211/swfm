@@ -102,8 +102,21 @@ def parser():
     return p
 
 
-def main(stop_event=None, argv=None):
-    p = parser(); a = p.parse_args(argv); out = Path(a.out_dir)
+def main(stop_event=None, argv=None, *, backend=None):
+    # Reuse finite population/provenance/recovery orchestration, not model code.
+    # Default remains the existing height-field screen, including its tests.
+    p = parser()
+    if backend is not None:
+        p.description = backend.__doc__
+        backend.add_args(p)
+    a = p.parse_args(argv); out = Path(a.out_dir)
+    run_protocol = backend.PROTOCOL if backend is not None else PROTOCOL
+    label = 'CCR' if backend is not None else 'FIELD'
+    render_brief = backend.brief if backend is not None else brief
+    prior_fn = backend.calibrate_train if backend is not None else calibrate_train
+    evaluate_fn = backend.evaluate if backend is not None else evaluate
+    train_fn = backend.train_step if backend is not None else train_step
+    speed_fn = backend.six_frame_speed if backend is not None else six_frame_speed
     if out.exists():
         p.error('new output required even on resume; refusing overwrite')
     for key in ('config', 'checkpoint', 'train_cache', 'dev_cache', 'population_manifest',
@@ -126,10 +139,10 @@ def main(stop_event=None, argv=None):
     head = optimizer = rng = contract = None
     def persist():
         write_json(out/'screen.json', result)
-        (out/'summary.txt').write_text(brief(result), encoding='utf-8')
+        (out/'summary.txt').write_text(render_brief(result), encoding='utf-8')
     def save():
         save_resume_checkpoint(out/'last.pt', payload(head, optimizer, rng, contract,
-            epoch=epoch, batch=batch, updates=updates, executed=executed, reports=reports))
+            epoch=epoch, batch=batch, updates=updates, executed=executed, reports=reports, protocol=run_protocol))
         result['checkpoint'] = str(out/'last.pt')
     persist()
     try:
@@ -168,8 +181,9 @@ def main(stop_event=None, argv=None):
             if a.max_updates > steps or a.prior_windows > len(train):
                 raise RuntimeError('requested early-stop/prior population exceeds fixed screen budget')
             torch.manual_seed(a.seed)  # teacher construction must not affect head initialization
-            head = HeightCausalField('shared_field', z_bins=teacher.columns.config.z_bins,
-                                     source_dim=teacher.columns.source_dim).to(device)
+            head = (backend.make_head(teacher, device) if backend is not None else
+                    HeightCausalField('shared_field', z_bins=teacher.columns.config.z_bins,
+                                     source_dim=teacher.columns.source_dim).to(device))
             optimizer = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=.01)
             rng = np.random.default_rng(a.seed+1)
             root = Path(__file__).resolve().parents[2]
@@ -178,7 +192,7 @@ def main(stop_event=None, argv=None):
                 'real_motion/causal_column_model.py', 'tools/real_motion/causal_column_common.py',
                 'tools/real_motion/joint_column_common.py', 'tools/real_motion/height_field_screen_common.py',
                 'tools/real_motion/height_field_screen_recovery.py', 'tools/real_motion/train_p0_f9_height_shared_field.py')})
-            contract = dict(protocol=PROTOCOL, teacher_sha256=digest, config_fingerprint=stable_json_fingerprint(cfg),
+            contract = dict(protocol=run_protocol, teacher_sha256=digest, config_fingerprint=stable_json_fingerprint(cfg),
                 cache_fingerprints=ck['cache_fingerprints'], info_fingerprints=ck['info_fingerprints'],
                 dev_manifest_fingerprint=ck['dev_manifest_fingerprint'], train_keys=chosen, dev_keys=keys64[:a.eval_windows],
                 final_dev_keys=parent_keys, seed=a.seed, epochs=a.epochs, train_fraction=a.train_fraction,
@@ -186,16 +200,19 @@ def main(stop_event=None, argv=None):
                 window_batch=4, source_budget=128, lr=a.lr, weight_decay=.01,
                 objective='equal_window_original_two_task_column_loss_GT_only',
                 schedule='whole_screen_cosine_0.1_floor_no_tail', thresholds=(.5, .5, .95),
-                model=dict(mode='shared_field', z_bins=head.z_bins, source_dim=head.source_dim, width=head.width, semantic_dim=4),
+                model=(backend.model_contract(head) if backend is not None else
+                       dict(mode='shared_field', z_bins=head.z_bins, source_dim=head.source_dim, width=head.width, semantic_dim=4)),
                 transport_frozen=True, final_dev512=not a.skip_dev512,
                 fps_windows=a.fps_windows, speed_repeats=a.speed_repeats,
                 implementation=implementation, torch_version=str(torch.__version__))
+            if backend is not None:
+                contract.update(backend.contract_extra(a, root))
             write_json(out/'contract.json', contract)
             if a.resume:
                 saved = torch.load(a.resume, map_location='cpu', weights_only=False)
-                (epoch, batch, updates, executed), reports = restore(saved, head, optimizer, rng, contract)
+                (epoch, batch, updates, executed), reports = restore(saved, head, optimizer, rng, contract, protocol=run_protocol)
                 result['reports'] = reports
-                print(f'FIELD_RESUME update={updates}/{steps} next_epoch={epoch+1} batch_cursor={batch}; optimizer/RNG/cosine preserved', flush=True)
+                print(f'{label}_RESUME update={updates}/{steps} next_epoch={epoch+1} batch_cursor={batch}; optimizer/RNG/cosine preserved', flush=True)
             teacher.eval().requires_grad_(False)
             provider = PilotProvider(a.base_checkpoint, CLEAN_SHA256, make_prepare_config(cfg), device, a.cpu_workers, teacher, None)
             provider.raw_prefetch_workers = provider.raw_prefetch_depth = min(2, a.cpu_workers)
@@ -203,30 +220,33 @@ def main(stop_event=None, argv=None):
                 namespace = geometry_namespace(cfg, provider, ck['info_fingerprints'], ck['cache_fingerprints'], a.dataroot)
                 cache = CausalGeometryCache(a.causal_geometry_cache, namespace, max_bytes=0, ram_bytes=256*2**20)
                 provider.causal_geometry_cache = cache
-            train_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.train_info, verbose=False), 256)
-            dev_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info, verbose=False), 256)
+            raw_limit = 256  # MiB, not a record count; bounded immutable frame cache.
+            train_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.train_info, verbose=False), raw_limit)
+            dev_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info, verbose=False), raw_limit)
+            if backend is not None:
+                backend.setup(provider, a)
             del ck
             result.update(actual_cuda=device.type == 'cuda', teacher_snapshot=str(snapshot), teacher_sha256=digest,
                 training_population=dict(windows=len(train), epochs=a.epochs, total_window_exposures=len(train)*a.epochs,
                                          optimizer_updates=steps, prior_windows=a.prior_windows),
                 cache_policy='read existing fixed geometry; zero NEW geometry disk writes; 256MiB geometry RAM')
-            print(f'FIELD_SCREEN TRAIN={len(train)} x {a.epochs} passes; {steps} updates; dev={len(dev)}; no KD, old epoch19 READ ONLY', flush=True)
+            print(f'{label}_SCREEN TRAIN={len(train)} x {a.epochs} passes; {steps} updates; dev={len(dev)}; no KD, old epoch19 READ ONLY', flush=True)
             if 'train_prior' not in reports:
-                reports['train_prior'] = calibrate_train(provider, train_source, train[:a.prior_windows], teacher, head,
+                reports['train_prior'] = prior_fn(provider, train_source, train[:a.prior_windows], teacher, head,
                                                           progress=progress, stop_event=stop_event)
                 save(); persist()
             if 'initial_dev64' not in reports:
                 with preserve_training_rng(rng):
-                    reports['initial_dev64'] = evaluate(provider, dev_source, dev, teacher, head, include_old=True,
+                    reports['initial_dev64'] = evaluate_fn(provider, dev_source, dev, teacher, head, include_old=True,
                                                          progress=progress, stop_event=stop_event)
                 save(); persist()
             def monitor_pending():
                 if epoch and not any(r['epoch'] == epoch for r in reports.get('epochs', [])):
                     with preserve_training_rng(rng):
-                        report = evaluate(provider, dev_source, dev, teacher, head, progress=progress, stop_event=stop_event)
+                        report = evaluate_fn(provider, dev_source, dev, teacher, head, progress=progress, stop_event=stop_event)
                     reports.setdefault('epochs', []).append(dict(epoch=epoch, update=updates, evaluation=report))
                     m = report['variants']['joint']['metrics']; old = reports['initial_dev64']['variants']['old_joint']['metrics']
-                    print(f"FIELD_EPOCH {epoch}/{a.epochs} mIoU={m['mIoU']:.6f} vs_old={m['mIoU']-old['mIoU']:+.6f} "
+                    print(f"{label}_EPOCH {epoch}/{a.epochs} mIoU={m['mIoU']:.6f} vs_old={m['mIoU']-old['mIoU']:+.6f} "
                           f"MovingMicro={m['MovingMicro']:.6f} vs_old_Moving={m['MovingMicro']-old['MovingMicro']:+.6f}", flush=True)
                     save(); persist()
             with ThreadPoolExecutor(max_workers=min(3, a.cpu_workers)) as pool:
@@ -242,16 +262,18 @@ def main(stop_event=None, argv=None):
                             break
                         lr = learning_rate(updates, steps, a.lr)
                         optimizer.param_groups[0]['lr'] = lr
-                        stat = train_step(provider, rows, teacher, head, optimizer, rng, candidate_pool=pool)
+                        stat = train_fn(provider, rows, teacher, head, optimizer, rng, candidate_pool=pool)
                         updates += 1; batch += 1; executed += len(rows)
                         reports['train_seconds'] = reports.get('train_seconds', 0.)+stat['seconds']
                         reports['input_wait_seconds'] = reports.get('input_wait_seconds', 0.)+waited
-                        progress(dict(event='height_field_train', epoch=epoch+1, epoch_batch=batch, epoch_batches=counts[epoch],
+                        progress(dict(event='ccr_train' if backend is not None else 'height_field_train', epoch=epoch+1, epoch_batch=batch, epoch_batches=counts[epoch],
                                       update=updates, target=steps, lr=lr, input_wait_seconds=waited, **stat))
                         if updates == 1 or updates % 32 == 0:
-                            print(f"FIELD_TRAIN epoch={epoch+1}/{a.epochs} batch={batch}/{counts[epoch]} update={updates}/{steps} "
+                            details = (f"sampled_points={stat['sampled_points']} canonical_points={stat['canonical_points']}" if backend is not None else
+                                       f"dynamic_columns={stat.get('dynamic_refine_columns', 0)}")
+                            print(f"{label}_TRAIN epoch={epoch+1}/{a.epochs} batch={batch}/{counts[epoch]} update={updates}/{steps} "
                                   f"loss={stat['loss']:.6f} seconds/window={stat['seconds']/len(rows):.4f} "
-                                  f"dynamic_columns={stat.get('dynamic_refine_columns', 0)} allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
+                                  f"{details} allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
                         if batch == counts[epoch]:
                             epoch += 1; batch = 0; save(); persist(); break
                         if updates % 32 == 0 or stop_event is not None and stop_event.is_set():
@@ -265,16 +287,16 @@ def main(stop_event=None, argv=None):
                 input_wait_seconds_per_window=reports.get('input_wait_seconds', 0.)/max(executed, 1),
                 transport_frozen=True, training_speedup_NOT_claimed=True)
             if epoch < a.epochs or stop_event is not None and stop_event.is_set():
-                result.update(status='stopped', route='resume_identical_shared_field_screen'); persist(); return 0
+                result.update(status='stopped', route='resume_identical_CCR_screen' if backend is not None else 'resume_identical_shared_field_screen'); persist(); return 0
             monitor_pending()
             if not a.skip_dev512 and 'final_dev512' not in reports:
                 with preserve_training_rng(rng):
-                    reports['final_dev512'] = evaluate(provider, dev_source, dev512, teacher, head, include_old=True,
+                    reports['final_dev512'] = evaluate_fn(provider, dev_source, dev512, teacher, head, include_old=True,
                                                        progress=progress, stop_event=stop_event)
                 save(); persist()
             if 'speed' not in reports:
                 with preserve_training_rng(rng):
-                    reports['speed'] = six_frame_speed(provider, dev_source, dev[:a.fps_windows], teacher, head,
+                    reports['speed'] = speed_fn(provider, dev_source, dev[:a.fps_windows], teacher, head,
                                                         repeats=a.speed_repeats, stop_event=stop_event)
                 save(); persist()
             final = reports.get('final_dev512', reports['epochs'][-1]['evaluation'])
@@ -285,14 +307,16 @@ def main(stop_event=None, argv=None):
                         all_horizons_Moving_within_0_10pp=all(new['per_horizon'][h]['MovingMicro'] >= old['per_horizon'][h]['MovingMicro']-.1
                                                            for h in ('1.0', '2.0', '3.0')),
                         paired_inference_speedup_ge_3=reports['speed']['speedup'] >= 3.)
+            if backend is not None:
+                gate = backend.gate(new, old, reports['speed'])
             gate['pass'] = all(gate.values())
             if sha256(snapshot) != digest:
                 raise RuntimeError('immutable reference snapshot changed')
             result.update(status='complete', gate=gate, route='candidate_for_further_training_NOT_promoted' if gate['pass']
                           else 'screen_not_passed_no_automatic_retry')
-            save(); persist(); print(brief(result), flush=True); return 0
+            save(); persist(); print(render_brief(result), flush=True); return 0
     except InterruptedError as error:
-        result.update(status='stopped', error=str(error), route='resume_last_completed_shared_field_checkpoint')
+        result.update(status='stopped', error=str(error), route='resume_last_completed_CCR_checkpoint' if backend is not None else 'resume_last_completed_shared_field_checkpoint')
         persist(); return 0
     except BaseException as error:
         # Do not snapshot half-updated tensors/counters after a failed step.
@@ -303,6 +327,8 @@ def main(stop_event=None, argv=None):
         result['elapsed_seconds_this_invocation'] = time.perf_counter()-begun
         if cache is not None:
             result['geometry_cache'] = cache.stats(); cache.close()
+        if backend is not None and 'provider' in locals():
+            backend.close(provider, result)
         persist()
 
 

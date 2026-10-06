@@ -19,17 +19,17 @@ def validate_cursor(contract, epoch, batch, updates, executed):
         raise RuntimeError('checkpoint counters disagree with fixed population/order')
 
 
-def payload(head, optimizer, rng, contract, *, epoch, batch, updates, executed, reports):
+def payload(head, optimizer, rng, contract, *, epoch, batch, updates, executed, reports, protocol=PROTOCOL):
     validate_cursor(contract, epoch, batch, updates, executed)
-    return dict(protocol=PROTOCOL, contract=contract, head=head.state_dict(), optimizer=optimizer.state_dict(),
+    return dict(protocol=protocol, contract=contract, head=head.state_dict(), optimizer=optimizer.state_dict(),
                 numpy_rng=copy.deepcopy(rng.bit_generator.state), torch_rng=torch.get_rng_state(),
                 cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                 epoch=epoch, batch=batch, updates=updates, executed=executed, reports=copy.deepcopy(reports),
                 transport_frozen=True, deployable=False)
 
 
-def restore(saved, head, optimizer, rng, contract):
-    if (saved.get('protocol') != PROTOCOL or saved.get('transport_frozen') is not True
+def restore(saved, head, optimizer, rng, contract, *, protocol=PROTOCOL):
+    if (saved.get('protocol') != protocol or saved.get('transport_frozen') is not True
             or saved.get('deployable') is not False
             or stable_json_fingerprint(saved.get('contract')) != stable_json_fingerprint(contract)):
         raise RuntimeError('only identical shared-field screen resumes; old Local optimizer/budget changes rejected')
