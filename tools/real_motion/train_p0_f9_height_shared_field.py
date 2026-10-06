@@ -193,7 +193,8 @@ def main(stop_event=None, argv=None, *, backend=None):
             if backend is not None and getattr(a,'warm_start_head',None):
                 warm_info=backend.warm_start_head(
                     head,a.warm_start_head,teacher_sha256=digest,
-                    config_fingerprint=stable_json_fingerprint(cfg))
+                    config_fingerprint=stable_json_fingerprint(cfg),
+                    dev_manifest_fingerprint=manifest['manifest_fingerprint'])
             optimizer = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=.01)
             rng = np.random.default_rng(a.seed+1)
             root = Path(__file__).resolve().parents[2]
@@ -219,11 +220,15 @@ def main(stop_event=None, argv=None, *, backend=None):
                 contract.update(backend.contract_extra(a, root))
             write_json(out/'contract.json', contract)
             if warm_info is not None:
+                reusable_old=warm_info.pop('reusable_initial_dev64_old',None)
                 result['warm_start']=warm_info
                 # Preserve the source TRAIN-only probability calibration. The
                 # continuation experiment changes coverage, not thresholds or
                 # calibration, so do not silently recompute positive_weight.
                 reports.setdefault('train_prior',warm_info['train_prior'])
+                if reusable_old is not None:
+                    reports.setdefault('initial_dev64',reusable_old)
+                    result['warm_start_old_local_dev64_reused']=True
             if a.resume:
                 saved = torch.load(a.resume, map_location='cpu', weights_only=False)
                 (epoch, batch, updates, executed), reports = restore(saved, head, optimizer, rng, contract, protocol=run_protocol)
@@ -242,10 +247,15 @@ def main(stop_event=None, argv=None, *, backend=None):
             if backend is not None:
                 backend.setup(provider, a)
             del ck
+            fast_backend=bool(backend is not None and getattr(a,'ccr_fast_train',False))
+            checkpoint_every=256 if fast_backend else 32
             result.update(actual_cuda=device.type == 'cuda', teacher_snapshot=str(snapshot), teacher_sha256=digest,
                 training_population=dict(windows=len(train), epochs=a.epochs, total_window_exposures=len(train)*a.epochs,
                                          optimizer_updates=steps, prior_windows=a.prior_windows),
-                cache_policy='read existing fixed geometry; zero NEW geometry disk writes; 256MiB geometry RAM')
+                cache_policy=('ephemeral minimal geometry + prefetched lazy canonical support; zero descriptor disk writes'
+                              if fast_backend else
+                              'read existing fixed geometry; zero NEW geometry disk writes; 256MiB geometry RAM'),
+                checkpoint_every_updates=checkpoint_every)
             print(f'{label}_SCREEN TRAIN={len(train)} x {a.epochs} passes; {steps} updates; dev={len(dev)}; no KD, old epoch19 READ ONLY', flush=True)
             if 'train_prior' not in reports:
                 reports['train_prior'] = prior_fn(provider, train_source, train[:a.prior_windows], teacher, head,
@@ -275,7 +285,9 @@ def main(stop_event=None, argv=None, *, backend=None):
                         break
                     ordered = [r for g in groups[epoch][batch:] for r in g]
                     previous_end = time.perf_counter()
-                    for rows in prefetch_column_batches(provider, train_source, ordered, 4, 128, io_workers=min(2, a.cpu_workers)):
+                    for rows in prefetch_column_batches(
+                            provider, train_source, ordered, 4, 128,
+                            io_workers=getattr(provider,'train_io_workers',min(2,a.cpu_workers))):
                         waited = time.perf_counter()-previous_end
                         if (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
                             break
@@ -295,7 +307,7 @@ def main(stop_event=None, argv=None, *, backend=None):
                                   f"{details} allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
                         if batch == counts[epoch]:
                             epoch += 1; batch = 0; save(); persist(); break
-                        if updates % 32 == 0 or stop_event is not None and stop_event.is_set():
+                        if updates % checkpoint_every == 0 or stop_event is not None and stop_event.is_set():
                             save(); persist()
                         previous_end = time.perf_counter()
                     if (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
