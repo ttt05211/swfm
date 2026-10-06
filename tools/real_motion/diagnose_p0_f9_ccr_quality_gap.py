@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""Read-only Point CCR quality-gap diagnostic against epoch19 Local.
+
+Answers one question before any further training:
+  Is the remaining Local-vs-CCR gap mainly learnability/training budget, or is
+  useful Local behavior outside the current CCR support/action contract?
+
+The restricted oracle uses future GT ONLY to choose correct actions inside the
+already-built CCR support and legality mask, then passes those actions through
+the exact official CCR compositor. GT never changes support, source identity,
+projection, ownership, fallback, or motion.
+
+No checkpoint writes, threshold search, training, cache expansion or promotion.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import argparse
+from collections import defaultdict
+from contextlib import nullcontext
+import json
+import math
+import time
+
+import numpy as np
+import torch
+
+from real_motion.canonical_causal_repair import repair_targets, compose_canonical
+from real_motion.canonical_repair_execution import CanonicalCpuExecution
+from real_motion.column_runtime_pipeline import CachedColumnSource, prefetch_raw_columns
+from real_motion.nuscenes_adapter import NuScenesWindowSource, gt_moving_support_sequence
+from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
+from real_motion.source_evidence_audit import edit_quality
+from real_motion.v21_source_induction import stable_json_fingerprint
+from tools.real_motion import causal_column_common as columns
+from tools.real_motion.ccr_screen_common import build_inputs, map_inputs, old_execution
+from tools.real_motion.eval_p0_f9_v18_se2 import load_cache
+from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import (
+    Metrics, align_records, delta, load_manifest, sha256,
+)
+from tools.real_motion.pilot_p0_f9_canonical_causal_repair import probabilities
+from tools.real_motion.point_ccr_v18_fps_common import load_point_head
+from tools.real_motion.run_p0_f9_shared_evidence_pilot import PilotProvider, require_cuda
+from tools.real_motion.shared_evidence_pilot_common import GATES, moving_support_masks
+from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256, write_json, finite_json
+from tools.real_motion.train_p0_f9_causal_columns import record_keys
+from tools.real_motion.train_p0_f9_joint_causal_columns import load_joint
+from real_motion.causal_column_completion import actions_from_probabilities, compose_dense
+
+
+PROTOCOL = "p0_f9_ccr_quality_gap_restricted_oracle_v1"
+REPORT = columns.REPORT
+VARIANTS = (
+    "current_joint",
+    "current_static",
+    "current_dynamic",
+    "current_add_only",
+    "current_remove_only",
+    "restricted_oracle",
+    "oracle_static",
+    "oracle_dynamic",
+    "oracle_add_only",
+    "oracle_remove_only",
+    "old_local",
+)
+
+
+def _safe_div(a, b):
+    return None if not b else float(a) / float(b)
+
+
+def _action_bucket():
+    return dict(valid=0, target_pos=0, pred_pos=0, tp=0, fp=0, fn=0)
+
+
+def _update_action(bucket, valid, target, pred):
+    valid = np.asarray(valid, bool)
+    target = np.asarray(target, bool) & valid
+    pred = np.asarray(pred, bool) & valid
+    bucket["valid"] += int(valid.sum())
+    bucket["target_pos"] += int(target.sum())
+    bucket["pred_pos"] += int(pred.sum())
+    bucket["tp"] += int((target & pred).sum())
+    bucket["fp"] += int((~target & pred & valid).sum())
+    bucket["fn"] += int((target & ~pred).sum())
+
+
+def _finish_action(bucket):
+    out = dict(bucket)
+    out["precision"] = _safe_div(out["tp"], out["tp"] + out["fp"])
+    out["recall"] = _safe_div(out["tp"], out["tp"] + out["fn"])
+    p, r = out["precision"], out["recall"]
+    out["f1"] = None if p is None or r is None or p + r == 0 else 2 * p * r / (p + r)
+    out["positive_rate"] = _safe_div(out["target_pos"], out["valid"])
+    return out
+
+
+def _checkpoint_curve(saved):
+    reports = saved.get("reports", {})
+    initial_old = (
+        reports.get("initial_dev64", {})
+        .get("variants", {})
+        .get("old_joint", {})
+        .get("metrics")
+    )
+    rows = []
+    for row in reports.get("epochs", []):
+        metrics = row.get("evaluation", {}).get("variants", {}).get("joint", {}).get("metrics")
+        if not metrics:
+            continue
+        item = {
+            "epoch": int(row.get("epoch", len(rows) + 1)),
+            "update": int(row.get("update", 0)),
+            "mIoU": float(metrics["mIoU"]),
+            "MovingMicro": float(metrics["MovingMicro"]),
+            "per_horizon": metrics["per_horizon"],
+        }
+        if initial_old:
+            item["vs_old_mIoU_pp"] = item["mIoU"] - float(initial_old["mIoU"])
+            item["vs_old_MovingMicro_pp"] = item["MovingMicro"] - float(initial_old["MovingMicro"])
+        rows.append(item)
+    return {
+        "initial_old_dev64": initial_old,
+        "epochs": rows,
+        "last_epoch_delta": (
+            None if len(rows) < 2 else {
+                "mIoU_pp": rows[-1]["mIoU"] - rows[-2]["mIoU"],
+                "MovingMicro_pp": rows[-1]["MovingMicro"] - rows[-2]["MovingMicro"],
+            }
+        ),
+    }
+
+
+def _role_masks(evidence):
+    return {
+        "static": np.asarray(evidence.actor) < 0,
+        "dynamic": np.asarray(evidence.actor) >= 0,
+    }
+
+
+def _compose_variants(prep, evidence, plan, p, target):
+    zeros = np.zeros_like(p[..., 0], dtype=np.float32)
+    ones_add = target[..., 0].astype(np.float32)
+    ones_remove = target[..., 1].astype(np.float32)
+    return {
+        "current_joint": compose_canonical(
+            prep.baseline, evidence, plan, p[..., 0], p[..., 1], thresholds=(.5, .95), role="all"
+        ),
+        "current_static": compose_canonical(
+            prep.baseline, evidence, plan, p[..., 0], p[..., 1], thresholds=(.5, .95), role="static"
+        ),
+        "current_dynamic": compose_canonical(
+            prep.baseline, evidence, plan, p[..., 0], p[..., 1], thresholds=(.5, .95), role="dynamic"
+        ),
+        "current_add_only": compose_canonical(
+            prep.baseline, evidence, plan, p[..., 0], zeros, thresholds=(.5, .95), role="all"
+        ),
+        "current_remove_only": compose_canonical(
+            prep.baseline, evidence, plan, zeros, p[..., 1], thresholds=(.5, .95), role="all"
+        ),
+        "restricted_oracle": compose_canonical(
+            prep.baseline, evidence, plan, ones_add, ones_remove, thresholds=(.5, .95), role="all"
+        ),
+        "oracle_static": compose_canonical(
+            prep.baseline, evidence, plan, ones_add, ones_remove, thresholds=(.5, .95), role="static"
+        ),
+        "oracle_dynamic": compose_canonical(
+            prep.baseline, evidence, plan, ones_add, ones_remove, thresholds=(.5, .95), role="dynamic"
+        ),
+        "oracle_add_only": compose_canonical(
+            prep.baseline, evidence, plan, ones_add, zeros, thresholds=(.5, .95), role="all"
+        ),
+        "oracle_remove_only": compose_canonical(
+            prep.baseline, evidence, plan, zeros, ones_remove, thresholds=(.5, .95), role="all"
+        ),
+    }
+
+
+def _old_helpful_coverage(before, old_dense, gt, evidence, plan, target, h):
+    """How many Local fixes are exactly expressible by one legal CCR action."""
+    before = np.asarray(before)
+    old_dense = np.asarray(old_dense)
+    gt = np.asarray(gt)
+    helpful = (old_dense == gt) & (before != gt)
+    harmful = (old_dense != gt) & (before == gt) & (old_dense != before)
+    changed = old_dense != before
+
+    positives = target[:, h, 0] | target[:, h, 1]
+    flats = np.asarray(plan.flat[:, h], np.int64)
+    recoverable = np.unique(flats[positives & (flats >= 0)])
+    helpful_flat = np.flatnonzero(helpful.ravel())
+    reachable = np.isin(helpful_flat, recoverable, assume_unique=False)
+
+    rows = {
+        "old_changed": int(changed.sum()),
+        "old_helpful": int(helpful.sum()),
+        "old_harmful": int(harmful.sum()),
+        "old_helpful_reachable_by_exact_CCR_action": int(reachable.sum()),
+        "old_helpful_unreachable": int(len(helpful_flat) - reachable.sum()),
+    }
+    rows["reachable_fraction"] = _safe_div(
+        rows["old_helpful_reachable_by_exact_CCR_action"], rows["old_helpful"]
+    )
+
+    # Useful Local edits by GT semantic class, with current CCR reachability.
+    per_class = {}
+    flat_gt = gt.ravel()
+    for cid in np.unique(flat_gt[helpful_flat]) if len(helpful_flat) else ():
+        ids = helpful_flat[flat_gt[helpful_flat] == cid]
+        ok = np.isin(ids, recoverable, assume_unique=False)
+        per_class[str(int(cid))] = {
+            "old_helpful": int(len(ids)),
+            "reachable": int(ok.sum()),
+            "unreachable": int(len(ids) - ok.sum()),
+            "reachable_fraction": _safe_div(int(ok.sum()), int(len(ids))),
+        }
+    rows["per_gt_class"] = per_class
+    return rows
+
+
+def _merge_coverage(total, row):
+    for key in (
+        "old_changed", "old_helpful", "old_harmful",
+        "old_helpful_reachable_by_exact_CCR_action", "old_helpful_unreachable",
+    ):
+        total[key] += int(row[key])
+    for cid, values in row["per_gt_class"].items():
+        dst = total["per_gt_class"][cid]
+        for key in ("old_helpful", "reachable", "unreachable"):
+            dst[key] += int(values[key])
+
+
+def _finish_coverage(total):
+    out = {k: int(v) for k, v in total.items() if k != "per_gt_class"}
+    out["reachable_fraction"] = _safe_div(
+        out["old_helpful_reachable_by_exact_CCR_action"], out["old_helpful"]
+    )
+    out["per_gt_class"] = {}
+    for cid, values in sorted(total["per_gt_class"].items(), key=lambda x: int(x[0])):
+        row = dict(values)
+        row["reachable_fraction"] = _safe_div(row["reachable"], row["old_helpful"])
+        out["per_gt_class"][cid] = row
+    return out
+
+
+def _top_class_gaps(metrics):
+    rows = []
+    current = metrics["current_joint"]
+    old = metrics["old_local"]
+    oracle = metrics["restricted_oracle"]
+    for h in ("1.0", "2.0", "3.0"):
+        c = current["per_horizon"][h]["semantic_per_class"]
+        o = old["per_horizon"][h]["semantic_per_class"]
+        q = oracle["per_horizon"][h]["semantic_per_class"]
+        for cid in c:
+            if all(np.isfinite(x[cid]) for x in (c, o, q)):
+                rows.append({
+                    "horizon_s": h,
+                    "class_id": int(cid),
+                    "old_minus_current_pp": float(o[cid] - c[cid]),
+                    "oracle_minus_current_pp": float(q[cid] - c[cid]),
+                    "oracle_minus_old_pp": float(q[cid] - o[cid]),
+                    "current_iou": float(c[cid]),
+                    "old_iou": float(o[cid]),
+                    "oracle_iou": float(q[cid]),
+                })
+    rows.sort(key=lambda x: x["old_minus_current_pp"], reverse=True)
+    return rows[:20]
+
+
+def _decision(metrics):
+    current = metrics["current_joint"]
+    old = metrics["old_local"]
+    oracle = metrics["restricted_oracle"]
+    tol = .20
+    oracle_gate = {
+        "mIoU_within_0_20pp_of_old": oracle["mIoU"] >= old["mIoU"] - tol,
+        "MovingMicro_within_0_20pp_of_old": oracle["MovingMicro"] >= old["MovingMicro"] - tol,
+        "all_horizons_MovingMicro_within_0_20pp_of_old": all(
+            oracle["per_horizon"][h]["MovingMicro"] >= old["per_horizon"][h]["MovingMicro"] - tol
+            for h in ("1.0", "2.0", "3.0")
+        ),
+    }
+    oracle_gate["pass"] = all(oracle_gate.values())
+    return {
+        "current_vs_old_pp": delta(current, old),
+        "oracle_vs_current_pp": delta(oracle, current),
+        "oracle_vs_old_pp": delta(oracle, old),
+        "restricted_oracle_gate": oracle_gate,
+        "route": (
+            "SUPPORT_SUFFICIENT__test_training_budget_full_TRAIN20430_x3_warm_start"
+            if oracle_gate["pass"]
+            else "SUPPORT_OR_COMPOSITOR_LIMIT__do_not_blindly_add_epochs; change one support/context axis first"
+        ),
+        "note": (
+            "Restricted oracle is diagnostic only: GT chooses actions inside the current legal CCR domain; "
+            "it is not an arbitrary-scene GT upper bound."
+        ),
+    }
+
+
+def _summary(result):
+    lines = [
+        "===== POINT CCR QUALITY GAP / RESTRICTED ORACLE =====",
+        "status=" + result["status"],
+        "protocol=" + PROTOCOL,
+        "GT is diagnostic-only and cannot change CCR support/legality/motion.",
+    ]
+    if result.get("metrics"):
+        m = result["metrics"]
+        for name in ("baseline", "current_joint", "old_local", "restricted_oracle",
+                     "current_static", "current_dynamic", "current_add_only", "current_remove_only",
+                     "oracle_static", "oracle_dynamic", "oracle_add_only", "oracle_remove_only"):
+            x = m[name]
+            lines.append(
+                f'{name}: IoU={x["IoU"]:.6f} mIoU={x["mIoU"]:.6f} '
+                f'MovingMacro={x["MovingMacro"]:.6f} MovingMicro={x["MovingMicro"]:.6f}'
+            )
+    if result.get("decision"):
+        d = result["decision"]
+        lines.append("current_vs_old=" + json.dumps(d["current_vs_old_pp"], ensure_ascii=False))
+        lines.append("oracle_vs_current=" + json.dumps(d["oracle_vs_current_pp"], ensure_ascii=False))
+        lines.append("oracle_vs_old=" + json.dumps(d["oracle_vs_old_pp"], ensure_ascii=False))
+        lines.append("restricted_oracle_gate=" + json.dumps(d["restricted_oracle_gate"]))
+        lines.append("ROUTE=" + d["route"])
+    if result.get("old_helpful_coverage"):
+        c = result["old_helpful_coverage"]["all_report_horizons"]
+        lines.append(
+            "old Local helpful voxel reachability: "
+            f'{c["old_helpful_reachable_by_exact_CCR_action"]}/{c["old_helpful"]} '
+            f'= {c["reachable_fraction"]}'
+        )
+    if result.get("training_curve"):
+        lines.append("checkpoint_training_curve=" + json.dumps(result["training_curve"], ensure_ascii=False))
+    if result.get("action_learning"):
+        lines.append("action_learning=" + json.dumps(result["action_learning"], ensure_ascii=False))
+    if "error" in result:
+        lines.append("error=" + result["error"])
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_config_args(parser)
+    for key in (
+        "checkpoint", "ccr-checkpoint", "base-checkpoint", "dev-cache",
+        "population-manifest", "dataroot", "dev-info", "out-dir",
+    ):
+        parser.add_argument("--" + key, required=True)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--windows", type=int, default=64, choices=(64, 512))
+    parser.add_argument("--cpu-workers", type=int, default=8)
+    parser.add_argument("--ccr-cpu-execution", choices=("numpy", "native", "native_parallel"), default="native_parallel")
+    parser.add_argument("--ccr-cpu-workers", type=int, default=4)
+    args = parser.parse_args(argv)
+
+    out = Path(args.out_dir)
+    if out.exists():
+        parser.error("fresh output required")
+    for key in (
+        "config", "checkpoint", "ccr_checkpoint", "base_checkpoint",
+        "dev_cache", "population_manifest", "dev_info",
+    ):
+        if not Path(getattr(args, key) or "").is_file():
+            parser.error("missing " + key)
+    if not Path(args.dataroot).is_dir() or not 1 <= args.cpu_workers <= 16 or not 1 <= args.ccr_cpu_workers <= 8:
+        parser.error("invalid paths/workers")
+
+    device = require_cuda(args.device)
+    torch.set_num_threads(1)
+    out.mkdir(parents=True)
+    started = time.perf_counter()
+    result = {"status": "running", "protocol": PROTOCOL}
+    def persist():
+        write_json(out / "quality_gap.json", result)
+        (out / "summary.txt").write_text(_summary(result), encoding="utf-8")
+    persist()
+
+    execution = None
+    try:
+        cfg = load_runtime_config(args.config, args.override)
+        config_fp = stable_json_fingerprint(cfg)
+        epoch19_sha = sha256(args.checkpoint)
+        if sha256(args.base_checkpoint) != CLEAN_SHA256:
+            raise RuntimeError("Clean-E14 base checkpoint fingerprint mismatch")
+        ck, teacher = load_joint(
+            args.checkpoint, device, reference_sha=CLEAN_SHA256,
+            config_sha=config_fp, allow_diagnostic=True,
+        )
+        if (
+            teacher.transport.config.history_frames != 4
+            or ck.get("cursor_epoch") != 19
+            or ck["model_configs"].get("adaptive_context") is not None
+        ):
+            raise RuntimeError("selected four-history epoch19 Local checkpoint required")
+        teacher.eval().requires_grad_(False)
+        for path, expected in (
+            (args.dev_cache, ck["cache_fingerprints"]["dev"]),
+            (args.dev_info, ck["info_fingerprints"]["dev"]),
+        ):
+            if sha256(path) != expected:
+                raise RuntimeError("epoch19/data provenance mismatch: " + path)
+
+        saved = torch.load(args.ccr_checkpoint, map_location="cpu", weights_only=False)
+        head = load_point_head(
+            saved,
+            teacher_sha256=epoch19_sha,
+            config_fingerprint=config_fp,
+            source_dim=teacher.columns.source_dim,
+            device=device,
+        )
+        head.eval().requires_grad_(False)
+        result["training_curve"] = _checkpoint_curve(saved)
+
+        manifest, keys64, _ = load_manifest(args.population_manifest)
+        parent = tuple(map(tuple, manifest["parent_keys"]))
+        if (
+            len(keys64) != 64 or len(parent) != 512
+            or manifest["manifest_fingerprint"] != ck["dev_manifest_fingerprint"]
+            or parent != tuple(map(tuple, ck["dev_keys"]))
+            or saved["contract"]["dev_manifest_fingerprint"] != manifest["manifest_fingerprint"]
+        ):
+            raise RuntimeError("frozen dev manifest mismatch")
+        keys = keys64 if args.windows == 64 else parent
+        _, all_dev = load_cache(args.dev_cache)
+        record_keys(all_dev)
+        records = align_records(all_dev, keys)
+        del all_dev
+
+        provider = PilotProvider(
+            args.base_checkpoint, CLEAN_SHA256, make_prepare_config(cfg),
+            device, args.cpu_workers, teacher, None,
+        )
+        execution = CanonicalCpuExecution(args.ccr_cpu_execution, args.ccr_cpu_workers)
+        provider.ccr_execution = execution
+        source = CachedColumnSource(
+            NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False), 256
+        )
+
+        base = Metrics()
+        metric_obj = {name: Metrics() for name in VARIANTS}
+        quality = {name: defaultdict(int) for name in VARIANTS}
+        scenes = defaultdict(lambda: {name: Metrics() for name in ("baseline", *VARIANTS)})
+
+        action = defaultdict(_action_bucket)
+        coverage_all = {
+            "old_changed": 0,
+            "old_helpful": 0,
+            "old_harmful": 0,
+            "old_helpful_reachable_by_exact_CCR_action": 0,
+            "old_helpful_unreachable": 0,
+            "per_gt_class": defaultdict(lambda: {"old_helpful": 0, "reachable": 0, "unreachable": 0}),
+        }
+        coverage_h = {
+            str(.5 * (h + 1)): {
+                "old_changed": 0,
+                "old_helpful": 0,
+                "old_harmful": 0,
+                "old_helpful_reachable_by_exact_CCR_action": 0,
+                "old_helpful_unreachable": 0,
+                "per_gt_class": defaultdict(lambda: {"old_helpful": 0, "reachable": 0, "unreachable": 0}),
+            }
+            for h in REPORT
+        }
+        duplicate_positive_destinations = 0
+        positive_proposals = 0
+
+        with old_execution(teacher, provider):
+            for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records), 1):
+                output = teacher.motion(record, device)
+                prep = provider.prepare_columns(
+                    source, record, include_gt=True, raw_window=raw, outputs=output
+                )
+                evidence = build_inputs(provider, prep)
+                plan = map_inputs(provider, evidence, prep)
+                p = probabilities(head, evidence, plan, output, device)
+                target, valid = repair_targets(evidence, plan, raw["future_gt_occ"])
+                predictions = _compose_variants(prep, evidence, plan, p, target)
+
+                # Old Local only needs report horizons; preserve its official gates.
+                old_by_h = {}
+                for h in REPORT:
+                    old_plan = columns.candidate_plan(prep, h, provider.pcfg.grid, teacher.columns.config)
+                    old_p = columns.predict_probabilities(
+                        teacher.columns, prep, h, old_plan, provider.pcfg.grid, device, 256
+                    )
+                    old_by_h[h] = compose_dense(
+                        prep.baseline[h], old_plan,
+                        actions_from_probabilities(old_plan, old_p, GATES),
+                    )
+
+                support = gt_moving_support_sequence(
+                    source.nusc, prep.window.t0_token, prep.window.future_tokens,
+                    tuple(.5 * (h + 1) for h in range(6)),
+                    grid=provider.pcfg.grid, workers=provider.workers,
+                )
+                moving = moving_support_masks(support, provider.pcfg.grid.shape_hwd)
+
+                # Learned-action quality over the complete legal CCR domain.
+                roles = _role_masks(evidence)
+                pred_actions = np.stack(
+                    (p[..., 0] >= .5, p[..., 1] >= .95), axis=-1
+                ) & plan.legal
+                for role_name, role_mask in roles.items():
+                    for action_id, action_name in enumerate(("ADD", "REMOVE")):
+                        for h in range(6):
+                            mask = role_mask & valid[:, h, action_id]
+                            key = f"{role_name}/{action_name}/h{h+1}"
+                            _update_action(
+                                action[key],
+                                mask,
+                                target[:, h, action_id],
+                                pred_actions[:, h, action_id],
+                            )
+                        # Aggregate across six horizons without changing priors.
+                        role6 = np.broadcast_to(role_mask[:, None], target[..., action_id].shape)
+                        key = f"{role_name}/{action_name}/all"
+                        _update_action(
+                            action[key],
+                            role6 & valid[..., action_id],
+                            target[..., action_id],
+                            pred_actions[..., action_id],
+                        )
+                        for cid in np.unique(evidence.classes[role_mask]):
+                            class_mask = role_mask & (evidence.classes == cid)
+                            class6 = np.broadcast_to(class_mask[:, None], target[..., action_id].shape)
+                            key = f"{role_name}/{action_name}/class_{int(cid)}"
+                            _update_action(
+                                action[key],
+                                class6 & valid[..., action_id],
+                                target[..., action_id],
+                                pred_actions[..., action_id],
+                            )
+
+                # Duplicate GT-positive proposals are reported because the
+                # restricted oracle remains subject to the official compositor.
+                for h in range(6):
+                    positive = target[:, h, 0] | target[:, h, 1]
+                    flats = plan.flat[positive, h]
+                    flats = flats[flats >= 0]
+                    positive_proposals += int(len(flats))
+                    if len(flats):
+                        _, count = np.unique(flats, return_counts=True)
+                        duplicate_positive_destinations += int((count > 1).sum())
+
+                scene = scenes[str(record["scene_name"])]
+                for ri, h in enumerate(REPORT):
+                    gt = raw["future_gt_occ"][h]
+                    before = prep.baseline[h]
+                    base.update(ri, before, gt, moving[h])
+                    scene["baseline"].update(ri, before, gt, moving[h])
+
+                    pred_h = {name: predictions[name][h] for name in predictions}
+                    pred_h["old_local"] = old_by_h[h]
+                    for name in VARIANTS:
+                        dense = pred_h[name]
+                        metric_obj[name].update(ri, dense, gt, moving[h])
+                        scene[name].update(ri, dense, gt, moving[h])
+                        for key, value in edit_quality(before, dense, gt).items():
+                            quality[name][key] += value
+
+                    cov = _old_helpful_coverage(
+                        before, old_by_h[h], gt, evidence, plan, target, h
+                    )
+                    _merge_coverage(coverage_all, cov)
+                    _merge_coverage(coverage_h[str(.5 * (h + 1))], cov)
+
+                if wi == 1 or wi % 16 == 0 or wi == len(records):
+                    print(f"CCR_GAP {wi}/{len(records)}", flush=True)
+
+        baseline_metrics = base.compute()
+        metrics = {"baseline": baseline_metrics}
+        for name in VARIANTS:
+            metrics[name] = metric_obj[name].compute()
+        result["metrics"] = metrics
+        result["delta_vs_transport_pp"] = {
+            name: delta(metrics[name], baseline_metrics) for name in VARIANTS
+        }
+        result["decision"] = _decision(metrics)
+        result["top_semantic_gaps"] = _top_class_gaps(metrics)
+        result["action_learning"] = {
+            key: _finish_action(value) for key, value in sorted(action.items())
+        }
+        result["old_helpful_coverage"] = {
+            "all_report_horizons": _finish_coverage(coverage_all),
+            "per_horizon": {
+                h: _finish_coverage(value) for h, value in coverage_h.items()
+            },
+        }
+        result["oracle_conflicts"] = {
+            "positive_proposals": positive_proposals,
+            "destinations_with_multiple_positive_proposals": duplicate_positive_destinations,
+            "note": "duplicates are not removed; restricted oracle uses the official compositor exactly",
+        }
+        result["quality"] = {}
+        for name in VARIANTS:
+            q = dict(quality[name])
+            added, removed = q.get("added", 0), q.get("removed", 0)
+            q["addition_semantic_precision"] = _safe_div(q.get("added_semantic_tp", 0), added)
+            q["removal_false_occupancy_fraction"] = _safe_div(q.get("removed_false_occupancy", 0), removed)
+            result["quality"][name] = q
+
+        result["population"] = {
+            "windows": len(records),
+            "mode": "dev64" if args.windows == 64 else "dev512",
+            "manifest_fingerprint": manifest["manifest_fingerprint"],
+            "key_fingerprint": stable_json_fingerprint([list(x) for x in keys]),
+        }
+        result.update(
+            status="complete",
+            elapsed_seconds=time.perf_counter() - started,
+            read_only=True,
+            future_GT_model_input=False,
+            threshold_search=False,
+            route=result["decision"]["route"],
+        )
+        persist()
+        print(_summary(result), flush=True)
+        return 0
+    except BaseException as exc:
+        result.update(
+            status="failed",
+            error=type(exc).__name__ + ": " + str(exc),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+        persist()
+        raise
+    finally:
+        if execution is not None:
+            execution.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
