@@ -283,6 +283,7 @@ def _strong_all_horizons(
     cfg,
     profile=None,
     runtime_device=None,
+    majority_backend="dense_cuda",
 ):
     """Bit-exact-gated Strong/KTA runtime path for all six horizons.
 
@@ -381,7 +382,17 @@ def _strong_all_horizons(
             static_dst, known = accelerated_inverse[hi]
         _t = time.perf_counter() if profile is not None else None
         if runtime_device is not None and torch.device(runtime_device).type == "cuda":
-            out = majority_fill_cuda_exact(
+            if majority_backend == "sparse_cuda":
+                from real_motion.v18_execution_trial import majority_fill_sparse_cuda_exact
+                fill_function = majority_fill_sparse_cuda_exact
+            elif majority_backend == "native":
+                from real_motion.v18_execution_trial import majority_fill_native_exact
+                fill_function = majority_fill_native_exact
+            elif majority_backend == "dense_cuda":
+                fill_function = majority_fill_cuda_exact
+            else:
+                raise ValueError("unknown Strong majority execution backend")
+            out = fill_function(
                 static_dst,
                 ~known,
                 kernel=cfg.fill_kernel,

@@ -34,6 +34,54 @@ extern "C" void* memcpy(void* dst, const void* src, decltype(sizeof(0)) n) {
 
 API int swfm_column_cpu_abi() noexcept { return 4; }
 
+// Frozen Strong 5x5x1 majority: every unknown voxel, integer counts only.
+// Threshold and tied winners are flagged for scipy float32 replay by Python.
+// There is no candidate limit, geometry change, allocation or internal thread.
+API int swfm_v18_majority(const u8* sem, const u8* unknown, i64 xsize,
+    i64 ysize, i64 zsize, u8* output, u8* ambiguous) noexcept {
+    constexpr i64 limit = 0x7fffffffffffffffLL;
+    if (xsize < 1 || ysize < 1 || zsize < 1 || xsize > limit/ysize
+        || xsize*ysize > limit/zsize) return -1;
+    const i64 n = xsize*ysize*zsize;
+    for (i64 i = 0; i < n; ++i) {
+        if (sem[i] > 17 || unknown[i] > 1) return -2;
+        output[i] = sem[i]; ambiguous[i] = 0;
+    }
+    for (i64 x = 0; x < xsize; ++x) {
+        const i64 xa = x > 2 ? x-2 : 0;
+        const i64 xb = x+2 < xsize ? x+2 : xsize-1;
+        for (i64 y = 0; y < ysize; ++y) {
+            const i64 ya = y > 2 ? y-2 : 0;
+            const i64 yb = y+2 < ysize ? y+2 : ysize-1;
+            for (i64 z = 0; z < zsize; ++z) {
+                const i64 index = (x*ysize+y)*zsize+z;
+                if (!unknown[index]) continue;
+                int counts[18] = {};
+                int denominator = 0;
+                for (i64 xx = xa; xx <= xb; ++xx) {
+                    for (i64 yy = ya; yy <= yb; ++yy) {
+                        const i64 neighbor = (xx*ysize+yy)*zsize+z;
+                        if (!unknown[neighbor]) {
+                            ++counts[sem[neighbor]]; ++denominator;
+                        }
+                    }
+                }
+                if (!denominator) continue;
+                int best = 0, maximum = 0, ties = 0;
+                for (int c = 0; c < 18; ++c) {
+                    if (counts[c] > maximum) {
+                        maximum = counts[c]; best = c; ties = 1;
+                    } else if (counts[c] == maximum) ++ties;
+                }
+                const int lhs = 10*maximum, rhs = 3*denominator;
+                if (lhs > rhs && ties == 1) output[index] = static_cast<u8>(best);
+                else if (lhs == rhs || (lhs > rhs && ties > 1)) ambiguous[index] = 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // Original six TRAIN strata, each retaining ascending candidate-row order.
 // Counts/fill are integer-only; random draws ALWAYS remain on the caller.
 API int swfm_sampling_strata(const u8* kinds, const i32* actors, const u8* positive,

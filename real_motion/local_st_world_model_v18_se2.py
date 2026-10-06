@@ -241,7 +241,8 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
         x = self.spatial_stem(x)
         Hs, Ws = x.shape[-2:]
         x = x.reshape(B, history_frames, cfg.d_model, Hs, Ws)
-        obj = self.kinematic_proj(features).view(B, 1, cfg.d_model, 1, 1)
+        projected_source = self.kinematic_proj(features)
+        obj = projected_source.view(B, 1, cfg.d_model, 1, 1)
         fm = self.frame_motion_proj(frame_motion_features.to(x.dtype)).view(
             B, history_frames, cfg.d_model, 1, 1
         )
@@ -253,7 +254,8 @@ class LocalSpatialTemporalWorldModelV18SE2(LocalSpatialTemporalWorldModelV17):
             B, history_frames * Hs * Ws, cfg.d_model
         )
         q = self.future_query.expand(B, -1, -1) + self.future_time_embedding
-        q = q + self.kinematic_proj(features).unsqueeze(1)
+        q = q + (projected_source if getattr(self, 'reuse_source_projection', False)
+                 else self.kinematic_proj(features)).unsqueeze(1)
         q = q + self.kta_future_proj(kta_displacement_xy_m.to(q.dtype) / 20.0)
         for block in self.decoder:
             q = block(q, context)

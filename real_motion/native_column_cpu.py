@@ -31,6 +31,11 @@ def backend_name():
 
 def get_native():
     if backend_name() == 'numpy': return None
+    return get_prepared_native()
+
+
+def get_prepared_native():
+    """Explicit kernel opt-in without switching every column CPU operation."""
     if _loaded is None: raise RuntimeError('native CPU requested before prepare_native(); run native preflight first')
     return _loaded
 
@@ -148,6 +153,7 @@ class NativeColumns:
         self.compact_fn = self._bind('swfm_compact_columns', [P]*9+[I]*4+[J]+[P]*8)
         self.support_many_fn = self._bind('swfm_support_many', [P]*2+[I]*5+[P,I]+[P]*3, count=True)
         self.gather_many_fn = self._bind('swfm_gather_many', [P]+[I]*3+[P]*2+[I]*3+[P]*9)
+        self.v18_majority_fn = self._bind('swfm_v18_majority', [P]*2+[I]*3+[P]*2)
         self.lock = Lock(); self.calls = {}
 
     def _bind(self, name, args, count=False):
@@ -165,6 +171,16 @@ class NativeColumns:
         with self.lock: calls = dict(self.calls)
         return dict(backend='native', path=self.path, **self.manifest, calls=calls,
             floating_point_geometry='unchanged_numpy_float64', internal_threads=1)
+
+    def v18_majority(self, semantics, unknown):
+        shape = self._grid(np.asarray(semantics).shape)
+        sem = _array(semantics, np.uint8, shape)
+        unknown = _bits(unknown, shape)
+        output = np.empty(shape, np.uint8); ambiguous = np.empty(shape, np.uint8)
+        self._call('v18_majority', self.v18_majority_fn,
+                   _pointer(sem), _pointer(unknown), *shape,
+                   _pointer(output), _pointer(ambiguous))
+        return output, ambiguous
 
     @staticmethod
     def _grid(value):

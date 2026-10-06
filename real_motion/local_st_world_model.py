@@ -291,8 +291,13 @@ class FutureQueryBlock(nn.Module):
         z = self.self_norm(q)
         y, _ = self.self_attn(z, z, z, need_weights=False)
         q = q + y
+        # Opt-in execution experiment. Both operands still contain exactly the
+        # same normalized values; default frozen execution stays untouched.
+        normalized_context = self.cross_ctx_norm(context) if getattr(self, 'reuse_context_norm', False) else None
         y, _ = self.cross_attn(
-            self.cross_q_norm(q), self.cross_ctx_norm(context), self.cross_ctx_norm(context),
+            self.cross_q_norm(q),
+            normalized_context.view_as(normalized_context) if normalized_context is not None else self.cross_ctx_norm(context),
+            normalized_context if normalized_context is not None else self.cross_ctx_norm(context),
             need_weights=False,
         )
         q = q + y
