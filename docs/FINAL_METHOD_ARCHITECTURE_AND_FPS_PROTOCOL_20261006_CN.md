@@ -657,6 +657,46 @@ elapsed = time.perf_counter() - start
 
 ---
 
+# 13.1 正式 FPS 冻结结果（L40S，2026-10-06）
+
+固定 20 个窗口（18 scene-balanced + 2 high-source stress），batch=1，3 次重复，共 60 个 synchronized samples / 360 个未来帧：
+
+- **Dense Forecast FPS = 47.9285**
+- mean six-frame latency = **125.186 ms**
+- P50 = **130.548 ms**
+- P90 = **145.928 ms**
+- legacy/new parity = **20 / 20 PASS**
+- status = **complete**
+
+正式计时范围严格遵守本文件第 10 节：
+
+- timer 内：live KTA/Strong、V18 motion、SE(2) transport、future projection/ownership、CCR shared encoding + six readouts、constrained dense composition；
+- timer 外：history-only representation、disk I/O、GT/metrics、checkpoint loading、compile/warmup。
+
+阶段均值（仅诊断，不替代 uninterrupted synchronized wall-clock 总时间）：
+
+| Stage | Mean ms |
+|---|---:|
+| causal motion prior | 0.405 |
+| Strong prior | **83.214** |
+| Strong clear index | 0.503 |
+| live KTA staging | 0.075 |
+| V18 motion forward | 6.456 |
+| source transport + layers | 7.841 |
+| six projection / ownership / legality | 13.083 |
+| shared CCR encode + six readouts | 8.964 |
+| constrained dense composition | 3.692 |
+
+当前最大 runtime bottleneck 是 Strong prior（约 66.5% 正式六帧时延）。**该结果现阶段冻结，不继续做 FPS micro-optimization。**
+
+因为 20/20 同窗 old/new motion/probability/dense byte parity 全部通过，本轮数据流清理判定为 execution-equivalent refactor：
+
+> **不需要因为数据流清理而重新训练 epoch19 V18 或当前 Point CCR checkpoint。**
+
+下一阶段优先追当前 Point CCR 与 epoch19 Local 的质量差距，而不是继续优化 FPS。
+
+---
+
 # 14. 实现状态（2026-10-06 晚）
 
 当前实现分支：
