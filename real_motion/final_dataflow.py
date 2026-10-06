@@ -449,7 +449,7 @@ def forecast_six(
     }
 
 
-def batch_frozen_motion(teacher, rows, device, *, render_readback=True):
+def batch_frozen_motion(teacher, rows, device, *, render_readback=False):
     """One frozen V18 forward for a multi-window batch, split by source count.
 
     Frozen motion is source-row independent: V18's first dimension is a batch
