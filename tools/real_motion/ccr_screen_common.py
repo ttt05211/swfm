@@ -17,7 +17,7 @@ from real_motion.canonical_causal_repair import (
     repair_targets, compose_canonical, repair_loss,
 )
 from real_motion.canonical_repair_context import (
-    FixedCanonicalCache, build_fixed_canonical, fixed_history_digest,
+    FixedCanonicalCache, build_fixed_canonical,
     full_static_conflicts, sample_causal_points, map_sampled_canonical,
 )
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
@@ -175,11 +175,15 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
         raw=raw,
         state={**causal['prepared_state'],'rec':record,'gpu':None},
         registrations=causal['registrations'])
-    digest=fixed_history_digest(prep,provider.pcfg.grid)
+    # Ephemeral prefetch never enters a persistent cache, so hashing several
+    # MiB of raw history solely to name this in-memory object is wasted work.
+    # Dataset/config/checkpoint provenance has already been verified globally.
+    ephemeral_key=stable_json_fingerprint([
+        str(record['scene_name']),str(record['t0_token']),'CCR_FAST_EPHEMERAL_v1'])
     fixed=build_fixed_canonical(
         prep,provider.pcfg.grid,neighbors=False,
         kernels=execution_kernels(provider),executor=None,lazy_sampled=True)
-    fixed[0].fixed_history_sha256=digest
+    fixed[0].fixed_history_sha256=ephemeral_key
     conflicts=full_static_conflicts(fixed[0],prep,provider.pcfg.grid)
     causal['_ccr_prefetched_fixed']=fixed
     causal['_ccr_prefetched_conflicts']=conflicts
