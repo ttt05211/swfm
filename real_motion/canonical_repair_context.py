@@ -77,7 +77,17 @@ def fixed_history_digest(prepared, grid):
     return h.hexdigest()
 
 
-def build_fixed_canonical(prepared, grid, *, neighbors=True, kernels=None, executor=None):
+def build_fixed_canonical(prepared, grid, *, neighbors=True, kernels=None, executor=None, lazy_sampled=False):
+    if lazy_sampled and neighbors:
+        raise ValueError('lazy sampled CCR cache is point-head only; neighbours require full features')
+    if lazy_sampled:
+        lazy=build_canonical_evidence(prepared,grid,materialize_features=False,
+                                      kernels=kernels,executor=executor)
+        lazy.causal_strata=build_causal_strata(lazy)
+        lazy.audit={**lazy.audit,'shared_neighbors':False,'fixed_raw_history_descriptors':True,
+                    'learned_features_cached':False,'features_materialized':False,
+                    'sampled_feature_materialization':True}
+        return lazy,None
     if kernels is not None and not neighbors:
         full=build_canonical_evidence(prepared,grid,kernels=kernels,executor=executor)
         full.causal_strata=build_causal_strata(full)
@@ -124,9 +134,13 @@ class FixedCanonicalCache:
     are inputs, not future supervision. They may be reused. Entries are keyed
     by their actual causal contents plus neighbour configuration.
     """
-    def __init__(self, max_mib=256, *, neighbors=True, disk_root=None, max_disk_mib=0, async_writes=False, kernels=None, executor=None):
+    def __init__(self, max_mib=256, *, neighbors=True, disk_root=None, max_disk_mib=0, async_writes=False, kernels=None, executor=None,
+                 lazy_sampled=False):
         if not np.isfinite(max_mib) or max_mib < 0: raise ValueError('invalid cache budget')
         self.limit = int(max_mib*2**20); self.neighbors = bool(neighbors)
+        self.lazy_sampled=bool(lazy_sampled)
+        if self.lazy_sampled and self.neighbors:
+            raise ValueError('lazy sampled CCR cache requires neighbors=False')
         self.kernels=kernels
         self.executor=executor
         self.values = OrderedDict(); self.bytes = 0; self.lock = RLock()
@@ -154,8 +168,9 @@ class FixedCanonicalCache:
                 return value
             self.misses += 1
         def builder():
-            tick = time.perf_counter(); value = build_fixed_canonical(prepared, grid, neighbors=self.neighbors,
-                                                                   kernels=self.kernels,executor=self.executor)
+            tick = time.perf_counter(); value = build_fixed_canonical(
+                prepared, grid, neighbors=self.neighbors, kernels=self.kernels,
+                executor=self.executor, lazy_sampled=self.lazy_sampled)
             value[0].fixed_history_sha256 = digest
             with self.lock: self.build_seconds += time.perf_counter()-tick
             return value
@@ -214,6 +229,7 @@ class FixedCanonicalCache:
                         disk=self.disk.stats() if self.disk is not None else None,
                         static_query_mib=self.static_query_bytes/2**20,
                         static_query_limit_mib=self.static_query_limit/2**20,
+                        lazy_sampled_features=self.lazy_sampled,
                         future_supervision_cached=False, learned_features_cached=False)
 
     def close(self):
