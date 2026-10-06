@@ -272,8 +272,13 @@ def main(stop_event=None, argv=None, *, backend=None):
                         report = evaluate_fn(provider, dev_source, dev, teacher, head, progress=progress, stop_event=stop_event)
                     reports.setdefault('epochs', []).append(dict(epoch=epoch, update=updates, evaluation=report))
                     m = report['variants']['joint']['metrics']; old = reports['initial_dev64']['variants']['old_joint']['metrics']
+                    action=report.get('action_learning',{})
+                    def recall(key):
+                        value=action.get(key,{}).get('recall')
+                        return 'n/a' if value is None else f'{100*value:.1f}%'
                     print(f"{label}_EPOCH {epoch}/{a.epochs} mIoU={m['mIoU']:.6f} vs_old={m['mIoU']-old['mIoU']:+.6f} "
-                          f"MovingMicro={m['MovingMicro']:.6f} vs_old_Moving={m['MovingMicro']-old['MovingMicro']:+.6f}", flush=True)
+                          f"MovingMicro={m['MovingMicro']:.6f} vs_old_Moving={m['MovingMicro']-old['MovingMicro']:+.6f} "
+                          f"sADD_R={recall('static/ADD')} dADD_R={recall('dynamic/ADD')} dREM_R={recall('dynamic/REMOVE')}", flush=True)
                     save(); persist()
             with ThreadPoolExecutor(max_workers=min(3, a.cpu_workers)) as pool:
                 while epoch < a.epochs:
@@ -303,8 +308,9 @@ def main(stop_event=None, argv=None, *, backend=None):
                             details = (f"sampled_points={stat['sampled_points']} canonical_points={stat['canonical_points']}" if backend is not None else
                                        f"dynamic_columns={stat.get('dynamic_refine_columns', 0)}")
                             print(f"{label}_TRAIN epoch={epoch+1}/{a.epochs} batch={batch}/{counts[epoch]} update={updates}/{steps} "
-                                  f"loss={stat['loss']:.6f} seconds/window={stat['seconds']/len(rows):.4f} "
-                                  f"{details} allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
+                                  f"loss={stat['loss']:.6f} train_s/window={stat['seconds']/len(rows):.4f} "
+                                  f"wait_s/window={waited/len(rows):.4f} {details} "
+                                  f"allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
                         if batch == counts[epoch]:
                             epoch += 1; batch = 0; save(); persist(); break
                         if updates % checkpoint_every == 0 or stop_event is not None and stop_event.is_set():
