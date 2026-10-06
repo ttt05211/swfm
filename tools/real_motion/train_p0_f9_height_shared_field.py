@@ -98,6 +98,8 @@ def parser():
     p.add_argument('--speed-repeats', type=int, default=2)
     p.add_argument('--max-updates', type=int, default=0,
                    help='optional safe early-stop budget, NOT a different cosine schedule')
+    p.add_argument('--stop-after-epoch', type=int, default=0,
+                   help='safe checkpoint/monitor stop after N completed epochs; 0 runs full contract')
     p.add_argument('--skip-dev512', action='store_true')
     return p
 
@@ -126,8 +128,9 @@ def main(stop_event=None, argv=None, *, backend=None):
     if a.resume and not Path(a.resume).is_file():
         p.error('missing new shared-field screen checkpoint')
     if (not Path(a.dataroot).is_dir() or min(a.epochs, a.cpu_workers, a.prior_windows, a.fps_windows, a.speed_repeats) < 1
-            or not 1 <= a.eval_windows <= 64 or a.fps_windows > a.eval_windows or not 0 < a.train_fraction < 1
-            or not np.isfinite(a.lr) or a.lr <= 0 or a.max_updates < 0):
+            or not 1 <= a.eval_windows <= 64 or a.fps_windows > a.eval_windows or not 0 < a.train_fraction <= 1
+            or not np.isfinite(a.lr) or a.lr <= 0 or a.max_updates < 0
+            or not 0 <= a.stop_after_epoch <= a.epochs):
         p.error('invalid finite screen budgets')
     device = require_cuda(a.device); torch.set_num_threads(1); torch.manual_seed(a.seed)
     from real_motion.native_column_cpu import backend_name, prepare_native
@@ -173,7 +176,9 @@ def main(stop_event=None, argv=None, *, backend=None):
             _, all_train = load_cache(a.train_cache); keys = record_keys(all_train)
             if len(keys) != 20430 or tuple(keys) != tuple(map(tuple, ck['train_keys'])):
                 raise RuntimeError('full TRAIN20430 identity/order changed')
-            chosen, _ = select_population(keys, {s for s, _ in parent_keys}, fraction=a.train_fraction, seed=a.seed)
+            chosen = (tuple(keys) if np.isclose(a.train_fraction,1.0,rtol=0,atol=1e-12)
+                      else select_population(keys, {s for s, _ in parent_keys},
+                                             fraction=a.train_fraction, seed=a.seed)[0])
             train = align_records(all_train, chosen); del all_train
             groups = [epoch_groups(train, a.seed, i) for i in range(a.epochs)]
             sizes = [[len(g) for g in rows] for rows in groups]
@@ -184,6 +189,11 @@ def main(stop_event=None, argv=None, *, backend=None):
             head = (backend.make_head(teacher, device) if backend is not None else
                     HeightCausalField('shared_field', z_bins=teacher.columns.config.z_bins,
                                      source_dim=teacher.columns.source_dim).to(device))
+            warm_info=None
+            if backend is not None and getattr(a,'warm_start_head',None):
+                warm_info=backend.warm_start_head(
+                    head,a.warm_start_head,teacher_sha256=digest,
+                    config_fingerprint=stable_json_fingerprint(cfg))
             optimizer = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=.01)
             rng = np.random.default_rng(a.seed+1)
             root = Path(__file__).resolve().parents[2]
@@ -208,6 +218,12 @@ def main(stop_event=None, argv=None, *, backend=None):
             if backend is not None:
                 contract.update(backend.contract_extra(a, root))
             write_json(out/'contract.json', contract)
+            if warm_info is not None:
+                result['warm_start']=warm_info
+                # Preserve the source TRAIN-only probability calibration. The
+                # continuation experiment changes coverage, not thresholds or
+                # calibration, so do not silently recompute positive_weight.
+                reports.setdefault('train_prior',warm_info['train_prior'])
             if a.resume:
                 saved = torch.load(a.resume, map_location='cpu', weights_only=False)
                 (epoch, batch, updates, executed), reports = restore(saved, head, optimizer, rng, contract, protocol=run_protocol)
@@ -252,6 +268,9 @@ def main(stop_event=None, argv=None, *, backend=None):
             with ThreadPoolExecutor(max_workers=min(3, a.cpu_workers)) as pool:
                 while epoch < a.epochs:
                     monitor_pending()
+                    if a.stop_after_epoch and epoch >= a.stop_after_epoch:
+                        print(f'{label}_STOP_AFTER_EPOCH {epoch}/{a.epochs}; resume checkpoint is complete for this boundary', flush=True)
+                        break
                     if stop_event is not None and stop_event.is_set():
                         break
                     ordered = [r for g in groups[epoch][batch:] for r in g]
@@ -287,7 +306,10 @@ def main(stop_event=None, argv=None, *, backend=None):
                 input_wait_seconds_per_window=reports.get('input_wait_seconds', 0.)/max(executed, 1),
                 transport_frozen=True, training_speedup_NOT_claimed=True)
             if epoch < a.epochs or stop_event is not None and stop_event.is_set():
-                result.update(status='stopped', route='resume_identical_CCR_screen' if backend is not None else 'resume_identical_shared_field_screen'); persist(); return 0
+                reason=('planned_epoch_boundary' if a.stop_after_epoch and epoch >= a.stop_after_epoch
+                        else 'interrupt_or_update_budget')
+                result.update(status='stopped', stop_reason=reason,
+                              route='resume_identical_CCR_screen' if backend is not None else 'resume_identical_shared_field_screen'); persist(); return 0
             monitor_pending()
             if not a.skip_dev512 and 'final_dev512' not in reports:
                 with preserve_training_rng(rng):
