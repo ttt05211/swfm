@@ -476,7 +476,11 @@ def batch_frozen_motion(teacher, rows, device, *, render_readback=False):
         required = ("residual_xy_m", "yaw_delta_rad")
         if all(k in output for k in required):
             render = {
-                k: output[k].detach().cpu().numpy()
+                # NumPy has no native bfloat16 dtype.  Renderer arithmetic in
+                # the legacy path consumes ordinary CPU floats, so promote the
+                # already-computed BF16 values to float32 before one packed
+                # D2H transfer.  This changes representation only, not values.
+                k: output[k].detach().to(torch.float32).cpu().numpy()
                 for k in required
             }
     split = []
