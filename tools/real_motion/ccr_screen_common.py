@@ -60,10 +60,47 @@ def add_args(parser):
     parser.add_argument('--ccr-batched-head',action='store_true',help='same window-wise loss, batched point MLP; FP rounding may differ')
     parser.add_argument('--ccr-batched-motion',action='store_true',
                         help='one frozen V18 forward per packed window batch; enable only after parity gate')
+    parser.add_argument('--warm-start-head',
+                        help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
 
 
 def make_head(teacher, device):
     return CanonicalRepairHead(source_dim=teacher.columns.source_dim).to(device)
+
+
+def warm_start_head(head, path, *, teacher_sha256, config_fingerprint):
+    """Load only Point-CCR weights/calibration; never optimizer/RNG/cursor.
+
+    This is a new full-data continuation experiment, not an exact resume of the
+    finite 20%-TRAIN screen. Reusing positive_weight keeps probability
+    calibration fixed so the first question is training/data coverage.
+    """
+    saved=torch.load(path,map_location='cpu',weights_only=False);c=saved.get('contract',{})
+    if (saved.get('protocol')!=PROTOCOL or c.get('protocol')!=PROTOCOL
+            or saved.get('transport_frozen') is not True
+            or c.get('teacher_sha256')!=teacher_sha256
+            or c.get('config_fingerprint')!=config_fingerprint
+            or c.get('model')!=model_contract(head)):
+        raise RuntimeError('warm-start Point CCR checkpoint/teacher/config/model mismatch')
+    state=saved.get('head')
+    if not isinstance(state,dict):
+        raise RuntimeError('warm-start checkpoint lacks Point CCR head state')
+    head.load_state_dict(state,strict=True)
+    if (not all(torch.isfinite(v).all() for v in head.state_dict().values())
+            or not bool((head.positive_weight>=1).all())):
+        raise RuntimeError('warm-start Point CCR has invalid weights/calibration')
+    prior=saved.get('reports',{}).get('train_prior')
+    if not prior or 'positive_weights' not in prior:
+        raise RuntimeError('warm-start Point CCR lacks persisted TRAIN-only positive weights')
+    return dict(
+        checkpoint_sha256=sha256(path),
+        source_epoch=int(saved.get('epoch',0)),
+        source_updates=int(saved.get('updates',0)),
+        source_train_fraction=float(c.get('train_fraction',float('nan'))),
+        positive_weights=np.asarray(head.positive_weight.detach().cpu()).tolist(),
+        train_prior={**prior,'reused_for_full_data_warm_start':True,
+                     'note':'kept fixed to isolate training/data coverage; not recalibrated on DEV'},
+    )
 
 
 def model_contract(head):
@@ -88,6 +125,12 @@ def contract_extra(args, root):
     # disabled. Enabling it creates an explicit new training execution contract.
     if getattr(args,'ccr_batched_motion',False):
         result['batched_motion'] = True
+    warm=getattr(args,'warm_start_head',None)
+    if warm:
+        if not Path(warm).is_file():
+            raise ValueError('missing --warm-start-head checkpoint')
+        result['warm_start_head_sha256']=sha256(warm)
+        result['warm_start_semantics']='weights+positive_weight_only_fresh_optimizer_schedule_population'
     return result
 
 
@@ -233,6 +276,8 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
     teacher.eval(); head.eval(); names = ('static_repair', 'dynamic_repair', 'joint') + (('old_joint',) if include_old else ())
     base = Metrics(); metrics = {name: Metrics() for name in names}
     quality = {name: defaultdict(int) for name in names}
+    # role(static/dynamic) x action(ADD/REMOVE): tp/fp/fn/valid
+    action_counts=np.zeros((2,2,4),np.int64)
     scenes = defaultdict(lambda: {name: Metrics() for name in ('baseline', *names)})
     started = previous = time.perf_counter(); stages = defaultdict(float)
     with old_execution(teacher, provider) if include_old else nullcontext():
@@ -248,6 +293,17 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
             evidence = build_inputs(provider,prep)
             plan = map_inputs(provider,evidence,prep)
             p = probabilities(head, evidence, plan, output, provider.device)
+            target,valid=repair_targets(evidence,plan,raw['future_gt_occ'])
+            predicted=np.stack((p[...,0]>=.5,p[...,1]>=.95),axis=-1)&plan.legal
+            roles=evidence.actor>=0
+            for role in (0,1):
+                role_mask=(roles==bool(role))[:,None]
+                for action in (0,1):
+                    mask=valid[...,action]&role_mask
+                    y=target[...,action]&mask;z=predicted[...,action]&mask
+                    action_counts[role,action]+=(
+                        int((y&z).sum()),int((~y&z&mask).sum()),
+                        int((y&~z).sum()),int(mask.sum()))
             predictions = {name: compose_canonical(prep.baseline, evidence, plan, p[..., 0], p[..., 1],
                 role={'static_repair': 'static', 'dynamic_repair': 'dynamic', 'joint': 'all'}[name])
                 for name in names if name != 'old_joint'}
@@ -273,7 +329,16 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
             if wi == 1 or wi % 16 == 0 or wi == len(records):
                 print(f'CCR_EVAL {wi}/{len(records)}', flush=True)
     report = columns.report_states(base, metrics, quality, scenes)
-    report.update(windows=len(records), seconds=time.perf_counter()-started, stages_seconds=dict(stages), support=SUPPORT_NOTE)
+    action_learning={}
+    for role,name in ((0,'static'),(1,'dynamic')):
+        for action,label in ((0,'ADD'),(1,'REMOVE')):
+            tp,fp,fn,valid_count=[int(x) for x in action_counts[role,action]]
+            action_learning[f'{name}/{label}']=dict(
+                tp=tp,fp=fp,fn=fn,valid=valid_count,
+                precision=(tp/(tp+fp) if tp+fp else None),
+                recall=(tp/(tp+fn) if tp+fn else None))
+    report.update(windows=len(records), seconds=time.perf_counter()-started, stages_seconds=dict(stages),
+                  support=SUPPORT_NOTE,action_learning=action_learning)
     return report
 
 
@@ -313,8 +378,9 @@ def gate(new, old, speed):
 
 
 def brief(result):
+    warm=bool(result.get('warm_start'))
     lines = ['===== POINT CCR / GT-ONLY THREE-PASS SCREEN =====', 'status: '+result['status'], 'protocol: '+PROTOCOL,
-             '4 histories -> 6 futures; epoch19 motion FROZEN; RANDOM point head; no KD/AE.',
+             '4 histories -> 6 futures; epoch19 motion FROZEN; '+('WARM-START point head' if warm else 'RANDOM point head')+'; no KD/AE.',
              'Fixed CCR_ADD=0.5 / CCR_REMOVE=0.95; old Local=(0.5,0.5,0.95).',
              'Support: '+SUPPORT_NOTE]
     if 'training_population' in result:
@@ -322,8 +388,13 @@ def brief(result):
     reports = result.get('reports', {}); initial = reports.get('initial_dev64', {}).get('variants', {}).get('old_joint')
     for row in reports.get('epochs', []):
         m = row['evaluation']['variants']['joint']['metrics']
+        a=row['evaluation'].get('action_learning',{})
+        def rr(key):
+            value=a.get(key,{}).get('recall')
+            return 'n/a' if value is None else f'{100*value:.1f}%'
         lines.append(f"epoch={row['epoch']} update={row['update']} dev64_mIoU={m['mIoU']:.6f} MovingMicro={m['MovingMicro']:.6f}" +
-            (f" vs_old_mIoU={m['mIoU']-initial['metrics']['mIoU']:+.6f} vs_old_Moving={m['MovingMicro']-initial['metrics']['MovingMicro']:+.6f}" if initial else ''))
+            (f" vs_old_mIoU={m['mIoU']-initial['metrics']['mIoU']:+.6f} vs_old_Moving={m['MovingMicro']-initial['metrics']['MovingMicro']:+.6f}" if initial else '')+
+            f" sADD_R={rr('static/ADD')} dADD_R={rr('dynamic/ADD')} dREM_R={rr('dynamic/REMOVE')}")
     final = reports.get('final_dev512')
     if final:
         lines.append('===== FINAL DEV512 (development population; NOT independent test) =====')
