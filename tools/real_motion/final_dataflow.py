@@ -539,6 +539,13 @@ def batched_frozen_motion(teacher, records, device):
         "features", "local_semantic_tube", "kta_displacement_xy_m",
         "frame_motion_features", "target_source_mask_tube",
     )
+    # Unit-test/custom teachers may intentionally expose only an abstract
+    # motion(record) contract. Keep that compatibility path, while every
+    # real Point-CCR training record contains the five frozen V18 inputs and
+    # therefore takes the single batched forward below.
+    if any(any(key not in record for key in keys) for record in records):
+        with torch.no_grad():
+            return [teacher.motion(record, device) for record in records]
     sizes = [int(r["features"].shape[0]) for r in records]
     merged = {
         key: torch.cat([torch.as_tensor(r[key]) for r in records], dim=0)
