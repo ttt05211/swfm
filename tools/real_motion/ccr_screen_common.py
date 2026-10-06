@@ -4,7 +4,7 @@ No distillation, learned-feature cache, GT candidate selection or dev tuning.
 The old Local frontier GEN support is NOT preserved by this representation.
 """
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 import json
 import time
@@ -157,6 +157,17 @@ def contract_extra(args, root):
     return result
 
 
+def _ccr_minimal_fixed_geometry(provider, raw, record):
+    """Exact Point-CCR fixed geometry without legacy Local static/frontier work."""
+    from tools.real_motion.joint_column_full_common import build_ccr_training_geometry
+    workers=1 if getattr(provider,'raw_prefetch_workers',1)>=2 else min(3,provider.workers)
+    profile={}
+    causal=build_ccr_training_geometry(
+        raw,record,provider.pcfg,provider.strong,workers,profile=profile)
+    causal['_ccr_fast_profile']=profile
+    return causal
+
+
 def _ccr_fast_fixed_geometry(provider, raw, record):
     """Worker-owned history/fixed-transport preparation for fast Point CCR.
 
@@ -166,11 +177,7 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
     drawn on the training thread.
     """
     from types import SimpleNamespace
-    from tools.real_motion.joint_column_full_common import build_ccr_training_geometry
-    workers=1 if getattr(provider,'raw_prefetch_workers',1)>=2 else min(3,provider.workers)
-    profile={}
-    causal=build_ccr_training_geometry(
-        raw,record,provider.pcfg,provider.strong,workers,profile=profile)
+    causal=_ccr_minimal_fixed_geometry(provider,raw,record)
     prep=SimpleNamespace(
         raw=raw,
         state={**causal['prepared_state'],'rec':record,'gpu':None},
@@ -187,8 +194,21 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
     conflicts=full_static_conflicts(fixed[0],prep,provider.pcfg.grid)
     causal['_ccr_prefetched_fixed']=fixed
     causal['_ccr_prefetched_conflicts']=conflicts
-    causal['_ccr_fast_profile']=profile
     return causal
+
+
+@contextmanager
+def _evaluation_geometry(provider, include_old):
+    """Use minimal Point-CCR geometry for current-only eval; full geometry for old Local."""
+    if not getattr(provider,'ccr_fast_train',False):
+        yield
+        return
+    previous=getattr(provider,'fixed_geometry_builder',None)
+    provider.fixed_geometry_builder=(None if include_old else _ccr_minimal_fixed_geometry)
+    try:
+        yield
+    finally:
+        provider.fixed_geometry_builder=previous
 
 
 def _independent_sample_loss(head, sample, plan, output, target, weight, device):
@@ -428,7 +448,7 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
     action_counts=np.zeros((2,2,4),np.int64)
     scenes = defaultdict(lambda: {name: Metrics() for name in ('baseline', *names)})
     started = previous = time.perf_counter(); stages = defaultdict(float)
-    with old_execution(teacher, provider) if include_old else nullcontext():
+    with _evaluation_geometry(provider,include_old), (old_execution(teacher, provider) if include_old else nullcontext()):
         for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records), 1):
             tick = time.perf_counter(); stages['input_wait'] += tick-previous
             if stop_event is not None and stop_event.is_set():
@@ -493,7 +513,7 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
 @torch.no_grad()
 def six_frame_speed(provider, source, records, teacher, head, *, repeats=2, stop_event=None):
     teacher.eval(); head.eval(); trials = []
-    with old_execution(teacher, provider):
+    with _evaluation_geometry(provider,True), old_execution(teacher, provider):
         for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records, include_gt=False), 1):
             if raw.get('future_gt_occ') is not None:
                 raise RuntimeError('FPS cannot load future GT')
