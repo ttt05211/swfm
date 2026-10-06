@@ -22,7 +22,7 @@ from real_motion.canonical_repair_context import (
 )
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
 from real_motion.canonical_repair_batch import batched_repair_losses
-from real_motion.final_dataflow import batch_frozen_motion
+from real_motion.final_dataflow import batch_frozen_motion, parallel_frozen_motion
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
 from real_motion.column_execution import execution_session
 from real_motion.nuscenes_adapter import gt_moving_support_sequence
@@ -68,7 +68,9 @@ def add_args(parser):
     parser.add_argument('--ccr-prefetch-workers',type=int,default=4,
                         help='CPU window look-ahead workers for --ccr-fast-train (bounded to 4)')
     parser.add_argument('--ccr-motion-superbatch-updates',type=int,default=1,
-                        help='pack this many logical 4-window updates into one frozen V18 forward; optimizer batch stays unchanged')
+                        help='prepare this many logical 4-window updates together; optimizer batch stays unchanged')
+    parser.add_argument('--ccr-motion-streams',type=int,default=4,
+                        help='independent CUDA streams for frozen V18 window forwards in fast mode')
     parser.add_argument('--warm-start-head',
                         help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
 
@@ -146,6 +148,8 @@ def contract_extra(args, root):
                                   if getattr(args,'ccr_fast_train',False) else None),
                 motion_superbatch_updates=(max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
                                            if getattr(args,'ccr_fast_train',False) else 1),
+                motion_streams=(max(1,int(getattr(args,'ccr_motion_streams',4)))
+                                if getattr(args,'ccr_fast_train',False) else 1),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
     # Preserve old checkpoint identity when the new execution-only batching is
@@ -216,12 +220,13 @@ def _evaluation_geometry(provider, include_old):
 
 
 def prepare_frozen_superbatch(provider, rows, teacher):
-    """One frozen V18 forward for several logical optimizer batches."""
+    """Prepare several logical updates while preserving per-window V18 shapes."""
     if not rows:
         raise ValueError('empty frozen-motion superbatch')
-    with torch.no_grad():
-        return batch_frozen_motion(
-            teacher,rows,provider.device,render_readback=True)
+    return parallel_frozen_motion(
+        teacher,rows,provider.device,
+        streams=getattr(provider,'ccr_motion_streams',1),
+        render_readback=True)
 
 
 def _independent_sample_loss(head, sample, plan, output, target, weight, device):
@@ -246,6 +251,9 @@ def setup(provider, args):
     fast=bool(getattr(args,'ccr_fast_train',False))
     prefetch=min(4,max(1,int(getattr(args,'ccr_prefetch_workers',4))))
     super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
+    motion_streams=max(1,int(getattr(args,'ccr_motion_streams',4)))
+    if motion_streams>8:
+        raise ValueError('CCR frozen-motion CUDA streams are capped at 8')
     if super_updates>8:
         raise ValueError('CCR frozen-motion superbatch is capped at 8 logical updates (32 windows / <=1024 sources)')
     if fast and prefetch>max(1,args.cpu_workers):
@@ -262,6 +270,7 @@ def setup(provider, args):
     provider.ccr_batched_motion=bool(getattr(args,'ccr_batched_motion',False) or fast)
     provider.ccr_verify_batched_motion_remaining=1 if fast else 0
     provider.ccr_motion_superbatch_updates=super_updates if fast else 1
+    provider.ccr_motion_streams=motion_streams if fast else 1
     provider.ccr_verify_batched_head_remaining=1 if fast else 0
     provider.ccr_fast_train=fast
     if fast:
@@ -278,8 +287,9 @@ def setup(provider, args):
     provider.ccr_samples_per_role = args.samples_per_role
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
     if fast:
-        print(f'CCR_FAST_TRAIN batched_motion=1 batched_head=1 lazy_sampled=1 minimal_geometry=1 '
-              f'prefetch_workers={prefetch} motion_superbatch_updates={super_updates} '
+        print(f'CCR_FAST_TRAIN independent_motion_streams={motion_streams} batched_head=1 '
+              f'lazy_sampled=1 minimal_geometry=1 prefetch_workers={prefetch} '
+              f'motion_superbatch_updates={super_updates} '
               f'(logical optimizer batch remains 4 windows)',flush=True)
 
 
