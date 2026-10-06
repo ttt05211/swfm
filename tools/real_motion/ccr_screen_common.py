@@ -215,6 +215,15 @@ def _evaluation_geometry(provider, include_old):
         provider.fixed_geometry_builder=previous
 
 
+def prepare_frozen_superbatch(provider, rows, teacher):
+    """One frozen V18 forward for several logical optimizer batches."""
+    if not rows:
+        raise ValueError('empty frozen-motion superbatch')
+    with torch.no_grad():
+        return batch_frozen_motion(
+            teacher,rows,provider.device,render_readback=True)
+
+
 def _independent_sample_loss(head, sample, plan, output, target, weight, device):
     def upload(value):
         return torch.as_tensor(np.ascontiguousarray(value),device=device)
@@ -325,6 +334,16 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         if len(batched_motion)!=len(rows):
             raise RuntimeError('precomputed frozen V18 output/window count mismatch')
         stages['precomputed_batched_motion'] += 0.0
+        if getattr(provider,'ccr_verify_batched_motion_remaining',0)>0:
+            with torch.no_grad():
+                motion_refs=[teacher.motion(record,device) for record,_ in rows]
+            for got,ref in zip(batched_motion,motion_refs):
+                for key,value in ref.items():
+                    if not isinstance(value,torch.Tensor):continue
+                    other=got[key]
+                    if not torch.allclose(other,value,rtol=2e-5,atol=2e-6):
+                        diff=float((other.float()-value.float()).abs().max().detach().cpu())
+                        raise RuntimeError(f'precomputed superbatched V18 parity failed: {key} max_abs={diff}')
     elif getattr(provider,'ccr_batched_motion',False):
         tick = time.perf_counter()
         with torch.no_grad():
