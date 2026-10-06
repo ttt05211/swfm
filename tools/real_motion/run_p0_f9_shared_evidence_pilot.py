@@ -46,7 +46,12 @@ class PilotProvider(FullJointColumnProvider):
     def load_raw_columns(self,source,record,*,include_gt):
         from tools.real_motion.causal_column_common import FrozenColumns
         raw=FrozenColumns.load_raw_columns(self,source,record,include_gt=include_gt)
-        def build():return build_fixed_geometry(raw,record,self.pcfg,self.strong,min(3,self.workers),self.joint.columns.config)
+        custom=getattr(self,'fixed_geometry_builder',None)
+        def build():
+            if custom is not None:
+                return custom(self,raw,record)
+            workers=max(1,min(3,self.workers//max(1,getattr(self,'raw_prefetch_workers',1))))
+            return build_fixed_geometry(raw,record,self.pcfg,self.strong,workers,self.joint.columns.config)
         cache=getattr(self,'causal_geometry_cache',None)
         if cache is None:evidence=build();hit=False
         else:evidence,hit=cache.get_or_build((str(record['scene_name']),str(record['t0_token'])),raw,build,defer_write=True)
