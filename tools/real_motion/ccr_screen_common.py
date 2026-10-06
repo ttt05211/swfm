@@ -14,9 +14,12 @@ import torch
 
 from real_motion.canonical_causal_repair import (
     CanonicalRepairHead, build_canonical_evidence, map_canonical_evidence,
-    repair_targets, compose_canonical,
+    repair_targets, compose_canonical, repair_loss,
 )
-from real_motion.canonical_repair_context import FixedCanonicalCache
+from real_motion.canonical_repair_context import (
+    FixedCanonicalCache, build_fixed_canonical, fixed_history_digest,
+    full_static_conflicts, sample_causal_points, map_sampled_canonical,
+)
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
 from real_motion.canonical_repair_batch import batched_repair_losses
 from real_motion.final_dataflow import batch_frozen_motion
@@ -60,6 +63,10 @@ def add_args(parser):
     parser.add_argument('--ccr-batched-head',action='store_true',help='same window-wise loss, batched point MLP; FP rounding may differ')
     parser.add_argument('--ccr-batched-motion',action='store_true',
                         help='one frozen V18 forward per packed window batch; enable only after parity gate')
+    parser.add_argument('--ccr-fast-train',action='store_true',
+                        help='max execution-only speed: batched frozen motion/head, lazy sampled features, minimal prefetched geometry')
+    parser.add_argument('--ccr-prefetch-workers',type=int,default=4,
+                        help='CPU window look-ahead workers for --ccr-fast-train (bounded to 4)')
     parser.add_argument('--warm-start-head',
                         help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
 
@@ -118,12 +125,16 @@ def contract_extra(args, root):
                 thresholds=dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95)),
                 samples_per_role=args.samples_per_role, remove_loss_weight=.25,
                 cpu_execution=getattr(args,'ccr_cpu_execution','numpy'),cpu_workers=getattr(args,'ccr_cpu_workers',4),
-                batched_head=getattr(args,'ccr_batched_head',False),
+                batched_head=bool(getattr(args,'ccr_batched_head',False) or getattr(args,'ccr_fast_train',False)),
+                fast_train=bool(getattr(args,'ccr_fast_train',False)),
+                lazy_sampled_features=bool(getattr(args,'ccr_fast_train',False)),
+                prefetch_workers=(min(4,max(1,getattr(args,'ccr_prefetch_workers',4)))
+                                  if getattr(args,'ccr_fast_train',False) else None),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
     # Preserve old checkpoint identity when the new execution-only batching is
     # disabled. Enabling it creates an explicit new training execution contract.
-    if getattr(args,'ccr_batched_motion',False):
+    if getattr(args,'ccr_batched_motion',False) or getattr(args,'ccr_fast_train',False):
         result['batched_motion'] = True
     warm=getattr(args,'warm_start_head',None)
     if warm:
@@ -134,11 +145,59 @@ def contract_extra(args, root):
     return result
 
 
+def _ccr_fast_fixed_geometry(provider, raw, record):
+    """Worker-owned history/fixed-transport preparation for fast Point CCR.
+
+    No learned tensors, future GT labels, sampled IDs or action targets are
+    cached here.  The canonical support is the same complete support; only
+    feature materialization is deferred until the GT-independent sample IDs are
+    drawn on the training thread.
+    """
+    from types import SimpleNamespace
+    from tools.real_motion.joint_column_full_common import build_ccr_training_geometry
+    workers=1 if getattr(provider,'raw_prefetch_workers',1)>=2 else min(3,provider.workers)
+    profile={}
+    causal=build_ccr_training_geometry(
+        raw,record,provider.pcfg,provider.strong,workers,profile=profile)
+    prep=SimpleNamespace(
+        raw=raw,
+        state={**causal['prepared_state'],'rec':record,'gpu':None},
+        registrations=causal['registrations'])
+    digest=fixed_history_digest(prep,provider.pcfg.grid)
+    fixed=build_fixed_canonical(
+        prep,provider.pcfg.grid,neighbors=False,
+        kernels=execution_kernels(provider),executor=None,lazy_sampled=True)
+    fixed[0].fixed_history_sha256=digest
+    conflicts=full_static_conflicts(fixed[0],prep,provider.pcfg.grid)
+    causal['_ccr_prefetched_fixed']=fixed
+    causal['_ccr_prefetched_conflicts']=conflicts
+    causal['_ccr_fast_profile']=profile
+    return causal
+
+
+def _independent_sample_loss(head, sample, plan, output, target, weight, device):
+    def upload(value):
+        return torch.as_tensor(np.ascontiguousarray(value),device=device)
+    actor=upload(sample.actor)
+    tensors={k:v for k,v in output.items() if isinstance(v,torch.Tensor)}
+    with torch.no_grad(), torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
+        live=head.project_sources(tensors)
+        encoded=head.encode(upload(sample.features),upload(sample.labels),actor,
+                            upload(sample.classes),live)
+        logits=head.decode(encoded,actor,upload(plan.context),upload(plan.base),
+                           upload(plan.fallback),upload(plan.legal),live)
+        return repair_loss(head,logits,actor,upload(target),upload(weight)).float()
+
+
 def setup(provider, args):
     # Reclaimable OS file cache is not treated as available tensor memory.
     # Explicit modest RAM bounds avoid duplicating the entire 20k population.
     if args.descriptor_ram_mib > 8192:
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
+    fast=bool(getattr(args,'ccr_fast_train',False))
+    prefetch=min(4,max(1,int(getattr(args,'ccr_prefetch_workers',4))))
+    if fast and prefetch>max(1,args.cpu_workers):
+        prefetch=max(1,args.cpu_workers)
     if args.descriptor_cache and args.descriptor_disk_mib:
         import shutil
         parent = Path(args.descriptor_cache).resolve()
@@ -147,15 +206,25 @@ def setup(provider, args):
         if shutil.disk_usage(parent).free < 2*2**30:
             raise RuntimeError('less than 2GiB free: disable descriptor disk writes or free space first')
     provider.ccr_execution=CanonicalCpuExecution(getattr(args,'ccr_cpu_execution','numpy'),getattr(args,'ccr_cpu_workers',4))
-    provider.ccr_batched_head=getattr(args,'ccr_batched_head',False)
-    provider.ccr_batched_motion=getattr(args,'ccr_batched_motion',False)
+    provider.ccr_batched_head=bool(getattr(args,'ccr_batched_head',False) or fast)
+    provider.ccr_batched_motion=bool(getattr(args,'ccr_batched_motion',False) or fast)
+    provider.ccr_verify_batched_motion_remaining=1 if fast else 0
+    provider.ccr_verify_batched_head_remaining=1 if fast else 0
+    provider.ccr_fast_train=fast
+    if fast:
+        provider.raw_prefetch_workers=provider.raw_prefetch_depth=prefetch
+        provider.train_io_workers=prefetch
+        provider.fixed_geometry_builder=_ccr_fast_fixed_geometry
     provider.ccr_cache = FixedCanonicalCache(args.descriptor_ram_mib, neighbors=False,
         disk_root=args.descriptor_cache, max_disk_mib=args.descriptor_disk_mib, async_writes=True,
-        kernels=provider.ccr_execution.kernels,executor=provider.ccr_execution.pool)
+        kernels=provider.ccr_execution.kernels,executor=provider.ccr_execution.pool,
+        lazy_sampled=fast)
     if provider.ccr_cache.disk is not None:
         provider.ccr_cache.disk.reserve = 2*2**30
     provider.ccr_samples_per_role = args.samples_per_role
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
+    if fast:
+        print(f'CCR_FAST_TRAIN batched_motion=1 batched_head=1 lazy_sampled=1 minimal_geometry=1 prefetch_workers={prefetch}',flush=True)
 
 
 def close(provider, result):
@@ -203,34 +272,70 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
     device = provider.device; sync(device); started = time.perf_counter()
     head.train(); teacher.eval(); optimizer.zero_grad(set_to_none=True)
     stages = defaultdict(float); losses = []; sampled = total = 0
-    packed=[];outputs=[];sizes=[]
-    batched_motion = None
+    packed=[];outputs=[];sizes=[];pending=[]
+    batched_motion = None; motion_refs = None
     if getattr(provider,'ccr_batched_motion',False):
         tick = time.perf_counter()
         with torch.no_grad():
-            batched_motion = batch_frozen_motion(teacher, rows, device)
+            batched_motion = batch_frozen_motion(teacher, rows, device, render_readback=True)
+            if getattr(provider,'ccr_verify_batched_motion_remaining',0)>0:
+                motion_refs=[teacher.motion(record,device) for record,_ in rows]
+                for got,ref in zip(batched_motion,motion_refs):
+                    for key,value in ref.items():
+                        if not isinstance(value,torch.Tensor):continue
+                        other=got[key]
+                        if not torch.allclose(other,value,rtol=2e-5,atol=2e-6):
+                            diff=float((other.float()-value.float()).abs().max().detach().cpu())
+                            raise RuntimeError(f'batched frozen V18 parity failed: {key} max_abs={diff}')
         stages['batched_motion_forward'] += time.perf_counter()-tick
+
+    def materialize(evidence,ids,importance,prep,conflicts,gt):
+        sample,plan=map_sampled_canonical(
+            evidence,ids,prep,provider.pcfg.grid,conflicts,
+            kernels=execution_kernels(provider))
+        y,valid=repair_targets(sample,plan,gt)
+        return sample,plan,y,importance[:,None,None]*valid
+
     for row_index, (record, raw) in enumerate(rows):
         tick = time.perf_counter()
         with torch.no_grad():
             output = (batched_motion[row_index] if batched_motion is not None
                       else teacher.motion(record, device))
+            ref_prep=None
+            if motion_refs is not None:
+                ref_prep=provider.prepare_columns(
+                    None,record,include_gt=True,raw_window=raw,outputs=motion_refs[row_index])
             prep = provider.prepare_columns(None, record, include_gt=True, raw_window=raw, outputs=output)
+            if ref_prep is not None:
+                for name in ('baseline','owners','fallbacks'):
+                    a=getattr(prep,name);b=getattr(ref_prep,name)
+                    if len(a)!=len(b) or any(not np.array_equal(x,y) for x,y in zip(a,b)):
+                        raise RuntimeError(f'batched frozen V18 rendered {name} parity failed')
         stages['live_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
-        evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
-        conflicts = provider.ccr_cache.static_conflicts(evidence, prep, provider.pcfg.grid)
+
+        causal=raw.get('_column_causal_preparation') or {}
+        prefetched=causal.get('_ccr_prefetched_fixed')
+        if prefetched is not None:
+            evidence,_=prefetched
+            conflicts=causal['_ccr_prefetched_conflicts']
+            stages['prefetched_fixed_input_hits'] += 1
+        else:
+            evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
+            conflicts = provider.ccr_cache.static_conflicts(evidence, prep, provider.pcfg.grid)
         stages['fixed_input_hash_cache_conflicts'] += time.perf_counter()-tick; tick = time.perf_counter()
-        # Sample BEFORE future projection/GT labels. Every class/source/history
-        # stratum has positive inclusion probability; N/k restores sums.
+
         if getattr(provider,'ccr_batched_head',False):
-            from real_motion.canonical_repair_context import sample_causal_points,map_sampled_canonical
             ids,importance=sample_causal_points(evidence,rng,per_role=provider.ccr_samples_per_role)
-            sample,plan=map_sampled_canonical(evidence,ids,prep,provider.pcfg.grid,conflicts,kernels=execution_kernels(provider))
-            y,valid=repair_targets(sample,plan,raw['future_gt_occ']);weight=importance[:,None,None]*valid
-            packed.append((sample,plan,y,weight));outputs.append(output);sizes.append(len(output['history_source_context']))
-            sampled+=len(ids);total+=len(evidence)
-            stages['sample_live_projection_encoder_loss']+=time.perf_counter()-tick
+            if candidate_pool is not None and len(rows)>1:
+                fut=candidate_pool.submit(
+                    materialize,evidence,ids,importance,prep,conflicts,raw['future_gt_occ'])
+                pending.append((row_index,fut,output,len(evidence),len(ids)))
+            else:
+                item=materialize(evidence,ids,importance,prep,conflicts,raw['future_gt_occ'])
+                pending.append((row_index,item,output,len(evidence),len(ids)))
+            stages['sample_dispatch']+=time.perf_counter()-tick
             continue
+
         loss, n = loss_for_causal(head, evidence, output, prep, provider.pcfg.grid,
             raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role,
             kernels=execution_kernels(provider))
@@ -241,16 +346,43 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         stages['backward'] += time.perf_counter()-tick
         losses.append(loss.detach()); sampled += n; total += len(evidence)
         del loss, evidence, prep, output, conflicts
-    if packed:
-        tick=time.perf_counter();fields=list(zip(*packed))
-        merged={k:torch.cat([o[k] for o in outputs],0) for k in outputs[0]}
-        batch_losses=batched_repair_losses(head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
+
+    if motion_refs is not None:
+        provider.ccr_verify_batched_motion_remaining=0
+
+    if pending:
+        tick=time.perf_counter()
+        for row_index,item,output,n_total,n_sample in pending:
+            sample,plan,y,weight=(item.result() if hasattr(item,'result') else item)
+            packed.append((sample,plan,y,weight));outputs.append(output)
+            sizes.append(len(output['history_source_context']))
+            sampled+=n_sample;total+=n_total
+        stages['sample_materialize_wait']+=time.perf_counter()-tick
+        fields=list(zip(*packed))
+        merged={
+            k:torch.cat([o[k] for o in outputs],0)
+            for k,v in outputs[0].items() if isinstance(v,torch.Tensor)
+        }
+        tick=time.perf_counter()
+        batch_losses=batched_repair_losses(
+            head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
+        if getattr(provider,'ccr_verify_batched_head_remaining',0)>0:
+            refs=torch.stack([
+                _independent_sample_loss(head,*row,output,device)
+                for row,output in zip(packed,outputs)
+            ])
+            actual=torch.stack([v.float() for v in batch_losses])
+            if not torch.allclose(actual,refs,rtol=5e-3,atol=5e-4):
+                diff=float((actual-refs).abs().max().detach().cpu())
+                raise RuntimeError(f'batched Point CCR loss parity failed: max_abs={diff}')
+            provider.ccr_verify_batched_head_remaining=0
         loss=sum(batch_losses)/len(rows)
         if not torch.isfinite(loss):raise RuntimeError('nonfinite batched CCR loss')
-        stages['sample_live_projection_encoder_loss']+=time.perf_counter()-tick;tick=time.perf_counter()
+        stages['batched_head_forward_loss']+=time.perf_counter()-tick;tick=time.perf_counter()
         loss.backward();stages['backward']+=time.perf_counter()-tick
         losses=[v.detach() for v in batch_losses]
-        del batch_losses,loss,merged,fields,packed,outputs,evidence,prep,output,conflicts
+        del batch_losses,loss,merged,fields,packed,outputs
+
     tick = time.perf_counter(); norm = torch.nn.utils.clip_grad_norm_(head.parameters(), 5.)
     if not torch.isfinite(norm):
         raise RuntimeError('nonfinite CCR gradient; previous completed checkpoint preserved')
