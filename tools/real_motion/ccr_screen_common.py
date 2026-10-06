@@ -19,6 +19,7 @@ from real_motion.canonical_causal_repair import (
 from real_motion.canonical_repair_context import FixedCanonicalCache
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
 from real_motion.canonical_repair_batch import batched_repair_losses
+from real_motion.final_dataflow import batch_frozen_motion
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
 from real_motion.column_execution import execution_session
 from real_motion.nuscenes_adapter import gt_moving_support_sequence
@@ -57,6 +58,8 @@ def add_args(parser):
     parser.add_argument('--ccr-cpu-execution',choices=('numpy','native','native_parallel'),default='numpy')
     parser.add_argument('--ccr-cpu-workers',type=int,default=4)
     parser.add_argument('--ccr-batched-head',action='store_true',help='same window-wise loss, batched point MLP; FP rounding may differ')
+    parser.add_argument('--ccr-batched-motion',action='store_true',
+                        help='one frozen V18 forward per packed window batch; enable only after parity gate')
 
 
 def make_head(teacher, device):
@@ -79,6 +82,7 @@ def contract_extra(args, root):
                 samples_per_role=args.samples_per_role, remove_loss_weight=.25,
                 cpu_execution=getattr(args,'ccr_cpu_execution','numpy'),cpu_workers=getattr(args,'ccr_cpu_workers',4),
                 batched_head=getattr(args,'ccr_batched_head',False),
+                batched_motion=getattr(args,'ccr_batched_motion',False),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
 
@@ -97,6 +101,7 @@ def setup(provider, args):
             raise RuntimeError('less than 2GiB free: disable descriptor disk writes or free space first')
     provider.ccr_execution=CanonicalCpuExecution(getattr(args,'ccr_cpu_execution','numpy'),getattr(args,'ccr_cpu_workers',4))
     provider.ccr_batched_head=getattr(args,'ccr_batched_head',False)
+    provider.ccr_batched_motion=getattr(args,'ccr_batched_motion',False)
     provider.ccr_cache = FixedCanonicalCache(args.descriptor_ram_mib, neighbors=False,
         disk_root=args.descriptor_cache, max_disk_mib=args.descriptor_disk_mib, async_writes=True,
         kernels=provider.ccr_execution.kernels,executor=provider.ccr_execution.pool)
@@ -152,10 +157,17 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
     head.train(); teacher.eval(); optimizer.zero_grad(set_to_none=True)
     stages = defaultdict(float); losses = []; sampled = total = 0
     packed=[];outputs=[];sizes=[]
-    for record, raw in rows:
+    batched_motion = None
+    if getattr(provider,'ccr_batched_motion',False):
         tick = time.perf_counter()
         with torch.no_grad():
-            output = teacher.motion(record, device)
+            batched_motion = batch_frozen_motion(teacher, rows, device)
+        stages['batched_motion_forward'] += time.perf_counter()-tick
+    for row_index, (record, raw) in enumerate(rows):
+        tick = time.perf_counter()
+        with torch.no_grad():
+            output = (batched_motion[row_index] if batched_motion is not None
+                      else teacher.motion(record, device))
             prep = provider.prepare_columns(None, record, include_gt=True, raw_window=raw, outputs=output)
         stages['live_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
         evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
