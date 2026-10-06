@@ -368,7 +368,7 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
             head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
         if getattr(provider,'ccr_verify_batched_head_remaining',0)>0:
             refs=torch.stack([
-                _independent_sample_loss(head,*row,output,device)
+                _independent_sample_loss(head,row[0],row[1],output,row[2],row[3],device)
                 for row,output in zip(packed,outputs)
             ])
             actual=torch.stack([v.float() for v in batch_losses])
