@@ -211,6 +211,44 @@ def prefetch_column_batches(provider, source, records, batch_size, source_budget
         if io is not None: io.shutdown(wait=True, cancel_futures=True)
 
 
+def prefetch_logical_superbatches(provider, source, logical_groups, super_updates, *, io_workers=4):
+    """Prefetch several EXISTING logical optimizer batches as one CPU bundle.
+
+    Group boundaries are preserved exactly. This is execution batching only:
+    callers may run one frozen model forward over the flattened bundle, then
+    perform the original optimizer steps in the original order.
+    """
+    if super_updates < 1 or io_workers < 1:
+        raise ValueError('positive superbatch/update worker budgets required')
+    groups=list(logical_groups)
+    if not groups:
+        return
+    chunks=[groups[i:i+super_updates] for i in range(0,len(groups),super_updates)]
+    io=ThreadPoolExecutor(max_workers=io_workers) if io_workers>1 else None
+    def load(chunk):
+        flat=[record for group in chunk for record in group]
+        if io is None:
+            raws=[provider.load_raw_columns(source,r,include_gt=True) for r in flat]
+        else:
+            raws=list(io.map(lambda r:provider.load_raw_columns(source,r,include_gt=True),flat))
+        out=[];cursor=0
+        for group in chunk:
+            n=len(group)
+            out.append(list(zip(group,raws[cursor:cursor+n])))
+            cursor+=n
+        return out
+    try:
+        with ThreadPoolExecutor(max_workers=1) as lookahead:
+            pending=lookahead.submit(load,chunks[0])
+            for i in range(len(chunks)):
+                current=pending.result()
+                pending=(lookahead.submit(load,chunks[i+1]) if i+1<len(chunks) else None)
+                yield current
+    finally:
+        if io is not None:
+            io.shutdown(wait=True,cancel_futures=True)
+
+
 def epoch_order(length, seed, epoch):
     if length < 1 or epoch < 0: raise ValueError('invalid epoch population')
     return np.random.default_rng(np.random.SeedSequence([seed, epoch])).permutation(length)
