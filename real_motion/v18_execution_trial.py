@@ -97,6 +97,18 @@ path; refuse changed weights, training mode or an enabled autograd context.
 
 @contextmanager
 def reuse_v18_projections(model):
+    """Reuse duplicate projections only on frozen/no-grad execution paths.
+
+    In training/autograd mode the two algebraically equivalent graphs can
+    accumulate LayerNorm/projection gradients in a different floating-point
+    order.  There is no training-speed reason to enable this inference-only
+    optimization, so keep the historical graph untouched whenever gradients
+    are enabled.  Formal FPS runs are @torch.no_grad and still take the reuse
+    path.
+    """
+    if torch.is_grad_enabled():
+        yield
+        return
     modules = [(model, 'reuse_source_projection')]
     modules += [(block, 'reuse_context_norm') for block in model.decoder]
     previous = [(m, name, hasattr(m, name), getattr(m, name, None)) for m, name in modules]
