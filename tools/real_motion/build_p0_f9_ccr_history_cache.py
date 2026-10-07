@@ -30,10 +30,10 @@ from real_motion.native_column_cpu import backend_name, prepare_native
 from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
 from real_motion.v21_source_induction import stable_json_fingerprint
-from tools.real_motion.ccr_screen_common import (
-    CCR_HISTORY_CACHE_PROTOCOL,
-    _ccr_fast_fixed_geometry,
-    ccr_history_cache_namespace,
+from real_motion.ccr_history_geometry import (
+    PROTOCOL as CCR_HISTORY_CACHE_PROTOCOL,
+    build_ccr_history_geometry,
+    namespace as ccr_history_cache_namespace,
 )
 from tools.real_motion.eval_p0_f9_v18_se2 import load_cache
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import sha256
@@ -148,7 +148,7 @@ def main():
         device,a.cpu_workers,teacher,None)
     provider.runtime_config_fingerprint=a._runtime_config_fingerprint
     provider.ccr_execution=CanonicalCpuExecution('native_parallel',max(1,min(4,a.cpu_workers)))
-    provider.fixed_geometry_builder=_ccr_fast_fixed_geometry
+    provider.fixed_geometry_builder=build_ccr_history_geometry
     provider.raw_prefetch_workers=provider.raw_prefetch_depth=min(a.prefetch_workers,a.cpu_workers)
     provider.raw_io_workers=1
 
@@ -158,7 +158,8 @@ def main():
         a.cache_root,namespace,
         max_bytes=int(a.max_cache_gib*2**30),
         ram_bytes=int(a.cache_ram_mib*2**20),
-        reserve_bytes=int(a.reserve_gib*2**30))
+        reserve_bytes=int(a.reserve_gib*2**30),
+        compression_level=6)
     provider.ccr_history_cache=cache
     provider.ccr_history_cache_mode='build'
 
