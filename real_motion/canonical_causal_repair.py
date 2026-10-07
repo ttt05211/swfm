@@ -32,6 +32,21 @@ class CanonicalEvidence:
 
 
 @dataclass
+class CompactCanonicalSupport:
+    """TRAIN-only exact canonical support before point materialization.
+
+    Integer lattices retain the complete candidate population and exact global
+    ordering, but omit O(N) world/presence/feature arrays until GT-independent
+    Monte-Carlo IDs are known.
+    """
+    layouts: list
+    audit: dict
+    points: int
+
+    def __len__(self): return int(self.points)
+
+
+@dataclass
 class RepairPlan:
     flat: np.ndarray             # [N,6], out-of-query = -1
     base: np.ndarray
@@ -44,7 +59,8 @@ def grid_arrays(grid):
     return np.array([grid.x_min,grid.y_min,grid.z_min]),np.asarray(grid.voxel_size),np.asarray(grid.shape_hwd)
 
 
-def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_lattice_cells, materialize_features=True, kernels=None):
+def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_lattice_cells,
+            materialize_features=True, kernels=None, compact_only=False):
     """Bounded per-entity lattice. Large sparse extents use scalar-key lookup.
 
     No source/grid crop or resolution change. The temporary dense budget is a
@@ -95,6 +111,10 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
     if native_last is not None:last=native_last
     else:
         last=np.full(len(keys),-1,np.int64);np.maximum.at(last,point_ids,np.arange(len(points)))
+    if compact_only:
+        layout=dict(keys=keys,flags=flags,bits=bits if dense else None,at=at,lo=lo,shape=shape,
+                    dense=dense,volume=volume,last=last,points=points)
+        return None,None,None,None,dense,volume,layout
     world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
     real=last>=0;world[real]=points[last[real]]
     if not materialize_features:
@@ -177,15 +197,18 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
             pts.append(aligned);cells.append(cell)
         groups.append(entity(actor,int(comp['class_id']),pts,cells))
         actors.append(actor);classes.append(int(comp['class_id']))
+    static_points={11:[],13:[]};static_cells={11:[],13:[]}
+    for f in range(4):
+        occ=np.asarray(raw['history_occ'][f]);vis=np.asarray(raw['history_observed'][f],bool)
+        mask=vis&((occ==11)|(occ==13));ijk=np.argwhere(mask)
+        labels=occ[tuple(ijk.T)] if len(ijk) else np.empty(0,np.uint8)
+        world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
+        cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
+        for cls in (11,13):
+            take=labels==cls
+            static_points[cls].append(world[take]);static_cells[cls].append(cell[take])
     for cls in (11,13):
-        pts=[];cells=[]
-        for f in range(4):
-            occ=np.asarray(raw['history_occ'][f]);vis=np.asarray(raw['history_observed'][f],bool)
-            ijk=np.argwhere((occ==cls)&vis)
-            world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
-            cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
-            pts.append(world);cells.append(cell)
-        groups.append(entity(STATIC,cls,pts,cells))
+        groups.append(entity(STATIC,cls,static_points[cls],static_cells[cls]))
         actors.append(STATIC);classes.append(cls)
     data=[];labels=[];worlds=[];presence=[];aa=[];cc=[];layouts=[];cursor=0
     for group,actor,cls in zip(groups,actors,classes):
@@ -206,6 +229,68 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
          'halo_points':int((~pres.any(1)).sum()),'future_GT_used':False,'metric_observations_preserved':True,
          'support':'all t0 sources + visible registered source history + observed road/sidewalk + one face halo',
          'features_materialized':materialize_features},None if materialize_features else layouts)
+
+
+def build_compact_canonical_support(prepared, grid, *, halo=True, max_lattice_cells=4_000_000, kernels=None, executor=None):
+    """Complete canonical population with no full-population world/features.
+
+    Global point ordering is identical to build_canonical_evidence().  Dynamic
+    entities are followed by static road11 and sidewalk13, and each entity uses
+    the same sorted lattice keys.  This is a training execution optimization,
+    never a support approximation.
+    """
+    raw,state=prepared.raw,prepared.state
+    if any(len(raw[k])!=4 for k in ('history_occ','history_observed','history_poses')):
+        raise ValueError('CCR requires exactly four historical frames')
+    if max_lattice_cells<1: raise ValueError('positive temporary lattice budget required')
+    origin,step,_=grid_arrays(grid);inverse=np.linalg.inv(np.asarray(state['current_pose']))
+    groups=[];actors=[];classes=[];counts={'dense_entities':0,'sparse_entities':0,'max_lattice_cells':0}
+    def entity(actor,cls,pts,cells):
+        options=dict(halo=halo,max_lattice_cells=max_lattice_cells,materialize_features=False,
+                     kernels=kernels,compact_only=True)
+        return (_entity(actor,cls,pts,cells,prepared,grid,**options) if executor is None else
+                executor.submit(_entity,actor,cls,pts,cells,prepared,grid,**options))
+    for actor,comp in enumerate(state['current']):
+        pts=[];cells=[]
+        for f,reg in enumerate(prepared.registrations[actor]):
+            if reg is None:
+                pts.append(np.empty((0,3)));cells.append(np.empty((0,3),np.int64));continue
+            ijk=np.asarray(reg[1],np.int64)
+            aligned=transform_points(transform_points(origin+(ijk+.5)*step,raw['history_poses'][f]),reg[0])
+            if f<3:
+                visible=np.asarray(raw['history_observed'][f],bool)[tuple(ijk.T)]
+                aligned=aligned[visible]
+            cell=ijk.copy() if f==3 else np.floor((transform_points(aligned,inverse)-origin)/step).astype(np.int64)
+            pts.append(aligned);cells.append(cell)
+        groups.append(entity(actor,int(comp['class_id']),pts,cells));actors.append(actor);classes.append(int(comp['class_id']))
+    static_points={11:[],13:[]};static_cells={11:[],13:[]}
+    for f in range(4):
+        occ=np.asarray(raw['history_occ'][f]);vis=np.asarray(raw['history_observed'][f],bool)
+        mask=vis&((occ==11)|(occ==13));ijk=np.argwhere(mask)
+        labels=occ[tuple(ijk.T)] if len(ijk) else np.empty(0,np.uint8)
+        world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
+        cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
+        for cls in (11,13):
+            take=labels==cls;static_points[cls].append(world[take]);static_cells[cls].append(cell[take])
+    for cls in (11,13):
+        groups.append(entity(STATIC,cls,static_points[cls],static_cells[cls]));actors.append(STATIC);classes.append(cls)
+    layouts=[];cursor=0;dynamic_points=static_points_count=halo_points=0
+    for group,actor,cls in zip(groups,actors,classes):
+        if executor is not None:group=group.result()
+        if group is None:continue
+        _,_,_,_,dense,volume,layout=group;n=len(layout['keys'])
+        layout=dict(start=cursor,stop=cursor+n,actor=actor,cls=cls,**layout)
+        layouts.append(layout);cursor+=n
+        counts['dense_entities' if dense else 'sparse_entities']+=1
+        counts['max_lattice_cells']=max(counts['max_lattice_cells'],volume)
+        if actor>=0:dynamic_points+=n
+        else:static_points_count+=n
+        halo_points+=int((layout['flags']==0).sum())
+    audit={**counts,'points':cursor,'dynamic_points':dynamic_points,'static_points':static_points_count,
+           'halo_points':halo_points,'future_GT_used':False,'metric_observations_preserved':True,
+           'support':'all t0 sources + visible registered source history + observed road/sidewalk + one face halo',
+           'features_materialized':False,'compact_sampled_only':True}
+    return CompactCanonicalSupport(layouts,audit,cursor)
 
 
 def materialize_canonical_features(evidence, prepared, grid, indices):
