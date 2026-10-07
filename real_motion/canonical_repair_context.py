@@ -385,9 +385,16 @@ def materialize_compact_canonical_features(support, prepared, grid, indices):
     actors=np.empty(n,np.int32);classes=np.empty(n,np.uint8);worlds=np.empty((n,3),np.float64)
     presence=np.empty((n,4),bool)
     origin,step,shape=grid_arrays(grid);inverse=np.linalg.inv(prepared.state['current_pose'])
+    sorted_ids=bool(len(ids)<2 or np.all(ids[1:]>=ids[:-1]))
     for layout in support.layouts:
-        selected=np.flatnonzero((ids>=layout['start'])&(ids<layout['stop']))
-        if not len(selected):continue
+        if sorted_ids:
+            left=int(np.searchsorted(ids,layout['start'],'left'))
+            right=int(np.searchsorted(ids,layout['stop'],'left'))
+            if right<=left:continue
+            selected=np.arange(left,right,dtype=np.int64)
+        else:
+            selected=np.flatnonzero((ids>=layout['start'])&(ids<layout['stop']))
+            if not len(selected):continue
         local=(ids[selected]-layout['start']).astype(np.int64,copy=False)
         actor=int(layout['actor']);cls=int(layout['cls'])
         at=np.asarray(layout['at'])[local];keys=np.asarray(layout['keys'])[local]
@@ -396,11 +403,16 @@ def materialize_compact_canonical_features(support, prepared, grid, indices):
         world=_compact_layout_world(layout,prepared,grid,local)
         actors[selected]=actor;classes[selected]=cls;worlds[selected]=world;presence[selected]=pres
         inside=np.zeros((len(local),4),bool);observed=inside.copy()
+        matrices=layout.get('history_matrices')
         for f in range(4):
-            registration=np.eye(4) if actor==STATIC else prepared.registrations[actor][f]
-            if registration is None:continue
-            reg=np.eye(4) if actor==STATIC else registration[0]
-            matrix=np.linalg.inv(prepared.raw['history_poses'][f])@np.linalg.inv(reg)
+            if matrices is None:
+                registration=np.eye(4) if actor==STATIC else prepared.registrations[actor][f]
+                if registration is None:continue
+                reg=np.eye(4) if actor==STATIC else registration[0]
+                matrix=np.linalg.inv(prepared.raw['history_poses'][f])@np.linalg.inv(reg)
+            else:
+                matrix=matrices[f]
+                if matrix is None:continue
             ijk=np.floor((transform_points(world,matrix)-origin)/step).astype(np.int64)
             valid=((ijk>=0)&(ijk<shape)).all(1);inside[:,f]=valid
             observed[valid,f]=np.asarray(prepared.raw['history_observed'][f],bool)[tuple(ijk[valid].T)]
@@ -422,7 +434,9 @@ def materialize_compact_canonical_features(support, prepared, grid, indices):
             neighbours[:,d]=neighbour_flags!=0
             density+=((neighbour_flags[:,None]>>np.arange(4))&1).astype(np.float32)/6
         if actor>=0:
-            center=transform_points(np.asarray(prepared.state['current'][actor]['centroid_world'])[None],inverse)[0]
+            center=(np.asarray(layout['center_ego'])
+                    if layout.get('center_ego') is not None else
+                    transform_points(np.asarray(prepared.state['current'][actor]['centroid_world'])[None],inverse)[0])
             relative=(origin+(at+.5)*step-center)/8
         else:
             relative=(origin+(at+.5)*step)/40
