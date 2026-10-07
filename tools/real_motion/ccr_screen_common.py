@@ -792,7 +792,21 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
             if stop_event is not None and stop_event.is_set():
                 raise InterruptedError('CCR evaluation interrupted; resume last completed training checkpoint')
             output = teacher.motion(record, provider.device)
-            prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw, outputs=output)
+            cached_causal=raw.get('_column_causal_preparation')
+            if cached_causal is not None and raw.get('_ccr_history_cache_hit') and not getattr(provider,'columns_checked',False):
+                # Persistent VAL geometry is intentionally slim. Preserve the
+                # renderer's one-time live exactness gate, then restore the
+                # immutable cached support for all subsequent evidence work.
+                del raw['_column_causal_preparation']
+                try:
+                    prep=provider.prepare_columns(
+                        source,record,include_gt=True,raw_window=raw,outputs=output)
+                finally:
+                    raw['_column_causal_preparation']=cached_causal
+                print('CCR_VAL_CACHE_LIVE_EXACTNESS_PREFLIGHT PASS',flush=True)
+            else:
+                prep = provider.prepare_columns(
+                    source, record, include_gt=True, raw_window=raw, outputs=output)
             stages['prepare_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
             # Fresh complete causal domain. Evaluation never samples by GT or
             # reuses TRAIN sampled plans/learned features.
