@@ -280,6 +280,10 @@ def main(stop_event=None, argv=None, *, backend=None):
                 # cache-miss failure.
                 if getattr(provider,'ccr_history_cache',None) is not None:
                     provider.ccr_history_cache_source=train_source
+                if getattr(provider,'ccr_val_history_cache',None) is not None:
+                    provider.ccr_val_history_cache_source=dev_source
+                    # Verify cached full-evidence materialization once per run.
+                    provider.ccr_verify_cached_full_evidence_remaining=1
             del ck
             fast_backend=bool(backend is not None and getattr(a,'ccr_fast_train',False))
             checkpoint_every=256 if fast_backend else 32
