@@ -442,6 +442,7 @@ def main(argv=None):
             config_fingerprint=config_fp,
             source_dim=teacher.columns.source_dim,
             device=device,
+            allow_completed_epoch_boundary=True,
         )
         head.eval().requires_grad_(False)
         result["training_curve"] = _checkpoint_curve(saved)
