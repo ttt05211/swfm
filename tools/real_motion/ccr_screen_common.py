@@ -6,6 +6,7 @@ The old Local frontier GEN support is NOT preserved by this representation.
 from collections import defaultdict
 from contextlib import nullcontext, contextmanager
 from pathlib import Path
+import copy
 import json
 import time
 
@@ -13,12 +14,13 @@ import numpy as np
 import torch
 
 from real_motion.canonical_causal_repair import (
-    CanonicalRepairHead, build_canonical_evidence, map_canonical_evidence,
-    repair_targets, compose_canonical, repair_loss,
+    CanonicalRepairHead, build_canonical_evidence, build_compact_canonical_support,
+    map_canonical_evidence, repair_targets, compose_canonical, repair_loss,
 )
 from real_motion.canonical_repair_context import (
     FixedCanonicalCache, build_fixed_canonical,
     full_static_conflicts, sample_causal_points, map_sampled_canonical,
+    sample_compact_causal_points, map_sampled_compact_canonical,
 )
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
 from real_motion.canonical_repair_batch import batched_repair_losses
@@ -191,27 +193,15 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
         raw=raw,
         state={**causal['prepared_state'],'rec':record,'gpu':None},
         registrations=causal['registrations'])
-    # Ephemeral prefetch never enters a persistent cache, so hashing several
-    # MiB of raw history solely to name this in-memory object is wasted work.
-    # Dataset/config/checkpoint provenance has already been verified globally.
-    ephemeral_key=stable_json_fingerprint([
-        str(record['scene_name']),str(record['t0_token']),'CCR_FAST_EPHEMERAL_v1'])
     tick=time.perf_counter()
-    fixed=build_fixed_canonical(
-        prep,provider.pcfg.grid,neighbors=False,
-        kernels=execution_kernels(provider),
-        executor=getattr(getattr(provider,'ccr_execution',None),'pool',None),
-        lazy_sampled=True)
-    causal['_ccr_fast_profile']['canonical_support']=time.perf_counter()-tick
-    fixed[0].fixed_history_sha256=ephemeral_key
-    tick=time.perf_counter()
-    conflicts=full_static_conflicts(fixed[0],prep,provider.pcfg.grid)
-    causal['_ccr_fast_profile']['static_conflicts']=time.perf_counter()-tick
+    compact=build_compact_canonical_support(
+        prep,provider.pcfg.grid,kernels=execution_kernels(provider),
+        executor=getattr(getattr(provider,'ccr_execution',None),'pool',None))
+    causal['_ccr_fast_profile']['compact_support']=time.perf_counter()-tick
     causal['_ccr_fast_profile']['fast_total']=sum(
         float(v) for k,v in causal['_ccr_fast_profile'].items()
         if k not in ('total','geometry_workers') and isinstance(v,(int,float)))
-    causal['_ccr_prefetched_fixed']=fixed
-    causal['_ccr_prefetched_conflicts']=conflicts
+    causal['_ccr_compact_support']=compact
     return causal
 
 
@@ -310,6 +300,7 @@ def setup(provider, args):
     provider.ccr_motion_superbatch_updates=super_updates if fast else 1
     provider.ccr_motion_streams=motion_streams if fast else 1
     provider.ccr_verify_batched_head_remaining=1 if fast else 0
+    provider.ccr_verify_compact_remaining=1 if fast else 0
     provider.ccr_fast_train=fast
     if fast:
         provider.raw_prefetch_workers=provider.raw_prefetch_depth=prefetch
@@ -409,10 +400,14 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
                             raise RuntimeError(f'batched frozen V18 parity failed: {key} max_abs={diff}')
         stages['batched_motion_forward'] += time.perf_counter()-tick
 
-    def materialize(evidence,ids,importance,prep,conflicts,gt):
-        sample,plan=map_sampled_canonical(
-            evidence,ids,prep,provider.pcfg.grid,conflicts,
-            kernels=execution_kernels(provider))
+    def materialize(evidence,ids,importance,prep,conflicts,gt,compact=None):
+        if compact is None:
+            sample,plan=map_sampled_canonical(
+                evidence,ids,prep,provider.pcfg.grid,conflicts,
+                kernels=execution_kernels(provider))
+        else:
+            sample,plan=map_sampled_compact_canonical(
+                compact,ids,prep,provider.pcfg.grid,kernels=execution_kernels(provider))
         y,valid=repair_targets(sample,plan,gt)
         return sample,plan,y,importance[:,None,None]*valid
 
@@ -434,8 +429,12 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         stages['live_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
 
         causal=raw.get('_column_causal_preparation') or {}
+        compact=causal.get('_ccr_compact_support')
         prefetched=causal.get('_ccr_prefetched_fixed')
-        if prefetched is not None:
+        evidence=conflicts=None
+        if compact is not None:
+            stages['compact_support_hits'] += 1
+        elif prefetched is not None:
             evidence,_=prefetched
             conflicts=causal['_ccr_prefetched_conflicts']
             stages['prefetched_fixed_input_hits'] += 1
@@ -445,14 +444,48 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         stages['fixed_input_hash_cache_conflicts'] += time.perf_counter()-tick; tick = time.perf_counter()
 
         if getattr(provider,'ccr_batched_head',False):
-            ids,importance=sample_causal_points(evidence,rng,per_role=provider.ccr_samples_per_role)
+            rng_before=copy.deepcopy(rng.bit_generator.state) if compact is not None and getattr(provider,'ccr_verify_compact_remaining',0)>0 else None
+            if compact is not None:
+                ids,importance=sample_compact_causal_points(compact,rng,per_role=provider.ccr_samples_per_role)
+                population=len(compact)
+            else:
+                ids,importance=sample_causal_points(evidence,rng,per_role=provider.ccr_samples_per_role)
+                population=len(evidence)
+            if rng_before is not None:
+                # One real-window gate: compact support must reproduce the old
+                # complete-evidence population, sample IDs/weights and sampled
+                # plan/targets exactly. The live RNG is consumed only once.
+                legacy,_=build_fixed_canonical(
+                    prep,provider.pcfg.grid,neighbors=False,kernels=execution_kernels(provider),
+                    executor=None,lazy_sampled=True)
+                shadow=np.random.default_rng();shadow.bit_generator.state=rng_before
+                old_ids,old_importance=sample_causal_points(
+                    legacy,shadow,per_role=provider.ccr_samples_per_role)
+                if not np.array_equal(ids,old_ids) or not np.array_equal(importance,old_importance):
+                    raise RuntimeError('compact CCR sampler parity failed')
+                old_conflicts=full_static_conflicts(legacy,prep,provider.pcfg.grid)
+                old_item=materialize(legacy,old_ids,old_importance,prep,old_conflicts,raw['future_gt_occ'])
+                new_item=materialize(None,ids,importance,prep,None,raw['future_gt_occ'],compact=compact)
+                for ai,bi in zip(old_item[:2],new_item[:2]):
+                    names=('features','labels','actor','classes','world','presence') if hasattr(ai,'features') else ('flat','base','fallback','legal','context')
+                    for name in names:
+                        if not np.array_equal(getattr(ai,name),getattr(bi,name)):
+                            raise RuntimeError(f'compact CCR sampled parity failed: {name}')
+                if not np.array_equal(old_item[2],new_item[2]) or not np.array_equal(old_item[3],new_item[3]):
+                    raise RuntimeError('compact CCR target/weight parity failed')
+                print(f'CCR_COMPACT_SAMPLE_PARITY PASS population={population} sampled={len(ids)}',flush=True)
+                provider.ccr_verify_compact_remaining=0
+                item=new_item
+                pending.append((row_index,item,output,population,len(ids)))
+                stages['compact_parity_gate']+=time.perf_counter()-tick
+                continue
             if candidate_pool is not None and len(rows)>1:
                 fut=candidate_pool.submit(
-                    materialize,evidence,ids,importance,prep,conflicts,raw['future_gt_occ'])
-                pending.append((row_index,fut,output,len(evidence),len(ids)))
+                    materialize,evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],compact)
+                pending.append((row_index,fut,output,population,len(ids)))
             else:
-                item=materialize(evidence,ids,importance,prep,conflicts,raw['future_gt_occ'])
-                pending.append((row_index,item,output,len(evidence),len(ids)))
+                item=materialize(evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],compact)
+                pending.append((row_index,item,output,population,len(ids)))
             stages['sample_dispatch']+=time.perf_counter()-tick
             continue
 
