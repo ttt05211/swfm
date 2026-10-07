@@ -327,7 +327,10 @@ def build_compact_canonical_support(prepared, grid, *, halo=True, max_lattice_ce
            'support':'all t0 sources + visible registered source history + observed road/sidewalk + one face halo',
            'features_materialized':False,'compact_sampled_only':True}
     support=CompactCanonicalSupport(layouts,audit,cursor)
-    support.causal_strata=compact_causal_strata(support)
+    # Do not persist an O(N) duplicate array of global row IDs. Exact causal
+    # strata are reconstructed from compact uint8 flags on each sampling pass;
+    # sample_compact_causal_points already preserves the original bucket/code
+    # order and RNG calls for this representation.
     return support
 
 
