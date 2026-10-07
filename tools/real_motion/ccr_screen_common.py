@@ -19,7 +19,7 @@ from real_motion.canonical_causal_repair import (
 )
 from real_motion.canonical_repair_context import (
     FixedCanonicalCache, build_fixed_canonical,
-    full_static_conflicts, sample_causal_points, map_sampled_canonical,
+    full_static_conflicts, compact_static_conflicts, sample_causal_points, map_sampled_canonical,
     sample_compact_causal_points, map_sampled_compact_canonical,
 )
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
@@ -200,10 +200,14 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
     compact=build_compact_canonical_support(
         prep,provider.pcfg.grid,kernels=execution_kernels(provider),executor=None)
     causal['_ccr_fast_profile']['compact_support']=time.perf_counter()-tick
+    tick=time.perf_counter()
+    conflicts=compact_static_conflicts(compact,prep,provider.pcfg.grid)
+    causal['_ccr_fast_profile']['static_conflicts']=time.perf_counter()-tick
     causal['_ccr_fast_profile']['fast_total']=sum(
         float(v) for k,v in causal['_ccr_fast_profile'].items()
         if k not in ('total','geometry_workers') and isinstance(v,(int,float)))
     causal['_ccr_compact_support']=compact
+    causal['_ccr_compact_conflicts']=conflicts
     return causal
 
 
@@ -406,14 +410,15 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
                             raise RuntimeError(f'batched frozen V18 parity failed: {key} max_abs={diff}')
         stages['batched_motion_forward'] += time.perf_counter()-tick
 
-    def materialize(evidence,ids,importance,prep,conflicts,gt,compact=None):
+    def materialize(evidence,ids,importance,prep,conflicts,gt,compact=None,compact_conflicts=None):
         if compact is None:
             sample,plan=map_sampled_canonical(
                 evidence,ids,prep,provider.pcfg.grid,conflicts,
                 kernels=execution_kernels(provider))
         else:
             sample,plan=map_sampled_compact_canonical(
-                compact,ids,prep,provider.pcfg.grid,kernels=execution_kernels(provider))
+                compact,ids,prep,provider.pcfg.grid,kernels=execution_kernels(provider),
+                static_conflicts=compact_conflicts)
         y,valid=repair_targets(sample,plan,gt)
         return sample,plan,y,importance[:,None,None]*valid
 
@@ -436,6 +441,7 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
 
         causal=raw.get('_column_causal_preparation') or {}
         compact=causal.get('_ccr_compact_support')
+        compact_conflicts=causal.get('_ccr_compact_conflicts')
         prefetched=causal.get('_ccr_prefetched_fixed')
         evidence=conflicts=None
         if compact is not None:
@@ -471,7 +477,8 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
                     raise RuntimeError('compact CCR sampler parity failed')
                 old_conflicts=full_static_conflicts(legacy,prep,provider.pcfg.grid)
                 old_item=materialize(legacy,old_ids,old_importance,prep,old_conflicts,raw['future_gt_occ'])
-                new_item=materialize(None,ids,importance,prep,None,raw['future_gt_occ'],compact=compact)
+                new_item=materialize(None,ids,importance,prep,None,raw['future_gt_occ'],
+                                     compact=compact,compact_conflicts=compact_conflicts)
                 for ai,bi in zip(old_item[:2],new_item[:2]):
                     names=('features','labels','actor','classes','world','presence') if hasattr(ai,'features') else ('flat','base','fallback','legal','context')
                     for name in names:
@@ -487,10 +494,12 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
                 continue
             if candidate_pool is not None and len(rows)>1:
                 fut=candidate_pool.submit(
-                    materialize,evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],compact)
+                    materialize,evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],
+                    compact,compact_conflicts)
                 pending.append((row_index,fut,output,population,len(ids)))
             else:
-                item=materialize(evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],compact)
+                item=materialize(evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],
+                                 compact,compact_conflicts)
                 pending.append((row_index,item,output,population,len(ids)))
             stages['sample_dispatch']+=time.perf_counter()-tick
             continue
