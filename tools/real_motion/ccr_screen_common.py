@@ -30,6 +30,10 @@ from real_motion.ccr_history_geometry import (
     build_ccr_history_geometry,
     namespace as ccr_history_cache_namespace,
 )
+from real_motion.ccr_val_history_cache import (
+    namespace as ccr_val_history_cache_namespace,
+    validate_manifest as validate_ccr_val_history_cache_manifest,
+)
 from real_motion.canonical_repair_batch import batched_repair_losses
 from real_motion.final_dataflow import batch_frozen_motion, parallel_frozen_motion
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
@@ -116,7 +120,11 @@ def add_args(parser):
     parser.add_argument('--ccr-history-cache-mode',choices=('off','require'),default='off',
                         help='require=fail closed on any missing history-geometry window; never rebuild during training')
     parser.add_argument('--ccr-history-cache-ram-mib',type=int,default=1024,
-                        help='bounded RAM LRU for verified persistent history-geometry artifacts')
+                        help='bounded RAM LRU for verified persistent TRAIN history-geometry artifacts')
+    parser.add_argument('--ccr-val-history-cache',
+                        help='persistent VAL fixed-history geometry cache for quality evaluation only')
+    parser.add_argument('--ccr-val-history-cache-ram-mib',type=int,default=512,
+                        help='bounded RAM LRU for verified persistent VAL history-geometry artifacts')
     parser.add_argument('--warm-start-head',
                         help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
     parser.add_argument(
@@ -314,6 +322,8 @@ def setup(provider, args):
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
     if not 0 <= int(getattr(args,'ccr_history_cache_ram_mib',1024)) <= 16384:
         raise ValueError('CCR history cache RAM LRU must be in [0,16384] MiB')
+    if not 0 <= int(getattr(args,'ccr_val_history_cache_ram_mib',512)) <= 16384:
+        raise ValueError('CCR VAL history cache RAM LRU must be in [0,16384] MiB')
     history_mode=getattr(args,'ccr_history_cache_mode','off')
     history_root=getattr(args,'ccr_history_cache',None)
     if history_mode!='off' and not history_root:
@@ -370,6 +380,21 @@ def setup(provider, args):
     if provider.ccr_cache.disk is not None:
         provider.ccr_cache.disk.reserve = 2*2**30
     provider.ccr_samples_per_role = args.samples_per_role
+    val_history_root=getattr(args,'ccr_val_history_cache',None)
+    if val_history_root:
+        root=Path(__file__).resolve().parents[2]
+        namespace=ccr_val_history_cache_namespace(provider,args,root)
+        provider.ccr_val_history_cache=CausalGeometryCache(
+            val_history_root,namespace,max_bytes=0,
+            ram_bytes=int(args.ccr_val_history_cache_ram_mib)*2**20,reserve_bytes=0,
+            compression_level=6)
+        provider.ccr_val_history_cache_mode='require'
+        manifest=validate_ccr_val_history_cache_manifest(provider.ccr_val_history_cache,args)
+        print('CCR_VAL_HISTORY_CACHE '+json.dumps({
+            'mode':'require','root':str(Path(val_history_root).resolve()),
+            'namespace':provider.ccr_val_history_cache.namespace,
+            'ram_mib':args.ccr_val_history_cache_ram_mib,
+            'disk_gib':manifest.get('disk_gib')},sort_keys=True),flush=True)
     if history_root and history_mode!='off':
         root=Path(__file__).resolve().parents[2]
         namespace=ccr_history_cache_namespace(provider,args,root)
@@ -413,6 +438,10 @@ def close(provider, result):
     if history is not None:
         result['ccr_history_cache']=history.stats()
         history.close()
+    val_history=getattr(provider,'ccr_val_history_cache',None)
+    if val_history is not None:
+        result['ccr_val_history_cache']=val_history.stats()
+        val_history.close()
     execution=getattr(provider,'ccr_execution',None)
     if execution is not None:execution.close()
 
