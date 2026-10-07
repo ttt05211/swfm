@@ -83,7 +83,8 @@ def build_ccr_training_geometry(raw, record, pcfg, strong, workers, *, profile=N
     support, labels, loss, motion, renderer or compositor.
     """
     started=time.perf_counter();grid=pcfg.grid
-    state=runtime._prepare_record(record,None,pcfg,strong,'cpu',raw_window=raw)
+    state=runtime._prepare_record(
+        record,None,pcfg,strong,'cpu',raw_window=raw,majority_backend='native')
     strong_at=time.perf_counter()
     state['column_backgrounds']=[compose_component_replacements_fast_exact(
         a,comps,[],dynamic_class_ids=DYN,free_label=FREE,grid=grid,
