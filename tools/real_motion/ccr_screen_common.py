@@ -307,9 +307,13 @@ def setup(provider, args):
     provider.ccr_fast_train=fast
     provider.ccr_sample_workers=sample_workers
     if fast:
-        provider.raw_prefetch_workers=provider.raw_prefetch_depth=prefetch
+        # Generic raw prefetch (prior/eval) has a deliberately conservative
+        # <=4 contract. TRAIN has its own logical-superbatch producer budget and
+        # may still use the larger execution-only prefetch split.
+        raw_prefetch=min(4,prefetch)
+        provider.raw_prefetch_workers=provider.raw_prefetch_depth=raw_prefetch
         # Outer window parallelism owns the CPU budget. Avoid nested raw-I/O
-        # pools multiplying 16/32 window workers into hundreds of threads.
+        # pools multiplying window workers into hundreds of threads.
         provider.raw_io_workers=1
         provider.train_io_workers=prefetch
         provider.fixed_geometry_builder=_ccr_fast_fixed_geometry
