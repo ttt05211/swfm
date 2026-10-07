@@ -10,7 +10,9 @@ already-built CCR support and legality mask, then passes those actions through
 the exact official CCR compositor. GT never changes support, source identity,
 projection, ownership, fallback, or motion.
 
-No checkpoint writes, threshold search, training, cache expansion or promotion.
+No checkpoint writes, training, cache expansion or promotion.  With
+--full-action-diagnostics, a predefined DEV threshold grid is evaluated only
+to diagnose ranking/calibration; those DEV optima are explicitly non-deployable.
 """
 from __future__ import annotations
 
@@ -131,7 +133,7 @@ def _update_ranking(bucket, scores, target, mask):
     bucket["pos"] += np.bincount(pos_ids,minlength=PROB_BINS)
     bucket["neg"] += np.bincount(neg_ids,minlength=PROB_BINS)
     bucket["score_sum"] += np.bincount(ids,weights=score,minlength=PROB_BINS)
-    bucket["score_sq_sum"] += float(np.square(score,dtype=np.float64).sum())
+    bucket["score_sq_sum"] += float(np.square(score.astype(np.float64,copy=False)).sum())
     bucket["positive_score_sum"] += float(score[y].sum(dtype=np.float64))
     bucket["count"] += int(len(score))
     bucket["positives"] += int(y.sum())
