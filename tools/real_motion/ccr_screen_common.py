@@ -119,6 +119,10 @@ def add_args(parser):
                         help='bounded RAM LRU for verified persistent history-geometry artifacts')
     parser.add_argument('--warm-start-head',
                         help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
+    parser.add_argument(
+        '--ccr-add-only-natural-bce', action='store_true',
+        help=('experimental clean repair objective: train ADD only with importance-corrected natural-prior BCE; '
+              'positive_weight=1, REMOVE disabled at evaluation. Use a random head; no warm start.'))
 
 
 def make_head(teacher, device):
@@ -179,13 +183,21 @@ def model_contract(head):
 def contract_extra(args, root):
     if min(args.descriptor_disk_mib, args.descriptor_ram_mib) < 0 or args.samples_per_role < 1:
         raise ValueError('invalid finite CCR cache/sampling budget')
+    add_only=bool(getattr(args,'ccr_add_only_natural_bce',False))
+    if add_only and getattr(args,'warm_start_head',None):
+        raise ValueError('--ccr-add-only-natural-bce requires a random head; do not mix old weighted-BCE warm-start logits')
     files = ('real_motion/canonical_causal_repair.py', 'real_motion/canonical_repair_context.py',
              'tools/real_motion/ccr_screen_common.py', 'tools/real_motion/train_p0_f9_point_ccr.py',
              'tools/real_motion/pilot_p0_f9_canonical_causal_repair.py','real_motion/canonical_repair_execution.py',
              'real_motion/canonical_repair_batch.py','real_motion/native/column_cpu.cpp')
-    result = dict(objective='equal_window_role_action_BCE_causal_MC_GT_only',
-                thresholds=dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95)),
-                samples_per_role=args.samples_per_role, remove_loss_weight=.25,
+    result = dict(
+                objective=('equal_window_role_balanced_ADD_only_natural_prior_BCE_causal_MC_GT_only'
+                           if add_only else 'equal_window_role_action_BCE_causal_MC_GT_only'),
+                thresholds=(dict(CCR_ADD=.5, CCR_REMOVE=None, old_Local=(.5, .5, .95))
+                            if add_only else dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95))),
+                samples_per_role=args.samples_per_role,
+                remove_loss_weight=(0.0 if add_only else .25),
+                add_only_natural_bce=add_only,
                 cpu_execution=getattr(args,'ccr_cpu_execution','numpy'),cpu_workers=getattr(args,'ccr_cpu_workers',4),
                 batched_head=bool(getattr(args,'ccr_batched_head',False) or getattr(args,'ccr_fast_train',False)),
                 fast_train=bool(getattr(args,'ccr_fast_train',False)),
@@ -280,7 +292,7 @@ def prepare_frozen_superbatch(provider, rows, teacher):
     return actual
 
 
-def _independent_sample_loss(head, sample, plan, output, target, weight, device):
+def _independent_sample_loss(head, sample, plan, output, target, weight, device, *, add_only=False):
     def upload(value):
         return torch.as_tensor(np.ascontiguousarray(value),device=device)
     actor=upload(sample.actor)
@@ -291,7 +303,8 @@ def _independent_sample_loss(head, sample, plan, output, target, weight, device)
                             upload(sample.classes),live)
         logits=head.decode(encoded,actor,upload(plan.context),upload(plan.base),
                            upload(plan.fallback),upload(plan.legal),live)
-        return repair_loss(head,logits,actor,upload(target),upload(weight)).float()
+        return (_add_only_natural_loss(head,logits,actor,upload(target),upload(weight))
+                if add_only else repair_loss(head,logits,actor,upload(target),upload(weight))).float()
 
 
 def setup(provider, args):
@@ -337,6 +350,7 @@ def setup(provider, args):
     provider.ccr_verify_batched_head_remaining=1 if fast else 0
     provider.ccr_verify_compact_remaining=1 if fast else 0
     provider.ccr_fast_train=fast
+    provider.ccr_add_only_natural_bce=bool(getattr(args,'ccr_add_only_natural_bce',False))
     provider.ccr_sample_workers=sample_workers
     if fast:
         # Generic raw prefetch (prior/eval) has a deliberately conservative
@@ -379,6 +393,8 @@ def setup(provider, args):
             'namespace':provider.ccr_history_cache.namespace,
             'ram_mib':args.ccr_history_cache_ram_mib},sort_keys=True),flush=True)
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
+    if provider.ccr_add_only_natural_bce:
+        print('CCR_OBJECTIVE ADD_ONLY_NATURAL_BCE positive_weight=1 REMOVE_disabled threshold_ADD=0.5',flush=True)
     if fast:
         print(f'CCR_FAST_TRAIN independent_motion_streams={motion_streams} batched_head=1 '
               f'compact_sampled_only=1 minimal_geometry=1 '
@@ -420,14 +436,67 @@ def calibrate_train(provider, source, records, teacher, head, *, progress=None, 
                 counts[role, action] += (int(mask.sum())-positive, positive)
         if wi == 1 or wi % 32 == 0 or wi == len(records):
             print(f'CCR_TRAIN_PRIOR {wi}/{len(records)} unsampled TRAIN_only', flush=True)
-    weights = np.sqrt(counts[..., 0]/np.maximum(counts[..., 1], 1)).clip(1, 32).astype(np.float32)
+    if getattr(provider,'ccr_add_only_natural_bce',False):
+        # Causal-strata sampling is GT-independent; its importance weights
+        # recover each role's natural legal-ADD population.  No pos_weight and
+        # no posterior correction are needed for this clean ADD-only objective.
+        weights=np.ones((2,2),np.float32)
+        correction='none; ADD logits are trained directly against importance-corrected natural priors'
+        objective='role-balanced ADD-only natural-prior BCE'
+    else:
+        weights = np.sqrt(counts[..., 0]/np.maximum(counts[..., 1], 1)).clip(1, 32).astype(np.float32)
+        correction='subtract log(pos_weight); not empirical calibration guarantee'
+        objective='role/action weighted BCE'
     head.positive_weight.copy_(torch.as_tensor(weights, device=provider.device))
     report = dict(population='TRAIN-only full unsampled legal CCR action support', windows=len(records),
                   counts=counts.tolist(), positive_weights=weights.tolist(), seconds=time.perf_counter()-started,
-                  probability_correction='subtract log(pos_weight); not empirical calibration guarantee')
+                  objective=objective,probability_correction=correction)
     if progress:
         progress(dict(event='ccr_train_prior', **report))
     return report
+
+
+def _add_only_natural_loss(head,logits,actors,target,weight):
+    """Importance-corrected natural-prior ADD BCE, equal static/dynamic role weight."""
+    roles=actors>=0
+    bce=torch.nn.functional.binary_cross_entropy_with_logits(
+        logits[...,0].float(),target[...,0].float(),reduction='none')
+    loss=logits.sum()*0
+    for role in (False,True):
+        w=weight[...,0]*(roles==role)[:,None]
+        loss=loss+(bce*w).sum()/w.sum().clamp_min(1)
+    return loss
+
+
+def _batched_add_only_losses(head,evidences,plans,output,source_sizes,targets,weights,device):
+    count=len(evidences)
+    if not (count==len(plans)==len(source_sizes)==len(targets)==len(weights)) or not count:
+        raise ValueError('nonempty equal ADD-only window lists required')
+    if sum(source_sizes)!=len(output['history_source_context']):
+        raise ValueError('live source population mismatch')
+    actors=[];offset=0
+    for evidence,n in zip(evidences,source_sizes):
+        actor=evidence.actor.astype(np.int64,copy=True);dynamic=actor>=0
+        if np.any(actor[dynamic]>=n):
+            raise ValueError('local actor exceeds its source population')
+        actor[dynamic]+=offset;offset+=n;actors.append(actor)
+    lengths=[len(e) for e in evidences]
+    def upload(values):
+        return torch.as_tensor(np.ascontiguousarray(np.concatenate(values)),device=device)
+    actor=upload(actors)
+    with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
+        live=head.project_sources(output)
+        encoded=head.encode(
+            upload([e.features for e in evidences]),upload([e.labels for e in evidences]),
+            actor,upload([e.classes for e in evidences]),live)
+        logits=head.decode(
+            encoded,actor,upload([p.context for p in plans]),upload([p.base for p in plans]),
+            upload([p.fallback for p in plans]),upload([p.legal for p in plans]),live)
+        y=upload(targets);w=upload(weights);cursor=0;losses=[]
+        for n in lengths:
+            sl=slice(cursor,cursor+n);cursor+=n
+            losses.append(_add_only_natural_loss(head,logits[sl],actor[sl],y[sl],w[sl]))
+    return losses
 
 
 def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=None, frozen_outputs=None):
@@ -580,9 +649,29 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
             stages['sample_dispatch']+=time.perf_counter()-tick
             continue
 
-        loss, n = loss_for_causal(head, evidence, output, prep, provider.pcfg.grid,
-            raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role,
-            kernels=execution_kernels(provider))
+        if getattr(provider,'ccr_add_only_natural_bce',False):
+            ids,importance=sample_causal_points(
+                evidence,rng,per_role=provider.ccr_samples_per_role)
+            sample,plan=map_sampled_canonical(
+                evidence,ids,prep,provider.pcfg.grid,conflicts,
+                kernels=execution_kernels(provider))
+            target,valid=repair_targets(sample,plan,raw['future_gt_occ'])
+            actor=torch.as_tensor(np.ascontiguousarray(sample.actor),device=device)
+            def upload(value):
+                return torch.as_tensor(np.ascontiguousarray(value),device=device)
+            with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
+                live=head.project_sources(output)
+                encoded=head.encode(upload(sample.features),upload(sample.labels),actor,
+                                    upload(sample.classes),live)
+                logits=head.decode(encoded,actor,upload(plan.context),upload(plan.base),
+                                   upload(plan.fallback),upload(plan.legal),live)
+                weight=importance[:,None,None]*valid
+                loss=_add_only_natural_loss(head,logits,actor,upload(target),upload(weight))
+            n=len(ids)
+        else:
+            loss, n = loss_for_causal(head, evidence, output, prep, provider.pcfg.grid,
+                raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role,
+                kernels=execution_kernels(provider))
         if not torch.isfinite(loss):
             raise RuntimeError('nonfinite CCR loss; previous completed checkpoint preserved')
         stages['sample_live_projection_encoder_loss'] += time.perf_counter()-tick; tick = time.perf_counter()
@@ -608,11 +697,15 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
             for k,v in outputs[0].items() if isinstance(v,torch.Tensor)
         }
         tick=time.perf_counter()
-        batch_losses=batched_repair_losses(
+        add_only=bool(getattr(provider,'ccr_add_only_natural_bce',False))
+        batch_losses=(_batched_add_only_losses(
             head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
+            if add_only else batched_repair_losses(
+                head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device))
         if getattr(provider,'ccr_verify_batched_head_remaining',0)>0:
             refs=torch.stack([
-                _independent_sample_loss(head,row[0],row[1],output,row[2],row[3],device)
+                _independent_sample_loss(
+                    head,row[0],row[1],output,row[2],row[3],device,add_only=add_only)
                 for row,output in zip(packed,outputs)
             ])
             actual=torch.stack([v.float() for v in batch_losses])
@@ -670,7 +763,10 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
             plan = map_inputs(provider,evidence,prep)
             p = probabilities(head, evidence, plan, output, provider.device)
             target,valid=repair_targets(evidence,plan,raw['future_gt_occ'])
-            predicted=np.stack((p[...,0]>=.5,p[...,1]>=.95),axis=-1)&plan.legal
+            add_only=bool(getattr(provider,'ccr_add_only_natural_bce',False))
+            predicted=np.stack(
+                (p[...,0]>=.5,np.zeros_like(p[...,1],dtype=bool) if add_only else p[...,1]>=.95),
+                axis=-1)&plan.legal
             roles=evidence.actor>=0
             for role in (0,1):
                 role_mask=(roles==bool(role))[:,None]
@@ -680,8 +776,11 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
                     action_counts[role,action]+=(
                         int((y&z).sum()),int((~y&z&mask).sum()),
                         int((y&~z).sum()),int(mask.sum()))
-            predictions = {name: compose_canonical(prep.baseline, evidence, plan, p[..., 0], p[..., 1],
-                role={'static_repair': 'static', 'dynamic_repair': 'dynamic', 'joint': 'all'}[name])
+            remove=np.zeros_like(p[...,1],dtype=np.float32) if add_only else p[...,1]
+            predictions = {name: compose_canonical(
+                prep.baseline,evidence,plan,p[...,0],remove,
+                thresholds=(.5,None) if add_only else (.5,.95),
+                role={'static_repair':'static','dynamic_repair':'dynamic','joint':'all'}[name])
                 for name in names if name != 'old_joint'}
             stages['fresh_canonical_all_six_probabilities_compose'] += time.perf_counter()-tick; tick = time.perf_counter()
             support = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
@@ -720,6 +819,10 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
 
 @torch.no_grad()
 def six_frame_speed(provider, source, records, teacher, head, *, repeats=2, stop_event=None):
+    if getattr(provider,'ccr_add_only_natural_bce',False):
+        raise RuntimeError(
+            'ADD-only experimental screen has no frozen official FPS protocol yet; '
+            'stop at an epoch boundary and evaluate quality first')
     teacher.eval(); head.eval(); trials = []
     with _evaluation_geometry(provider,True), old_execution(teacher, provider):
         for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records, include_gt=False), 1):
@@ -755,9 +858,12 @@ def gate(new, old, speed):
 
 def brief(result):
     warm=bool(result.get('warm_start'))
+    prior=result.get('reports',{}).get('train_prior',{})
+    add_only=(prior.get('objective')=='role-balanced ADD-only natural-prior BCE')
     lines = ['===== POINT CCR / GT-ONLY THREE-PASS SCREEN =====', 'status: '+result['status'], 'protocol: '+PROTOCOL,
              '4 histories -> 6 futures; epoch19 motion FROZEN; '+('WARM-START point head' if warm else 'RANDOM point head')+'; no KD/AE.',
-             'Fixed CCR_ADD=0.5 / CCR_REMOVE=0.95; old Local=(0.5,0.5,0.95).',
+             ('ADD-ONLY natural-prior BCE; fixed CCR_ADD=0.5; REMOVE disabled.'
+              if add_only else 'Fixed CCR_ADD=0.5 / CCR_REMOVE=0.95; old Local=(0.5,0.5,0.95).'),
              'Support: '+SUPPORT_NOTE]
     if 'training_population' in result:
         lines.append('TRAIN '+json.dumps(result['training_population']))
