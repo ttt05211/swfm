@@ -391,6 +391,16 @@ def setup(provider, args):
             history_root,namespace,max_bytes=0,
             ram_bytes=int(args.ccr_history_cache_ram_mib)*2**20,reserve_bytes=0)
         provider.ccr_history_cache_mode=history_mode
+        manifest_path=provider.ccr_history_cache.root/'manifest.json'
+        if history_mode=='require':
+            if not manifest_path.is_file():
+                raise RuntimeError(f'required CCR history cache manifest missing: {manifest_path}')
+            manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+            if (manifest.get('complete') is not True or int(manifest.get('windows',-1))!=20430
+                    or manifest.get('namespace')!=provider.ccr_history_cache.namespace
+                    or manifest.get('future_GT_cached') is not False
+                    or manifest.get('learned_outputs_cached') is not False):
+                raise RuntimeError('required CCR history cache manifest is incomplete or provenance-invalid')
         print('CCR_HISTORY_CACHE '+json.dumps({
             'mode':history_mode,'root':str(Path(history_root).resolve()),
             'namespace':provider.ccr_history_cache.namespace,
@@ -411,7 +421,9 @@ def close(provider, result):
             cache.disk.flush()
         result['descriptor_cache'] = cache.stats(); cache.close()
     history=getattr(provider,'ccr_history_cache',None)
-    if history is not None:history.close()
+    if history is not None:
+        result['ccr_history_cache']=history.stats()
+        history.close()
     execution=getattr(provider,'ccr_execution',None)
     if execution is not None:execution.close()
 
