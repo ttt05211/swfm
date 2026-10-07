@@ -65,8 +65,8 @@ def add_args(parser):
                         help='one frozen V18 forward per packed window batch; enable only after parity gate')
     parser.add_argument('--ccr-fast-train',action='store_true',
                         help='max execution-only speed: batched frozen motion/head, lazy sampled features, minimal prefetched geometry')
-    parser.add_argument('--ccr-prefetch-workers',type=int,default=4,
-                        help='CPU window look-ahead workers for --ccr-fast-train (bounded to 4)')
+    parser.add_argument('--ccr-prefetch-workers',type=int,default=16,
+                        help='CPU window look-ahead workers for --ccr-fast-train (bounded to 32)')
     parser.add_argument('--ccr-motion-superbatch-updates',type=int,default=1,
                         help='prepare this many logical 4-window updates together; optimizer batch stays unchanged')
     parser.add_argument('--ccr-motion-streams',type=int,default=4,
@@ -144,7 +144,7 @@ def contract_extra(args, root):
                 batched_head=bool(getattr(args,'ccr_batched_head',False) or getattr(args,'ccr_fast_train',False)),
                 fast_train=bool(getattr(args,'ccr_fast_train',False)),
                 lazy_sampled_features=bool(getattr(args,'ccr_fast_train',False)),
-                prefetch_workers=(min(4,max(1,getattr(args,'ccr_prefetch_workers',4)))
+                prefetch_workers=(min(32,max(1,getattr(args,'ccr_prefetch_workers',16)))
                                   if getattr(args,'ccr_fast_train',False) else None),
                 motion_superbatch_updates=(max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
                                            if getattr(args,'ccr_fast_train',False) else 1),
@@ -168,7 +168,8 @@ def contract_extra(args, root):
 def _ccr_minimal_fixed_geometry(provider, raw, record):
     """Exact Point-CCR fixed geometry without legacy Local static/frontier work."""
     from tools.real_motion.joint_column_full_common import build_ccr_training_geometry
-    workers=1 if getattr(provider,'raw_prefetch_workers',1)>=2 else min(3,provider.workers)
+    prefetch=max(1,getattr(provider,'raw_prefetch_workers',1))
+    workers=max(1,min(2,provider.workers//prefetch))
     profile={}
     causal=build_ccr_training_geometry(
         raw,record,provider.pcfg,provider.strong,workers,profile=profile)
@@ -195,11 +196,20 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
     # Dataset/config/checkpoint provenance has already been verified globally.
     ephemeral_key=stable_json_fingerprint([
         str(record['scene_name']),str(record['t0_token']),'CCR_FAST_EPHEMERAL_v1'])
+    tick=time.perf_counter()
     fixed=build_fixed_canonical(
         prep,provider.pcfg.grid,neighbors=False,
-        kernels=execution_kernels(provider),executor=None,lazy_sampled=True)
+        kernels=execution_kernels(provider),
+        executor=getattr(getattr(provider,'ccr_execution',None),'pool',None),
+        lazy_sampled=True)
+    causal['_ccr_fast_profile']['canonical_support']=time.perf_counter()-tick
     fixed[0].fixed_history_sha256=ephemeral_key
+    tick=time.perf_counter()
     conflicts=full_static_conflicts(fixed[0],prep,provider.pcfg.grid)
+    causal['_ccr_fast_profile']['static_conflicts']=time.perf_counter()-tick
+    causal['_ccr_fast_profile']['fast_total']=sum(
+        float(v) for k,v in causal['_ccr_fast_profile'].items()
+        if k not in ('total','geometry_workers') and isinstance(v,(int,float)))
     causal['_ccr_prefetched_fixed']=fixed
     causal['_ccr_prefetched_conflicts']=conflicts
     return causal
@@ -277,7 +287,7 @@ def setup(provider, args):
     if args.descriptor_ram_mib > 8192:
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
     fast=bool(getattr(args,'ccr_fast_train',False))
-    prefetch=min(4,max(1,int(getattr(args,'ccr_prefetch_workers',4))))
+    prefetch=min(32,max(1,int(getattr(args,'ccr_prefetch_workers',16))))
     super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
     motion_streams=max(1,int(getattr(args,'ccr_motion_streams',4)))
     if motion_streams>8:
@@ -303,7 +313,9 @@ def setup(provider, args):
     provider.ccr_fast_train=fast
     if fast:
         provider.raw_prefetch_workers=provider.raw_prefetch_depth=prefetch
-        provider.raw_io_workers=min(2,max(1,args.cpu_workers))
+        # Outer window parallelism owns the CPU budget. Avoid nested raw-I/O
+        # pools multiplying 16/32 window workers into hundreds of threads.
+        provider.raw_io_workers=1
         provider.train_io_workers=prefetch
         provider.fixed_geometry_builder=_ccr_fast_fixed_geometry
     provider.ccr_cache = FixedCanonicalCache(args.descriptor_ram_mib, neighbors=False,
