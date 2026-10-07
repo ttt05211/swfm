@@ -242,6 +242,13 @@ def main(stop_event=None, argv=None, *, backend=None):
                 mode='EXECUTION_UPGRADE_RESUME' if a.resume_execution_upgrade else 'RESUME'
                 print(f'{label}_{mode} update={updates}/{steps} next_epoch={epoch+1} batch_cursor={batch}; '
                       f'head/optimizer/RNG/cosine preserved', flush=True)
+            # Reporting baseline for this process only. Exact resume preserves
+            # historical cumulative timings, but those old timings must not
+            # contaminate ETA after an execution-only speed upgrade.
+            run_timing_base=dict(
+                executed=int(executed),
+                train_seconds=float(reports.get('train_seconds',0.)),
+                input_wait_seconds=float(reports.get('input_wait_seconds',0.)))
             teacher.eval().requires_grad_(False)
             provider = PilotProvider(a.base_checkpoint, CLEAN_SHA256, make_prepare_config(cfg), device, a.cpu_workers, teacher, None)
             provider.raw_prefetch_workers = provider.raw_prefetch_depth = min(2, a.cpu_workers)
@@ -320,8 +327,10 @@ def main(stop_event=None, argv=None, *, backend=None):
                     if updates == 1 or updates % 32 == 0:
                         details = (f"sampled_points={stat['sampled_points']} canonical_points={stat['canonical_points']}" if backend is not None else
                                    f"dynamic_columns={stat.get('dynamic_refine_columns', 0)}")
-                        wall_total=reports.get('train_seconds',0.)+reports.get('input_wait_seconds',0.)
-                        wall_per_window=wall_total/max(executed,1)
+                        local_train=reports.get('train_seconds',0.)-run_timing_base['train_seconds']
+                        local_wait=reports.get('input_wait_seconds',0.)-run_timing_base['input_wait_seconds']
+                        local_windows=max(1,executed-run_timing_base['executed'])
+                        wall_per_window=(local_train+local_wait)/local_windows
                         done_epoch_windows=sum(sizes[epoch][:batch]) if epoch < len(sizes) else len(train)
                         remaining_epoch=max(0,len(train)-done_epoch_windows)
                         eta_min=remaining_epoch*wall_per_window/60.
