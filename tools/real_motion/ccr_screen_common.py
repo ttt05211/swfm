@@ -456,7 +456,26 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
             if motion_refs is not None:
                 ref_prep=provider.prepare_columns(
                     None,record,include_gt=True,raw_window=raw,outputs=motion_refs[row_index])
-            prep = provider.prepare_columns(None, record, include_gt=True, raw_window=raw, outputs=output)
+            # A completed persistent TRAIN cache intentionally stores a slim
+            # prepared_state and omits dense/current/previous Strong inputs.
+            # If the warm-start reused both TRAIN prior and initial DEV64, the
+            # very first renderer exactness gate can therefore occur here.
+            # Run that ONE preflight through the original live preparation
+            # path, then immediately restore the immutable cached geometry for
+            # compact sampling.  This does not alter the persistent cache
+            # namespace or any later training window.
+            cached_causal=raw.get('_column_causal_preparation')
+            if cached_causal is not None and not getattr(provider,'columns_checked',False):
+                del raw['_column_causal_preparation']
+                try:
+                    prep = provider.prepare_columns(
+                        None, record, include_gt=True, raw_window=raw, outputs=output)
+                finally:
+                    raw['_column_causal_preparation']=cached_causal
+                print('CCR_CACHE_LIVE_EXACTNESS_PREFLIGHT PASS; persistent TRAIN cache preserved',flush=True)
+            else:
+                prep = provider.prepare_columns(
+                    None, record, include_gt=True, raw_window=raw, outputs=output)
             if ref_prep is not None:
                 for name in ('baseline','owners','fallbacks'):
                     a=getattr(prep,name);b=getattr(ref_prep,name)
