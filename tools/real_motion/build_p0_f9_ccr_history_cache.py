@@ -15,7 +15,11 @@ import argparse
 import json
 from pathlib import Path
 import shutil
+import sys
 import time
+
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
