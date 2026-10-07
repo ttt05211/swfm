@@ -194,9 +194,11 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
         state={**causal['prepared_state'],'rec':record,'gpu':None},
         registrations=causal['registrations'])
     tick=time.perf_counter()
+    # Window-level parallelism owns the scarce 10-core budget. Nested entity
+    # pools make outer workers block and underutilize cores; keep each compact
+    # lattice single-threaded and parallelize whole windows instead.
     compact=build_compact_canonical_support(
-        prep,provider.pcfg.grid,kernels=execution_kernels(provider),
-        executor=getattr(getattr(provider,'ccr_execution',None),'pool',None))
+        prep,provider.pcfg.grid,kernels=execution_kernels(provider),executor=None)
     causal['_ccr_fast_profile']['compact_support']=time.perf_counter()-tick
     causal['_ccr_fast_profile']['fast_total']=sum(
         float(v) for k,v in causal['_ccr_fast_profile'].items()
@@ -277,9 +279,12 @@ def setup(provider, args):
     if args.descriptor_ram_mib > 8192:
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
     fast=bool(getattr(args,'ccr_fast_train',False))
-    prefetch=min(32,max(1,int(getattr(args,'ccr_prefetch_workers',16))))
+    requested_prefetch=min(32,max(1,int(getattr(args,'ccr_prefetch_workers',16))))
     super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
     motion_streams=max(1,int(getattr(args,'ccr_motion_streams',4)))
+    sample_workers=min(2,max(1,args.cpu_workers//4)) if fast else 1
+    # Reserve sampled-materialization workers that overlap next-bundle prep.
+    prefetch=min(requested_prefetch,max(1,args.cpu_workers-sample_workers))
     if motion_streams>8:
         raise ValueError('CCR frozen-motion CUDA streams are capped at 8')
     if super_updates>8:
@@ -302,6 +307,7 @@ def setup(provider, args):
     provider.ccr_verify_batched_head_remaining=1 if fast else 0
     provider.ccr_verify_compact_remaining=1 if fast else 0
     provider.ccr_fast_train=fast
+    provider.ccr_sample_workers=sample_workers
     if fast:
         provider.raw_prefetch_workers=provider.raw_prefetch_depth=prefetch
         # Outer window parallelism owns the CPU budget. Avoid nested raw-I/O
@@ -319,8 +325,8 @@ def setup(provider, args):
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
     if fast:
         print(f'CCR_FAST_TRAIN independent_motion_streams={motion_streams} batched_head=1 '
-              f'lazy_sampled=1 minimal_geometry=1 prefetch_workers={prefetch} '
-              f'motion_superbatch_updates={super_updates} '
+              f'compact_sampled_only=1 minimal_geometry=1 prefetch_workers={prefetch} '
+              f'sample_workers={sample_workers} motion_superbatch_updates={super_updates} '
               f'(logical optimizer batch remains 4 windows)',flush=True)
 
 
