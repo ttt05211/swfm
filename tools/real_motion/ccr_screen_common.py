@@ -448,8 +448,24 @@ def close(provider, result):
 
 @torch.no_grad()
 def calibrate_train(provider, source, records, teacher, head, *, progress=None, stop_event=None):
-    counts = np.zeros((2, 2, 2), np.int64)
     started = time.perf_counter()
+    if getattr(provider,'ccr_add_only_natural_bce',False):
+        # This objective has no fitted prior/calibration parameter.  Causal
+        # sampling is GT-independent and importance-corrected during each
+        # update, so scanning a TRAIN prefix here would be wasted work.
+        weights=np.ones((2,2),np.float32)
+        head.positive_weight.copy_(torch.as_tensor(weights,device=provider.device))
+        report=dict(
+            population='none; ADD-only natural-prior objective requires no fitted TRAIN prior',
+            windows=0,counts=None,positive_weights=weights.tolist(),
+            seconds=time.perf_counter()-started,
+            objective='role-balanced ADD-only natural-prior BCE',
+            probability_correction='none; sigmoid(logit) is used directly')
+        if progress:
+            progress(dict(event='ccr_train_prior',**report))
+        print('CCR_TRAIN_PRIOR SKIP add-only natural BCE needs no fitted prior',flush=True)
+        return report
+    counts = np.zeros((2, 2, 2), np.int64)
     for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records), 1):
         if stop_event is not None and stop_event.is_set():
             raise InterruptedError('TRAIN-only prior interrupted; restart prior before any update')
@@ -465,17 +481,9 @@ def calibrate_train(provider, source, records, teacher, head, *, progress=None, 
                 counts[role, action] += (int(mask.sum())-positive, positive)
         if wi == 1 or wi % 32 == 0 or wi == len(records):
             print(f'CCR_TRAIN_PRIOR {wi}/{len(records)} unsampled TRAIN_only', flush=True)
-    if getattr(provider,'ccr_add_only_natural_bce',False):
-        # Causal-strata sampling is GT-independent; its importance weights
-        # recover each role's natural legal-ADD population.  No pos_weight and
-        # no posterior correction are needed for this clean ADD-only objective.
-        weights=np.ones((2,2),np.float32)
-        correction='none; ADD logits are trained directly against importance-corrected natural priors'
-        objective='role-balanced ADD-only natural-prior BCE'
-    else:
-        weights = np.sqrt(counts[..., 0]/np.maximum(counts[..., 1], 1)).clip(1, 32).astype(np.float32)
-        correction='subtract log(pos_weight); not empirical calibration guarantee'
-        objective='role/action weighted BCE'
+    weights = np.sqrt(counts[..., 0]/np.maximum(counts[..., 1], 1)).clip(1, 32).astype(np.float32)
+    correction='subtract log(pos_weight); not empirical calibration guarantee'
+    objective='role/action weighted BCE'
     head.positive_weight.copy_(torch.as_tensor(weights, device=provider.device))
     report = dict(population='TRAIN-only full unsampled legal CCR action support', windows=len(records),
                   counts=counts.tolist(), positive_weights=weights.tolist(), seconds=time.perf_counter()-started,
