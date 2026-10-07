@@ -6,9 +6,10 @@ import numpy as np
 
 
 class CachedColumnSource:
-    def __init__(self, source, max_mib=256):
+    def __init__(self, source, max_mib=256, *, copy_on_insert=True):
         if max_mib < 0: raise ValueError('negative frame cache budget')
         self.source, self.limit = source, int(max_mib*2**20)
+        self.copy_on_insert=bool(copy_on_insert)
         self.rows, self.pending = OrderedDict(), {}
         self.lock = Lock(); self.bytes = 0; self.hits = 0; self.misses = 0
 
@@ -26,7 +27,12 @@ class CachedColumnSource:
         try:
             value = loader()
             arrays = value if isinstance(value, tuple) else (value,)
-            arrays = tuple(np.asarray(a).copy() for a in arrays)
+            # NuScenes NPZ loaders already return fresh owning arrays. Training
+            # can opt out of a second full 3-D copy while still freezing the
+            # cached views read-only. Generic callers retain copy-on-insert.
+            arrays = tuple(
+                np.asarray(a).copy() if self.copy_on_insert else np.asarray(a)
+                for a in arrays)
             for a in arrays: a.setflags(write=False)
             value = arrays if isinstance(value, tuple) else arrays[0]
             size = sum(a.nbytes for a in arrays)
