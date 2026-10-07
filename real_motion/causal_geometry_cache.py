@@ -53,13 +53,17 @@ class CausalGeometryCache:
     _roots_lock = Lock()
     _root_usage = {}
 
-    def __init__(self, root, namespace, *, max_bytes=4*2**30, ram_bytes=128*2**20, reserve_bytes=2**30):
+    def __init__(self, root, namespace, *, max_bytes=4*2**30, ram_bytes=128*2**20, reserve_bytes=2**30,
+                 compression_level=1):
         if min(max_bytes, ram_bytes, reserve_bytes) < 0: raise ValueError('negative geometry cache budget')
+        if not isinstance(compression_level,int) or not 0 <= compression_level <= 9:
+            raise ValueError('zlib compression_level must be an integer in [0,9]')
         self.namespace = hashlib.sha256((PROTOCOL+namespace).encode()).hexdigest()
         self.cache_root = Path(root).resolve()
         self.root = self.cache_root/self.namespace
         self.root.mkdir(parents=True, exist_ok=True)
         self.limit, self.ram_limit, self.reserve = int(max_bytes), int(ram_bytes), int(reserve_bytes)
+        self.compression_level=int(compression_level)
         self.lock = Lock(); self.rows = OrderedDict(); self.ram_used = 0
         # One quota across ALL provenance namespaces, not 16 GiB per config.
         # Shared admission accounting covers concurrent workers/cache instances
@@ -188,7 +192,7 @@ class CausalGeometryCache:
                 self.skipped_writes += 1; return
         started = time.perf_counter()
         packed = zlib.compress(pickle.dumps({'namespace': self.namespace, 'key': tuple(key),
-            'causal_sha': causal_sha, 'geometry': value}, protocol=5), level=1)
+            'causal_sha': causal_sha, 'geometry': value}, protocol=5), level=self.compression_level)
         blob = MAGIC+hashlib.sha256(packed).digest()+packed
         written = skipped = disabled = False
         with self._roots_lock:
@@ -241,4 +245,5 @@ class CausalGeometryCache:
                 skipped_writes=self.skipped_writes, disk_mib=self.disk_used/2**20,
                 disk_limit_mib=self.limit/2**20, ram_mib=self.ram_used/2**20,
                 pending_writes=len(self.pending), background_write_seconds=self.write_seconds,
-                directory=str(self.root), namespace=self.namespace)
+                directory=str(self.root), namespace=self.namespace,
+                compression_level=self.compression_level)
