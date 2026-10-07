@@ -155,7 +155,7 @@ def _per_class_gap(metrics):
 def _scene_summary(scene_metrics):
     rows=[]
     for scene,variants in scene_metrics.items():
-        m={k:v.compute() for k,v in variants.items()}
+        m={k:variants[k].compute() for k in VARIANTS}
         rows.append(dict(
             scene=scene,
             windows=int(variants["_windows"]),
