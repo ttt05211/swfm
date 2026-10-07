@@ -89,6 +89,8 @@ def parser():
                    help='preserve optimizer/RNG/cursor across whitelisted execution-only CCR speed changes')
     p.add_argument('--device', default='cuda')
     p.add_argument('--cpu-workers', type=int, default=8)
+    p.add_argument('--frame-cache-mib', type=int, default=4096,
+                   help='bounded immutable occupancy/visibility frame RAM cache; execution-only')
     p.add_argument('--causal-geometry-cache')
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--train-fraction', type=float, default=.2)
@@ -132,7 +134,7 @@ def main(stop_event=None, argv=None, *, backend=None):
     if (not Path(a.dataroot).is_dir() or min(a.epochs, a.cpu_workers, a.prior_windows, a.fps_windows, a.speed_repeats) < 1
             or not 1 <= a.eval_windows <= 64 or a.fps_windows > a.eval_windows or not 0 < a.train_fraction <= 1
             or not np.isfinite(a.lr) or a.lr <= 0 or a.max_updates < 0
-            or not 0 <= a.stop_after_epoch <= a.epochs):
+            or not 0 <= a.stop_after_epoch <= a.epochs or not 0 <= a.frame_cache_mib <= 16384):
         p.error('invalid finite screen budgets')
     device = require_cuda(a.device); torch.set_num_threads(1); torch.manual_seed(a.seed)
     from real_motion.native_column_cpu import backend_name, prepare_native
@@ -247,9 +249,15 @@ def main(stop_event=None, argv=None, *, backend=None):
                 namespace = geometry_namespace(cfg, provider, ck['info_fingerprints'], ck['cache_fingerprints'], a.dataroot)
                 cache = CausalGeometryCache(a.causal_geometry_cache, namespace, max_bytes=0, ram_bytes=256*2**20)
                 provider.causal_geometry_cache = cache
-            raw_limit = 256  # MiB, not a record count; bounded immutable frame cache.
-            train_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.train_info, verbose=False), raw_limit)
-            dev_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info, verbose=False), raw_limit)
+            # Windows overlap heavily in history/future frame tokens. A few GiB
+            # of bounded immutable frame reuse is cheap on the 80GiB training
+            # allocation and avoids repeated decode/copy work across random
+            # window order and later epochs.
+            train_source = CachedColumnSource(
+                NuScenesWindowSource(a.dataroot, info_pkl=a.train_info, verbose=False), a.frame_cache_mib)
+            dev_source = CachedColumnSource(
+                NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info, verbose=False), min(1024,a.frame_cache_mib))
+            result['frame_cache_mib']=dict(train=a.frame_cache_mib,dev=min(1024,a.frame_cache_mib))
             if backend is not None:
                 backend.setup(provider, a)
             del ck
