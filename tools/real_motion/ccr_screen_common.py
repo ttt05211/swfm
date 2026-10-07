@@ -23,6 +23,7 @@ from real_motion.canonical_repair_context import (
     sample_compact_causal_points, map_sampled_compact_canonical,
 )
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
+from real_motion.causal_geometry_cache import CausalGeometryCache
 from real_motion.canonical_repair_batch import batched_repair_losses
 from real_motion.final_dataflow import batch_frozen_motion, parallel_frozen_motion
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
@@ -38,6 +39,7 @@ from tools.real_motion.height_field_screen_common import sync
 from real_motion.causal_column_completion import actions_from_probabilities, compose_dense
 
 PROTOCOL = 'p0_f9_point_ccr_gt_screen_v1'
+CCR_HISTORY_CACHE_PROTOCOL = 'p0_f9_ccr_history_geometry_v1'
 SUPPORT_NOTE = 'canonical historical static/dynamic support; NOT equivalent to old frontier GEN'
 
 
@@ -73,6 +75,12 @@ def add_args(parser):
                         help='prepare this many logical 4-window updates together; optimizer batch stays unchanged')
     parser.add_argument('--ccr-motion-streams',type=int,default=4,
                         help='independent CUDA streams for frozen V18 window forwards in fast mode')
+    parser.add_argument('--ccr-history-cache',
+                        help='persistent fixed causal-history geometry cache built by build_p0_f9_ccr_history_cache.py')
+    parser.add_argument('--ccr-history-cache-mode',choices=('off','require'),default='off',
+                        help='require=fail closed on any missing history-geometry window; never rebuild during training')
+    parser.add_argument('--ccr-history-cache-ram-mib',type=int,default=1024,
+                        help='bounded RAM LRU for verified persistent history-geometry artifacts')
     parser.add_argument('--warm-start-head',
                         help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
 
@@ -126,6 +134,37 @@ def warm_start_head(head, path, *, teacher_sha256, config_fingerprint, dev_manif
                      'note':'kept fixed to isolate training/data coverage; not recalibrated on DEV'},
         reusable_initial_dev64_old=reusable_old,
     )
+
+
+def ccr_history_cache_namespace(provider, args, root):
+    """Identity of fixed history geometry reusable across CCR/joint training.
+
+    Deliberately excludes trainable CCR parameters and frozen-V18 learned
+    outputs.  Any code/config/data change that can alter Strong/source
+    extraction, causal registration or compact support creates a new namespace.
+    """
+    files=(
+        'real_motion/canonical_causal_repair.py',
+        'real_motion/canonical_repair_context.py',
+        'real_motion/causal_geometry_cache.py',
+        'tools/real_motion/ccr_screen_common.py',
+        'tools/real_motion/joint_column_full_common.py',
+        'tools/real_motion/causal_column_common.py',
+        'tools/real_motion/benchmark_p0_f9_v18_runtime.py',
+        'real_motion/native/column_cpu.cpp',
+    )
+    identity=dict(
+        protocol=CCR_HISTORY_CACHE_PROTOCOL,
+        runtime_config_fingerprint=getattr(provider,'runtime_config_fingerprint',None),
+        active_history_frames=int(provider.joint.transport.config.history_frames),
+        train_cache_sha256=sha256(args.train_cache),
+        train_info_sha256=sha256(args.train_info),
+        dataroot=str(Path(args.dataroot).resolve()),
+        implementation=stable_json_fingerprint({p:sha256(root/p) for p in files}),
+    )
+    if identity['runtime_config_fingerprint'] is None:
+        raise RuntimeError('missing runtime config fingerprint for CCR history cache')
+    return stable_json_fingerprint(identity)
 
 
 def model_contract(head):
@@ -282,6 +321,12 @@ def setup(provider, args):
     # Explicit modest RAM bounds avoid duplicating the entire 20k population.
     if args.descriptor_ram_mib > 8192:
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
+    if not 0 <= int(getattr(args,'ccr_history_cache_ram_mib',1024)) <= 16384:
+        raise ValueError('CCR history cache RAM LRU must be in [0,16384] MiB')
+    history_mode=getattr(args,'ccr_history_cache_mode','off')
+    history_root=getattr(args,'ccr_history_cache',None)
+    if history_mode!='off' and not history_root:
+        raise ValueError('--ccr-history-cache-mode require needs --ccr-history-cache')
     fast=bool(getattr(args,'ccr_fast_train',False))
     requested_prefetch=min(32,max(1,int(getattr(args,'ccr_prefetch_workers',16))))
     super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
@@ -329,6 +374,17 @@ def setup(provider, args):
     if provider.ccr_cache.disk is not None:
         provider.ccr_cache.disk.reserve = 2*2**30
     provider.ccr_samples_per_role = args.samples_per_role
+    if history_root:
+        root=Path(__file__).resolve().parents[2]
+        namespace=ccr_history_cache_namespace(provider,args,root)
+        provider.ccr_history_cache=CausalGeometryCache(
+            history_root,namespace,max_bytes=0,
+            ram_bytes=int(args.ccr_history_cache_ram_mib)*2**20,reserve_bytes=0)
+        provider.ccr_history_cache_mode=history_mode
+        print('CCR_HISTORY_CACHE '+json.dumps({
+            'mode':history_mode,'root':str(Path(history_root).resolve()),
+            'namespace':provider.ccr_history_cache.namespace,
+            'ram_mib':args.ccr_history_cache_ram_mib},sort_keys=True),flush=True)
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
     if fast:
         print(f'CCR_FAST_TRAIN independent_motion_streams={motion_streams} batched_head=1 '
@@ -344,6 +400,8 @@ def close(provider, result):
         if cache.disk is not None:
             cache.disk.flush()
         result['descriptor_cache'] = cache.stats(); cache.close()
+    history=getattr(provider,'ccr_history_cache',None)
+    if history is not None:history.close()
     execution=getattr(provider,'ccr_execution',None)
     if execution is not None:execution.close()
 
