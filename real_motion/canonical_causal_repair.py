@@ -282,6 +282,22 @@ def build_compact_canonical_support(prepared, grid, *, halo=True, max_lattice_ce
         if group is None:continue
         _,_,_,_,dense,volume,layout=group;n=len(layout['keys'])
         layout=dict(start=cursor,stop=cursor+n,actor=actor,cls=cls,**layout)
+        # These small per-entity matrices replace repeated np.linalg.inv calls
+        # during sampled materialization. They are computed with the exact same
+        # expressions as the legacy path and are history-only.
+        history_matrices=[]
+        for f in range(4):
+            registration=np.eye(4) if actor==STATIC else prepared.registrations[actor][f]
+            if registration is None:
+                history_matrices.append(None)
+            else:
+                reg=np.eye(4) if actor==STATIC else registration[0]
+                history_matrices.append(
+                    np.linalg.inv(prepared.raw['history_poses'][f])@np.linalg.inv(reg))
+        layout['history_matrices']=history_matrices
+        if actor>=0:
+            layout['center_ego']=transform_points(
+                np.asarray(state['current'][actor]['centroid_world'])[None],inverse)[0]
         if actor==STATIC:
             points=transform_points(origin+(layout['at']+.5)*step,np.asarray(state['current_pose']))
             real=np.asarray(layout['last'])>=0
