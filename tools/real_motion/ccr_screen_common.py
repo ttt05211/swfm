@@ -24,6 +24,11 @@ from real_motion.canonical_repair_context import (
 )
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
 from real_motion.causal_geometry_cache import CausalGeometryCache
+from real_motion.ccr_history_geometry import (
+    PROTOCOL as CCR_HISTORY_CACHE_PROTOCOL,
+    build_ccr_history_geometry,
+    namespace as ccr_history_cache_namespace,
+)
 from real_motion.canonical_repair_batch import batched_repair_losses
 from real_motion.final_dataflow import batch_frozen_motion, parallel_frozen_motion
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
@@ -39,7 +44,6 @@ from tools.real_motion.height_field_screen_common import sync
 from real_motion.causal_column_completion import actions_from_probabilities, compose_dense
 
 PROTOCOL = 'p0_f9_point_ccr_gt_screen_v1'
-CCR_HISTORY_CACHE_PROTOCOL = 'p0_f9_ccr_history_geometry_v1'
 SUPPORT_NOTE = 'canonical historical static/dynamic support; NOT equivalent to old frontier GEN'
 
 
@@ -136,37 +140,6 @@ def warm_start_head(head, path, *, teacher_sha256, config_fingerprint, dev_manif
     )
 
 
-def ccr_history_cache_namespace(provider, args, root):
-    """Identity of fixed history geometry reusable across CCR/joint training.
-
-    Deliberately excludes trainable CCR parameters and frozen-V18 learned
-    outputs.  Any code/config/data change that can alter Strong/source
-    extraction, causal registration or compact support creates a new namespace.
-    """
-    files=(
-        'real_motion/canonical_causal_repair.py',
-        'real_motion/canonical_repair_context.py',
-        'real_motion/causal_geometry_cache.py',
-        'tools/real_motion/ccr_screen_common.py',
-        'tools/real_motion/joint_column_full_common.py',
-        'tools/real_motion/causal_column_common.py',
-        'tools/real_motion/benchmark_p0_f9_v18_runtime.py',
-        'real_motion/native/column_cpu.cpp',
-    )
-    identity=dict(
-        protocol=CCR_HISTORY_CACHE_PROTOCOL,
-        runtime_config_fingerprint=getattr(provider,'runtime_config_fingerprint',None),
-        active_history_frames=int(provider.joint.transport.config.history_frames),
-        train_cache_sha256=sha256(args.train_cache),
-        train_info_sha256=sha256(args.train_info),
-        dataroot=str(Path(args.dataroot).resolve()),
-        implementation=stable_json_fingerprint({p:sha256(root/p) for p in files}),
-    )
-    if identity['runtime_config_fingerprint'] is None:
-        raise RuntimeError('missing runtime config fingerprint for CCR history cache')
-    return stable_json_fingerprint(identity)
-
-
 def model_contract(head):
     return dict(mode='point_CCR', source_dim=head.source_dim, width=head.width)
 
@@ -219,45 +192,8 @@ def _ccr_minimal_fixed_geometry(provider, raw, record):
 
 
 def _ccr_fast_fixed_geometry(provider, raw, record):
-    """Worker-owned history/fixed-transport preparation for fast Point CCR.
-
-    No learned tensors, future GT labels, sampled IDs or action targets are
-    cached here.  The canonical support is the same complete support; only
-    feature materialization is deferred until the GT-independent sample IDs are
-    drawn on the training thread.
-    """
-    from types import SimpleNamespace
-    causal=_ccr_minimal_fixed_geometry(provider,raw,record)
-    prep=SimpleNamespace(
-        raw=raw,
-        state={**causal['prepared_state'],'rec':record,'gpu':None},
-        registrations=causal['registrations'])
-    tick=time.perf_counter()
-    # Window-level parallelism owns the scarce 10-core budget. Nested entity
-    # pools make outer workers block and underutilize cores; keep each compact
-    # lattice single-threaded and parallelize whole windows instead.
-    compact=build_compact_canonical_support(
-        prep,provider.pcfg.grid,kernels=execution_kernels(provider),executor=None)
-    causal['_ccr_fast_profile']['compact_support']=time.perf_counter()-tick
-    tick=time.perf_counter()
-    conflicts=compact_static_conflicts(compact,prep,provider.pcfg.grid)
-    causal['_ccr_fast_profile']['static_conflicts']=time.perf_counter()-tick
-    causal['_ccr_fast_profile']['fast_total']=sum(
-        float(v) for k,v in causal['_ccr_fast_profile'].items()
-        if k not in ('total','geometry_workers') and isinstance(v,(int,float)))
-    causal['_ccr_compact_support']=compact
-    causal['_ccr_compact_conflicts']=conflicts
-    # Persist/runtime-retain only state consumed after this point.  In
-    # particular, drop dense current/previous semantics and duplicate Strong
-    # baseline tensors: raw history remains the source for sampled semantic /
-    # visibility lookups, while rendering needs only these fixed fields.
-    keep=('current_pose','current','source_world_points','source_rel_xy',
-          'source_z_t0','world_to_future','column_backgrounds')
-    missing=[k for k in keep if k not in causal['prepared_state']]
-    if missing:
-        raise RuntimeError(f'incomplete compact CCR prepared state: {missing}')
-    causal['prepared_state']={k:causal['prepared_state'][k] for k in keep}
-    return causal
+    """Stable reusable fixed-history geometry; no learned outputs or future GT."""
+    return build_ccr_history_geometry(provider,raw,record)
 
 
 @contextmanager
@@ -389,7 +325,8 @@ def setup(provider, args):
         namespace=ccr_history_cache_namespace(provider,args,root)
         provider.ccr_history_cache=CausalGeometryCache(
             history_root,namespace,max_bytes=0,
-            ram_bytes=int(args.ccr_history_cache_ram_mib)*2**20,reserve_bytes=0)
+            ram_bytes=int(args.ccr_history_cache_ram_mib)*2**20,reserve_bytes=0,
+            compression_level=6)
         provider.ccr_history_cache_mode=history_mode
         manifest_path=provider.ccr_history_cache.root/'manifest.json'
         if history_mode=='require':
