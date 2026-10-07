@@ -57,8 +57,11 @@ from tools.real_motion.train_p0_f9_joint_causal_columns import load_joint
 from real_motion.causal_column_completion import actions_from_probabilities, compose_dense
 
 
-PROTOCOL = "p0_f9_ccr_quality_gap_restricted_oracle_v1"
+PROTOCOL = "p0_f9_ccr_quality_gap_restricted_oracle_v2"
 REPORT = columns.REPORT
+PROB_BINS = 2048
+ADD_DIAG_THRESHOLDS = (0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)
+REMOVE_DIAG_THRESHOLDS = (0.10, 0.20, 0.40, 0.60, 0.80, 0.90, 0.95)
 VARIANTS = (
     "current_joint",
     "current_static",
@@ -102,6 +105,150 @@ def _finish_action(bucket):
     out["f1"] = None if p is None or r is None or p + r == 0 else 2 * p * r / (p + r)
     out["positive_rate"] = _safe_div(out["target_pos"], out["valid"])
     return out
+
+
+def _ranking_bucket():
+    return dict(
+        pos=np.zeros(PROB_BINS, np.int64),
+        neg=np.zeros(PROB_BINS, np.int64),
+        score_sum=np.zeros(PROB_BINS, np.float64),
+        score_sq_sum=0.0,
+        positive_score_sum=0.0,
+        count=0,
+        positives=0,
+    )
+
+
+def _update_ranking(bucket, scores, target, mask):
+    mask=np.asarray(mask,bool)
+    if not np.any(mask):
+        return
+    score=np.asarray(scores,np.float32)[mask]
+    y=np.asarray(target,bool)[mask]
+    score=np.clip(score,0.0,1.0)
+    ids=np.minimum((score*(PROB_BINS-1)).astype(np.int32),PROB_BINS-1)
+    pos_ids=ids[y];neg_ids=ids[~y]
+    bucket["pos"] += np.bincount(pos_ids,minlength=PROB_BINS)
+    bucket["neg"] += np.bincount(neg_ids,minlength=PROB_BINS)
+    bucket["score_sum"] += np.bincount(ids,weights=score,minlength=PROB_BINS)
+    bucket["score_sq_sum"] += float(np.square(score,dtype=np.float64).sum())
+    bucket["positive_score_sum"] += float(score[y].sum(dtype=np.float64))
+    bucket["count"] += int(len(score))
+    bucket["positives"] += int(y.sum())
+
+
+def _hist_quantile(hist, q):
+    total=int(np.asarray(hist,np.int64).sum())
+    if total<=0:
+        return None
+    rank=float(q)*max(total-1,0)
+    idx=int(np.searchsorted(np.cumsum(hist),rank+1,side="left"))
+    return float(idx/(PROB_BINS-1))
+
+
+def _ranking_at_threshold(pos,neg,threshold):
+    idx=min(PROB_BINS-1,max(0,int(np.ceil(float(threshold)*(PROB_BINS-1)))))
+    tp=int(pos[idx:].sum());fp=int(neg[idx:].sum())
+    positives=int(pos.sum());negatives=int(neg.sum())
+    fn=positives-tp
+    precision=_safe_div(tp,tp+fp);recall=_safe_div(tp,positives)
+    f1=None if precision is None or recall is None or precision+recall==0 else 2*precision*recall/(precision+recall)
+    return dict(
+        threshold=float(threshold),tp=tp,fp=fp,fn=fn,
+        precision=precision,recall=recall,f1=f1,
+        predicted_positive_rate=_safe_div(tp+fp,positives+negatives),
+    )
+
+
+def _finish_ranking(bucket):
+    pos=np.asarray(bucket["pos"],np.int64);neg=np.asarray(bucket["neg"],np.int64)
+    positives=int(pos.sum());negatives=int(neg.sum());count=positives+negatives
+    if count==0:
+        return dict(count=0,positives=0)
+    tp=np.cumsum(pos[::-1]);fp=np.cumsum(neg[::-1])
+    precision=np.divide(tp,tp+fp,out=np.ones_like(tp,dtype=np.float64),where=(tp+fp)>0)
+    recall=tp/max(positives,1)
+    delta_recall=pos[::-1]/max(positives,1)
+    average_precision=float(np.sum(precision*delta_recall)) if positives else None
+    f1=np.divide(2*precision*recall,precision+recall,
+                 out=np.zeros_like(precision),where=(precision+recall)>0)
+    best_i=int(np.argmax(f1)) if len(f1) else 0
+    best_threshold=float((PROB_BINS-1-best_i)/(PROB_BINS-1))
+    neg_below=np.cumsum(neg)-neg
+    auc=(float(np.sum(pos*(neg_below+0.5*neg)))/(positives*negatives)
+         if positives and negatives else None)
+
+    # ECE on 20 equal-width groups, using actual probability sums rather than
+    # bin midpoints. This is diagnosis only; no threshold is promoted.
+    edges=np.linspace(0,PROB_BINS,21,dtype=int)
+    ece=0.0
+    for lo,hi in zip(edges[:-1],edges[1:]):
+        n=int(pos[lo:hi].sum()+neg[lo:hi].sum())
+        if not n: continue
+        conf=float(bucket["score_sum"][lo:hi].sum())/n
+        acc=float(pos[lo:hi].sum())/n
+        ece += n/count*abs(conf-acc)
+    sum_p=float(bucket["score_sum"].sum())
+    brier=(float(bucket["score_sq_sum"])-2*float(bucket["positive_score_sum"])+positives)/count
+    pmean=(float(bucket["positive_score_sum"])/positives if positives else None)
+    nsum=sum_p-float(bucket["positive_score_sum"])
+    nmean=(nsum/negatives if negatives else None)
+    threshold_rows={}
+    for t in (0.02,0.05,0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90,0.95):
+        threshold_rows[f"{t:.2f}"]=_ranking_at_threshold(pos,neg,t)
+    return dict(
+        count=count,positives=positives,negatives=negatives,
+        prevalence=_safe_div(positives,count),
+        average_precision=average_precision,
+        ap_lift_over_prevalence=(_safe_div(average_precision,_safe_div(positives,count))
+                                 if average_precision is not None else None),
+        auroc=auc,brier=float(brier),ece20=float(ece),
+        mean_score_positive=pmean,mean_score_negative=nmean,
+        positive_quantiles={str(q):_hist_quantile(pos,q) for q in (0.1,0.25,0.5,0.75,0.9)},
+        negative_quantiles={str(q):_hist_quantile(neg,q) for q in (0.1,0.25,0.5,0.75,0.9)},
+        best_f1=dict(
+            threshold=best_threshold,
+            f1=float(f1[best_i]) if len(f1) else None,
+            precision=float(precision[best_i]) if len(precision) else None,
+            recall=float(recall[best_i]) if len(recall) else None,
+        ),
+        fixed_thresholds=threshold_rows,
+        approximation=dict(
+            probability_bins=PROB_BINS,
+            note="AP/AUROC/quantiles use a fixed streaming probability histogram; no raw validation probabilities are persisted.",
+        ),
+    )
+
+
+def _new_threshold_metrics():
+    return {
+        "add_all": {f"{t:.2f}": Metrics() for t in ADD_DIAG_THRESHOLDS},
+        "add_static": {f"{t:.2f}": Metrics() for t in ADD_DIAG_THRESHOLDS},
+        "add_dynamic": {f"{t:.2f}": Metrics() for t in ADD_DIAG_THRESHOLDS},
+        "remove_all": {f"{t:.2f}": Metrics() for t in REMOVE_DIAG_THRESHOLDS},
+    }
+
+
+def _threshold_summary(metrics):
+    out={}
+    for family,rows in metrics.items():
+        out[family]={t:m.compute() for t,m in rows.items()}
+    return out
+
+
+def _best_threshold_rows(sweep):
+    result={}
+    for family,rows in sweep.items():
+        if not rows: continue
+        best_m=max(rows.items(),key=lambda kv:kv[1]["mIoU"])
+        best_mov=max(rows.items(),key=lambda kv:kv[1]["MovingMicro"])
+        result[family]=dict(
+            best_mIoU_threshold=float(best_m[0]),
+            best_mIoU=float(best_m[1]["mIoU"]),
+            best_MovingMicro_threshold=float(best_mov[0]),
+            best_MovingMicro=float(best_mov[1]["MovingMicro"]),
+        )
+    return result
 
 
 def _checkpoint_curve(saved):
@@ -370,6 +517,28 @@ def _summary(result):
                 parts.append(f'{label}R=' + ("n/a" if r is None else f"{100*r:.1f}%"))
         if parts:
             lines.append("ACTION RECALL  " + "  ".join(parts))
+    ranking=result.get("action_ranking_calibration",{})
+    if ranking:
+        for key,label in (("static/ADD/all","sADD"),("dynamic/ADD/all","dADD"),
+                          ("static/REMOVE/all","sREM"),("dynamic/REMOVE/all","dREM")):
+            row=ranking.get(key,{})
+            if row:
+                lines.append(
+                    f'{label} RANK AP={row.get("average_precision"):.4f} '
+                    f'base={row.get("prevalence"):.4f} '
+                    f'lift={row.get("ap_lift_over_prevalence"):.2f} '
+                    f'AUROC={row.get("auroc"):.4f} '
+                    f'bestF1@{row.get("best_f1",{}).get("threshold"):.3f}'
+                )
+    best=result.get("diagnostic_threshold_best",{})
+    if best:
+        for family in ("add_all","add_static","add_dynamic","remove_all"):
+            row=best.get(family)
+            if row:
+                lines.append(
+                    f'{family} DENSE best-mIoU@{row["best_mIoU_threshold"]:.2f}={row["best_mIoU"]:.4f} '
+                    f'best-Moving@{row["best_MovingMicro_threshold"]:.2f}={row["best_MovingMicro"]:.4f}'
+                )
     if d:
         lines.append("ROUTE=" + d["route"])
     if "error" in result:
@@ -394,6 +563,10 @@ def main(argv=None):
     parser.add_argument("--ccr-val-history-cache",
                         help="persistent VAL fixed-history geometry cache; quality evaluation only")
     parser.add_argument("--ccr-val-history-cache-ram-mib", type=int, default=512)
+    parser.add_argument(
+        "--full-action-diagnostics", action="store_true",
+        help="one-pass read-only probability ranking/calibration + fixed-grid dense threshold diagnostics; never promotes thresholds",
+    )
     args = parser.parse_args(argv)
 
     out = Path(args.out_dir)
@@ -506,6 +679,9 @@ def main(argv=None):
         scenes = defaultdict(lambda: {name: Metrics() for name in ("baseline", *VARIANTS)})
 
         action = defaultdict(_action_bucket)
+        ranking = defaultdict(_ranking_bucket) if args.full_action_diagnostics else None
+        threshold_metrics = _new_threshold_metrics() if args.full_action_diagnostics else None
+        threshold_parity_checked = False
         coverage_all = {
             "old_changed": 0,
             "old_helpful": 0,
@@ -587,25 +763,36 @@ def main(argv=None):
                                 target[:, h, action_id],
                                 pred_actions[:, h, action_id],
                             )
+                            if ranking is not None:
+                                _update_ranking(
+                                    ranking[key],p[:,h,action_id],target[:,h,action_id],mask)
                         # Aggregate across six horizons without changing priors.
                         role6 = np.broadcast_to(role_mask[:, None], target[..., action_id].shape)
                         key = f"{role_name}/{action_name}/all"
+                        aggregate_mask=role6 & valid[..., action_id]
                         _update_action(
                             action[key],
-                            role6 & valid[..., action_id],
+                            aggregate_mask,
                             target[..., action_id],
                             pred_actions[..., action_id],
                         )
+                        if ranking is not None:
+                            _update_ranking(
+                                ranking[key],p[...,action_id],target[...,action_id],aggregate_mask)
                         for cid in np.unique(evidence.classes[role_mask]):
                             class_mask = role_mask & (evidence.classes == cid)
                             class6 = np.broadcast_to(class_mask[:, None], target[..., action_id].shape)
                             key = f"{role_name}/{action_name}/class_{int(cid)}"
+                            class_valid=class6 & valid[..., action_id]
                             _update_action(
                                 action[key],
-                                class6 & valid[..., action_id],
+                                class_valid,
                                 target[..., action_id],
                                 pred_actions[..., action_id],
                             )
+                            if ranking is not None and action_id==0:
+                                _update_ranking(
+                                    ranking[key],p[...,action_id],target[...,action_id],class_valid)
 
                 # Duplicate GT-positive proposals are reported because the
                 # restricted oracle remains subject to the official compositor.
@@ -617,6 +804,38 @@ def main(argv=None):
                     if len(flats):
                         _, count = np.unique(flats, return_counts=True)
                         duplicate_positive_destinations += int((count > 1).sum())
+
+                if threshold_metrics is not None:
+                    zeros=np.zeros_like(p[...,0],dtype=np.float32)
+                    # Diagnostic-only fixed threshold axes. Convert decisions to
+                    # binary masks and pass them through the OFFICIAL compositor
+                    # at its safe 0.5 gate; this does not weaken deployment
+                    # threshold guards or alter composition semantics.
+                    for t in ADD_DIAG_THRESHOLDS:
+                        add_mask=(p[...,0]>=t).astype(np.float32)
+                        for family,role in (("add_all","all"),("add_static","static"),("add_dynamic","dynamic")):
+                            dense=compose_canonical(
+                                prep.baseline,evidence,plan,add_mask,zeros,
+                                thresholds=(.5,None),role=role)
+                            for ri,h in enumerate(REPORT):
+                                threshold_metrics[family][f"{t:.2f}"].update(
+                                    ri,dense[h],raw["future_gt_occ"][h],moving[h])
+                        if (not threshold_parity_checked) and abs(t-.5)<1e-12:
+                            diagnostic_default=compose_canonical(
+                                prep.baseline,evidence,plan,add_mask,zeros,
+                                thresholds=(.5,None),role="all")
+                            if any(not np.array_equal(a,b) for a,b in
+                                   zip(diagnostic_default,predictions["current_add_only"])):
+                                raise RuntimeError("diagnostic ADD mask compositor parity failed")
+                            threshold_parity_checked=True
+                    for t in REMOVE_DIAG_THRESHOLDS:
+                        remove_mask=(p[...,1]>=t).astype(np.float32)
+                        dense=compose_canonical(
+                            prep.baseline,evidence,plan,zeros,remove_mask,
+                            thresholds=(None,.5),role="all")
+                        for ri,h in enumerate(REPORT):
+                            threshold_metrics["remove_all"][f"{t:.2f}"].update(
+                                ri,dense[h],raw["future_gt_occ"][h],moving[h])
 
                 scene = scenes[str(record["scene_name"])]
                 for ri, h in enumerate(REPORT):
@@ -656,6 +875,27 @@ def main(argv=None):
         result["action_learning"] = {
             key: _finish_action(value) for key, value in sorted(action.items())
         }
+        if ranking is not None:
+            result["action_ranking_calibration"] = {
+                key:_finish_ranking(value) for key,value in sorted(ranking.items())
+            }
+            result["diagnostic_threshold_sweep"]=_threshold_summary(threshold_metrics)
+            result["diagnostic_threshold_best"]=_best_threshold_rows(
+                result["diagnostic_threshold_sweep"])
+            result["diagnostic_threshold_contract"]=dict(
+                add_thresholds=list(ADD_DIAG_THRESHOLDS),
+                remove_thresholds=list(REMOVE_DIAG_THRESHOLDS),
+                axes=(
+                    "ADD-only all/static/dynamic role sweeps and REMOVE-only all-role sweep; "
+                    "one axis at a time, no 2-D dev tuning"
+                ),
+                compositor="official compose_canonical fed binary action masks",
+                promotion_allowed=False,
+                note=(
+                    "DEV diagnostic only. Any selected threshold must be frozen before an "
+                    "independent evaluation; these DEV512 optima are not deployable/reportable tuned results."
+                ),
+            )
         result["old_helpful_coverage"] = {
             "all_report_horizons": _finish_coverage(coverage_all),
             "per_horizon": {
@@ -687,6 +927,8 @@ def main(argv=None):
             read_only=True,
             future_GT_model_input=False,
             threshold_search=False,
+            diagnostic_threshold_sweep=bool(args.full_action_diagnostics),
+            threshold_selection_for_deployment=False,
             route=result["decision"]["route"],
         )
         persist()
