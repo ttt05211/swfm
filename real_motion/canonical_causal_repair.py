@@ -378,7 +378,15 @@ def materialize_compact_canonical(support, prepared, grid, indices):
         if not len(selected):continue
         local=ids[selected]-int(layout['start'])
         a=int(layout['actor']);cls=int(layout['cls'])
-        at=layout['at'][local];keys=layout['keys'][local]
+        all_keys=np.asarray(layout['keys'],np.int64)
+        keys=all_keys[local]
+        stored_at=layout.get('at')
+        if stored_at is None:
+            at=np.stack(np.unravel_index(
+                keys,tuple(int(x) for x in np.asarray(layout['shape']).tolist())),axis=1).astype(np.int64,copy=False)
+            at+=np.asarray(layout['lo'],np.int64)
+        else:
+            at=np.asarray(stored_at,np.int64)[local]
         flags=np.asarray(layout['flags'],np.uint8)[local]
         pres=((flags[:,None]>>np.arange(4))&1).astype(bool)
         if 'static_world' in layout:
@@ -407,11 +415,12 @@ def materialize_compact_canonical(support, prepared, grid, indices):
         for d,delta in enumerate(FACE):
             neighbour=keys+int(delta@strides)
             valid=((at+delta-layout['lo']>=0)&(at+delta-layout['lo']<layout['shape'])).all(1)
-            if layout['dense']:
-                neighbour_flags=layout['bits'][neighbour.clip(0,layout['volume']-1)]
+            bits=layout.get('bits')
+            if layout['dense'] and bits is not None:
+                neighbour_flags=bits[neighbour.clip(0,layout['volume']-1)]
             else:
-                loc=np.searchsorted(layout['keys'],neighbour);found=loc<len(layout['keys'])
-                found[found]&=layout['keys'][loc[found]]==neighbour[found]
+                loc=np.searchsorted(all_keys,neighbour);found=loc<len(all_keys)
+                found[found]&=all_keys[loc[found]]==neighbour[found]
                 neighbour_flags=np.zeros(len(local),np.uint8);neighbour_flags[found]=layout['flags'][loc[found]]
             neighbour_flags=np.where(valid,neighbour_flags,0)
             neighbours[:,d]=neighbour_flags!=0
