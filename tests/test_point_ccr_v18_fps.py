@@ -68,6 +68,21 @@ def load_saved(saved):
     return load_point_head(saved, teacher_sha256='teacher', config_fingerprint='cfg', source_dim=8, device='cpu')
 
 
+def test_read_only_diagnostic_loader_accepts_completed_epoch_boundary_only():
+    saved=saved_head()
+    saved['epoch']=2; saved['batch']=0; saved['updates']=4; saved['executed']=12
+    # Strict FPS/deployment loader still rejects an unfinished 3-pass schedule.
+    with pytest.raises(RuntimeError,match='THREE-pass'):
+        load_saved(saved)
+    head=load_point_head(saved,teacher_sha256='teacher',config_fingerprint='cfg',
+                         source_dim=8,device='cpu',allow_completed_epoch_boundary=True)
+    assert not head.training and not any(p.requires_grad for p in head.parameters())
+    saved['batch']=1; saved['updates']=5; saved['executed']=16
+    with pytest.raises(RuntimeError,match='completed epoch boundary'):
+        load_point_head(saved,teacher_sha256='teacher',config_fingerprint='cfg',
+                        source_dim=8,device='cpu',allow_completed_epoch_boundary=True)
+
+
 def test_completed_point_head_loader_does_not_restore_optimizer_or_rng():
     saved = saved_head(); saved['optimizer'] = {'must_never_restore': True}
     rng = torch.get_rng_state().clone()
