@@ -286,8 +286,11 @@ def setup(provider, args):
     requested_prefetch=min(32,max(1,int(getattr(args,'ccr_prefetch_workers',16))))
     super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
     motion_streams=max(1,int(getattr(args,'ccr_motion_streams',4)))
-    sample_workers=min(2,max(1,args.cpu_workers//4)) if fast else 1
-    # Reserve sampled-materialization workers that overlap next-bundle prep.
+    # Compact support made producer work much cheaper; sampled feature/plan
+    # materialization is now the dominant CPU work inside each optimizer step.
+    # On the real 10-core allocation, 6 producer + 4 sampled workers balances
+    # the pipeline substantially better than the old 8 + 2 split.
+    sample_workers=min(4,max(1,args.cpu_workers//2)) if fast else 1
     prefetch=min(requested_prefetch,max(1,args.cpu_workers-sample_workers))
     if motion_streams>8:
         raise ValueError('CCR frozen-motion CUDA streams are capped at 8')
@@ -329,8 +332,9 @@ def setup(provider, args):
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
     if fast:
         print(f'CCR_FAST_TRAIN independent_motion_streams={motion_streams} batched_head=1 '
-              f'compact_sampled_only=1 minimal_geometry=1 prefetch_workers={prefetch} '
-              f'sample_workers={sample_workers} motion_superbatch_updates={super_updates} '
+              f'compact_sampled_only=1 minimal_geometry=1 '
+              f'cpu_split=producer{prefetch}+sample{sample_workers}/{args.cpu_workers} '
+              f'motion_superbatch_updates={super_updates} '
               f'(logical optimizer batch remains 4 windows)',flush=True)
 
 
