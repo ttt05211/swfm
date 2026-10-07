@@ -99,7 +99,7 @@ def main():
         p.add_argument('--'+key,required=True)
     p.add_argument('--device',default='cpu')
     p.add_argument('--cpu-workers',type=int,default=10)
-    p.add_argument('--prefetch-workers',type=int,default=6)
+    p.add_argument('--prefetch-workers',type=int,default=4)
     p.add_argument('--frame-cache-mib',type=int,default=4096)
     p.add_argument('--cache-ram-mib',type=int,default=1024)
     p.add_argument('--max-cache-gib',type=float,default=32.)
@@ -110,7 +110,7 @@ def main():
     a=p.parse_args()
 
     if (not Path(a.dataroot).is_dir() or min(a.cpu_workers,a.prefetch_workers,a.pilot_windows) < 1
-            or a.prefetch_workers>a.cpu_workers or not 0<=a.frame_cache_mib<=16384
+            or a.prefetch_workers>min(a.cpu_workers,4) or not 0<=a.frame_cache_mib<=16384
             or not 0<=a.cache_ram_mib<=16384 or not 1<=a.max_cache_gib<=128
             or not 0<=a.reserve_gib<=64):
         p.error('invalid bounded cache-build resources')
