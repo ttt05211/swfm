@@ -363,12 +363,24 @@ def sample_compact_causal_points(support, rng, *, per_role=1024):
     return ids[order],importance[order]
 
 
+def _compact_layout_at(layout, local=None):
+    """Recover exact integer lattice coordinates from persisted compact keys."""
+    keys=np.asarray(layout['keys'],np.int64)
+    local=(np.arange(len(keys),dtype=np.int64) if local is None else np.asarray(local,np.int64))
+    stored=layout.get('at')
+    if stored is not None:
+        return np.asarray(stored,np.int64)[local]
+    shape=tuple(int(x) for x in np.asarray(layout['shape']).tolist())
+    unraveled=np.stack(np.unravel_index(keys[local],shape),axis=1).astype(np.int64,copy=False)
+    return unraveled+np.asarray(layout['lo'],np.int64)
+
+
 def _compact_layout_world(layout, prepared, grid, local=None):
     local=(np.arange(len(layout['keys']),dtype=np.int64) if local is None else np.asarray(local,np.int64))
     if layout.get('static_world') is not None:
         return np.asarray(layout['static_world'],np.float64)[local]
     origin,step,_=grid_arrays(grid)
-    at=np.asarray(layout['at'])[local]
+    at=_compact_layout_at(layout,local)
     world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
     last=np.asarray(layout['last'],np.int64)[local];real=last>=0
     if real.any():
@@ -397,7 +409,7 @@ def materialize_compact_canonical_features(support, prepared, grid, indices):
             if not len(selected):continue
         local=(ids[selected]-layout['start']).astype(np.int64,copy=False)
         actor=int(layout['actor']);cls=int(layout['cls'])
-        at=np.asarray(layout['at'])[local];keys=np.asarray(layout['keys'])[local]
+        at=_compact_layout_at(layout,local);keys=np.asarray(layout['keys'],np.int64)[local]
         flags=np.asarray(layout['flags'],np.uint8)[local]
         pres=((flags[:,None]>>np.arange(4))&1).astype(bool)
         world=_compact_layout_world(layout,prepared,grid,local)
@@ -423,8 +435,9 @@ def materialize_compact_canonical_features(support, prepared, grid, indices):
         for d,delta in enumerate(FACE):
             neighbour=keys+int(delta@strides)
             valid=((at+delta-layout['lo']>=0)&(at+delta-layout['lo']<layout['shape'])).all(1)
-            if layout['dense']:
-                neighbour_flags=np.asarray(layout['bits'])[neighbour.clip(0,layout['volume']-1)]
+            bits=layout.get('bits')
+            if layout['dense'] and bits is not None:
+                neighbour_flags=np.asarray(bits)[neighbour.clip(0,layout['volume']-1)]
             else:
                 loc=np.searchsorted(all_keys,neighbour);found=loc<len(all_keys)
                 found[found]&=all_keys[loc[found]]==neighbour[found]
