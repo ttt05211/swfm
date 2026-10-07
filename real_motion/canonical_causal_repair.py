@@ -105,16 +105,18 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
         flags=np.zeros(len(keys),np.uint8)
         np.bitwise_or.at(flags,point_ids,(1<<times).astype(np.uint8))
         at=np.stack(np.unravel_index(keys,tuple(shape)),axis=1)+lo
-    presence=((flags[:,None]>>np.arange(4))&1).astype(bool)
     # Frame concatenation is chronological; latest metric sample wins. t0 is
     # last, so observed t0 source coordinates are always preserved exactly.
     if native_last is not None:last=native_last
     else:
         last=np.full(len(keys),-1,np.int64);np.maximum.at(last,point_ids,np.arange(len(points)))
     if compact_only:
+        # TRAIN samples from flags directly; do not materialize the discarded
+        # O(Nx4) presence matrix for the complete population.
         layout=dict(keys=keys,flags=flags,bits=bits if dense else None,at=at,lo=lo,shape=shape,
                     dense=dense,volume=volume,last=last,points=points)
         return None,None,None,None,dense,volume,layout
+    presence=((flags[:,None]>>np.arange(4))&1).astype(bool)
     world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
     real=last>=0;world[real]=points[last[real]]
     if not materialize_features:
@@ -285,6 +287,10 @@ def build_compact_canonical_support(prepared, grid, *, halo=True, max_lattice_ce
             real=np.asarray(layout['last'])>=0
             if np.any(real):points[real]=np.asarray(layout['points'])[np.asarray(layout['last'])[real]]
             layout['static_world']=points
+            # static sampled rows and conflict projection now use static_world;
+            # retain last only for exact age/halo semantics, not all historical
+            # metric point payloads.
+            layout['points']=None
         layouts.append(layout);cursor+=n
         counts['dense_entities' if dense else 'sparse_entities']+=1
         counts['max_lattice_cells']=max(counts['max_lattice_cells'],volume)
