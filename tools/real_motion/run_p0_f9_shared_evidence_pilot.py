@@ -55,19 +55,26 @@ class PilotProvider(FullJointColumnProvider):
         key=(str(record['scene_name']),str(record['t0_token']))
         history_cache=getattr(self,'ccr_history_cache',None)
         history_source=getattr(self,'ccr_history_cache_source',None)
-        use_history_cache=(history_cache is not None and
-                           (history_source is None or source is history_source))
-        if use_history_cache:
-            mode=getattr(self,'ccr_history_cache_mode','require')
-            if mode=='require':
-                evidence=history_cache.require(key,raw);hit=True
-            elif mode=='build':
-                evidence,hit=history_cache.get_or_build(key,raw,build,defer_write=False)
+        val_history_cache=getattr(self,'ccr_val_history_cache',None)
+        val_history_source=getattr(self,'ccr_val_history_cache_source',None)
+        selected_cache=None;selected_mode=None
+        if val_history_cache is not None and source is val_history_source:
+            selected_cache=val_history_cache
+            selected_mode=getattr(self,'ccr_val_history_cache_mode','require')
+        elif history_cache is not None and (history_source is None or source is history_source):
+            selected_cache=history_cache
+            selected_mode=getattr(self,'ccr_history_cache_mode','require')
+        if selected_cache is not None:
+            if selected_mode=='require':
+                evidence=selected_cache.require(key,raw);hit=True
+            elif selected_mode=='build':
+                evidence,hit=selected_cache.get_or_build(key,raw,build,defer_write=False)
             else:
-                raise RuntimeError(f'unknown CCR history cache mode: {mode}')
+                raise RuntimeError(f'unknown CCR history cache mode: {selected_mode}')
             raw['_column_causal_preparation']=evidence
             raw['_causal_geometry_cache_hit']=hit
             raw['_ccr_history_cache_hit']=hit
+            raw['_ccr_history_cache_split']=('val' if selected_cache is val_history_cache else 'train')
             return raw
         cache=getattr(self,'causal_geometry_cache',None)
         if cache is None:evidence=build();hit=False
