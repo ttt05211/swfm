@@ -384,7 +384,7 @@ def setup(provider, args):
     if provider.ccr_cache.disk is not None:
         provider.ccr_cache.disk.reserve = 2*2**30
     provider.ccr_samples_per_role = args.samples_per_role
-    if history_root:
+    if history_root and history_mode!='off':
         root=Path(__file__).resolve().parents[2]
         namespace=ccr_history_cache_namespace(provider,args,root)
         provider.ccr_history_cache=CausalGeometryCache(
