@@ -314,33 +314,36 @@ def build_causal_strata(evidence):
 
 
 def sample_compact_causal_points(support, rng, *, per_role=1024):
-    """Exact sample_causal_points() result without O(N) evidence arrays.
-
-    Buckets are reconstructed directly from per-entity lattice flags. Sorted
-    code order and ascending global row order exactly match build_causal_strata
-    + stable argsort, so the same RNG state produces the same IDs/weights.
-    """
+    """Exact sample_causal_points() result without O(N) evidence arrays."""
     if per_role < 1: raise ValueError('positive causal sampling budget required')
+    population=getattr(support,'causal_strata',None)
+    if population is None:
+        # Backward-compatible reconstruction for older compact artifacts.
+        population=[]
+        for dynamic in (False,True):
+            buckets={}
+            for layout in support.layouts:
+                if (int(layout['actor'])>=0)!=dynamic:continue
+                flags=np.asarray(layout['flags'],np.uint8)
+                status=np.where((flags&8)!=0,0,np.where((flags&7)!=0,1,2))
+                base=np.arange(int(layout['start']),int(layout['stop']),dtype=np.int64)
+                for st in (0,1,2):
+                    ids=base[status==st]
+                    if not len(ids):continue
+                    code=(int(layout['actor'])+2)*57+int(layout['cls'])*3+st
+                    buckets.setdefault(code,[]).append(ids)
+            rows=[];counts=[]
+            for code in sorted(buckets):
+                parts=buckets[code];bucket=np.concatenate(parts) if len(parts)>1 else parts[0]
+                rows.append(bucket);counts.append(len(bucket))
+            population.append((
+                np.concatenate(rows).astype(np.int32,copy=False) if rows else np.empty(0,np.int32),
+                np.asarray(counts,np.int32)))
     selected=[];weights=[]
-    for dynamic in (False,True):
-        buckets={}
-        for layout in support.layouts:
-            if (int(layout['actor'])>=0)!=dynamic:continue
-            flags=np.asarray(layout['flags'],np.uint8)
-            status=np.where((flags&8)!=0,0,np.where((flags&7)!=0,1,2))
-            base=np.arange(int(layout['start']),int(layout['stop']),dtype=np.int64)
-            for st in (0,1,2):
-                ids=base[status==st]
-                if not len(ids):continue
-                code=(int(layout['actor'])+2)*57+int(layout['cls'])*3+st
-                buckets.setdefault(code,[]).append(ids)
-        ordered=[]
-        for code in sorted(buckets):
-            parts=buckets[code];ordered.append(np.concatenate(parts) if len(parts)>1 else parts[0])
-        if not ordered:continue
-        counts=np.asarray([len(x) for x in ordered],np.int64)
-        population=sum(int(x) for x in counts)
-        budget=min(population,max(per_role,len(counts)))
+    for rows,stored_counts in population:
+        if not len(rows):continue
+        counts=stored_counts.astype(np.int64)
+        budget=min(len(rows),max(per_role,len(counts)))
         allocation=np.ones(len(counts),np.int64)
         while allocation.sum()<budget:
             room=counts-allocation;active=room>0;share=np.sqrt(counts)*active
@@ -349,7 +352,9 @@ def sample_compact_causal_points(support, rng, *, per_role=1024):
                 rank=np.argsort(-share/(allocation+1),kind='stable')
                 extra[rank[active[rank]][:min(int(budget-allocation.sum()),int(active.sum()))]]=1
             allocation+=extra
-        for bucket,n,k in zip(ordered,counts,allocation):
+        cursor=0
+        for n,k in zip(counts,allocation):
+            bucket=rows[cursor:cursor+n].astype(np.int64);cursor+=int(n)
             chosen=rng.choice(bucket,int(k),replace=False)
             selected.append(chosen);weights.append(np.full(len(chosen),n/k,np.float32))
     ids=np.concatenate(selected) if selected else np.empty(0,np.int64)
@@ -359,8 +364,10 @@ def sample_compact_causal_points(support, rng, *, per_role=1024):
 
 
 def _compact_layout_world(layout, prepared, grid, local=None):
-    origin,step,_=grid_arrays(grid)
     local=(np.arange(len(layout['keys']),dtype=np.int64) if local is None else np.asarray(local,np.int64))
+    if layout.get('static_world') is not None:
+        return np.asarray(layout['static_world'],np.float64)[local]
+    origin,step,_=grid_arrays(grid)
     at=np.asarray(layout['at'])[local]
     world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
     last=np.asarray(layout['last'],np.int64)[local];real=last>=0
@@ -451,11 +458,12 @@ def compact_static_conflicts(support, prepared, grid):
     return result
 
 
-def map_sampled_compact_canonical(support, ids, prepared, grid, *, kernels=None):
+def map_sampled_compact_canonical(support, ids, prepared, grid, *, kernels=None, static_conflicts=None):
     """Sampled-only exact CCR plan with full-population static conflict guard."""
     sampled=materialize_compact_canonical_features(support,prepared,grid,ids)
     plan=map_canonical_evidence(sampled,prepared,grid,kernels=kernels)
-    conflicts=compact_static_conflicts(support,prepared,grid)
+    conflicts=(compact_static_conflicts(support,prepared,grid)
+               if static_conflicts is None else static_conflicts)
     static=sampled.actor<0
     for h in range(6):
         plan.legal[static&np.isin(plan.flat[:,h],conflicts[h]),h,0]=False
