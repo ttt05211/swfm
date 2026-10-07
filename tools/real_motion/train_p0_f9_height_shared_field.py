@@ -274,6 +274,12 @@ def main(stop_event=None, argv=None, *, backend=None):
             result['frame_cache_mib']=dict(train=a.frame_cache_mib,dev=min(1024,a.frame_cache_mib))
             if backend is not None:
                 backend.setup(provider, a)
+                # The persistent CCR history cache was built only for TRAIN20430.
+                # Require exact hits for training/prior, but let DEV evaluation
+                # build its fixed geometry live instead of treating DEV as a
+                # cache-miss failure.
+                if getattr(provider,'ccr_history_cache',None) is not None:
+                    provider.ccr_history_cache_source=train_source
             del ck
             fast_backend=bool(backend is not None and getattr(a,'ccr_fast_train',False))
             checkpoint_every=256 if fast_backend else 32
