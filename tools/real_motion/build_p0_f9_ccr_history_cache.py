@@ -12,6 +12,8 @@ budget.  Training should consume it with --ccr-history-cache-mode require.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import shutil
@@ -25,7 +27,7 @@ import torch
 
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
 from real_motion.causal_geometry_cache import CausalGeometryCache
-from real_motion.column_runtime_pipeline import CachedColumnSource, prefetch_raw_columns
+from real_motion.column_runtime_pipeline import CachedColumnSource
 from real_motion.native_column_cpu import backend_name, prepare_native
 from real_motion.nuscenes_adapter import NuScenesWindowSource
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
@@ -92,6 +94,42 @@ def _manifest(cache, args, namespace, *, records, seconds, pilot, complete):
     return payload
 
 
+def _parallel_cache_rows(provider, source, records, workers):
+    """Builder-only bounded parallelism.
+
+    Generic runtime prefetch stays capped at 4 for training/eval exactness and
+    existing tests.  Cache construction is offline, immutable and CPU-bound, so
+    use up to 8 independent whole-window jobs on the user's 10-core allocation.
+    Each job owns one window and nested geometry workers collapse to one through
+    provider.raw_prefetch_workers, preventing CPU oversubscription.
+    """
+    workers=int(workers)
+    if not 1 <= workers <= 8:
+        raise ValueError('CCR history cache builder requires 1..8 parallel windows')
+    iterator=iter(records)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending=deque()
+        def submit_next():
+            record=next(iterator,None)
+            if record is None:
+                return False
+            pending.append((record,pool.submit(
+                provider.load_raw_columns,source,record,include_gt=False)))
+            return True
+        for _ in range(workers):
+            if not submit_next():
+                break
+        try:
+            while pending:
+                record,future=pending.popleft()
+                raw=future.result()
+                submit_next()
+                yield record,raw
+        finally:
+            for _,future in pending:
+                future.cancel()
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     add_config_args(p)
@@ -99,7 +137,7 @@ def main():
         p.add_argument('--'+key,required=True)
     p.add_argument('--device',default='cpu')
     p.add_argument('--cpu-workers',type=int,default=10)
-    p.add_argument('--prefetch-workers',type=int,default=4)
+    p.add_argument('--prefetch-workers',type=int,default=8)
     p.add_argument('--frame-cache-mib',type=int,default=4096)
     p.add_argument('--cache-ram-mib',type=int,default=1024)
     p.add_argument('--max-cache-gib',type=float,default=32.)
@@ -110,7 +148,7 @@ def main():
     a=p.parse_args()
 
     if (not Path(a.dataroot).is_dir() or min(a.cpu_workers,a.prefetch_workers,a.pilot_windows) < 1
-            or a.prefetch_workers>min(a.cpu_workers,4) or not 0<=a.frame_cache_mib<=16384
+            or a.prefetch_workers>min(a.cpu_workers,8) or not 0<=a.frame_cache_mib<=16384
             or not 0<=a.cache_ram_mib<=16384 or not 1<=a.max_cache_gib<=128
             or not 0<=a.reserve_gib<=64):
         p.error('invalid bounded cache-build resources')
@@ -147,7 +185,7 @@ def main():
         a.base_checkpoint,CLEAN_SHA256,make_prepare_config(cfg),
         device,a.cpu_workers,teacher,None)
     provider.runtime_config_fingerprint=a._runtime_config_fingerprint
-    provider.ccr_execution=CanonicalCpuExecution('native_parallel',max(1,min(4,a.cpu_workers)))
+    provider.ccr_execution=CanonicalCpuExecution('native',1)
     provider.fixed_geometry_builder=build_ccr_history_geometry
     provider.raw_prefetch_workers=provider.raw_prefetch_depth=min(a.prefetch_workers,a.cpu_workers)
     provider.raw_io_workers=1
@@ -171,7 +209,7 @@ def main():
     pilot=None
     try:
         for wi,(record,raw) in enumerate(
-                prefetch_raw_columns(provider,source,records,include_gt=False),1):
+                _parallel_cache_rows(provider,source,records,a.prefetch_workers),1):
             if raw.get('future_gt_occ') is not None:
                 raise RuntimeError('CCR history cache builder loaded future GT')
             geometry=raw.get('_column_causal_preparation')
@@ -217,10 +255,13 @@ def main():
                 elapsed=time.perf_counter()-started
                 rate=wi/max(elapsed,1e-9)
                 eta=(len(records)-wi)/max(rate,1e-9)/60
+                stats=cache.stats()
                 print(
                     f'CCR_HISTORY_CACHE_BUILD {wi}/{len(records)} '
                     f'artifacts={count} disk={used/2**30:.2f}GiB '
-                    f'rate={rate:.2f}win/s ETA_min={eta:.1f}',
+                    f'rate={rate:.2f}win/s ETA_min={eta:.1f} '
+                    f'parallel_windows={a.prefetch_workers} '
+                    f'write_cpu_s={stats["background_write_seconds"]:.1f}',
                     flush=True)
 
         cache.flush()
