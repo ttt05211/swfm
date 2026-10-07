@@ -668,6 +668,10 @@ def main(argv=None):
             provider.ccr_history_cache=val_history_cache
             provider.ccr_history_cache_mode='require'
             provider.ccr_history_cache_source=source
+            # First cached DEV window must reproduce the old complete evidence
+            # byte-for-byte before the faster compact-materialization path is
+            # trusted for the remainder of this process.
+            provider.ccr_verify_cached_full_evidence_remaining=1
             result['val_history_cache']=dict(
                 mode='require',root=str(Path(args.ccr_val_history_cache).resolve()),
                 namespace=val_history_cache.namespace,
