@@ -247,6 +247,16 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
         if k not in ('total','geometry_workers') and isinstance(v,(int,float)))
     causal['_ccr_compact_support']=compact
     causal['_ccr_compact_conflicts']=conflicts
+    # Persist/runtime-retain only state consumed after this point.  In
+    # particular, drop dense current/previous semantics and duplicate Strong
+    # baseline tensors: raw history remains the source for sampled semantic /
+    # visibility lookups, while rendering needs only these fixed fields.
+    keep=('current_pose','current','source_world_points','source_rel_xy',
+          'source_z_t0','world_to_future','column_backgrounds')
+    missing=[k for k in keep if k not in causal['prepared_state']]
+    if missing:
+        raise RuntimeError(f'incomplete compact CCR prepared state: {missing}')
+    causal['prepared_state']={k:causal['prepared_state'][k] for k in keep}
     return causal
 
 
