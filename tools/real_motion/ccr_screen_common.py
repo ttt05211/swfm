@@ -15,7 +15,8 @@ import torch
 
 from real_motion.canonical_causal_repair import (
     CanonicalRepairHead, build_canonical_evidence, build_compact_canonical_support,
-    map_canonical_evidence, repair_targets, compose_canonical, repair_loss,
+    materialize_compact_canonical, map_canonical_evidence, repair_targets,
+    compose_canonical, repair_loss,
 )
 from real_motion.canonical_repair_context import (
     FixedCanonicalCache, build_fixed_canonical,
@@ -52,8 +53,39 @@ def execution_kernels(provider):
 
 
 def build_inputs(provider,prep):
+    """Build the complete inference domain.
+
+    Persistent TRAIN/VAL history caches already contain the exact compact
+    canonical population.  For quality evaluation, materialize ALL feature rows
+    from that cached population instead of rebuilding entity lattices/support
+    from raw history.  Learned motion/projection/probabilities remain fresh.
+
+    Official FPS does not attach the persistent history cache, so its frozen
+    timing boundary is unchanged.
+    """
+    causal=(prep.raw or {}).get('_column_causal_preparation') or {}
+    compact=causal.get('_ccr_compact_support')
+    cached=bool((prep.raw or {}).get('_ccr_history_cache_hit'))
+    if compact is not None and cached:
+        ids=np.arange(len(compact),dtype=np.int64)
+        evidence=materialize_compact_canonical(
+            compact,prep,provider.pcfg.grid,ids)
+        if getattr(provider,'ccr_verify_cached_full_evidence_remaining',0)>0:
+            execution=getattr(provider,'ccr_execution',None)
+            legacy=(build_canonical_evidence(prep,provider.pcfg.grid)
+                    if execution is None else execution.build(prep,provider.pcfg.grid))
+            for name in ('features','labels','actor','classes','world','presence'):
+                if not np.array_equal(getattr(evidence,name),getattr(legacy,name)):
+                    raise RuntimeError(
+                        f'cached full CCR evidence parity failed: {name}')
+            provider.ccr_verify_cached_full_evidence_remaining=0
+            print(
+                f'CCR_CACHED_FULL_EVIDENCE_PARITY PASS points={len(evidence)}',
+                flush=True)
+        return evidence
     execution=getattr(provider,'ccr_execution',None)
-    return build_canonical_evidence(prep,provider.pcfg.grid) if execution is None else execution.build(prep,provider.pcfg.grid)
+    return (build_canonical_evidence(prep,provider.pcfg.grid)
+            if execution is None else execution.build(prep,provider.pcfg.grid))
 
 
 def map_inputs(provider,evidence,prep):
