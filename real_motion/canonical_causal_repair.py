@@ -303,10 +303,19 @@ def build_compact_canonical_support(prepared, grid, *, halo=True, max_lattice_ce
             real=np.asarray(layout['last'])>=0
             if np.any(real):points[real]=np.asarray(layout['points'])[np.asarray(layout['last'])[real]]
             layout['static_world']=points
-            # static sampled rows and conflict projection now use static_world;
-            # retain last only for exact age/halo semantics, not all historical
-            # metric point payloads.
+            # Static sampled rows and conflict projection use static_world.
             layout['points']=None
+        # Persistent compact support never needs the full integer XYZ table:
+        # at == unravel(keys, shape) + lo exactly.  Nor does sampled-only
+        # materialization need the dense volume-sized bits array; keys+flags
+        # give the identical neighbour flags by searchsorted.  Dropping both
+        # cuts cache size without changing population/order/RNG/features.
+        layout['at']=None
+        layout['bits']=None
+        if np.asarray(layout['last']).size:
+            if np.asarray(layout['last']).max(initial=-1) >= np.iinfo(np.int32).max:
+                raise RuntimeError('compact CCR last-index exceeds int32')
+            layout['last']=np.asarray(layout['last'],np.int32)
         layouts.append(layout);cursor+=n
         counts['dense_entities' if dense else 'sparse_entities']+=1
         counts['max_lattice_cells']=max(counts['max_lattice_cells'],volume)
