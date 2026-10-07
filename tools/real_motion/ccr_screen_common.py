@@ -250,16 +250,30 @@ def _ccr_fast_fixed_geometry(provider, raw, record):
 
 @contextmanager
 def _evaluation_geometry(provider, include_old):
-    """Use minimal Point-CCR geometry for current-only eval; full geometry for old Local."""
-    if not getattr(provider,'ccr_fast_train',False):
-        yield
-        return
+    """Select exact evaluation geometry without mixing incompatible cache payloads.
+
+    The reusable TRAIN/VAL CCR history cache is intentionally slim: it keeps the
+    transport renderer state + canonical support needed by Point CCR, but drops
+    legacy Local's future static memory/footprints/frontier geometry.  Therefore
+    an evaluation that also scores old Local must bypass the slim persistent VAL
+    cache and rebuild the legacy full fixed geometry live.  Current-only
+    monitoring keeps using the fast VAL cache.
+    """
     previous=getattr(provider,'fixed_geometry_builder',None)
-    provider.fixed_geometry_builder=(None if include_old else _ccr_minimal_fixed_geometry)
+    previous_val_source=getattr(provider,'ccr_val_history_cache_source',None)
+    if include_old and getattr(provider,'ccr_val_history_cache',None) is not None:
+        # A sentinel object cannot compare identical to the real dev source in
+        # PilotProvider.load_raw_columns(), so this cleanly disables only the
+        # VAL persistent cache during paired old-Local reference evaluation.
+        provider.ccr_val_history_cache_source=object()
+    if getattr(provider,'ccr_fast_train',False):
+        provider.fixed_geometry_builder=(None if include_old else _ccr_minimal_fixed_geometry)
     try:
         yield
     finally:
         provider.fixed_geometry_builder=previous
+        if getattr(provider,'ccr_val_history_cache',None) is not None:
+            provider.ccr_val_history_cache_source=previous_val_source
 
 
 def prepare_frozen_superbatch(provider, rows, teacher):
