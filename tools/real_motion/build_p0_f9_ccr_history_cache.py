@@ -100,6 +100,8 @@ def main():
     p.add_argument('--cache-ram-mib',type=int,default=1024)
     p.add_argument('--max-cache-gib',type=float,default=32.)
     p.add_argument('--pilot-windows',type=int,default=128)
+    p.add_argument('--pilot-only',action='store_true',
+                   help='build/verify only the pilot prefix, report projected size, then stop safely')
     p.add_argument('--reserve-gib',type=float,default=2.)
     a=p.parse_args()
 
@@ -198,6 +200,12 @@ def main():
                     raise RuntimeError(
                         f'insufficient disk for projected cache plus reserve: '
                         f'projected={projected/2**30:.2f}GiB free={free/2**30:.2f}GiB')
+                if a.pilot_only:
+                    manifest=_manifest(
+                        cache,a,namespace,records=len(records),
+                        seconds=time.perf_counter()-started,pilot=pilot,complete=False)
+                    print('CCR_HISTORY_CACHE_PILOT_ONLY '+json.dumps(manifest,sort_keys=True),flush=True)
+                    return
 
             if wi==1 or wi%128==0 or wi==len(records):
                 count,used=_namespace_usage(cache)
