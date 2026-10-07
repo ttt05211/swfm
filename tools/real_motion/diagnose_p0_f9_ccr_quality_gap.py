@@ -31,6 +31,11 @@ import torch
 
 from real_motion.canonical_causal_repair import repair_targets, compose_canonical
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
+from real_motion.causal_geometry_cache import CausalGeometryCache
+from real_motion.ccr_val_history_cache import (
+    namespace as val_history_cache_namespace,
+    validate_manifest as validate_val_history_cache_manifest,
+)
 from real_motion.column_runtime_pipeline import CachedColumnSource, prefetch_raw_columns
 from real_motion.nuscenes_adapter import NuScenesWindowSource, gt_moving_support_sequence
 from real_motion.runtime_config import add_config_args, load_runtime_config, make_prepare_config
@@ -386,6 +391,9 @@ def main(argv=None):
     parser.add_argument("--cpu-workers", type=int, default=8)
     parser.add_argument("--ccr-cpu-execution", choices=("numpy", "native", "native_parallel"), default="native_parallel")
     parser.add_argument("--ccr-cpu-workers", type=int, default=4)
+    parser.add_argument("--ccr-val-history-cache",
+                        help="persistent VAL fixed-history geometry cache; quality evaluation only")
+    parser.add_argument("--ccr-val-history-cache-ram-mib", type=int, default=512)
     args = parser.parse_args(argv)
 
     out = Path(args.out_dir)
@@ -397,7 +405,9 @@ def main(argv=None):
     ):
         if not Path(getattr(args, key) or "").is_file():
             parser.error("missing " + key)
-    if not Path(args.dataroot).is_dir() or not 1 <= args.cpu_workers <= 16 or not 1 <= args.ccr_cpu_workers <= 8:
+    if (not Path(args.dataroot).is_dir() or not 1 <= args.cpu_workers <= 16
+            or not 1 <= args.ccr_cpu_workers <= 8
+            or not 0 <= args.ccr_val_history_cache_ram_mib <= 16384):
         parser.error("invalid paths/workers")
 
     device = require_cuda(args.device)
@@ -411,6 +421,7 @@ def main(argv=None):
     persist()
 
     execution = None
+    val_history_cache = None
     try:
         cfg = load_runtime_config(args.config, args.override)
         config_fp = stable_json_fingerprint(cfg)
@@ -471,6 +482,23 @@ def main(argv=None):
         source = CachedColumnSource(
             NuScenesWindowSource(args.dataroot, info_pkl=args.dev_info, verbose=False), 256
         )
+        if args.ccr_val_history_cache:
+            root=Path(__file__).resolve().parents[2]
+            namespace_input=val_history_cache_namespace(provider,args,root)
+            val_history_cache=CausalGeometryCache(
+                args.ccr_val_history_cache,namespace_input,max_bytes=0,
+                ram_bytes=int(args.ccr_val_history_cache_ram_mib)*2**20,
+                reserve_bytes=0,compression_level=6)
+            manifest_cache=validate_val_history_cache_manifest(val_history_cache,args)
+            provider.ccr_history_cache=val_history_cache
+            provider.ccr_history_cache_mode='require'
+            provider.ccr_history_cache_source=source
+            result['val_history_cache']=dict(
+                mode='require',root=str(Path(args.ccr_val_history_cache).resolve()),
+                namespace=val_history_cache.namespace,
+                ram_mib=args.ccr_val_history_cache_ram_mib,
+                manifest_disk_gib=manifest_cache.get('disk_gib'))
+            print('CCR_VAL_HISTORY_CACHE '+json.dumps(result['val_history_cache'],sort_keys=True),flush=True)
 
         base = Metrics()
         metric_obj = {name: Metrics() for name in VARIANTS}
@@ -503,9 +531,21 @@ def main(argv=None):
         with old_execution(teacher, provider):
             for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records), 1):
                 output = teacher.motion(record, device)
-                prep = provider.prepare_columns(
-                    source, record, include_gt=True, raw_window=raw, outputs=output
-                )
+                cached_causal=raw.get('_column_causal_preparation')
+                if cached_causal is not None and not getattr(provider,'columns_checked',False):
+                    # One live preflight preserves the frozen V18 exactness gate;
+                    # all following windows use the verified persistent VAL cache.
+                    del raw['_column_causal_preparation']
+                    try:
+                        prep=provider.prepare_columns(
+                            source,record,include_gt=True,raw_window=raw,outputs=output)
+                    finally:
+                        raw['_column_causal_preparation']=cached_causal
+                    print('CCR_VAL_CACHE_LIVE_EXACTNESS_PREFLIGHT PASS',flush=True)
+                else:
+                    prep = provider.prepare_columns(
+                        source, record, include_gt=True, raw_window=raw, outputs=output
+                    )
                 evidence = build_inputs(provider, prep)
                 plan = map_inputs(provider, evidence, prep)
                 p = probabilities(head, evidence, plan, output, device)
@@ -661,6 +701,10 @@ def main(argv=None):
         persist()
         raise
     finally:
+        if val_history_cache is not None:
+            result['val_history_cache_stats']=val_history_cache.stats()
+            val_history_cache.close()
+            persist()
         if execution is not None:
             execution.close()
 
