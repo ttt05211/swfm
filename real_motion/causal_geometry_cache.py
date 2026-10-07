@@ -90,6 +90,35 @@ class CausalGeometryCache:
         if self.writer_error is not None:
             raise RuntimeError('causal geometry background writer failed') from self.writer_error
 
+    def require(self, key, raw):
+        """Read an existing verified artifact; never build or write on a miss."""
+        name, causal_sha = self._address(key, raw)
+        path = self.root/(name+'.cgc')
+        with self.lock:
+            self._check_error()
+            if name in self.rows:
+                self.rows.move_to_end(name); self.hits += 1
+                return self.rows[name][0]
+        if not path.is_file():
+            with self.lock: self.misses += 1
+            raise FileNotFoundError(
+                f'required causal geometry cache miss: key={tuple(key)} path={path}')
+        blob = path.read_bytes()
+        if (len(blob) < len(MAGIC)+32 or not blob.startswith(MAGIC)
+                or hashlib.sha256(blob[len(MAGIC)+32:]).digest() != blob[len(MAGIC):len(MAGIC)+32]):
+            raise RuntimeError(f'corrupt causal geometry cache: {path}')
+        try:
+            payload = pickle.loads(zlib.decompress(blob[len(MAGIC)+32:]))
+        except Exception as exc:
+            raise RuntimeError(f'invalid causal geometry cache: {path}') from exc
+        if (payload.get('namespace') != self.namespace or payload.get('causal_sha') != causal_sha
+                or tuple(payload.get('key', ())) != tuple(key)):
+            raise RuntimeError(f'causal geometry cache provenance mismatch: {path}')
+        value = payload['geometry']
+        with self.lock:
+            self.hits += 1; self._remember(name, value)
+        return value
+
     def get_or_build(self, key, raw, builder, *, defer_write=False):
         name, causal_sha = self._address(key, raw)
         path = self.root/(name+'.cgc')
