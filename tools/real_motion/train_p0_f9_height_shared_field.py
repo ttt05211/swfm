@@ -263,10 +263,14 @@ def main(stop_event=None, argv=None, *, backend=None):
             # window order and later epochs.
             train_source = CachedColumnSource(
                 NuScenesWindowSource(a.dataroot, info_pkl=a.train_info, verbose=False),
-                a.frame_cache_mib, copy_on_insert=False)
+                a.frame_cache_mib)
             dev_source = CachedColumnSource(
                 NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info, verbose=False),
-                min(1024,a.frame_cache_mib), copy_on_insert=False)
+                min(1024,a.frame_cache_mib))
+            # Keep constructor shape backward-compatible with dependency-light
+            # mocks while enabling zero-copy immutable caching in real runs.
+            train_source.copy_on_insert=False
+            dev_source.copy_on_insert=False
             result['frame_cache_mib']=dict(train=a.frame_cache_mib,dev=min(1024,a.frame_cache_mib))
             if backend is not None:
                 backend.setup(provider, a)
