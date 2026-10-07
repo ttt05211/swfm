@@ -286,7 +286,9 @@ def main(stop_event=None, argv=None, *, backend=None):
                           f"MovingMicro={m['MovingMicro']:.6f} vs_old_Moving={m['MovingMicro']-old['MovingMicro']:+.6f} "
                           f"sADD_R={recall('static/ADD')} dADD_R={recall('dynamic/ADD')} dREM_R={recall('dynamic/REMOVE')}", flush=True)
                     save(); persist()
-            with ThreadPoolExecutor(max_workers=min(3, a.cpu_workers)) as pool:
+            sample_workers=(getattr(provider,'ccr_sample_workers',min(3,a.cpu_workers))
+                            if backend is not None else min(3,a.cpu_workers))
+            with ThreadPoolExecutor(max_workers=sample_workers) as pool:
                 def run_step(rows, waited, frozen_outputs=None, motion_share=0.):
                     nonlocal updates, batch, executed
                     if (stop_event is not None and stop_event.is_set()) or (a.max_updates and updates >= a.max_updates):
