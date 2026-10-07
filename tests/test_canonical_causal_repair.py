@@ -3,8 +3,10 @@ import numpy as np
 import pytest
 import torch
 from real_motion.geometry import OccupancyGrid
-from real_motion.canonical_causal_repair import (build_canonical_evidence,map_canonical_evidence,
+from real_motion.canonical_causal_repair import (build_canonical_evidence,build_compact_canonical_support,map_canonical_evidence,
     map_canonical_reference,materialize_canonical_features,repair_targets,compose_canonical,CanonicalRepairHead,FEATURE_DIM,sampled_tasks,repair_loss)
+from real_motion.canonical_repair_context import (build_causal_strata,sample_causal_points,
+    sample_compact_causal_points,map_sampled_canonical,map_sampled_compact_canonical,full_static_conflicts)
 
 
 def scene():
@@ -148,6 +150,27 @@ def test_deferred_train_features_match_eager_without_population_or_rng_changes(l
     small=materialize_canonical_features(deferred,p,grid,ids)
     np.testing.assert_array_equal(small.features,e.features[ids])
     np.testing.assert_array_equal(small.labels,e.labels[ids])
+
+
+def test_compact_sampled_only_support_is_exact_to_legacy_lazy_population():
+    grid,p=scene()
+    legacy=build_canonical_evidence(p,grid,materialize_features=False)
+    legacy.causal_strata=build_causal_strata(legacy)
+    compact=build_compact_canonical_support(p,grid)
+    assert len(compact)==len(legacy)
+    a=np.random.default_rng(123);b=np.random.default_rng(123)
+    ids,w=sample_causal_points(legacy,a,per_role=8)
+    cids,cw=sample_compact_causal_points(compact,b,per_role=8)
+    np.testing.assert_array_equal(ids,cids);np.testing.assert_array_equal(w,cw)
+    conflicts=full_static_conflicts(legacy,p,grid)
+    old,op=map_sampled_canonical(legacy,ids,p,grid,conflicts)
+    new,np_=map_sampled_compact_canonical(compact,cids,p,grid)
+    for name in ('features','labels','actor','classes','world','presence'):
+        np.testing.assert_array_equal(getattr(old,name),getattr(new,name))
+    for name in ('flat','base','fallback','legal','context'):
+        np.testing.assert_array_equal(getattr(op,name),getattr(np_,name))
+    oy,ov=repair_targets(old,op,p.baseline);ny,nv=repair_targets(new,np_,p.baseline)
+    np.testing.assert_array_equal(oy,ny);np.testing.assert_array_equal(ov,nv)
 
 
 def test_history_outside_t0_grid_is_retained_and_later_enters_query():
