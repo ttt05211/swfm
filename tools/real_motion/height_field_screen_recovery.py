@@ -45,3 +45,45 @@ def restore(saved, head, optimizer, rng, contract, *, protocol=PROTOCOL):
             raise RuntimeError('cannot restore CUDA screen RNG on CPU')
         torch.cuda.set_rng_state_all(saved['cuda_rng'])
     return tuple(saved[k] for k in ('epoch', 'batch', 'updates', 'executed')), copy.deepcopy(saved['reports'])
+
+
+def restore_execution_upgrade(saved, head, optimizer, rng, contract, *, protocol=PROTOCOL):
+    """Resume identical scientific training after execution-only code/settings changes.
+
+    Optimizer/RNG/cursor/population/schedule are preserved. Only explicitly
+    whitelisted performance metadata may differ.
+    """
+    if saved.get('protocol') != protocol or saved.get('transport_frozen') is not True or saved.get('deployable') is not False:
+        raise RuntimeError('invalid execution-upgrade checkpoint role/protocol')
+    old=copy.deepcopy(saved.get('contract'))
+    new=copy.deepcopy(contract)
+    if not isinstance(old,dict) or not isinstance(new,dict):
+        raise RuntimeError('missing execution-upgrade contracts')
+    # These fields describe how identical math is executed, not what is trained.
+    execution_keys={
+        'implementation','ccr_implementation','torch_version',
+        'cpu_execution','cpu_workers','batched_head','batched_motion',
+        'fast_train','lazy_sampled_features','prefetch_workers',
+        'motion_superbatch_updates','motion_streams'
+    }
+    for key in execution_keys:
+        old.pop(key,None);new.pop(key,None)
+    if stable_json_fingerprint(old)!=stable_json_fingerprint(new):
+        raise RuntimeError('execution-upgrade resume changed scientific training contract')
+    validate_cursor(contract,*[saved[k] for k in ('epoch','batch','updates','executed')])
+    if not isinstance(saved.get('reports'),dict) or 'train_prior' not in saved['reports']:
+        raise RuntimeError('missing completed TRAIN-only calibration')
+    head.load_state_dict(saved['head'],strict=True)
+    optimizer.load_state_dict(saved['optimizer'])
+    rng.bit_generator.state=saved['numpy_rng']
+    torch.set_rng_state(saved['torch_rng'].cpu())
+    if saved['cuda_rng']:
+        if not torch.cuda.is_available():
+            raise RuntimeError('cannot restore CUDA screen RNG on CPU')
+        torch.cuda.set_rng_state_all(saved['cuda_rng'])
+    reports=copy.deepcopy(saved['reports'])
+    reports.setdefault('execution_upgrades',[]).append(dict(
+        from_contract_fingerprint=stable_json_fingerprint(saved.get('contract')),
+        to_contract_fingerprint=stable_json_fingerprint(contract),
+        preserved='head+optimizer+numpy_rng+torch_rng+cuda_rng+cursor+population+schedule'))
+    return tuple(saved[k] for k in ('epoch','batch','updates','executed')),reports
