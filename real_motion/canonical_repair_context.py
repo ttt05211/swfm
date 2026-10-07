@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .canonical_causal_repair import (CanonicalRepairHead, FACE,
+from .canonical_causal_repair import (CanonicalRepairHead, CanonicalEvidence, FACE, STATIC, FEATURE_DIM,
     build_canonical_evidence, materialize_canonical_features, grid_arrays,
     map_canonical_evidence)
 from .source_evidence_audit import transform_points
@@ -311,6 +311,155 @@ def build_causal_strata(evidence):
         order=np.argsort(inverse,kind='stable')
         result.append((rows[order].astype(np.int32),counts.astype(np.int32)))
     return result
+
+
+def sample_compact_causal_points(support, rng, *, per_role=1024):
+    """Exact sample_causal_points() result without O(N) evidence arrays.
+
+    Buckets are reconstructed directly from per-entity lattice flags. Sorted
+    code order and ascending global row order exactly match build_causal_strata
+    + stable argsort, so the same RNG state produces the same IDs/weights.
+    """
+    if per_role < 1: raise ValueError('positive causal sampling budget required')
+    selected=[];weights=[]
+    for dynamic in (False,True):
+        buckets={}
+        for layout in support.layouts:
+            if (int(layout['actor'])>=0)!=dynamic:continue
+            flags=np.asarray(layout['flags'],np.uint8)
+            status=np.where((flags&8)!=0,0,np.where((flags&7)!=0,1,2))
+            base=np.arange(int(layout['start']),int(layout['stop']),dtype=np.int64)
+            for st in (0,1,2):
+                ids=base[status==st]
+                if not len(ids):continue
+                code=(int(layout['actor'])+2)*57+int(layout['cls'])*3+st
+                buckets.setdefault(code,[]).append(ids)
+        ordered=[]
+        for code in sorted(buckets):
+            parts=buckets[code];ordered.append(np.concatenate(parts) if len(parts)>1 else parts[0])
+        if not ordered:continue
+        counts=np.asarray([len(x) for x in ordered],np.int64)
+        population=sum(int(x) for x in counts)
+        budget=min(population,max(per_role,len(counts)))
+        allocation=np.ones(len(counts),np.int64)
+        while allocation.sum()<budget:
+            room=counts-allocation;active=room>0;share=np.sqrt(counts)*active
+            extra=np.minimum(room,np.floor((budget-allocation.sum())*share/share.sum()).astype(np.int64))
+            if not extra.sum():
+                rank=np.argsort(-share/(allocation+1),kind='stable')
+                extra[rank[active[rank]][:min(int(budget-allocation.sum()),int(active.sum()))]]=1
+            allocation+=extra
+        for bucket,n,k in zip(ordered,counts,allocation):
+            chosen=rng.choice(bucket,int(k),replace=False)
+            selected.append(chosen);weights.append(np.full(len(chosen),n/k,np.float32))
+    ids=np.concatenate(selected) if selected else np.empty(0,np.int64)
+    importance=np.concatenate(weights) if weights else np.empty(0,np.float32)
+    order=np.argsort(ids)
+    return ids[order],importance[order]
+
+
+def _compact_layout_world(layout, prepared, grid, local=None):
+    origin,step,_=grid_arrays(grid)
+    local=(np.arange(len(layout['keys']),dtype=np.int64) if local is None else np.asarray(local,np.int64))
+    at=np.asarray(layout['at'])[local]
+    world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
+    last=np.asarray(layout['last'],np.int64)[local];real=last>=0
+    if real.any():
+        world[real]=np.asarray(layout['points'],np.float64)[last[real]]
+    return world
+
+
+def materialize_compact_canonical_features(support, prepared, grid, indices):
+    """Materialize ONLY sampled canonical rows from exact compact lattices."""
+    ids=np.asarray(indices)
+    if ids.ndim!=1 or ids.dtype.kind not in 'iu' or np.any(ids>=len(support)) or np.any(ids<0):
+        raise ValueError('invalid compact canonical TRAIN point indices')
+    n=len(ids);features=np.empty((n,FEATURE_DIM),np.float32);labels=np.full((n,4),18,np.uint8)
+    actors=np.empty(n,np.int32);classes=np.empty(n,np.uint8);worlds=np.empty((n,3),np.float64)
+    presence=np.empty((n,4),bool)
+    origin,step,shape=grid_arrays(grid);inverse=np.linalg.inv(prepared.state['current_pose'])
+    for layout in support.layouts:
+        selected=np.flatnonzero((ids>=layout['start'])&(ids<layout['stop']))
+        if not len(selected):continue
+        local=(ids[selected]-layout['start']).astype(np.int64,copy=False)
+        actor=int(layout['actor']);cls=int(layout['cls'])
+        at=np.asarray(layout['at'])[local];keys=np.asarray(layout['keys'])[local]
+        flags=np.asarray(layout['flags'],np.uint8)[local]
+        pres=((flags[:,None]>>np.arange(4))&1).astype(bool)
+        world=_compact_layout_world(layout,prepared,grid,local)
+        actors[selected]=actor;classes[selected]=cls;worlds[selected]=world;presence[selected]=pres
+        inside=np.zeros((len(local),4),bool);observed=inside.copy()
+        for f in range(4):
+            registration=np.eye(4) if actor==STATIC else prepared.registrations[actor][f]
+            if registration is None:continue
+            reg=np.eye(4) if actor==STATIC else registration[0]
+            matrix=np.linalg.inv(prepared.raw['history_poses'][f])@np.linalg.inv(reg)
+            ijk=np.floor((transform_points(world,matrix)-origin)/step).astype(np.int64)
+            valid=((ijk>=0)&(ijk<shape)).all(1);inside[:,f]=valid
+            observed[valid,f]=np.asarray(prepared.raw['history_observed'][f],bool)[tuple(ijk[valid].T)]
+            labels[selected[valid],f]=np.asarray(prepared.raw['history_occ'][f])[tuple(ijk[valid].T)]
+        neighbours=np.zeros((len(local),6),np.float32);density=np.zeros((len(local),4),np.float32)
+        strides=np.array([int(layout['shape'][1])*int(layout['shape'][2]),int(layout['shape'][2]),1],np.int64)
+        all_keys=np.asarray(layout['keys'])
+        for d,delta in enumerate(FACE):
+            neighbour=keys+int(delta@strides)
+            valid=((at+delta-layout['lo']>=0)&(at+delta-layout['lo']<layout['shape'])).all(1)
+            if layout['dense']:
+                neighbour_flags=np.asarray(layout['bits'])[neighbour.clip(0,layout['volume']-1)]
+            else:
+                loc=np.searchsorted(all_keys,neighbour);found=loc<len(all_keys)
+                found[found]&=all_keys[loc[found]]==neighbour[found]
+                neighbour_flags=np.zeros(len(local),np.uint8)
+                neighbour_flags[found]=np.asarray(layout['flags'])[loc[found]]
+            neighbour_flags=np.where(valid,neighbour_flags,0)
+            neighbours[:,d]=neighbour_flags!=0
+            density+=((neighbour_flags[:,None]>>np.arange(4))&1).astype(np.float32)/6
+        if actor>=0:
+            center=transform_points(np.asarray(prepared.state['current'][actor]['centroid_world'])[None],inverse)[0]
+            relative=(origin+(at+.5)*step-center)/8
+        else:
+            relative=(origin+(at+.5)*step)/40
+        real=np.asarray(layout['last'],np.int64)[local]>=0
+        age=np.argmax(pres[:,::-1],axis=1).astype(np.float32)/3;age[~real]=1.
+        features[selected]=np.concatenate([relative,pres,observed,inside,neighbours,age[:,None],density,
+                                          pres[:,-1,None]],axis=1).astype(np.float32)
+    return CanonicalEvidence(features,labels,actors,classes,worlds,presence,support.audit)
+
+
+def compact_static_conflicts(support, prepared, grid):
+    """Exact full static conflict destinations without full CanonicalEvidence."""
+    origin,step,shape=grid_arrays(grid)
+    static={}
+    for layout in support.layouts:
+        if int(layout['actor'])!=STATIC:continue
+        cls=int(layout['cls']);world=_compact_layout_world(layout,prepared,grid)
+        static.setdefault(cls,[]).append(world)
+    for cls in tuple(static):
+        static[cls]=np.concatenate(static[cls]) if len(static[cls])>1 else static[cls][0]
+    result=[]
+    for h in range(6):
+        flats={}
+        for cls in (11,13):
+            world=static.get(cls)
+            if world is None or not len(world):
+                flats[cls]=np.empty(0,np.int64);continue
+            mapped=transform_points(world,prepared.state['world_to_future'][h])
+            ijk=np.floor((mapped-origin)/step).astype(np.int64)
+            good=((ijk>=0)&(ijk<shape)).all(1);q=ijk[good]
+            flats[cls]=np.unique((q[:,0]*shape[1]+q[:,1])*shape[2]+q[:,2])
+        result.append(np.intersect1d(flats[11],flats[13],assume_unique=True))
+    return result
+
+
+def map_sampled_compact_canonical(support, ids, prepared, grid, *, kernels=None):
+    """Sampled-only exact CCR plan with full-population static conflict guard."""
+    sampled=materialize_compact_canonical_features(support,prepared,grid,ids)
+    plan=map_canonical_evidence(sampled,prepared,grid,kernels=kernels)
+    conflicts=compact_static_conflicts(support,prepared,grid)
+    static=sampled.actor<0
+    for h in range(6):
+        plan.legal[static&np.isin(plan.flat[:,h],conflicts[h]),h,0]=False
+    return sampled,plan
 
 
 def sample_causal_points(evidence, rng, *, per_role=1024):
