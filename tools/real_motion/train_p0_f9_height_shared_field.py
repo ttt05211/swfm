@@ -251,6 +251,7 @@ def main(stop_event=None, argv=None, *, backend=None):
                 input_wait_seconds=float(reports.get('input_wait_seconds',0.)))
             teacher.eval().requires_grad_(False)
             provider = PilotProvider(a.base_checkpoint, CLEAN_SHA256, make_prepare_config(cfg), device, a.cpu_workers, teacher, None)
+            provider.runtime_config_fingerprint=stable_json_fingerprint(cfg)
             provider.raw_prefetch_workers = provider.raw_prefetch_depth = min(2, a.cpu_workers)
             if a.causal_geometry_cache:
                 namespace = geometry_namespace(cfg, provider, ck['info_fingerprints'], ck['cache_fingerprints'], a.dataroot)
