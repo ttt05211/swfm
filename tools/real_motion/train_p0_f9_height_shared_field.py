@@ -37,7 +37,7 @@ from tools.real_motion.joint_column_full_common import prefetch_column_batches, 
 from tools.real_motion.height_field_screen_common import (
     PROTOCOL, epoch_groups, learning_rate, train_step, calibrate_train, evaluate, six_frame_speed,
 )
-from tools.real_motion.height_field_screen_recovery import payload, restore
+from tools.real_motion.height_field_screen_recovery import payload, restore, restore_execution_upgrade
 
 
 def brief(result):
@@ -85,7 +85,9 @@ def parser():
     for key in ('checkpoint', 'train-cache', 'dev-cache', 'population-manifest', 'base-checkpoint',
                 'dataroot', 'train-info', 'dev-info', 'out-dir'):
         p.add_argument('--'+key, required=True)
-    p.add_argument('--resume'); p.add_argument('--device', default='cuda')
+    p.add_argument('--resume'); p.add_argument('--resume-execution-upgrade', action='store_true',
+                   help='preserve optimizer/RNG/cursor across whitelisted execution-only CCR speed changes')
+    p.add_argument('--device', default='cuda')
     p.add_argument('--cpu-workers', type=int, default=8)
     p.add_argument('--causal-geometry-cache')
     p.add_argument('--epochs', type=int, default=3)
@@ -231,9 +233,13 @@ def main(stop_event=None, argv=None, *, backend=None):
                     result['warm_start_old_local_dev64_reused']=True
             if a.resume:
                 saved = torch.load(a.resume, map_location='cpu', weights_only=False)
-                (epoch, batch, updates, executed), reports = restore(saved, head, optimizer, rng, contract, protocol=run_protocol)
+                restore_fn=(restore_execution_upgrade if a.resume_execution_upgrade else restore)
+                (epoch, batch, updates, executed), reports = restore_fn(
+                    saved, head, optimizer, rng, contract, protocol=run_protocol)
                 result['reports'] = reports
-                print(f'{label}_RESUME update={updates}/{steps} next_epoch={epoch+1} batch_cursor={batch}; optimizer/RNG/cosine preserved', flush=True)
+                mode='EXECUTION_UPGRADE_RESUME' if a.resume_execution_upgrade else 'RESUME'
+                print(f'{label}_{mode} update={updates}/{steps} next_epoch={epoch+1} batch_cursor={batch}; '
+                      f'head/optimizer/RNG/cosine preserved', flush=True)
             teacher.eval().requires_grad_(False)
             provider = PilotProvider(a.base_checkpoint, CLEAN_SHA256, make_prepare_config(cfg), device, a.cpu_workers, teacher, None)
             provider.raw_prefetch_workers = provider.raw_prefetch_depth = min(2, a.cpu_workers)
@@ -304,10 +310,15 @@ def main(stop_event=None, argv=None, *, backend=None):
                     if updates == 1 or updates % 32 == 0:
                         details = (f"sampled_points={stat['sampled_points']} canonical_points={stat['canonical_points']}" if backend is not None else
                                    f"dynamic_columns={stat.get('dynamic_refine_columns', 0)}")
+                        wall_total=reports.get('train_seconds',0.)+reports.get('input_wait_seconds',0.)
+                        wall_per_window=wall_total/max(executed,1)
+                        done_epoch_windows=sum(sizes[epoch][:batch]) if epoch < len(sizes) else len(train)
+                        remaining_epoch=max(0,len(train)-done_epoch_windows)
+                        eta_min=remaining_epoch*wall_per_window/60.
                         print(f"{label}_TRAIN epoch={epoch+1}/{a.epochs} batch={batch}/{counts[epoch]} update={updates}/{steps} "
-                              f"loss={stat['loss']:.6f} train_s/window={effective_seconds/len(rows):.4f} "
-                              f"wait_s/window={waited/len(rows):.4f} {details} "
-                              f"allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
+                              f"loss={stat['loss']:.6f} compute_s/window={effective_seconds/len(rows):.4f} "
+                              f"cpu_wait_s/window={waited/len(rows):.4f} wall_avg_s/window={wall_per_window:.4f} "
+                              f"ETA_epoch_min={eta_min:.1f} {details} allocated_after={stat['allocated_after_mib']:.1f}MiB", flush=True)
                     if updates % checkpoint_every == 0 or stop_event is not None and stop_event.is_set():
                         save(); persist()
                     return True
@@ -341,7 +352,8 @@ def main(stop_event=None, argv=None, *, backend=None):
                             for gi,rows in enumerate(logical_rows):
                                 n=len(rows);local=frozen[cursor:cursor+n];cursor+=n
                                 share=motion_seconds*n/total_windows
-                                if not run_step(rows, waited if gi==0 else 0., local, share):
+                                wait_share=waited*n/total_windows
+                                if not run_step(rows, wait_share, local, share):
                                     break
                                 if batch == counts[epoch]:
                                     epoch += 1; batch = 0; save(); persist(); epoch_done=True; break
