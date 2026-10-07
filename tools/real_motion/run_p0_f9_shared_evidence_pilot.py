@@ -54,7 +54,10 @@ class PilotProvider(FullJointColumnProvider):
             return build_fixed_geometry(raw,record,self.pcfg,self.strong,workers,self.joint.columns.config)
         key=(str(record['scene_name']),str(record['t0_token']))
         history_cache=getattr(self,'ccr_history_cache',None)
-        if history_cache is not None:
+        history_source=getattr(self,'ccr_history_cache_source',None)
+        use_history_cache=(history_cache is not None and
+                           (history_source is None or source is history_source))
+        if use_history_cache:
             mode=getattr(self,'ccr_history_cache_mode','require')
             if mode=='require':
                 evidence=history_cache.require(key,raw);hit=True
