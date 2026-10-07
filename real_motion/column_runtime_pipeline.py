@@ -75,8 +75,8 @@ def prefetch_raw_columns(provider, source, records, *, include_gt=True):
     iterator = iter(records)
     workers = getattr(provider, 'raw_prefetch_workers', 1)
     depth = getattr(provider, 'raw_prefetch_depth', workers)
-    if type(workers) is not int or type(depth) is not int or not 1 <= workers <= depth <= 32:
-        raise ValueError('raw prefetch requires 1 <= workers <= depth <= 32')
+    if type(workers) is not int or type(depth) is not int or not 1 <= workers <= depth <= 4:
+        raise ValueError('raw prefetch requires 1 <= workers <= depth <= 4')
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = deque()
         def submit_next():
