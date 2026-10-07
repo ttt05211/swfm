@@ -6,8 +6,8 @@ from .native_column_cpu import prepare_native, get_prepared_native
 
 class CanonicalCpuExecution:
     def __init__(self,mode='numpy',workers=4,build_dir=None):
-        if mode not in ('numpy','native','native_parallel') or not 1<=workers<=8:
-            raise ValueError('CCR execution requires numpy/native/native_parallel and 1..8 workers')
+        if mode not in ('numpy','native','native_parallel') or not 1<=workers<=32:
+            raise ValueError('CCR execution requires numpy/native/native_parallel and 1..32 workers')
         self.mode=mode;self.kernels=None;self.pool=None
         if mode!='numpy':
             prepare_native(build_dir);self.kernels=get_prepared_native()
