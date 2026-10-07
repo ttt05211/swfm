@@ -224,10 +224,10 @@ def _summary(result):
         d=row["delta_b_vs_old_local_remove_off"]
         lines.append(f'B-OLD_OFF mIoU={d["mIoU"]:+.4f} Moving={d["MovingMicro"]:+.4f}')
         for role in ("static","dynamic"):
-            q=row["action_ADD"].get(role,{})
+            q=row["action_ADD"].get(role+"/all6",{})
             if q:
                 lines.append(
-                    f'{role} ADD P={q["precision"]:.4f} R={q["recall"]:.4f} '
+                    f'{role} ADD(all6) P={q["precision"]:.4f} R={q["recall"]:.4f} '
                     f'FP={q["fp"]} FN={q["fn"]}')
     cov=result.get("population_contract",{})
     if cov:
@@ -418,7 +418,12 @@ def main(argv=None):
                     for role_name,role_mask in roles.items():
                         role6=np.broadcast_to(role_mask[:,None],target[...,0].shape)
                         mask=role6&valid[...,0]
-                        _update_bucket(st["action"][role_name],mask,target[...,0],pred_add)
+                        _update_bucket(st["action"][role_name+"/all6"],mask,target[...,0],pred_add)
+                        for h,seconds in zip(REPORT,("1.0","2.0","3.0")):
+                            hm=role_mask&valid[:,h,0]
+                            _update_bucket(
+                                st["action"][role_name+"/"+seconds+"s"],
+                                hm,target[:,h,0],pred_add[:,h])
 
                 sm=scene_metrics[scene];sm["_windows"]+=1
                 for ri,h in enumerate(REPORT):
