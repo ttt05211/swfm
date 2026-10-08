@@ -4,8 +4,9 @@ No distillation, learned-feature cache, GT candidate selection or dev tuning.
 The old Local frontier GEN support is NOT preserved by this representation.
 """
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
+import copy
 import json
 import time
 
@@ -13,12 +14,28 @@ import numpy as np
 import torch
 
 from real_motion.canonical_causal_repair import (
-    CanonicalRepairHead, build_canonical_evidence, map_canonical_evidence,
-    repair_targets, compose_canonical,
+    CanonicalRepairHead, build_canonical_evidence, build_compact_canonical_support,
+    materialize_compact_canonical, map_canonical_evidence, repair_targets,
+    compose_canonical, repair_loss,
 )
-from real_motion.canonical_repair_context import FixedCanonicalCache
+from real_motion.canonical_repair_context import (
+    FixedCanonicalCache, build_fixed_canonical,
+    full_static_conflicts, compact_static_conflicts, sample_causal_points, map_sampled_canonical,
+    sample_compact_causal_points, map_sampled_compact_canonical,
+)
 from real_motion.canonical_repair_execution import CanonicalCpuExecution
+from real_motion.causal_geometry_cache import CausalGeometryCache
+from real_motion.ccr_history_geometry import (
+    PROTOCOL as CCR_HISTORY_CACHE_PROTOCOL,
+    build_ccr_history_geometry,
+    namespace as ccr_history_cache_namespace,
+)
+from real_motion.ccr_val_history_cache import (
+    namespace as ccr_val_history_cache_namespace,
+    validate_manifest as validate_ccr_val_history_cache_manifest,
+)
 from real_motion.canonical_repair_batch import batched_repair_losses
+from real_motion.final_dataflow import batch_frozen_motion, parallel_frozen_motion
 from real_motion.column_runtime_pipeline import prefetch_raw_columns
 from real_motion.column_execution import execution_session
 from real_motion.nuscenes_adapter import gt_moving_support_sequence
@@ -40,8 +57,39 @@ def execution_kernels(provider):
 
 
 def build_inputs(provider,prep):
+    """Build the complete inference domain.
+
+    Persistent TRAIN/VAL history caches already contain the exact compact
+    canonical population.  For quality evaluation, materialize ALL feature rows
+    from that cached population instead of rebuilding entity lattices/support
+    from raw history.  Learned motion/projection/probabilities remain fresh.
+
+    Official FPS does not attach the persistent history cache, so its frozen
+    timing boundary is unchanged.
+    """
+    causal=(prep.raw or {}).get('_column_causal_preparation') or {}
+    compact=causal.get('_ccr_compact_support')
+    cached=bool((prep.raw or {}).get('_ccr_history_cache_hit'))
+    if compact is not None and cached:
+        ids=np.arange(len(compact),dtype=np.int64)
+        evidence=materialize_compact_canonical(
+            compact,prep,provider.pcfg.grid,ids)
+        if getattr(provider,'ccr_verify_cached_full_evidence_remaining',0)>0:
+            execution=getattr(provider,'ccr_execution',None)
+            legacy=(build_canonical_evidence(prep,provider.pcfg.grid)
+                    if execution is None else execution.build(prep,provider.pcfg.grid))
+            for name in ('features','labels','actor','classes','world','presence'):
+                if not np.array_equal(getattr(evidence,name),getattr(legacy,name)):
+                    raise RuntimeError(
+                        f'cached full CCR evidence parity failed: {name}')
+            provider.ccr_verify_cached_full_evidence_remaining=0
+            print(
+                f'CCR_CACHED_FULL_EVIDENCE_PARITY PASS points={len(evidence)}',
+                flush=True)
+        return evidence
     execution=getattr(provider,'ccr_execution',None)
-    return build_canonical_evidence(prep,provider.pcfg.grid) if execution is None else execution.build(prep,provider.pcfg.grid)
+    return (build_canonical_evidence(prep,provider.pcfg.grid)
+            if execution is None else execution.build(prep,provider.pcfg.grid))
 
 
 def map_inputs(provider,evidence,prep):
@@ -57,10 +105,83 @@ def add_args(parser):
     parser.add_argument('--ccr-cpu-execution',choices=('numpy','native','native_parallel'),default='numpy')
     parser.add_argument('--ccr-cpu-workers',type=int,default=4)
     parser.add_argument('--ccr-batched-head',action='store_true',help='same window-wise loss, batched point MLP; FP rounding may differ')
+    parser.add_argument('--ccr-batched-motion',action='store_true',
+                        help='one frozen V18 forward per packed window batch; enable only after parity gate')
+    parser.add_argument('--ccr-fast-train',action='store_true',
+                        help='max execution-only speed: batched frozen motion/head, lazy sampled features, minimal prefetched geometry')
+    parser.add_argument('--ccr-prefetch-workers',type=int,default=16,
+                        help='CPU window look-ahead workers for --ccr-fast-train (bounded to 32)')
+    parser.add_argument('--ccr-motion-superbatch-updates',type=int,default=1,
+                        help='prepare this many logical 4-window updates together; optimizer batch stays unchanged')
+    parser.add_argument('--ccr-motion-streams',type=int,default=4,
+                        help='independent CUDA streams for frozen V18 window forwards in fast mode')
+    parser.add_argument('--ccr-history-cache',
+                        help='persistent fixed causal-history geometry cache built by build_p0_f9_ccr_history_cache.py')
+    parser.add_argument('--ccr-history-cache-mode',choices=('off','require'),default='off',
+                        help='require=fail closed on any missing history-geometry window; never rebuild during training')
+    parser.add_argument('--ccr-history-cache-ram-mib',type=int,default=1024,
+                        help='bounded RAM LRU for verified persistent TRAIN history-geometry artifacts')
+    parser.add_argument('--ccr-val-history-cache',
+                        help='persistent VAL fixed-history geometry cache for quality evaluation only')
+    parser.add_argument('--ccr-val-history-cache-ram-mib',type=int,default=512,
+                        help='bounded RAM LRU for verified persistent VAL history-geometry artifacts')
+    parser.add_argument('--warm-start-head',
+                        help='Point CCR checkpoint used for WEIGHTS+positive_weight only; fresh optimizer/schedule/population')
+    parser.add_argument(
+        '--ccr-add-only-natural-bce', action='store_true',
+        help=('experimental clean repair objective: train ADD only with importance-corrected natural-prior BCE; '
+              'positive_weight=1, REMOVE disabled at evaluation. Use a random head; no warm start.'))
 
 
 def make_head(teacher, device):
     return CanonicalRepairHead(source_dim=teacher.columns.source_dim).to(device)
+
+
+def warm_start_head(head, path, *, teacher_sha256, config_fingerprint, dev_manifest_fingerprint=None):
+    """Load only Point-CCR weights/calibration; never optimizer/RNG/cursor.
+
+    This is a new full-data continuation experiment, not an exact resume of the
+    finite 20%-TRAIN screen. Reusing positive_weight keeps probability
+    calibration fixed so the first question is training/data coverage.
+    """
+    saved=torch.load(path,map_location='cpu',weights_only=False);c=saved.get('contract',{})
+    if (saved.get('protocol')!=PROTOCOL or c.get('protocol')!=PROTOCOL
+            or saved.get('transport_frozen') is not True
+            or c.get('teacher_sha256')!=teacher_sha256
+            or c.get('config_fingerprint')!=config_fingerprint
+            or (dev_manifest_fingerprint is not None and c.get('dev_manifest_fingerprint')!=dev_manifest_fingerprint)
+            or c.get('model')!=model_contract(head)):
+        raise RuntimeError('warm-start Point CCR checkpoint/teacher/config/model mismatch')
+    state=saved.get('head')
+    if not isinstance(state,dict):
+        raise RuntimeError('warm-start checkpoint lacks Point CCR head state')
+    head.load_state_dict(state,strict=True)
+    if (not all(torch.isfinite(v).all() for v in head.state_dict().values())
+            or not bool((head.positive_weight>=1).all())):
+        raise RuntimeError('warm-start Point CCR has invalid weights/calibration')
+    prior=saved.get('reports',{}).get('train_prior')
+    if not prior or 'positive_weights' not in prior:
+        raise RuntimeError('warm-start Point CCR lacks persisted TRAIN-only positive weights')
+    initial=saved.get('reports',{}).get('initial_dev64')
+    reusable_old=None
+    if initial and initial.get('variants',{}).get('old_joint'):
+        reusable_old={
+            'baseline':initial.get('baseline'),
+            'variants':{'old_joint':initial['variants']['old_joint']},
+            'windows':initial.get('windows',64),
+            'reused_reference_only':True,
+            'source_checkpoint_sha256':sha256(path),
+        }
+    return dict(
+        checkpoint_sha256=sha256(path),
+        source_epoch=int(saved.get('epoch',0)),
+        source_updates=int(saved.get('updates',0)),
+        source_train_fraction=float(c.get('train_fraction',float('nan'))),
+        positive_weights=np.asarray(head.positive_weight.detach().cpu()).tolist(),
+        train_prior={**prior,'reused_for_full_data_warm_start':True,
+                     'note':'kept fixed to isolate training/data coverage; not recalibrated on DEV'},
+        reusable_initial_dev64_old=reusable_old,
+    )
 
 
 def model_contract(head):
@@ -70,17 +191,142 @@ def model_contract(head):
 def contract_extra(args, root):
     if min(args.descriptor_disk_mib, args.descriptor_ram_mib) < 0 or args.samples_per_role < 1:
         raise ValueError('invalid finite CCR cache/sampling budget')
+    add_only=bool(getattr(args,'ccr_add_only_natural_bce',False))
+    if add_only and getattr(args,'warm_start_head',None):
+        raise ValueError('--ccr-add-only-natural-bce requires a random head; do not mix old weighted-BCE warm-start logits')
     files = ('real_motion/canonical_causal_repair.py', 'real_motion/canonical_repair_context.py',
              'tools/real_motion/ccr_screen_common.py', 'tools/real_motion/train_p0_f9_point_ccr.py',
              'tools/real_motion/pilot_p0_f9_canonical_causal_repair.py','real_motion/canonical_repair_execution.py',
              'real_motion/canonical_repair_batch.py','real_motion/native/column_cpu.cpp')
-    return dict(objective='equal_window_role_action_BCE_causal_MC_GT_only',
-                thresholds=dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95)),
-                samples_per_role=args.samples_per_role, remove_loss_weight=.25,
+    result = dict(
+                objective=('equal_window_role_balanced_ADD_only_natural_prior_BCE_causal_MC_GT_only'
+                           if add_only else 'equal_window_role_action_BCE_causal_MC_GT_only'),
+                thresholds=(dict(CCR_ADD=.5, CCR_REMOVE=None, old_Local=(.5, .5, .95))
+                            if add_only else dict(CCR_ADD=.5, CCR_REMOVE=.95, old_Local=(.5, .5, .95))),
+                samples_per_role=args.samples_per_role,
+                remove_loss_weight=(0.0 if add_only else .25),
+                add_only_natural_bce=add_only,
                 cpu_execution=getattr(args,'ccr_cpu_execution','numpy'),cpu_workers=getattr(args,'ccr_cpu_workers',4),
-                batched_head=getattr(args,'ccr_batched_head',False),
+                batched_head=bool(getattr(args,'ccr_batched_head',False) or getattr(args,'ccr_fast_train',False)),
+                fast_train=bool(getattr(args,'ccr_fast_train',False)),
+                lazy_sampled_features=bool(getattr(args,'ccr_fast_train',False)),
+                prefetch_workers=(min(32,max(1,getattr(args,'ccr_prefetch_workers',16)))
+                                  if getattr(args,'ccr_fast_train',False) else None),
+                motion_superbatch_updates=(max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
+                                           if getattr(args,'ccr_fast_train',False) else 1),
+                motion_streams=(max(1,int(getattr(args,'ccr_motion_streams',4)))
+                                if getattr(args,'ccr_fast_train',False) else 1),
                 support=SUPPORT_NOTE,
                 ccr_implementation=stable_json_fingerprint({p: sha256(root/p) for p in files}))
+    # Preserve old checkpoint identity when the new execution-only batching is
+    # disabled. Enabling it creates an explicit new training execution contract.
+    if getattr(args,'ccr_batched_motion',False) or getattr(args,'ccr_fast_train',False):
+        result['batched_motion'] = True
+    warm=getattr(args,'warm_start_head',None)
+    if warm:
+        if not Path(warm).is_file():
+            raise ValueError('missing --warm-start-head checkpoint')
+        result['warm_start_head_sha256']=sha256(warm)
+        result['warm_start_semantics']='weights+positive_weight_only_fresh_optimizer_schedule_population'
+    return result
+
+
+def _ccr_minimal_fixed_geometry(provider, raw, record):
+    """Exact Point-CCR fixed geometry without legacy Local static/frontier work."""
+    from tools.real_motion.joint_column_full_common import build_ccr_training_geometry
+    prefetch=max(1,getattr(provider,'raw_prefetch_workers',1))
+    workers=max(1,min(2,provider.workers//prefetch))
+    profile={}
+    causal=build_ccr_training_geometry(
+        raw,record,provider.pcfg,provider.strong,workers,profile=profile)
+    causal['_ccr_fast_profile']=profile
+    return causal
+
+
+def _ccr_fast_fixed_geometry(provider, raw, record):
+    """Stable reusable fixed-history geometry; no learned outputs or future GT."""
+    return build_ccr_history_geometry(provider,raw,record)
+
+
+@contextmanager
+def _evaluation_geometry(provider, include_old):
+    """Select exact evaluation geometry without mixing incompatible cache payloads.
+
+    The reusable TRAIN/VAL CCR history cache is intentionally slim: it keeps the
+    transport renderer state + canonical support needed by Point CCR, but drops
+    legacy Local's future static memory/footprints/frontier geometry.  Therefore
+    an evaluation that also scores old Local must bypass the slim persistent VAL
+    cache and rebuild the legacy full fixed geometry live.  Current-only
+    monitoring keeps using the fast VAL cache.
+    """
+    previous=getattr(provider,'fixed_geometry_builder',None)
+    previous_val_source=getattr(provider,'ccr_val_history_cache_source',None)
+    if include_old and getattr(provider,'ccr_val_history_cache',None) is not None:
+        # A sentinel object cannot compare identical to the real dev source in
+        # PilotProvider.load_raw_columns(), so this cleanly disables only the
+        # VAL persistent cache during paired old-Local reference evaluation.
+        provider.ccr_val_history_cache_source=object()
+    if getattr(provider,'ccr_fast_train',False):
+        provider.fixed_geometry_builder=(None if include_old else _ccr_minimal_fixed_geometry)
+    try:
+        yield
+    finally:
+        provider.fixed_geometry_builder=previous
+        if getattr(provider,'ccr_val_history_cache',None) is not None:
+            provider.ccr_val_history_cache_source=previous_val_source
+
+
+def prepare_frozen_superbatch(provider, rows, teacher):
+    """Prepare several logical updates while preserving per-window V18 shapes.
+
+    First use is strictly compared with the original sequential per-window
+    execution. Any mismatch disables stream concurrency and reuses the exact
+    sequential references instead of aborting or relaxing parity.
+    """
+    if not rows:
+        raise ValueError('empty frozen-motion superbatch')
+    streams=getattr(provider,'ccr_motion_streams',1)
+    actual=parallel_frozen_motion(
+        teacher,rows,provider.device,streams=streams,render_readback=True)
+    if getattr(provider,'ccr_verify_batched_motion_remaining',0)>0:
+        reference=parallel_frozen_motion(
+            teacher,rows,provider.device,streams=1,render_readback=True)
+        mismatch=None
+        for wi,(got,ref) in enumerate(zip(actual,reference)):
+            for key,value in ref.items():
+                if key=="_column_render_numpy":
+                    for name,array in value.items():
+                        if not np.array_equal(got[key][name],array):
+                            mismatch=f"window={wi} renderer={name}"
+                            break
+                elif isinstance(value,torch.Tensor) and not torch.equal(got[key],value):
+                    diff=float((got[key].float()-value.float()).abs().max().detach().cpu())
+                    mismatch=f"window={wi} tensor={key} max_abs={diff}"
+                if mismatch is not None:break
+            if mismatch is not None:break
+        if mismatch is not None:
+            print(f'CCR_MOTION_STREAM_FALLBACK {mismatch}; using exact sequential frozen V18',flush=True)
+            provider.ccr_motion_streams=1
+            actual=reference
+        else:
+            print(f'CCR_MOTION_STREAM_PARITY PASS windows={len(rows)} streams={streams}',flush=True)
+        provider.ccr_verify_batched_motion_remaining=0
+    return actual
+
+
+def _independent_sample_loss(head, sample, plan, output, target, weight, device, *, add_only=False):
+    def upload(value):
+        return torch.as_tensor(np.ascontiguousarray(value),device=device)
+    actor=upload(sample.actor)
+    tensors={k:v for k,v in output.items() if isinstance(v,torch.Tensor)}
+    with torch.no_grad(), torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
+        live=head.project_sources(tensors)
+        encoded=head.encode(upload(sample.features),upload(sample.labels),actor,
+                            upload(sample.classes),live)
+        logits=head.decode(encoded,actor,upload(plan.context),upload(plan.base),
+                           upload(plan.fallback),upload(plan.legal),live)
+        return (_add_only_natural_loss(head,logits,actor,upload(target),upload(weight))
+                if add_only else repair_loss(head,logits,actor,upload(target),upload(weight))).float()
 
 
 def setup(provider, args):
@@ -88,6 +334,30 @@ def setup(provider, args):
     # Explicit modest RAM bounds avoid duplicating the entire 20k population.
     if args.descriptor_ram_mib > 8192:
         raise ValueError('CCR screen RAM cache is limited to 8GiB; do not use full-population RAM')
+    if not 0 <= int(getattr(args,'ccr_history_cache_ram_mib',1024)) <= 16384:
+        raise ValueError('CCR history cache RAM LRU must be in [0,16384] MiB')
+    if not 0 <= int(getattr(args,'ccr_val_history_cache_ram_mib',512)) <= 16384:
+        raise ValueError('CCR VAL history cache RAM LRU must be in [0,16384] MiB')
+    history_mode=getattr(args,'ccr_history_cache_mode','off')
+    history_root=getattr(args,'ccr_history_cache',None)
+    if history_mode!='off' and not history_root:
+        raise ValueError('--ccr-history-cache-mode require needs --ccr-history-cache')
+    fast=bool(getattr(args,'ccr_fast_train',False))
+    requested_prefetch=min(32,max(1,int(getattr(args,'ccr_prefetch_workers',16))))
+    super_updates=max(1,int(getattr(args,'ccr_motion_superbatch_updates',1)))
+    motion_streams=max(1,int(getattr(args,'ccr_motion_streams',4)))
+    # Compact support made producer work much cheaper; sampled feature/plan
+    # materialization is now the dominant CPU work inside each optimizer step.
+    # On the real 10-core allocation, 6 producer + 4 sampled workers balances
+    # the pipeline substantially better than the old 8 + 2 split.
+    sample_workers=min(4,max(1,args.cpu_workers//2)) if fast else 1
+    prefetch=min(requested_prefetch,max(1,args.cpu_workers-sample_workers))
+    if motion_streams>8:
+        raise ValueError('CCR frozen-motion CUDA streams are capped at 8')
+    if super_updates>8:
+        raise ValueError('CCR frozen-motion superbatch is capped at 8 logical updates (32 windows / <=1024 sources)')
+    if fast and prefetch>max(1,args.cpu_workers):
+        prefetch=max(1,args.cpu_workers)
     if args.descriptor_cache and args.descriptor_disk_mib:
         import shutil
         parent = Path(args.descriptor_cache).resolve()
@@ -96,14 +366,80 @@ def setup(provider, args):
         if shutil.disk_usage(parent).free < 2*2**30:
             raise RuntimeError('less than 2GiB free: disable descriptor disk writes or free space first')
     provider.ccr_execution=CanonicalCpuExecution(getattr(args,'ccr_cpu_execution','numpy'),getattr(args,'ccr_cpu_workers',4))
-    provider.ccr_batched_head=getattr(args,'ccr_batched_head',False)
+    provider.ccr_batched_head=bool(getattr(args,'ccr_batched_head',False) or fast)
+    provider.ccr_batched_motion=bool(getattr(args,'ccr_batched_motion',False) or fast)
+    provider.ccr_verify_batched_motion_remaining=1 if fast else 0
+    provider.ccr_motion_superbatch_updates=super_updates if fast else 1
+    provider.ccr_motion_streams=motion_streams if fast else 1
+    provider.ccr_verify_batched_head_remaining=1 if fast else 0
+    provider.ccr_verify_compact_remaining=1 if fast else 0
+    provider.ccr_fast_train=fast
+    provider.ccr_add_only_natural_bce=bool(getattr(args,'ccr_add_only_natural_bce',False))
+    provider.ccr_sample_workers=sample_workers
+    if fast:
+        # Generic raw prefetch (prior/eval) has a deliberately conservative
+        # <=4 contract. TRAIN has its own logical-superbatch producer budget and
+        # may still use the larger execution-only prefetch split.
+        raw_prefetch=min(4,prefetch)
+        provider.raw_prefetch_workers=provider.raw_prefetch_depth=raw_prefetch
+        # Outer window parallelism owns the CPU budget. Avoid nested raw-I/O
+        # pools multiplying window workers into hundreds of threads.
+        provider.raw_io_workers=1
+        provider.train_io_workers=prefetch
+        provider.fixed_geometry_builder=_ccr_fast_fixed_geometry
     provider.ccr_cache = FixedCanonicalCache(args.descriptor_ram_mib, neighbors=False,
         disk_root=args.descriptor_cache, max_disk_mib=args.descriptor_disk_mib, async_writes=True,
-        kernels=provider.ccr_execution.kernels,executor=provider.ccr_execution.pool)
+        kernels=provider.ccr_execution.kernels,executor=provider.ccr_execution.pool,
+        lazy_sampled=fast)
     if provider.ccr_cache.disk is not None:
         provider.ccr_cache.disk.reserve = 2*2**30
     provider.ccr_samples_per_role = args.samples_per_role
+    val_history_root=getattr(args,'ccr_val_history_cache',None)
+    if val_history_root:
+        root=Path(__file__).resolve().parents[2]
+        namespace=ccr_val_history_cache_namespace(provider,args,root)
+        provider.ccr_val_history_cache=CausalGeometryCache(
+            val_history_root,namespace,max_bytes=0,
+            ram_bytes=int(args.ccr_val_history_cache_ram_mib)*2**20,reserve_bytes=0,
+            compression_level=6)
+        provider.ccr_val_history_cache_mode='require'
+        manifest=validate_ccr_val_history_cache_manifest(provider.ccr_val_history_cache,args)
+        print('CCR_VAL_HISTORY_CACHE '+json.dumps({
+            'mode':'require','root':str(Path(val_history_root).resolve()),
+            'namespace':provider.ccr_val_history_cache.namespace,
+            'ram_mib':args.ccr_val_history_cache_ram_mib,
+            'disk_gib':manifest.get('disk_gib')},sort_keys=True),flush=True)
+    if history_root and history_mode!='off':
+        root=Path(__file__).resolve().parents[2]
+        namespace=ccr_history_cache_namespace(provider,args,root)
+        provider.ccr_history_cache=CausalGeometryCache(
+            history_root,namespace,max_bytes=0,
+            ram_bytes=int(args.ccr_history_cache_ram_mib)*2**20,reserve_bytes=0,
+            compression_level=6)
+        provider.ccr_history_cache_mode=history_mode
+        manifest_path=provider.ccr_history_cache.root/'manifest.json'
+        if history_mode=='require':
+            if not manifest_path.is_file():
+                raise RuntimeError(f'required CCR history cache manifest missing: {manifest_path}')
+            manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+            if (manifest.get('complete') is not True or int(manifest.get('windows',-1))!=20430
+                    or manifest.get('namespace')!=provider.ccr_history_cache.namespace
+                    or manifest.get('future_GT_cached') is not False
+                    or manifest.get('learned_outputs_cached') is not False):
+                raise RuntimeError('required CCR history cache manifest is incomplete or provenance-invalid')
+        print('CCR_HISTORY_CACHE '+json.dumps({
+            'mode':history_mode,'root':str(Path(history_root).resolve()),
+            'namespace':provider.ccr_history_cache.namespace,
+            'ram_mib':args.ccr_history_cache_ram_mib},sort_keys=True),flush=True)
     print('CCR_FIXED_INPUT_CACHE '+json.dumps(provider.ccr_cache.stats()), flush=True)
+    if provider.ccr_add_only_natural_bce:
+        print('CCR_OBJECTIVE ADD_ONLY_NATURAL_BCE positive_weight=1 REMOVE_disabled threshold_ADD=0.5',flush=True)
+    if fast:
+        print(f'CCR_FAST_TRAIN independent_motion_streams={motion_streams} batched_head=1 '
+              f'compact_sampled_only=1 minimal_geometry=1 '
+              f'cpu_split=producer{prefetch}+sample{sample_workers}/{args.cpu_workers} '
+              f'motion_superbatch_updates={super_updates} '
+              f'(logical optimizer batch remains 4 windows)',flush=True)
 
 
 def close(provider, result):
@@ -112,14 +448,38 @@ def close(provider, result):
         if cache.disk is not None:
             cache.disk.flush()
         result['descriptor_cache'] = cache.stats(); cache.close()
+    history=getattr(provider,'ccr_history_cache',None)
+    if history is not None:
+        result['ccr_history_cache']=history.stats()
+        history.close()
+    val_history=getattr(provider,'ccr_val_history_cache',None)
+    if val_history is not None:
+        result['ccr_val_history_cache']=val_history.stats()
+        val_history.close()
     execution=getattr(provider,'ccr_execution',None)
     if execution is not None:execution.close()
 
 
 @torch.no_grad()
 def calibrate_train(provider, source, records, teacher, head, *, progress=None, stop_event=None):
-    counts = np.zeros((2, 2, 2), np.int64)
     started = time.perf_counter()
+    if getattr(provider,'ccr_add_only_natural_bce',False):
+        # This objective has no fitted prior/calibration parameter.  Causal
+        # sampling is GT-independent and importance-corrected during each
+        # update, so scanning a TRAIN prefix here would be wasted work.
+        weights=np.ones((2,2),np.float32)
+        head.positive_weight.copy_(torch.as_tensor(weights,device=provider.device))
+        report=dict(
+            population='none; ADD-only natural-prior objective requires no fitted TRAIN prior',
+            windows=0,counts=None,positive_weights=weights.tolist(),
+            seconds=time.perf_counter()-started,
+            objective='role-balanced ADD-only natural-prior BCE',
+            probability_correction='none; sigmoid(logit) is used directly')
+        if progress:
+            progress(dict(event='ccr_train_prior',**report))
+        print('CCR_TRAIN_PRIOR SKIP add-only natural BCE needs no fitted prior',flush=True)
+        return report
+    counts = np.zeros((2, 2, 2), np.int64)
     for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records), 1):
         if stop_event is not None and stop_event.is_set():
             raise InterruptedError('TRAIN-only prior interrupted; restart prior before any update')
@@ -136,45 +496,233 @@ def calibrate_train(provider, source, records, teacher, head, *, progress=None, 
         if wi == 1 or wi % 32 == 0 or wi == len(records):
             print(f'CCR_TRAIN_PRIOR {wi}/{len(records)} unsampled TRAIN_only', flush=True)
     weights = np.sqrt(counts[..., 0]/np.maximum(counts[..., 1], 1)).clip(1, 32).astype(np.float32)
+    correction='subtract log(pos_weight); not empirical calibration guarantee'
+    objective='role/action weighted BCE'
     head.positive_weight.copy_(torch.as_tensor(weights, device=provider.device))
     report = dict(population='TRAIN-only full unsampled legal CCR action support', windows=len(records),
                   counts=counts.tolist(), positive_weights=weights.tolist(), seconds=time.perf_counter()-started,
-                  probability_correction='subtract log(pos_weight); not empirical calibration guarantee')
+                  objective=objective,probability_correction=correction)
     if progress:
         progress(dict(event='ccr_train_prior', **report))
     return report
 
 
-def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=None):
+def _add_only_natural_loss(head,logits,actors,target,weight):
+    """Importance-corrected natural-prior ADD BCE, equal static/dynamic role weight."""
+    roles=actors>=0
+    bce=torch.nn.functional.binary_cross_entropy_with_logits(
+        logits[...,0].float(),target[...,0].float(),reduction='none')
+    loss=logits.sum()*0
+    for role in (False,True):
+        w=weight[...,0]*(roles==role)[:,None]
+        loss=loss+(bce*w).sum()/w.sum().clamp_min(1)
+    return loss
+
+
+def _batched_add_only_losses(head,evidences,plans,output,source_sizes,targets,weights,device):
+    count=len(evidences)
+    if not (count==len(plans)==len(source_sizes)==len(targets)==len(weights)) or not count:
+        raise ValueError('nonempty equal ADD-only window lists required')
+    if sum(source_sizes)!=len(output['history_source_context']):
+        raise ValueError('live source population mismatch')
+    actors=[];offset=0
+    for evidence,n in zip(evidences,source_sizes):
+        actor=evidence.actor.astype(np.int64,copy=True);dynamic=actor>=0
+        if np.any(actor[dynamic]>=n):
+            raise ValueError('local actor exceeds its source population')
+        actor[dynamic]+=offset;offset+=n;actors.append(actor)
+    lengths=[len(e) for e in evidences]
+    def upload(values):
+        return torch.as_tensor(np.ascontiguousarray(np.concatenate(values)),device=device)
+    actor=upload(actors)
+    with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
+        live=head.project_sources(output)
+        encoded=head.encode(
+            upload([e.features for e in evidences]),upload([e.labels for e in evidences]),
+            actor,upload([e.classes for e in evidences]),live)
+        logits=head.decode(
+            encoded,actor,upload([p.context for p in plans]),upload([p.base for p in plans]),
+            upload([p.fallback for p in plans]),upload([p.legal for p in plans]),live)
+        y=upload(targets);w=upload(weights);cursor=0;losses=[]
+        for n in lengths:
+            sl=slice(cursor,cursor+n);cursor+=n
+            losses.append(_add_only_natural_loss(head,logits[sl],actor[sl],y[sl],w[sl]))
+    return losses
+
+
+def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=None, frozen_outputs=None):
     if not rows or any(p.requires_grad for p in teacher.parameters()):
         raise RuntimeError('nonempty whole-window batch and frozen epoch19 motion required')
     device = provider.device; sync(device); started = time.perf_counter()
     head.train(); teacher.eval(); optimizer.zero_grad(set_to_none=True)
     stages = defaultdict(float); losses = []; sampled = total = 0
-    packed=[];outputs=[];sizes=[]
-    for record, raw in rows:
+    packed=[];outputs=[];sizes=[];pending=[]
+    batched_motion = frozen_outputs; motion_refs = None
+    if batched_motion is not None:
+        if len(batched_motion)!=len(rows):
+            raise RuntimeError('precomputed frozen V18 output/window count mismatch')
+        stages['precomputed_batched_motion'] += 0.0
+        if getattr(provider,'ccr_verify_batched_motion_remaining',0)>0:
+            with torch.no_grad():
+                motion_refs=[teacher.motion(record,device) for record,_ in rows]
+            for got,ref in zip(batched_motion,motion_refs):
+                for key,value in ref.items():
+                    if not isinstance(value,torch.Tensor):continue
+                    other=got[key]
+                    if not torch.allclose(other,value,rtol=2e-5,atol=2e-6):
+                        diff=float((other.float()-value.float()).abs().max().detach().cpu())
+                        raise RuntimeError(f'precomputed superbatched V18 parity failed: {key} max_abs={diff}')
+    elif getattr(provider,'ccr_batched_motion',False):
         tick = time.perf_counter()
         with torch.no_grad():
-            output = teacher.motion(record, device)
-            prep = provider.prepare_columns(None, record, include_gt=True, raw_window=raw, outputs=output)
+            batched_motion = batch_frozen_motion(teacher, rows, device, render_readback=True)
+            if getattr(provider,'ccr_verify_batched_motion_remaining',0)>0:
+                motion_refs=[teacher.motion(record,device) for record,_ in rows]
+                for got,ref in zip(batched_motion,motion_refs):
+                    for key,value in ref.items():
+                        if not isinstance(value,torch.Tensor):continue
+                        other=got[key]
+                        if not torch.allclose(other,value,rtol=2e-5,atol=2e-6):
+                            diff=float((other.float()-value.float()).abs().max().detach().cpu())
+                            raise RuntimeError(f'batched frozen V18 parity failed: {key} max_abs={diff}')
+        stages['batched_motion_forward'] += time.perf_counter()-tick
+
+    def materialize(evidence,ids,importance,prep,conflicts,gt,compact=None,compact_conflicts=None):
+        if compact is None:
+            sample,plan=map_sampled_canonical(
+                evidence,ids,prep,provider.pcfg.grid,conflicts,
+                kernels=execution_kernels(provider))
+        else:
+            sample,plan=map_sampled_compact_canonical(
+                compact,ids,prep,provider.pcfg.grid,kernels=execution_kernels(provider),
+                static_conflicts=compact_conflicts)
+        y,valid=repair_targets(sample,plan,gt)
+        return sample,plan,y,importance[:,None,None]*valid
+
+    for row_index, (record, raw) in enumerate(rows):
+        tick = time.perf_counter()
+        with torch.no_grad():
+            output = (batched_motion[row_index] if batched_motion is not None
+                      else teacher.motion(record, device))
+            ref_prep=None
+            if motion_refs is not None:
+                ref_prep=provider.prepare_columns(
+                    None,record,include_gt=True,raw_window=raw,outputs=motion_refs[row_index])
+            # A completed persistent TRAIN cache intentionally stores a slim
+            # prepared_state and omits dense/current/previous Strong inputs.
+            # If the warm-start reused both TRAIN prior and initial DEV64, the
+            # very first renderer exactness gate can therefore occur here.
+            # Run that ONE preflight through the original live preparation
+            # path, then immediately restore the immutable cached geometry for
+            # compact sampling.  This does not alter the persistent cache
+            # namespace or any later training window.
+            cached_causal=raw.get('_column_causal_preparation')
+            if cached_causal is not None and not getattr(provider,'columns_checked',False):
+                del raw['_column_causal_preparation']
+                try:
+                    prep = provider.prepare_columns(
+                        None, record, include_gt=True, raw_window=raw, outputs=output)
+                finally:
+                    raw['_column_causal_preparation']=cached_causal
+                print('CCR_CACHE_LIVE_EXACTNESS_PREFLIGHT PASS; persistent TRAIN cache preserved',flush=True)
+            else:
+                prep = provider.prepare_columns(
+                    None, record, include_gt=True, raw_window=raw, outputs=output)
+            if ref_prep is not None:
+                for name in ('baseline','owners','fallbacks'):
+                    a=getattr(prep,name);b=getattr(ref_prep,name)
+                    if len(a)!=len(b) or any(not np.array_equal(x,y) for x,y in zip(a,b)):
+                        raise RuntimeError(f'batched frozen V18 rendered {name} parity failed')
         stages['live_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
-        evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
-        conflicts = provider.ccr_cache.static_conflicts(evidence, prep, provider.pcfg.grid)
+
+        causal=raw.get('_column_causal_preparation') or {}
+        compact=causal.get('_ccr_compact_support')
+        compact_conflicts=causal.get('_ccr_compact_conflicts')
+        prefetched=causal.get('_ccr_prefetched_fixed')
+        evidence=conflicts=None
+        if compact is not None:
+            stages['compact_support_hits'] += 1
+        elif prefetched is not None:
+            evidence,_=prefetched
+            conflicts=causal['_ccr_prefetched_conflicts']
+            stages['prefetched_fixed_input_hits'] += 1
+        else:
+            evidence, _ = provider.ccr_cache.get(prep, provider.pcfg.grid)
+            conflicts = provider.ccr_cache.static_conflicts(evidence, prep, provider.pcfg.grid)
         stages['fixed_input_hash_cache_conflicts'] += time.perf_counter()-tick; tick = time.perf_counter()
-        # Sample BEFORE future projection/GT labels. Every class/source/history
-        # stratum has positive inclusion probability; N/k restores sums.
+
         if getattr(provider,'ccr_batched_head',False):
-            from real_motion.canonical_repair_context import sample_causal_points,map_sampled_canonical
-            ids,importance=sample_causal_points(evidence,rng,per_role=provider.ccr_samples_per_role)
-            sample,plan=map_sampled_canonical(evidence,ids,prep,provider.pcfg.grid,conflicts,kernels=execution_kernels(provider))
-            y,valid=repair_targets(sample,plan,raw['future_gt_occ']);weight=importance[:,None,None]*valid
-            packed.append((sample,plan,y,weight));outputs.append(output);sizes.append(len(output['history_source_context']))
-            sampled+=len(ids);total+=len(evidence)
-            stages['sample_live_projection_encoder_loss']+=time.perf_counter()-tick
+            rng_before=copy.deepcopy(rng.bit_generator.state) if compact is not None and getattr(provider,'ccr_verify_compact_remaining',0)>0 else None
+            if compact is not None:
+                ids,importance=sample_compact_causal_points(compact,rng,per_role=provider.ccr_samples_per_role)
+                population=len(compact)
+            else:
+                ids,importance=sample_causal_points(evidence,rng,per_role=provider.ccr_samples_per_role)
+                population=len(evidence)
+            if rng_before is not None:
+                # One real-window gate: compact support must reproduce the old
+                # complete-evidence population, sample IDs/weights and sampled
+                # plan/targets exactly. The live RNG is consumed only once.
+                legacy,_=build_fixed_canonical(
+                    prep,provider.pcfg.grid,neighbors=False,kernels=execution_kernels(provider),
+                    executor=None,lazy_sampled=True)
+                shadow=np.random.default_rng();shadow.bit_generator.state=rng_before
+                old_ids,old_importance=sample_causal_points(
+                    legacy,shadow,per_role=provider.ccr_samples_per_role)
+                if not np.array_equal(ids,old_ids) or not np.array_equal(importance,old_importance):
+                    raise RuntimeError('compact CCR sampler parity failed')
+                old_conflicts=full_static_conflicts(legacy,prep,provider.pcfg.grid)
+                old_item=materialize(legacy,old_ids,old_importance,prep,old_conflicts,raw['future_gt_occ'])
+                new_item=materialize(None,ids,importance,prep,None,raw['future_gt_occ'],
+                                     compact=compact,compact_conflicts=compact_conflicts)
+                for ai,bi in zip(old_item[:2],new_item[:2]):
+                    names=('features','labels','actor','classes','world','presence') if hasattr(ai,'features') else ('flat','base','fallback','legal','context')
+                    for name in names:
+                        if not np.array_equal(getattr(ai,name),getattr(bi,name)):
+                            raise RuntimeError(f'compact CCR sampled parity failed: {name}')
+                if not np.array_equal(old_item[2],new_item[2]) or not np.array_equal(old_item[3],new_item[3]):
+                    raise RuntimeError('compact CCR target/weight parity failed')
+                print(f'CCR_COMPACT_SAMPLE_PARITY PASS population={population} sampled={len(ids)}',flush=True)
+                provider.ccr_verify_compact_remaining=0
+                item=new_item
+                pending.append((row_index,item,output,population,len(ids)))
+                stages['compact_parity_gate']+=time.perf_counter()-tick
+                continue
+            if candidate_pool is not None and len(rows)>1:
+                fut=candidate_pool.submit(
+                    materialize,evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],
+                    compact,compact_conflicts)
+                pending.append((row_index,fut,output,population,len(ids)))
+            else:
+                item=materialize(evidence,ids,importance,prep,conflicts,raw['future_gt_occ'],
+                                 compact,compact_conflicts)
+                pending.append((row_index,item,output,population,len(ids)))
+            stages['sample_dispatch']+=time.perf_counter()-tick
             continue
-        loss, n = loss_for_causal(head, evidence, output, prep, provider.pcfg.grid,
-            raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role,
-            kernels=execution_kernels(provider))
+
+        if getattr(provider,'ccr_add_only_natural_bce',False):
+            ids,importance=sample_causal_points(
+                evidence,rng,per_role=provider.ccr_samples_per_role)
+            sample,plan=map_sampled_canonical(
+                evidence,ids,prep,provider.pcfg.grid,conflicts,
+                kernels=execution_kernels(provider))
+            target,valid=repair_targets(sample,plan,raw['future_gt_occ'])
+            actor=torch.as_tensor(np.ascontiguousarray(sample.actor),device=device)
+            def upload(value):
+                return torch.as_tensor(np.ascontiguousarray(value),device=device)
+            with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
+                live=head.project_sources(output)
+                encoded=head.encode(upload(sample.features),upload(sample.labels),actor,
+                                    upload(sample.classes),live)
+                logits=head.decode(encoded,actor,upload(plan.context),upload(plan.base),
+                                   upload(plan.fallback),upload(plan.legal),live)
+                weight=importance[:,None,None]*valid
+                loss=_add_only_natural_loss(head,logits,actor,upload(target),upload(weight))
+            n=len(ids)
+        else:
+            loss, n = loss_for_causal(head, evidence, output, prep, provider.pcfg.grid,
+                raw['future_gt_occ'], rng, device, conflicts, per_role=provider.ccr_samples_per_role,
+                kernels=execution_kernels(provider))
         if not torch.isfinite(loss):
             raise RuntimeError('nonfinite CCR loss; previous completed checkpoint preserved')
         stages['sample_live_projection_encoder_loss'] += time.perf_counter()-tick; tick = time.perf_counter()
@@ -182,16 +730,47 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
         stages['backward'] += time.perf_counter()-tick
         losses.append(loss.detach()); sampled += n; total += len(evidence)
         del loss, evidence, prep, output, conflicts
-    if packed:
-        tick=time.perf_counter();fields=list(zip(*packed))
-        merged={k:torch.cat([o[k] for o in outputs],0) for k in outputs[0]}
-        batch_losses=batched_repair_losses(head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
+
+    if motion_refs is not None:
+        provider.ccr_verify_batched_motion_remaining=0
+
+    if pending:
+        tick=time.perf_counter()
+        for row_index,item,output,n_total,n_sample in pending:
+            sample,plan,y,weight=(item.result() if hasattr(item,'result') else item)
+            packed.append((sample,plan,y,weight));outputs.append(output)
+            sizes.append(len(output['history_source_context']))
+            sampled+=n_sample;total+=n_total
+        stages['sample_materialize_wait']+=time.perf_counter()-tick
+        fields=list(zip(*packed))
+        merged={
+            k:torch.cat([o[k] for o in outputs],0)
+            for k,v in outputs[0].items() if isinstance(v,torch.Tensor)
+        }
+        tick=time.perf_counter()
+        add_only=bool(getattr(provider,'ccr_add_only_natural_bce',False))
+        batch_losses=(_batched_add_only_losses(
+            head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device)
+            if add_only else batched_repair_losses(
+                head,fields[0],fields[1],merged,sizes,fields[2],fields[3],device))
+        if getattr(provider,'ccr_verify_batched_head_remaining',0)>0:
+            refs=torch.stack([
+                _independent_sample_loss(
+                    head,row[0],row[1],output,row[2],row[3],device,add_only=add_only)
+                for row,output in zip(packed,outputs)
+            ])
+            actual=torch.stack([v.float() for v in batch_losses])
+            if not torch.allclose(actual,refs,rtol=5e-3,atol=5e-4):
+                diff=float((actual-refs).abs().max().detach().cpu())
+                raise RuntimeError(f'batched Point CCR loss parity failed: max_abs={diff}')
+            provider.ccr_verify_batched_head_remaining=0
         loss=sum(batch_losses)/len(rows)
         if not torch.isfinite(loss):raise RuntimeError('nonfinite batched CCR loss')
-        stages['sample_live_projection_encoder_loss']+=time.perf_counter()-tick;tick=time.perf_counter()
+        stages['batched_head_forward_loss']+=time.perf_counter()-tick;tick=time.perf_counter()
         loss.backward();stages['backward']+=time.perf_counter()-tick
         losses=[v.detach() for v in batch_losses]
-        del batch_losses,loss,merged,fields,packed,outputs,evidence,prep,output,conflicts
+        del batch_losses,loss,merged,fields,packed,outputs
+
     tick = time.perf_counter(); norm = torch.nn.utils.clip_grad_norm_(head.parameters(), 5.)
     if not torch.isfinite(norm):
         raise RuntimeError('nonfinite CCR gradient; previous completed checkpoint preserved')
@@ -217,23 +796,56 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
     teacher.eval(); head.eval(); names = ('static_repair', 'dynamic_repair', 'joint') + (('old_joint',) if include_old else ())
     base = Metrics(); metrics = {name: Metrics() for name in names}
     quality = {name: defaultdict(int) for name in names}
+    # role(static/dynamic) x action(ADD/REMOVE): tp/fp/fn/valid
+    action_counts=np.zeros((2,2,4),np.int64)
     scenes = defaultdict(lambda: {name: Metrics() for name in ('baseline', *names)})
     started = previous = time.perf_counter(); stages = defaultdict(float)
-    with old_execution(teacher, provider) if include_old else nullcontext():
+    with _evaluation_geometry(provider,include_old), (old_execution(teacher, provider) if include_old else nullcontext()):
         for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records), 1):
             tick = time.perf_counter(); stages['input_wait'] += tick-previous
             if stop_event is not None and stop_event.is_set():
                 raise InterruptedError('CCR evaluation interrupted; resume last completed training checkpoint')
             output = teacher.motion(record, provider.device)
-            prep = provider.prepare_columns(source, record, include_gt=True, raw_window=raw, outputs=output)
+            cached_causal=raw.get('_column_causal_preparation')
+            if cached_causal is not None and raw.get('_ccr_history_cache_hit') and not getattr(provider,'columns_checked',False):
+                # Persistent VAL geometry is intentionally slim. Preserve the
+                # renderer's one-time live exactness gate, then restore the
+                # immutable cached support for all subsequent evidence work.
+                del raw['_column_causal_preparation']
+                try:
+                    prep=provider.prepare_columns(
+                        source,record,include_gt=True,raw_window=raw,outputs=output)
+                finally:
+                    raw['_column_causal_preparation']=cached_causal
+                print('CCR_VAL_CACHE_LIVE_EXACTNESS_PREFLIGHT PASS',flush=True)
+            else:
+                prep = provider.prepare_columns(
+                    source, record, include_gt=True, raw_window=raw, outputs=output)
             stages['prepare_motion_render'] += time.perf_counter()-tick; tick = time.perf_counter()
             # Fresh complete causal domain. Evaluation never samples by GT or
             # reuses TRAIN sampled plans/learned features.
             evidence = build_inputs(provider,prep)
             plan = map_inputs(provider,evidence,prep)
             p = probabilities(head, evidence, plan, output, provider.device)
-            predictions = {name: compose_canonical(prep.baseline, evidence, plan, p[..., 0], p[..., 1],
-                role={'static_repair': 'static', 'dynamic_repair': 'dynamic', 'joint': 'all'}[name])
+            target,valid=repair_targets(evidence,plan,raw['future_gt_occ'])
+            add_only=bool(getattr(provider,'ccr_add_only_natural_bce',False))
+            predicted=np.stack(
+                (p[...,0]>=.5,np.zeros_like(p[...,1],dtype=bool) if add_only else p[...,1]>=.95),
+                axis=-1)&plan.legal
+            roles=evidence.actor>=0
+            for role in (0,1):
+                role_mask=(roles==bool(role))[:,None]
+                for action in (0,1):
+                    mask=valid[...,action]&role_mask
+                    y=target[...,action]&mask;z=predicted[...,action]&mask
+                    action_counts[role,action]+=(
+                        int((y&z).sum()),int((~y&z&mask).sum()),
+                        int((y&~z).sum()),int(mask.sum()))
+            remove=np.zeros_like(p[...,1],dtype=np.float32) if add_only else p[...,1]
+            predictions = {name: compose_canonical(
+                prep.baseline,evidence,plan,p[...,0],remove,
+                thresholds=(.5,None) if add_only else (.5,.95),
+                role={'static_repair':'static','dynamic_repair':'dynamic','joint':'all'}[name])
                 for name in names if name != 'old_joint'}
             stages['fresh_canonical_all_six_probabilities_compose'] += time.perf_counter()-tick; tick = time.perf_counter()
             support = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
@@ -257,14 +869,27 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
             if wi == 1 or wi % 16 == 0 or wi == len(records):
                 print(f'CCR_EVAL {wi}/{len(records)}', flush=True)
     report = columns.report_states(base, metrics, quality, scenes)
-    report.update(windows=len(records), seconds=time.perf_counter()-started, stages_seconds=dict(stages), support=SUPPORT_NOTE)
+    action_learning={}
+    for role,name in ((0,'static'),(1,'dynamic')):
+        for action,label in ((0,'ADD'),(1,'REMOVE')):
+            tp,fp,fn,valid_count=[int(x) for x in action_counts[role,action]]
+            action_learning[f'{name}/{label}']=dict(
+                tp=tp,fp=fp,fn=fn,valid=valid_count,
+                precision=(tp/(tp+fp) if tp+fp else None),
+                recall=(tp/(tp+fn) if tp+fn else None))
+    report.update(windows=len(records), seconds=time.perf_counter()-started, stages_seconds=dict(stages),
+                  support=SUPPORT_NOTE,action_learning=action_learning)
     return report
 
 
 @torch.no_grad()
 def six_frame_speed(provider, source, records, teacher, head, *, repeats=2, stop_event=None):
+    if getattr(provider,'ccr_add_only_natural_bce',False):
+        raise RuntimeError(
+            'ADD-only experimental screen has no frozen official FPS protocol yet; '
+            'stop at an epoch boundary and evaluate quality first')
     teacher.eval(); head.eval(); trials = []
-    with old_execution(teacher, provider):
+    with _evaluation_geometry(provider,True), old_execution(teacher, provider):
         for wi, (record, raw) in enumerate(prefetch_raw_columns(provider, source, records, include_gt=False), 1):
             if raw.get('future_gt_occ') is not None:
                 raise RuntimeError('FPS cannot load future GT')
@@ -297,17 +922,26 @@ def gate(new, old, speed):
 
 
 def brief(result):
+    warm=bool(result.get('warm_start'))
+    prior=result.get('reports',{}).get('train_prior',{})
+    add_only=(prior.get('objective')=='role-balanced ADD-only natural-prior BCE')
     lines = ['===== POINT CCR / GT-ONLY THREE-PASS SCREEN =====', 'status: '+result['status'], 'protocol: '+PROTOCOL,
-             '4 histories -> 6 futures; epoch19 motion FROZEN; RANDOM point head; no KD/AE.',
-             'Fixed CCR_ADD=0.5 / CCR_REMOVE=0.95; old Local=(0.5,0.5,0.95).',
+             '4 histories -> 6 futures; epoch19 motion FROZEN; '+('WARM-START point head' if warm else 'RANDOM point head')+'; no KD/AE.',
+             ('ADD-ONLY natural-prior BCE; fixed CCR_ADD=0.5; REMOVE disabled.'
+              if add_only else 'Fixed CCR_ADD=0.5 / CCR_REMOVE=0.95; old Local=(0.5,0.5,0.95).'),
              'Support: '+SUPPORT_NOTE]
     if 'training_population' in result:
         lines.append('TRAIN '+json.dumps(result['training_population']))
     reports = result.get('reports', {}); initial = reports.get('initial_dev64', {}).get('variants', {}).get('old_joint')
     for row in reports.get('epochs', []):
         m = row['evaluation']['variants']['joint']['metrics']
+        a=row['evaluation'].get('action_learning',{})
+        def rr(key):
+            value=a.get(key,{}).get('recall')
+            return 'n/a' if value is None else f'{100*value:.1f}%'
         lines.append(f"epoch={row['epoch']} update={row['update']} dev64_mIoU={m['mIoU']:.6f} MovingMicro={m['MovingMicro']:.6f}" +
-            (f" vs_old_mIoU={m['mIoU']-initial['metrics']['mIoU']:+.6f} vs_old_Moving={m['MovingMicro']-initial['metrics']['MovingMicro']:+.6f}" if initial else ''))
+            (f" vs_old_mIoU={m['mIoU']-initial['metrics']['mIoU']:+.6f} vs_old_Moving={m['MovingMicro']-initial['metrics']['MovingMicro']:+.6f}" if initial else '')+
+            f" sADD_R={rr('static/ADD')} dADD_R={rr('dynamic/ADD')} dREM_R={rr('dynamic/REMOVE')}")
     final = reports.get('final_dev512')
     if final:
         lines.append('===== FINAL DEV512 (development population; NOT independent test) =====')

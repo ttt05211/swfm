@@ -73,6 +73,41 @@ def build_fixed_geometry(raw, record, pcfg, strong, workers, column_config, *, p
     return evidence
 
 
+def build_ccr_training_geometry(raw, record, pcfg, strong, workers, *, profile=None):
+    """Minimal exact fixed geometry required by Point CCR training.
+
+    Unlike legacy Local-column preparation, Point CCR never reads future static
+    memory, ego footprints or old frontier candidate geometry.  Keep only the
+    exact Strong transport state, backgrounds, causal registrations and audit.
+    This removes a large deterministic CPU branch without changing the CCR
+    support, labels, loss, motion, renderer or compositor.
+    """
+    started=time.perf_counter();grid=pcfg.grid
+    state=runtime._prepare_record(
+        record,None,pcfg,strong,'cpu',raw_window=raw,majority_backend='native')
+    strong_at=time.perf_counter()
+    state['column_backgrounds']=[compose_component_replacements_fast_exact(
+        a,comps,[],dynamic_class_ids=DYN,free_label=FREE,grid=grid,
+        precomputed_clear_flat_indices=clear)
+        for a,comps,clear in zip(state['anchors'],state['baseline_by_hi'],state['baseline_clear_flat_by_hi'])]
+    background_at=time.perf_counter()
+    registrations,_,_,audit=causal_source_history(
+        raw['history_occ'],raw['history_poses'],state,grid,strong,workers,
+        previous_instances=state.get('previous'))
+    history_at=time.perf_counter()
+    result=dict(
+        current=state['current'],registrations=registrations,audit=audit,
+        footprints=None,memory=None,
+        prepared_state={k:v for k,v in state.items() if k not in ('rec','window','gpu')})
+    if profile is not None:
+        profile.update(strong_state=strong_at-started,
+                       static_backgrounds=background_at-strong_at,
+                       history_registration=history_at-background_at,
+                       skipped_old_static_memory_and_frontier=True,
+                       total=history_at-started)
+    return result
+
+
 class FullJointColumnProvider(JointColumnProvider):
     def can_prepare_cpu(self, raw):
         causal = (raw or {}).get('_column_causal_preparation')
@@ -156,7 +191,10 @@ def prefetch_column_batches(provider, source, records, batch_size, source_budget
         return [(r, provider.load_raw_columns(source, r, include_gt=True)) for r in rows]
     rows = group()
     if not rows: return
-    if getattr(provider, 'causal_geometry_cache', None) is not None:
+    # Raw occupancy loading + fixed geometry are CPU-only and immutable.  They
+    # may be prepared in parallel even when disk caching is disabled.  The old
+    # cache-gated condition accidentally serialized cold Point-CCR training.
+    if io_workers > 1:
         io = ThreadPoolExecutor(max_workers=io_workers)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -172,6 +210,44 @@ def prefetch_column_batches(provider, source, records, batch_size, source_budget
         # Join the outer loader before closing the inner window pool: an
         # in-flight next-batch loader may not have called io.map yet.
         if io is not None: io.shutdown(wait=True, cancel_futures=True)
+
+
+def prefetch_logical_superbatches(provider, source, logical_groups, super_updates, *, io_workers=4):
+    """Prefetch several EXISTING logical optimizer batches as one CPU bundle.
+
+    Group boundaries are preserved exactly. This is execution batching only:
+    callers may run one frozen model forward over the flattened bundle, then
+    perform the original optimizer steps in the original order.
+    """
+    if super_updates < 1 or io_workers < 1:
+        raise ValueError('positive superbatch/update worker budgets required')
+    groups=list(logical_groups)
+    if not groups:
+        return
+    chunks=[groups[i:i+super_updates] for i in range(0,len(groups),super_updates)]
+    io=ThreadPoolExecutor(max_workers=io_workers) if io_workers>1 else None
+    def load(chunk):
+        flat=[record for group in chunk for record in group]
+        if io is None:
+            raws=[provider.load_raw_columns(source,r,include_gt=True) for r in flat]
+        else:
+            raws=list(io.map(lambda r:provider.load_raw_columns(source,r,include_gt=True),flat))
+        out=[];cursor=0
+        for group in chunk:
+            n=len(group)
+            out.append(list(zip(group,raws[cursor:cursor+n])))
+            cursor+=n
+        return out
+    try:
+        with ThreadPoolExecutor(max_workers=1) as lookahead:
+            pending=lookahead.submit(load,chunks[0])
+            for i in range(len(chunks)):
+                current=pending.result()
+                pending=(lookahead.submit(load,chunks[i+1]) if i+1<len(chunks) else None)
+                yield current
+    finally:
+        if io is not None:
+            io.shutdown(wait=True,cancel_futures=True)
 
 
 def epoch_order(length, seed, epoch):

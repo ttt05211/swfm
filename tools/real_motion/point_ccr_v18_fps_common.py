@@ -83,7 +83,8 @@ def select_population(records, frozen_keys, *, windows=20, stress_windows=2):
     return selected, metadata
 
 
-def load_point_head(saved, *, teacher_sha256, config_fingerprint, source_dim, device):
+def load_point_head(saved, *, teacher_sha256, config_fingerprint, source_dim, device,
+                    allow_completed_epoch_boundary=False):
     c = saved.get('contract', {})
     if (saved.get('protocol') != POINT_PROTOCOL or c.get('protocol') != POINT_PROTOCOL
             or saved.get('transport_frozen') is not True or saved.get('deployable') is not False
@@ -94,7 +95,15 @@ def load_point_head(saved, *, teacher_sha256, config_fingerprint, source_dim, de
             or c.get('thresholds', {}).get('CCR_REMOVE') != .95):
         raise RuntimeError('point CCR checkpoint/teacher/config/threshold contract mismatch')
     validate_cursor(c, *[saved.get(k) for k in ('epoch','batch','updates','executed')])
-    if saved['epoch'] != c['epochs'] or saved['batch'] != 0 or c['epochs'] != 3:
+    if c['epochs'] != 3:
+        raise RuntimeError('Point CCR contract must retain the fixed THREE-pass schedule')
+    if allow_completed_epoch_boundary:
+        # Read-only diagnostics may inspect an explicitly completed epoch
+        # boundary (e.g. epoch 1/2) without weakening the stricter FPS/deploy
+        # loader. Never accept an in-progress batch cursor.
+        if not 1 <= saved['epoch'] <= c['epochs'] or saved['batch'] != 0:
+            raise RuntimeError('diagnostic Point CCR checkpoint must be a completed epoch boundary')
+    elif saved['epoch'] != c['epochs'] or saved['batch'] != 0:
         raise RuntimeError('completed THREE-pass point CCR checkpoint required; not resume/training')
     prior = saved.get('reports', {}).get('train_prior', {})
     positive = np.asarray(prior.get('positive_weights', []), dtype=np.float64)

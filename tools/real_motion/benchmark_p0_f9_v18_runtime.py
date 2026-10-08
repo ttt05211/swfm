@@ -400,12 +400,20 @@ def _strong_all_horizons(
                 device=runtime_device,
             )
         else:
-            out = majority_fill_sparse_5x5x1(
-                static_dst,
-                ~known,
-                kernel=cfg.fill_kernel,
-                min_fraction=cfg.fill_min_fraction,
-            )
+            if majority_backend == "native":
+                from real_motion.v18_execution_trial import majority_fill_native_exact
+                out = majority_fill_native_exact(
+                    static_dst, ~known, kernel=cfg.fill_kernel,
+                    min_fraction=cfg.fill_min_fraction, device=None)
+            else:
+                # Historical CPU fallback; dense/sparse CUDA backend names both
+                # resolve here when no CUDA runtime device is supplied.
+                out = majority_fill_sparse_5x5x1(
+                    static_dst,
+                    ~known,
+                    kernel=cfg.fill_kernel,
+                    min_fraction=cfg.fill_min_fraction,
+                )
         if profile is not None:
             profile["majority_fill_ms"] = profile.get("majority_fill_ms", 0.0) + (
                 time.perf_counter() - _t
@@ -478,6 +486,7 @@ def _prepare_record(
     device,
     *,
     raw_window=None,
+    majority_backend="dense_cuda",
 ):
     w = window_from_record(rec)
     scene = str(w.scene_name)
@@ -572,6 +581,7 @@ def _prepare_record(
         source_world_points,
         frame_dt_s=float(pcfg.frame_dt_s), grid=pcfg.grid, cfg=strong_cfg,
         runtime_device=device,
+        majority_backend=majority_backend,
     )
     baseline_clear_by_hi = [
         baseline_clear_mask(rows, grid=pcfg.grid) for rows in baseline_by_hi

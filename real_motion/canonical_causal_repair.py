@@ -32,6 +32,21 @@ class CanonicalEvidence:
 
 
 @dataclass
+class CompactCanonicalSupport:
+    """TRAIN-only exact canonical support before point materialization.
+
+    Integer lattices retain the complete candidate population and exact global
+    ordering, but omit O(N) world/presence/feature arrays until GT-independent
+    Monte-Carlo IDs are known.
+    """
+    layouts: list
+    audit: dict
+    points: int
+
+    def __len__(self): return int(self.points)
+
+
+@dataclass
 class RepairPlan:
     flat: np.ndarray             # [N,6], out-of-query = -1
     base: np.ndarray
@@ -44,7 +59,8 @@ def grid_arrays(grid):
     return np.array([grid.x_min,grid.y_min,grid.z_min]),np.asarray(grid.voxel_size),np.asarray(grid.shape_hwd)
 
 
-def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_lattice_cells, materialize_features=True, kernels=None):
+def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_lattice_cells,
+            materialize_features=True, kernels=None, compact_only=False):
     """Bounded per-entity lattice. Large sparse extents use scalar-key lookup.
 
     No source/grid crop or resolution change. The temporary dense budget is a
@@ -89,12 +105,18 @@ def _entity(actor, cls, frame_points, frame_cells, prepared, grid, *, halo, max_
         flags=np.zeros(len(keys),np.uint8)
         np.bitwise_or.at(flags,point_ids,(1<<times).astype(np.uint8))
         at=np.stack(np.unravel_index(keys,tuple(shape)),axis=1)+lo
-    presence=((flags[:,None]>>np.arange(4))&1).astype(bool)
     # Frame concatenation is chronological; latest metric sample wins. t0 is
     # last, so observed t0 source coordinates are always preserved exactly.
     if native_last is not None:last=native_last
     else:
         last=np.full(len(keys),-1,np.int64);np.maximum.at(last,point_ids,np.arange(len(points)))
+    if compact_only:
+        # TRAIN samples from flags directly; do not materialize the discarded
+        # O(Nx4) presence matrix for the complete population.
+        layout=dict(keys=keys,flags=flags,bits=bits if dense else None,at=at,lo=lo,shape=shape,
+                    dense=dense,volume=volume,last=last,points=points)
+        return None,None,None,None,dense,volume,layout
+    presence=((flags[:,None]>>np.arange(4))&1).astype(bool)
     world=transform_points(origin+(at+.5)*step,prepared.state['current_pose'])
     real=last>=0;world[real]=points[last[real]]
     if not materialize_features:
@@ -177,15 +199,18 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
             pts.append(aligned);cells.append(cell)
         groups.append(entity(actor,int(comp['class_id']),pts,cells))
         actors.append(actor);classes.append(int(comp['class_id']))
+    static_points={11:[],13:[]};static_cells={11:[],13:[]}
+    for f in range(4):
+        occ=np.asarray(raw['history_occ'][f]);vis=np.asarray(raw['history_observed'][f],bool)
+        mask=vis&((occ==11)|(occ==13));ijk=np.argwhere(mask)
+        labels=occ[tuple(ijk.T)] if len(ijk) else np.empty(0,np.uint8)
+        world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
+        cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
+        for cls in (11,13):
+            take=labels==cls
+            static_points[cls].append(world[take]);static_cells[cls].append(cell[take])
     for cls in (11,13):
-        pts=[];cells=[]
-        for f in range(4):
-            occ=np.asarray(raw['history_occ'][f]);vis=np.asarray(raw['history_observed'][f],bool)
-            ijk=np.argwhere((occ==cls)&vis)
-            world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
-            cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
-            pts.append(world);cells.append(cell)
-        groups.append(entity(STATIC,cls,pts,cells))
+        groups.append(entity(STATIC,cls,static_points[cls],static_cells[cls]))
         actors.append(STATIC);classes.append(cls)
     data=[];labels=[];worlds=[];presence=[];aa=[];cc=[];layouts=[];cursor=0
     for group,actor,cls in zip(groups,actors,classes):
@@ -207,6 +232,241 @@ def build_canonical_evidence(prepared, grid, *, halo=True, max_lattice_cells=4_0
          'support':'all t0 sources + visible registered source history + observed road/sidewalk + one face halo',
          'features_materialized':materialize_features},None if materialize_features else layouts)
 
+
+def build_compact_canonical_support(prepared, grid, *, halo=True, max_lattice_cells=4_000_000, kernels=None, executor=None):
+    """Complete canonical population with no full-population world/features.
+
+    Global point ordering is identical to build_canonical_evidence().  Dynamic
+    entities are followed by static road11 and sidewalk13, and each entity uses
+    the same sorted lattice keys.  This is a training execution optimization,
+    never a support approximation.
+    """
+    raw,state=prepared.raw,prepared.state
+    if any(len(raw[k])!=4 for k in ('history_occ','history_observed','history_poses')):
+        raise ValueError('CCR requires exactly four historical frames')
+    if max_lattice_cells<1: raise ValueError('positive temporary lattice budget required')
+    origin,step,_=grid_arrays(grid);inverse=np.linalg.inv(np.asarray(state['current_pose']))
+    groups=[];actors=[];classes=[];counts={'dense_entities':0,'sparse_entities':0,'max_lattice_cells':0}
+    def entity(actor,cls,pts,cells):
+        options=dict(halo=halo,max_lattice_cells=max_lattice_cells,materialize_features=False,
+                     kernels=kernels,compact_only=True)
+        return (_entity(actor,cls,pts,cells,prepared,grid,**options) if executor is None else
+                executor.submit(_entity,actor,cls,pts,cells,prepared,grid,**options))
+    for actor,comp in enumerate(state['current']):
+        pts=[];cells=[]
+        for f,reg in enumerate(prepared.registrations[actor]):
+            if reg is None:
+                pts.append(np.empty((0,3)));cells.append(np.empty((0,3),np.int64));continue
+            ijk=np.asarray(reg[1],np.int64)
+            aligned=transform_points(transform_points(origin+(ijk+.5)*step,raw['history_poses'][f]),reg[0])
+            if f<3:
+                visible=np.asarray(raw['history_observed'][f],bool)[tuple(ijk.T)]
+                aligned=aligned[visible]
+            cell=ijk.copy() if f==3 else np.floor((transform_points(aligned,inverse)-origin)/step).astype(np.int64)
+            pts.append(aligned);cells.append(cell)
+        groups.append(entity(actor,int(comp['class_id']),pts,cells));actors.append(actor);classes.append(int(comp['class_id']))
+    static_points={11:[],13:[]};static_cells={11:[],13:[]}
+    for f in range(4):
+        occ=np.asarray(raw['history_occ'][f]);vis=np.asarray(raw['history_observed'][f],bool)
+        mask=vis&((occ==11)|(occ==13));ijk=np.argwhere(mask)
+        labels=occ[tuple(ijk.T)] if len(ijk) else np.empty(0,np.uint8)
+        world=transform_points(origin+(ijk+.5)*step,raw['history_poses'][f])
+        cell=ijk if f==3 else np.floor((transform_points(world,inverse)-origin)/step).astype(np.int64)
+        for cls in (11,13):
+            take=labels==cls;static_points[cls].append(world[take]);static_cells[cls].append(cell[take])
+    for cls in (11,13):
+        groups.append(entity(STATIC,cls,static_points[cls],static_cells[cls]));actors.append(STATIC);classes.append(cls)
+    layouts=[];cursor=0;dynamic_points=static_points_count=halo_points=0
+    for group,actor,cls in zip(groups,actors,classes):
+        if executor is not None:group=group.result()
+        if group is None:continue
+        _,_,_,_,dense,volume,layout=group;n=len(layout['keys'])
+        layout=dict(start=cursor,stop=cursor+n,actor=actor,cls=cls,**layout)
+        # These small per-entity matrices replace repeated np.linalg.inv calls
+        # during sampled materialization. They are computed with the exact same
+        # expressions as the legacy path and are history-only.
+        history_matrices=[]
+        for f in range(4):
+            registration=np.eye(4) if actor==STATIC else prepared.registrations[actor][f]
+            if registration is None:
+                history_matrices.append(None)
+            else:
+                reg=np.eye(4) if actor==STATIC else registration[0]
+                history_matrices.append(
+                    np.linalg.inv(prepared.raw['history_poses'][f])@np.linalg.inv(reg))
+        layout['history_matrices']=history_matrices
+        if actor>=0:
+            layout['center_ego']=transform_points(
+                np.asarray(state['current'][actor]['centroid_world'])[None],inverse)[0]
+        if actor==STATIC:
+            points=transform_points(origin+(layout['at']+.5)*step,np.asarray(state['current_pose']))
+            real=np.asarray(layout['last'])>=0
+            if np.any(real):points[real]=np.asarray(layout['points'])[np.asarray(layout['last'])[real]]
+            layout['static_world']=points
+            # Static sampled rows and conflict projection use static_world.
+            layout['points']=None
+        # Persistent compact support never needs the full integer XYZ table:
+        # at == unravel(keys, shape) + lo exactly.  Nor does sampled-only
+        # materialization need the dense volume-sized bits array; keys+flags
+        # give the identical neighbour flags by searchsorted.  Dropping both
+        # cuts cache size without changing population/order/RNG/features.
+        layout['at']=None
+        layout['bits']=None
+        if np.asarray(layout['last']).size:
+            if np.asarray(layout['last']).max(initial=-1) >= np.iinfo(np.int32).max:
+                raise RuntimeError('compact CCR last-index exceeds int32')
+            layout['last']=np.asarray(layout['last'],np.int32)
+        layouts.append(layout);cursor+=n
+        counts['dense_entities' if dense else 'sparse_entities']+=1
+        counts['max_lattice_cells']=max(counts['max_lattice_cells'],volume)
+        if actor>=0:dynamic_points+=n
+        else:static_points_count+=n
+        halo_points+=int((layout['flags']==0).sum())
+    audit={**counts,'points':cursor,'dynamic_points':dynamic_points,'static_points':static_points_count,
+           'halo_points':halo_points,'future_GT_used':False,'metric_observations_preserved':True,
+           'support':'all t0 sources + visible registered source history + observed road/sidewalk + one face halo',
+           'features_materialized':False,'compact_sampled_only':True}
+    support=CompactCanonicalSupport(layouts,audit,cursor)
+    # Do not persist an O(N) duplicate array of global row IDs. Exact causal
+    # strata are reconstructed from compact uint8 flags on each sampling pass;
+    # sample_compact_causal_points already preserves the original bucket/code
+    # order and RNG calls for this representation.
+    return support
+
+
+
+def compact_causal_strata(support):
+    """Exact build_causal_strata() ordering without O(N) actor/class/presence arrays."""
+    buckets=[{},{}]
+    for layout in support.layouts:
+        role=int(layout['actor']>=0)
+        flags=np.asarray(layout['flags'],np.uint8)
+        status=np.where((flags&8)!=0,0,np.where(flags!=0,1,2)).astype(np.int64)
+        code=(int(layout['actor'])+2)*57+int(layout['cls'])*3+status
+        global_ids=np.arange(int(layout['start']),int(layout['stop']),dtype=np.int64)
+        for value in np.unique(code):
+            ids=global_ids[code==value]
+            buckets[role].setdefault(int(value),[]).append(ids)
+    result=[]
+    for role in (0,1):
+        rows=[];counts=[]
+        for code in sorted(buckets[role]):
+            ids=np.concatenate(buckets[role][code])
+            rows.append(ids);counts.append(len(ids))
+        result.append((
+            np.concatenate(rows).astype(np.int32,copy=False) if rows else np.empty(0,np.int32),
+            np.asarray(counts,np.int32)))
+    return result
+
+
+def materialize_compact_canonical(support, prepared, grid, indices):
+    """Materialize ONLY sampled rows from complete compact support.
+
+    The returned CanonicalEvidence is bit/exact-order compatible with slicing
+    the legacy lazy full-population evidence at the same global IDs.
+    """
+    ids=np.asarray(indices)
+    if ids.ndim!=1 or ids.dtype.kind not in 'iu' or np.any(ids<0) or np.any(ids>=len(support)):
+        raise ValueError('invalid compact canonical TRAIN point indices')
+    n=len(ids)
+    features=np.empty((n,FEATURE_DIM),np.float32)
+    labels=np.full((n,4),18,np.uint8)
+    actor=np.empty(n,np.int32);classes=np.empty(n,np.uint8)
+    world=np.empty((n,3),np.float64);presence=np.empty((n,4),bool)
+    origin,step,shape=grid_arrays(grid)
+    current_pose=np.asarray(prepared.state['current_pose'])
+    inverse=np.linalg.inv(current_pose)
+    for layout in support.layouts:
+        selected=np.flatnonzero((ids>=layout['start'])&(ids<layout['stop']))
+        if not len(selected):continue
+        local=ids[selected]-int(layout['start'])
+        a=int(layout['actor']);cls=int(layout['cls'])
+        all_keys=np.asarray(layout['keys'],np.int64)
+        keys=all_keys[local]
+        stored_at=layout.get('at')
+        if stored_at is None:
+            at=np.stack(np.unravel_index(
+                keys,tuple(int(x) for x in np.asarray(layout['shape']).tolist())),axis=1).astype(np.int64,copy=False)
+            at+=np.asarray(layout['lo'],np.int64)
+        else:
+            at=np.asarray(stored_at,np.int64)[local]
+        flags=np.asarray(layout['flags'],np.uint8)[local]
+        pres=((flags[:,None]>>np.arange(4))&1).astype(bool)
+        if 'static_world' in layout:
+            points=np.asarray(layout['static_world'])[local]
+        else:
+            points=transform_points(origin+(at+.5)*step,current_pose)
+            last=np.asarray(layout['last'])[local]
+            real=last>=0
+            if np.any(real):
+                points[real]=np.asarray(layout['points'])[last[real]]
+        actor[selected]=a;classes[selected]=cls;world[selected]=points;presence[selected]=pres
+
+        inside=np.zeros((len(local),4),bool);observed=inside.copy()
+        for frame in range(4):
+            registration=np.eye(4) if a==STATIC else prepared.registrations[a][frame]
+            if registration is None:continue
+            reg=np.eye(4) if a==STATIC else registration[0]
+            matrix=np.linalg.inv(prepared.raw['history_poses'][frame])@np.linalg.inv(reg)
+            ijk=np.floor((transform_points(points,matrix)-origin)/step).astype(np.int64)
+            valid=((ijk>=0)&(ijk<shape)).all(1);inside[:,frame]=valid
+            observed[valid,frame]=np.asarray(prepared.raw['history_observed'][frame],bool)[tuple(ijk[valid].T)]
+            labels[selected[valid],frame]=np.asarray(prepared.raw['history_occ'][frame])[tuple(ijk[valid].T)]
+
+        density=np.zeros((len(local),4),np.float32);neighbours=np.zeros((len(local),6),np.float32)
+        strides=np.array([int(layout['shape'][1])*int(layout['shape'][2]),int(layout['shape'][2]),1],np.int64)
+        for d,delta in enumerate(FACE):
+            neighbour=keys+int(delta@strides)
+            valid=((at+delta-layout['lo']>=0)&(at+delta-layout['lo']<layout['shape'])).all(1)
+            bits=layout.get('bits')
+            if layout['dense'] and bits is not None:
+                neighbour_flags=bits[neighbour.clip(0,layout['volume']-1)]
+            else:
+                loc=np.searchsorted(all_keys,neighbour);found=loc<len(all_keys)
+                found[found]&=all_keys[loc[found]]==neighbour[found]
+                neighbour_flags=np.zeros(len(local),np.uint8);neighbour_flags[found]=layout['flags'][loc[found]]
+            neighbour_flags=np.where(valid,neighbour_flags,0)
+            neighbours[:,d]=neighbour_flags!=0
+            density+=((neighbour_flags[:,None]>>np.arange(4))&1).astype(np.float32)/6
+        if a>=0:
+            center=transform_points(np.asarray(prepared.state['current'][a]['centroid_world'])[None],inverse)[0]
+            relative=(origin+(at+.5)*step-center)/8
+        else:
+            relative=(origin+(at+.5)*step)/40
+        age=np.argmax(pres[:,::-1],axis=1).astype(np.float32)/3
+        age[~pres.any(1)]=1.
+        features[selected]=np.concatenate(
+            [relative,pres,observed,inside,neighbours,age[:,None],density,pres[:,-1,None]],axis=1
+        ).astype(np.float32)
+    return CanonicalEvidence(features,labels,actor,classes,world,presence,support.audit)
+
+
+def compact_static_conflicts(support, prepared, grid):
+    """Exact full static class conflict set without dynamic/world materialization."""
+    origin,step,shape=grid_arrays(grid)
+    by_class={11:[],13:[]}
+    current_pose=np.asarray(prepared.state['current_pose'])
+    for layout in support.layouts:
+        if int(layout['actor'])!=STATIC:continue
+        if 'static_world' in layout:
+            points=np.asarray(layout['static_world'])
+        else:
+            at=np.asarray(layout['at'])
+            points=transform_points(origin+(at+.5)*step,current_pose)
+            last=np.asarray(layout['last']);real=last>=0
+            if np.any(real):points[real]=np.asarray(layout['points'])[last[real]]
+        by_class[int(layout['cls'])].append(points)
+    by_class={k:(np.concatenate(v) if v else np.empty((0,3),np.float64)) for k,v in by_class.items()}
+    result=[]
+    for h in range(6):
+        flats={}
+        for cls,points in by_class.items():
+            mapped=transform_points(points,prepared.state['world_to_future'][h])
+            ijk=np.floor((mapped-origin)/step).astype(np.int64)
+            good=((ijk>=0)&(ijk<shape)).all(1);ijk=ijk[good]
+            flats[cls]=np.unique((ijk[:,0]*shape[1]+ijk[:,1])*shape[2]+ijk[:,2]) if len(ijk) else np.empty(0,np.int64)
+        result.append(np.intersect1d(flats[11],flats[13],assume_unique=True))
+    return result
 
 def materialize_canonical_features(evidence, prepared, grid, indices):
     """EXACT feature rows for TRAIN's sampled points, after complete GT scan.

@@ -46,10 +46,39 @@ class PilotProvider(FullJointColumnProvider):
     def load_raw_columns(self,source,record,*,include_gt):
         from tools.real_motion.causal_column_common import FrozenColumns
         raw=FrozenColumns.load_raw_columns(self,source,record,include_gt=include_gt)
-        def build():return build_fixed_geometry(raw,record,self.pcfg,self.strong,min(3,self.workers),self.joint.columns.config)
+        custom=getattr(self,'fixed_geometry_builder',None)
+        def build():
+            if custom is not None:
+                return custom(self,raw,record)
+            workers=max(1,min(3,self.workers//max(1,getattr(self,'raw_prefetch_workers',1))))
+            return build_fixed_geometry(raw,record,self.pcfg,self.strong,workers,self.joint.columns.config)
+        key=(str(record['scene_name']),str(record['t0_token']))
+        history_cache=getattr(self,'ccr_history_cache',None)
+        history_source=getattr(self,'ccr_history_cache_source',None)
+        val_history_cache=getattr(self,'ccr_val_history_cache',None)
+        val_history_source=getattr(self,'ccr_val_history_cache_source',None)
+        selected_cache=None;selected_mode=None
+        if val_history_cache is not None and source is val_history_source:
+            selected_cache=val_history_cache
+            selected_mode=getattr(self,'ccr_val_history_cache_mode','require')
+        elif history_cache is not None and (history_source is None or source is history_source):
+            selected_cache=history_cache
+            selected_mode=getattr(self,'ccr_history_cache_mode','require')
+        if selected_cache is not None:
+            if selected_mode=='require':
+                evidence=selected_cache.require(key,raw);hit=True
+            elif selected_mode=='build':
+                evidence,hit=selected_cache.get_or_build(key,raw,build,defer_write=False)
+            else:
+                raise RuntimeError(f'unknown CCR history cache mode: {selected_mode}')
+            raw['_column_causal_preparation']=evidence
+            raw['_causal_geometry_cache_hit']=hit
+            raw['_ccr_history_cache_hit']=hit
+            raw['_ccr_history_cache_split']=('val' if selected_cache is val_history_cache else 'train')
+            return raw
         cache=getattr(self,'causal_geometry_cache',None)
         if cache is None:evidence=build();hit=False
-        else:evidence,hit=cache.get_or_build((str(record['scene_name']),str(record['t0_token'])),raw,build,defer_write=True)
+        else:evidence,hit=cache.get_or_build(key,raw,build,defer_write=True)
         raw['_column_causal_preparation']=evidence;raw['_causal_geometry_cache_hit']=hit
         return raw
 
