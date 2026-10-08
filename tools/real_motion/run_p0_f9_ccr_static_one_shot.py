@@ -366,7 +366,14 @@ def _summary(r):
                 f'old_wins_blocked_conflict={item["Old_static_win_blocked_any"]} '
                 f'old_wins_own_real_vs_halo={item["Old_static_win_own_real_vs_other_halo"]} '
                 f'blocked_both_direct_GT={item["blocked_both_direct_GT"]} '
-                f'blocked_both_halo_GT={item["blocked_both_pure_halo_GT"]}')
+                f'blocked_both_halo_GT={item["blocked_both_pure_halo_GT"]} '
+                f'B_only_TP={item["B_only_TP"]} '
+                f'Old_only_TP={item["Old_only_TP"]} '
+                f'B_only_FP={item["B_only_FP"]} '
+                f'Old_only_FP={item["Old_only_FP"]} '
+                f'B_only_FP_GT_free={item["B_only_FP_GT_free"]} '
+                f'B_only_FP_direct={item["B_only_FP_static_with_direct"]} '
+                f'B_only_FP_halo_only={item["B_only_FP_static_halo_only"]}')
     if "error" in r:lines.append("error="+r["error"])
     if r.get("candidate_interpretation"):
         lines.append("descriptive_candidate="+str(r["candidate_interpretation"]["descriptive_static_candidate"]))
