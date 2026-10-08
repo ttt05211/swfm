@@ -65,8 +65,8 @@ def _aggregate(trials):
     peak=np.asarray([x["peak_allocated_mib"] for x in trials],np.float64)
     inc=np.asarray([x["incremental_peak_allocated_mib"] for x in trials],np.float64)
     reserved=np.asarray([x["peak_reserved_mib"] for x in trials],np.float64)
-    if len(seconds)!=WINDOWS*REPEATS or not np.isfinite(seconds).all() or np.any(seconds<=0):
-        raise RuntimeError("incomplete/invalid frozen-B FPS population")
+    if not len(seconds) or not np.isfinite(seconds).all() or np.any(seconds<=0):
+        raise RuntimeError("invalid frozen-B FPS population")
     total=float(seconds.sum())
     stage_keys=sorted(set().union(*(x["host_stages_seconds"] for x in trials)))
     return dict(
@@ -283,6 +283,10 @@ def main(argv=None):
 
         if result["parity"]["passed_windows"]!=WINDOWS:
             raise RuntimeError("incomplete frozen-B parity gate")
+        if (len(result["trials"])!=WINDOWS*REPEATS
+                or len({row["key"] for row in result["trials"]})!=WINDOWS):
+            raise RuntimeError("incomplete frozen-B formal timing population")
+        result["aggregate"]=_aggregate(result["trials"])
         result.update(status="complete",elapsed_seconds=time.perf_counter()-started)
         persist();print(_summary(result),flush=True);return 0
     except BaseException as exc:
