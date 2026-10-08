@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from types import SimpleNamespace
 from real_motion.canonical_causal_repair import RepairPlan
 from real_motion.ccr_static_frozen_policies import (
@@ -7,12 +8,6 @@ from real_motion.ccr_static_frozen_policies import (
 from tools.real_motion.run_p0_f9_ccr_static_one_shot import (
     _analyze_unique_fp,_make_counts,
 )
-
-
-class Weight:
-    def detach(self):return self
-    def cpu(self):return self
-    def __getitem__(self,i):return np.asarray(3.0)
 
 
 def _evidence():
@@ -60,7 +55,7 @@ def test_all_static_policies_keep_dynamic_scores():
     ev=_evidence()
     score=np.zeros((7,6,2),np.float32)
     score[...,0]=.6
-    head=SimpleNamespace(positive_weight=Weight())
+    head=SimpleNamespace(positive_weight=torch.tensor([[3.0,1.0],[2.8,1.0]]))
     for policy in POLICIES:
         x=static_policy_score(score,ev,head,policy)
         assert np.array_equal(x[6,:,0],score[6,:,0])
