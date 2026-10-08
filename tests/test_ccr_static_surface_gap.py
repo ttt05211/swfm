@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from real_motion.causal_column_completion import GENERATE, REFINE
 from tools.real_motion.diagnose_p0_f9_ccr_static_surface_gap import (
     _old_class_support, _flatten_support, _static_diagnostic, _finish, _make_counts,
+    _static_surface_conflicts, _count_surface_conflicts,
 )
 
 
@@ -55,3 +56,50 @@ def test_flatten_support_ignores_illegal_entries():
     cls=np.array([True,True])
     mask=_flatten_support(ids,legal,cls,5)
     assert np.flatnonzero(mask).tolist()==[0,3]
+
+
+def test_static_conflict_masks_partition_direct_halo_evidence():
+    # Four exclusive conflict patterns on V18-free target voxels.
+    ev=SimpleNamespace(
+        actor=np.full(8,-2,np.int32),
+        classes=np.array([11,13,13,11,11,13,11,13],np.uint8),
+        presence=np.array([[1],[0],[1],[0],[1],[1],[0],[0]],bool))
+    flat=np.full((8,6),-1,np.int64)
+    flat[:,0]=[1,1,2,2,3,3,4,4]
+    plan=SimpleNamespace(
+        flat=flat,
+        legal=np.zeros((8,6,2),bool),
+    )
+    base=np.full(6,17,np.uint8)
+    masks=_static_surface_conflicts(ev,plan,0,base)
+    assert np.flatnonzero(masks["road_direct_sidewalk_pure_halo"]).tolist()==[1]
+    assert np.flatnonzero(masks["sidewalk_direct_road_pure_halo"]).tolist()==[2]
+    assert np.flatnonzero(masks["both_direct"]).tolist()==[3]
+    assert np.flatnonzero(masks["both_pure_halo"]).tolist()==[4]
+    assert np.flatnonzero(masks["any"]).tolist()==[1,2,3,4]
+    # Keep the frozen actual predictions unchanged; diagnose where Old
+    # wins rather than claiming all blocked targets could be recovered.
+    gt=np.array([17,11,13,11,13,17],np.uint8)
+    b=base.copy()
+    old=base.copy();old[1]=11
+    counts=_make_counts()
+    _count_surface_conflicts(counts,base,gt,b,old,11,masks)
+    assert counts["own_real_vs_other_halo_GT"]==1
+    assert counts["Old_static_win_own_real_vs_other_halo"]==1
+    assert counts["blocked_any_GT"]==2
+    assert counts["Old_static_win_blocked_any"]==1
+
+
+def test_static_conflict_audit_detects_native_planner_mismatch():
+    ev=SimpleNamespace(
+        actor=np.array([-2,-2],np.int32),
+        classes=np.array([11,13],np.uint8),
+        presence=np.array([[1],[0]],bool))
+    flat=np.full((2,6),-1,np.int64);flat[:,0]=[1,1]
+    legal=np.zeros((2,6,2),bool);legal[0,0,0]=True
+    plan=SimpleNamespace(flat=flat,legal=legal)
+    try:
+        _static_surface_conflicts(ev,plan,0,np.full(3,17,np.uint8))
+        assert False,"must fail closed when native planner disagrees"
+    except RuntimeError as exc:
+        assert "planner legality disagree" in str(exc)
