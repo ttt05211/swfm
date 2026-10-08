@@ -28,7 +28,7 @@ Frozen B：4历史→6未来，epoch19 V18固定 + full TRAIN Point CCR epoch2�
 
 最终集中本地回归124 passed/1 skipped；601个Python文件AST语法检查及Bash语法检查通过。覆盖CPU/CUDA实际更新、动态逐字节不变、cache/full/sample几何一致、无未来GT、next-update恢复、final-dev后中断只续做FPS、纯静态/动态/混合读出路由。修复旧测试mock的live-preflight、CUDA设备接口，测试入口提前设置cuBLAS确定性环境，不放宽容差。全仓库1437项重回归中途停止，未宣称完整CI通过。服务器训练尚未启动，本地没有完整nuScenes缓存。
 
-增加纯静态/动态分块的读出路由，保持批次大小和概率逐字节不变；冻结验证不保留无用旧读出的backward图。原Frozen B输入先快照；原文件不写。新分支提交/推送以最终交付记录为准。
+增加纯静态/动态分块的读出路由，保持批次大小和概率逐字节不变；冻结验证不保留无用旧读出的backward图。原Frozen B输入先快照；原文件不写。实现提交 `15a479a` 已推送到新分支 `feature/v22-surface-aware-ccr`，原分支未改动。
 
 本地RTX3050合成48000候选、5遍head-only：B81.28ms，新head未路由120.90ms、路由91.77ms，初始化概率字节一致。这不是正式FPS、联合训练耗时或精度验证。
 
@@ -46,8 +46,8 @@ OccFM服务器单L40S，10核/80GiB。旧cached完整轮十几分钟为用户经
 
 ## 下一步与未解决问题
 
-1. 提交推送用户已授权的新分支，给一个启动/恢复命令；本地合成head开销不是服务器FPS/精度证据。
-2. 服务器一次跑完完整TRAIN×3、final dev512及同口径FPS，确认静态增益、Moving不退、≥40FPS。
+1. 服务器拉取新分支，运行 `bash tools/real_motion/run_p0_f9_surface_ccr_full.sh`。本地合成head开销不是服务器FPS/精度证据。
+2. 一次跑完完整TRAIN×3、final dev512及同口径FPS，确认静态增益、Moving不退、≥40FPS；目前服务器训练未启动。
 3. 只有通过，才设计并启动同一结构的随机初始化完整联合训练；不能从冻结验证直接推断联合效果。
 
 具体设计、风险与命令见 `docs/SURFACE_CONSISTENT_CCR_FULL_VALIDATION_CN.md`。历史失败方案不重启，不复刻重复日志，必要时按旧文档索引检索。
