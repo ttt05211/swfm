@@ -92,8 +92,12 @@ class SurfaceAtlas:
             if not len(ids) or tree is None:
                 continue
             query = transform_points(evidence.world[ids], self.inverse)
-            distance, index = tree.query(query * self.scale, k=NEIGHBORS,
-                                         distance_upper_bound=RADIUS, workers=1)
+            scaled_query = query * self.scale
+            workers = int(getattr(self, 'query_workers', 1)) if len(ids) >= 4096 else 1
+            if not 1 <= workers <= 8:
+                raise ValueError('bounded surface query workers must be in 1..8')
+            distance, index = tree.query(scaled_query, k=NEIGHBORS,
+                                         distance_upper_bound=RADIUS, workers=workers)
             valid = np.isfinite(distance)
             safe = np.minimum(index, len(self.metric[cls]) - 1)
             delta = (self.metric[cls][safe] - query[:, None]) / self.step
@@ -119,8 +123,8 @@ class SurfaceAtlas:
             other = self.trees[13 if cls == 11 else 11]
             opposite = np.full(len(ids), np.inf)
             if other is not None:
-                opposite, _ = other.query(query * self.scale, k=1,
-                                           distance_upper_bound=RADIUS, workers=1)
+                opposite, _ = other.query(scaled_query, k=1,
+                                           distance_upper_bound=RADIUS, workers=workers)
             opposite_seen = np.isfinite(opposite)
             opposite = np.where(opposite_seen, opposite / RADIUS, 1.)
             recent = (weight * self.recent[cls][safe]).sum(1) / total
@@ -153,17 +157,26 @@ def augment_projection(evidence, plan, current_pose, world_to_future, grid):
         dz = evidence.features[ids, FEATURE_DIM + 1].astype(np.float64) * step[2]
         z_axis = np.asarray(current_pose, np.float64)[:3, 2]
         for h, matrix in enumerate(world_to_future):
-            mapped = transform_points(evidence.world[ids], matrix)
-            coordinate = (mapped - origin) / step
-            cells = np.floor(coordinate).astype(np.int64)
-            good = ((cells >= 0) & (cells < shape)).all(1)
-            flat = (cells[:, 0] * shape[1] + cells[:, 1]) * shape[2] + cells[:, 2]
-            expected = np.where(good, flat, -1)
+            snapshot = getattr(plan, 'static_phase', None)
+            if snapshot is None:
+                mapped = transform_points(evidence.world[ids], matrix)
+                coordinate = (mapped - origin) / step
+                cells = np.floor(coordinate).astype(np.int64)
+                good = ((cells >= 0) & (cells < shape)).all(1)
+                flat = (cells[:, 0] * shape[1] + cells[:, 1]) * shape[2] + cells[:, 2]
+                expected = np.where(good, flat, -1)
+                phase = coordinate - cells - .5
+                mapped_z = mapped[:,2]
+            else:
+                if not np.array_equal(ids, plan.static_rows):
+                    raise RuntimeError('ephemeral surface projection row identity changed')
+                phase = snapshot[h]
+                mapped_z = plan.static_z[h]
+                expected = plan.static_destinations[h]
             if not np.array_equal(expected, plan.flat[ids, h]):
                 raise RuntimeError("surface projection changed the canonical destination")
-            phase = coordinate - np.floor(coordinate) - .5
             height = dz * float(np.asarray(matrix)[2, :3] @ z_axis) / step[2]
-            result[ids, h] = np.column_stack((phase, mapped[:, 2] / 40., height, height - phase[:, 2]))
+            result[ids, h] = np.column_stack((phase, mapped_z / 40., height, height - phase[:, 2]))
     return replace(plan, context=np.concatenate((plan.context, result), -1))
 
 

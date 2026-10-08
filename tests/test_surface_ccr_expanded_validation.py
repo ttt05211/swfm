@@ -90,6 +90,9 @@ def test_known_execution_fix_resume_still_rejects_every_scientific_change(tmp_pa
 def test_legacy_execution_resume_requires_unchanged_head_file(monkeypatch):
     monkeypatch.setattr(cli, 'sha256', lambda path: cli.UNCHANGED_SURFACE_HEAD_SHA256)
     assert cli.compatible_execution_implementations('unused') == (cli.LEGACY_EXECUTION_IMPLEMENTATION,)
+    monkeypatch.setattr(cli,'sha256',lambda _:cli.SURFACE_EXECUTION_HEAD_SHA256)
+    assert cli.compatible_execution_implementations('unused') == (
+        cli.LEGACY_EXECUTION_IMPLEMENTATION,cli.PREVIOUS_EXECUTION_IMPLEMENTATION)
     monkeypatch.setattr(cli, 'sha256', lambda path: 'modified head')
     assert cli.compatible_execution_implementations('unused') == ()
 
@@ -144,10 +147,10 @@ def test_paired_fps_has_all_six_live_phase_and_full_20_population(monkeypatch):
     monkeypatch.setattr(common, 'prepare_history', history); monkeypatch.setattr(common, 'forecast_six', forecast)
     report = common.paired_speed(provider, None, records, teacher, head, baseline)
     assert report['probability_and_six_dense_parity_windows'] == 20
-    assert report['dynamic_byte_parity_windows'] == 20 and len(report['trials']) == 180
+    assert report['dynamic_byte_parity_windows'] == 20 and len(report['trials']) == 300
     assert report['selected_execution'] == 'surface_eager'  # no CUDA graph on CPU
     assert not report['actual_cuda'] and report['memory_mib'] is None
-    assert calls.count(SurfaceCanonicalRepairHead) == 160
+    assert calls.count(SurfaceCanonicalRepairHead) == 320
     assert calls.count(CanonicalRepairHead) == 80
 
 

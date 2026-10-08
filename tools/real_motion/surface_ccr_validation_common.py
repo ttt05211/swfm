@@ -13,6 +13,7 @@ from real_motion.final_dataflow import prepare_history, forecast_six
 from real_motion.source_evidence_audit import edit_quality
 from real_motion.surface_canonical_repair import SurfaceAtlas, augment_evidence, augment_projection
 from real_motion.surface_ccr_execution import SurfaceExecution
+from real_motion.surface_projection_execution import map_surface_evidence
 from real_motion.v21_source_induction import stable_json_fingerprint
 from tools.real_motion import ccr_screen_common as ccr
 from tools.real_motion.eval_p0_f9_v21_stage0_upper_bounds import Metrics, delta
@@ -175,8 +176,8 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
     if len(selected) != 20: raise RuntimeError('fixed 20 FPS windows required')
     device = provider.device
     graph = SurfaceExecution(head, device)
-    modes = ('frozen_B', 'surface_eager', 'surface_graph')
-    trials, parity, prepares, descriptors = [], 0, 0., 0.
+    modes = ('frozen_B', 'surface_eager', 'surface_graph', 'surface_fused_eager', 'surface_fused_graph')
+    trials, parity, prepares, descriptors, optimized_descriptors = [], 0, 0., 0., 0.
     def sync(): torch.cuda.synchronize(device) if device.type == 'cuda' else None
     try:
         with ThreadPoolExecutor(max_workers=min(4, provider.workers)) as pool:
@@ -190,6 +191,13 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                 atlas = SurfaceAtlas(plain.world, plain.classes, plain.presence, plain.actor, history.current_pose, provider.pcfg.grid)
                 enriched = augment_evidence(plain, atlas)
                 descriptors += time.perf_counter() - tick
+                tick = time.perf_counter()
+                parallel_atlas=SurfaceAtlas(plain.world,plain.classes,plain.presence,plain.actor,history.current_pose,provider.pcfg.grid)
+                parallel_atlas.query_workers=min(4,provider.workers)
+                optimized_enriched=augment_evidence(plain,parallel_atlas)
+                optimized_descriptors += time.perf_counter()-tick
+                if not np.array_equal(enriched.features,optimized_enriched.features):
+                    raise RuntimeError('parallel history surface descriptor bytes differ')
                 matrices = [np.linalg.inv(p) for p in history.future_poses]
                 phase_time = [0.]
                 def probability(model, evidence, plan, output, where, mode):
@@ -197,7 +205,7 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                         tick = time.perf_counter()
                         plan = augment_projection(evidence, plan, history.current_pose, matrices, provider.pcfg.grid)
                         phase_time[0] += time.perf_counter() - tick
-                    return (graph(model, evidence, plan, output, where) if mode == 'surface_graph'
+                    return (graph(model, evidence, plan, output, where) if mode.endswith('graph')
                             else frozen_b_probabilities(model, evidence, plan, output, where))
                 def run(mode, timed):
                     model = reference if mode == 'frozen_B' else head
@@ -208,7 +216,8 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                     before = torch.cuda.memory_allocated(device) if device.type == 'cuda' else 0
                     tick = time.perf_counter()
                     out = forecast_six(history, provider, teacher.transport, model,
-                        lambda *args: probability(*args, mode), kernels=ccr.execution_kernels(provider), executor=pool)
+                        lambda *args: probability(*args, mode), kernels=ccr.execution_kernels(provider), executor=pool,
+                        projection_fn=map_surface_evidence if mode.startswith('surface_fused') else None)
                     sync(); seconds = time.perf_counter() - tick
                     out['stages_seconds']['live_surface_phase_INCLUDED_in_readout'] = phase_time[0]
                     memory = (dict(peak_allocated=torch.cuda.max_memory_allocated(device)/2**20,
@@ -220,6 +229,10 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                     raise RuntimeError('optimized surface probabilities differ')
                 if any(not np.array_equal(a, b) for a, b in zip(expected['surface_eager']['dense'], expected['surface_graph']['dense'])):
                     raise RuntimeError('optimized surface dense forecasts differ')
+                for mode in ('surface_fused_eager','surface_fused_graph'):
+                    if (not np.array_equal(expected[mode]['probability'],expected['surface_eager']['probability'])
+                            or any(not np.array_equal(a,b) for a,b in zip(expected[mode]['dense'],expected['surface_eager']['dense']))):
+                        raise RuntimeError('fused projection probability/dense bytes differ; use reference execution')
                 dynamic = plain.actor >= 0
                 if not np.array_equal(expected['frozen_B']['probability'][dynamic], expected['surface_eager']['probability'][dynamic]):
                     raise RuntimeError('frozen dynamic predictions changed')
@@ -252,6 +265,7 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
             selected_execution=chosen, selection_basis='latency only after byte parity, NOT accuracy/method selection',
             graph_execution=graph.stats(), history_prepare_seconds_per_window=prepares/20,
             surface_descriptor_prepare_seconds_per_window=descriptors/20,
+            optimized_surface_descriptor_prepare_seconds_per_window=optimized_descriptors/20,
             actual_cuda=device.type == 'cuda', fps_windows=20, repeats=3,
             memory_mib={k: {field: max(r['memory_mib'][field] for r in trials if r['mode'] == k)
                 for field in ('peak_allocated', 'incremental_peak', 'peak_reserved')} for k in modes}

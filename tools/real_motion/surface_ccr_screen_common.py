@@ -34,6 +34,9 @@ SNAPSHOT_WARM_START_HEAD = True  # never depend on a mutable server last.pt duri
 
 def add_args(parser):
     base.add_args(parser)
+    parser.add_argument('--surface-reference-execution', action='store_true',
+                        help='diagnostic: original duplicate projection and single-thread tree queries')
+    parser.add_argument('--surface-query-workers', type=int, default=4)
     parser.set_defaults(train_fraction=1., epochs=3, lr=3e-4, cpu_workers=10,
                         ccr_cpu_execution='native_parallel', ccr_fast_train=True,
                         ccr_history_cache_mode='require', fps_windows=20,
@@ -112,6 +115,7 @@ def _atlas(provider,prep,evidence=None):
         # Ephemeral window state only. Do not mutate/cache compact artifacts or
         # put learned activations, labels, sampled IDs, or future phases here.
         prep.raw['_surface_atlas_live']=atlas
+    atlas.query_workers=getattr(provider,'surface_query_workers',1)
     return atlas
 
 
@@ -120,6 +124,11 @@ def setup(provider,args):
     provider.ccr_add_only_natural_bce=True  # selects ADD-only plumbing; loss uses head.add_only_weighted
     provider.ccr_old_gates=(.5,.5,None)
     provider.surface_fps_cpu_workers=int(args.ccr_cpu_workers)
+    provider.surface_query_workers=(1 if getattr(args,'surface_reference_execution',False)
+                                   else min(8,max(1,int(getattr(args,'surface_query_workers',4)))))
+    if not getattr(args,'surface_reference_execution',False):
+        from real_motion.surface_projection_execution import SurfaceMapExecution
+        provider.ccr_execution=SurfaceMapExecution(provider.ccr_execution)
     provider.ccr_augment_evidence=lambda evidence,prep: augment_evidence(evidence,_atlas(provider,prep,evidence))
     provider.ccr_augment_plan=lambda evidence,plan,prep: augment_projection(
         evidence,plan,prep.state['current_pose'],prep.state['world_to_future'],provider.pcfg.grid)

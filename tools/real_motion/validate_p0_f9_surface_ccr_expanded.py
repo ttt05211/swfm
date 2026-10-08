@@ -53,11 +53,20 @@ from tools.real_motion.surface_ccr_validation_common import (
 # The head and all cache/scientific contracts must still be identical.
 LEGACY_EXECUTION_IMPLEMENTATION = '25a932b9dff199d3fcc47eb829d3741304ee5d121b4f996462b39fe176f5d17d'
 UNCHANGED_SURFACE_HEAD_SHA256 = '92dde104ff0930c521461bb83d5e6f5aa2bf2410ba44492ffe95b2c3cb6f4933'
+# Audited execution-only changes: bounded identical KD queries + reuse of
+# float64 phases. Parameter names/shapes, arithmetic outputs, support and
+# thresholds remain byte-tested. Never accept arbitrary new head hashes.
+SURFACE_EXECUTION_HEAD_SHA256 = '9c858913ab9aba902bbb6ec183ab19dd1b34a60de5539aef4fa7438f3483aa0c'
+PREVIOUS_EXECUTION_IMPLEMENTATION = 'c19c01f9560c77df050a9764231c84311e3a24dc5e96207b317a26fd64167adb'
 
 
 def compatible_execution_implementations(root):
-    return ((LEGACY_EXECUTION_IMPLEMENTATION,)
-            if sha256(Path(root)/'real_motion/surface_canonical_repair.py') == UNCHANGED_SURFACE_HEAD_SHA256 else ())
+    digest=sha256(Path(root)/'real_motion/surface_canonical_repair.py')
+    if digest==UNCHANGED_SURFACE_HEAD_SHA256:
+        return (LEGACY_EXECUTION_IMPLEMENTATION,)
+    if digest==SURFACE_EXECUTION_HEAD_SHA256:
+        return (LEGACY_EXECUTION_IMPLEMENTATION,PREVIOUS_EXECUTION_IMPLEMENTATION)
+    return ()
 
 
 def load_surface(saved, baseline, *, teacher_sha, config_fp, manifest_fp, device):

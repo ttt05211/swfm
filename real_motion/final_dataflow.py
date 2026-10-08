@@ -325,6 +325,7 @@ def forecast_six(
     executor=None,
     majority_backend="native",
     reuse_motion_projections=True,
+    projection_fn=None,
 ):
     """Official Dense Forecast computation from history state to dense x6.
 
@@ -414,7 +415,7 @@ def forecast_six(
     evidence = history.canonical_evidence
     plan = call(
         "six_projection_ownership_legality",
-        lambda: map_canonical_evidence(
+        lambda: (projection_fn or map_canonical_evidence)(
             evidence, prep, provider.pcfg.grid, kernels=kernels, executor=executor
         ),
     )
