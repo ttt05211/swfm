@@ -588,7 +588,9 @@ def main(argv=None):
                     for group_name in group_names:
                         metric=cohorts[group_name]["metrics"]
                         metric["baseline"].update(ri,prep.baseline[h],raw["future_gt_occ"][h],moving[h])
-                        metric["Old_Local_REMOVE_off"].update(ri,old,raw["future_gt_occ"][h],moving[h])
+                        metric["Old_Local_REMOVE_off"].update(
+                            ri,old.reshape(raw["future_gt_occ"][h].shape),
+                            raw["future_gt_occ"][h],moving[h])
                         for policy,pred_frames in predictions.items():
                             metric[policy].update(
                                 ri,pred_frames[h],raw["future_gt_occ"][h],moving[h])
