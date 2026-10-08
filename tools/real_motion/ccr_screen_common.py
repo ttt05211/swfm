@@ -56,7 +56,7 @@ def execution_kernels(provider):
     return getattr(getattr(provider,'ccr_execution',None),'kernels',None)
 
 
-def build_inputs(provider,prep):
+def _build_inputs_base(provider,prep):
     """Build the complete inference domain.
 
     Persistent TRAIN/VAL history caches already contain the exact compact
@@ -92,9 +92,18 @@ def build_inputs(provider,prep):
             if execution is None else execution.build(prep,provider.pcfg.grid))
 
 
+def build_inputs(provider,prep):
+    evidence=_build_inputs_base(provider,prep)
+    augment=getattr(provider,'ccr_augment_evidence',None)
+    return evidence if augment is None else augment(evidence,prep)
+
+
 def map_inputs(provider,evidence,prep):
     execution=getattr(provider,'ccr_execution',None)
-    return map_canonical_evidence(evidence,prep,provider.pcfg.grid) if execution is None else execution.map(evidence,prep,provider.pcfg.grid)
+    plan=(map_canonical_evidence(evidence,prep,provider.pcfg.grid)
+          if execution is None else execution.map(evidence,prep,provider.pcfg.grid))
+    augment=getattr(provider,'ccr_augment_plan',None)
+    return plan if augment is None else augment(evidence,plan,prep)
 
 
 def add_args(parser):
@@ -508,12 +517,20 @@ def calibrate_train(provider, source, records, teacher, head, *, progress=None, 
 
 
 def _add_only_natural_loss(head,logits,actors,target,weight):
-    """Importance-corrected natural-prior ADD BCE, equal static/dynamic role weight."""
+    """Importance-corrected ADD BCE; opt-in model traits retain TRAIN weighting.
+
+    Existing natural-BCE heads still use no positive weight. The surface head
+    explicitly requests weighted ADD and static-only validation supervision.
+    """
     roles=actors>=0
+    positive=(head.positive_weight[roles.long(),None,0]
+              if getattr(head,'add_only_weighted',False) else None)
     bce=torch.nn.functional.binary_cross_entropy_with_logits(
-        logits[...,0].float(),target[...,0].float(),reduction='none')
+        logits[...,0].float(),target[...,0].float(),pos_weight=positive,reduction='none')
     loss=logits.sum()*0
     for role in (False,True):
+        if role and getattr(head,'static_only_training',False):
+            continue
         w=weight[...,0]*(roles==role)[:,None]
         loss=loss+(bce*w).sum()/w.sum().clamp_min(1)
     return loss
@@ -596,6 +613,9 @@ def train_step(provider, rows, teacher, head, optimizer, rng, *, candidate_pool=
             sample,plan=map_sampled_compact_canonical(
                 compact,ids,prep,provider.pcfg.grid,kernels=execution_kernels(provider),
                 static_conflicts=compact_conflicts)
+        augment=getattr(provider,'ccr_augment_sample',None)
+        if augment is not None:
+            sample,plan=augment(sample,plan,prep)
         y,valid=repair_targets(sample,plan,gt)
         return sample,plan,y,importance[:,None,None]*valid
 
@@ -793,7 +813,9 @@ def old_execution(teacher, provider):
 
 @torch.no_grad()
 def evaluate(provider, source, records, teacher, head, *, include_old=False, progress=None, stop_event=None):
-    teacher.eval(); head.eval(); names = ('static_repair', 'dynamic_repair', 'joint') + (('old_joint',) if include_old else ())
+    teacher.eval(); head.eval()
+    reference=getattr(provider,'ccr_reference_probabilities',None)
+    names = ('static_repair', 'dynamic_repair', 'joint') + (('frozen_B',) if reference else ()) + (('old_joint',) if include_old else ())
     base = Metrics(); metrics = {name: Metrics() for name in names}
     quality = {name: defaultdict(int) for name in names}
     # role(static/dynamic) x action(ADD/REMOVE): tp/fp/fn/valid
@@ -846,7 +868,12 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
                 prep.baseline,evidence,plan,p[...,0],remove,
                 thresholds=(.5,None) if add_only else (.5,.95),
                 role={'static_repair':'static','dynamic_repair':'dynamic','joint':'all'}[name])
-                for name in names if name != 'old_joint'}
+                for name in names if name not in ('old_joint','frozen_B')}
+            if reference is not None:
+                ref=reference(evidence,plan,output)
+                predictions['frozen_B']=compose_canonical(
+                    prep.baseline,evidence,plan,ref[...,0],np.zeros_like(ref[...,1]),
+                    thresholds=(.5,None),role='all')
             stages['fresh_canonical_all_six_probabilities_compose'] += time.perf_counter()-tick; tick = time.perf_counter()
             support = gt_moving_support_sequence(source.nusc, prep.window.t0_token, prep.window.future_tokens,
                 tuple(.5*(h+1) for h in range(6)), grid=provider.pcfg.grid, workers=provider.workers)
@@ -857,7 +884,8 @@ def evaluate(provider, source, records, teacher, head, *, include_old=False, pro
                 if include_old:
                     old_plan = columns.candidate_plan(prep, h, provider.pcfg.grid, teacher.columns.config)
                     old_p = columns.predict_probabilities(teacher.columns, prep, h, old_plan, provider.pcfg.grid, provider.device, 256)
-                    predictions['old_joint'] = {h: compose_dense(before, old_plan, actions_from_probabilities(old_plan, old_p, GATES))}
+                    gates=getattr(provider,'ccr_old_gates',GATES)
+                    predictions['old_joint'] = {h: compose_dense(before, old_plan, actions_from_probabilities(old_plan, old_p, gates))}
                 for name in names:
                     dense = predictions[name][h]
                     metrics[name].update(ri, dense, gt, moving[h]); scene[name].update(ri, dense, gt, moving[h])

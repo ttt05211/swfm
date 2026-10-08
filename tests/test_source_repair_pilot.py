@@ -140,7 +140,10 @@ def real_training_fixture():
     _,teacher,provider,rows=training_fixture();prep,grid,_,_,_=device_fixture()
     def prepare(source,record,*,include_gt,raw_window,outputs):
         result=copy.copy(prep);result.raw=raw_window;result.outputs=outputs
-        result.state=raw_window['_column_causal_preparation']['prepared_state']
+        # The live renderer exactness preflight deliberately bypasses cached
+        # preparation once. The mock must support that production API too.
+        cached=raw_window.get('_column_causal_preparation')
+        result.state=cached['prepared_state'] if cached is not None else prep.state
         result.baseline,result.owners,result.fallbacks,result.components,result.targets,result.yaws=reference.render_column_layers(
             result.state,record,outputs,grid)
         return result

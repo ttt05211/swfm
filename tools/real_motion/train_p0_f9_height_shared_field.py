@@ -195,6 +195,10 @@ def main(stop_event=None, argv=None, *, backend=None):
                                      source_dim=teacher.columns.source_dim).to(device))
             warm_info=None
             if backend is not None and getattr(a,'warm_start_head',None):
+                if getattr(backend,'SNAPSHOT_WARM_START_HEAD',False):
+                    warm_snapshot=out/'frozen_B_snapshot.pt'
+                    snapshot_checkpoint(a.warm_start_head,warm_snapshot)
+                    a.warm_start_head=str(warm_snapshot)
                 warm_info=backend.warm_start_head(
                     head,a.warm_start_head,teacher_sha256=digest,
                     config_fingerprint=stable_json_fingerprint(cfg),
@@ -428,8 +432,12 @@ def main(stop_event=None, argv=None, *, backend=None):
                 save(); persist()
             if 'speed' not in reports:
                 with preserve_training_rng(rng):
-                    reports['speed'] = speed_fn(provider, dev_source, dev[:a.fps_windows], teacher, head,
-                                                        repeats=a.speed_repeats, stop_event=stop_event)
+                    speed_population = (dev if getattr(backend, 'SPEED_FULL_MONITOR_POPULATION', False)
+                                        else dev[:a.fps_windows])
+                    speed_extra = ({'quality_report':reports.get('final_dev512',reports['epochs'][-1]['evaluation'])}
+                                   if getattr(backend,'SPEED_NEEDS_QUALITY_REPORT',False) else {})
+                    reports['speed'] = speed_fn(provider, dev_source, speed_population, teacher, head,
+                                                repeats=a.speed_repeats, stop_event=stop_event, **speed_extra)
                 save(); persist()
             final = reports.get('final_dev512', reports['epochs'][-1]['evaluation'])
             old = final['variants'].get('old_joint', reports['initial_dev64']['variants']['old_joint'])['metrics']

@@ -46,9 +46,10 @@ def optimizers(joint, control):
 def provider_for(prep, grid, joint):
     def prepare(source, record, *, include_gt, raw_window=None, outputs=None):
         result = copy.deepcopy(prep)
-        result.outputs = outputs if outputs is not None else joint.motion(record, torch.device('cpu'))
+        device = next(joint.parameters()).device
+        result.outputs = outputs if outputs is not None else joint.motion(record, device)
         return result
-    return SimpleNamespace(device=torch.device('cpu'), pcfg=SimpleNamespace(grid=grid), prepare_columns=prepare)
+    return SimpleNamespace(device=next(joint.parameters()).device, pcfg=SimpleNamespace(grid=grid), prepare_columns=prepare)
 
 
 def test_random_initialization_paired_identical_and_future_labels_not_inputs():

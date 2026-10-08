@@ -33,16 +33,18 @@ def frozen_b_probabilities(head, evidence, plan, output, device, *, chunk=8192):
                 if hasattr(head,"encode_queries") and len(evidence) else None)
         for start in range(0,len(evidence),chunk):
             sl=slice(start,start+chunk)
+            batch=(head.inference_batch(live,evidence.actor[sl])
+                   if hasattr(head,'inference_batch') else live)
             actor=tensor(evidence.actor[sl],device)
             encoded=(shared[sl] if shared is not None else
                      head.encode(
                          tensor(evidence.features[sl],device),
                          tensor(evidence.labels[sl],device),
-                         actor,tensor(evidence.classes[sl],device),live))
+                         actor,tensor(evidence.classes[sl],device),batch))
             logits=head.decode(
                 encoded,actor,tensor(plan.context[sl],device),
                 tensor(plan.base[sl],device),tensor(plan.fallback[sl],device),
-                tensor(plan.legal[sl],device),live)
+                tensor(plan.legal[sl],device),batch)
             score=torch.zeros_like(logits,dtype=torch.float32)
             score[...,0]=torch.sigmoid(logits[...,0].float())
             result.append(score.cpu().numpy())

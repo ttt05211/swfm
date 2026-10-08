@@ -1,6 +1,8 @@
 param(
     [Parameter(Position=0)]
-    [string[]]$PythonArgs = @('tools/real_motion/check_local_cuda_env.py')
+    [string[]]$PythonArgs = @('tools/real_motion/check_local_cuda_env.py'),
+    [string]$Interpreter,
+    [string]$UpstreamPath
 )
 
 # Reuse the existing CUDA installation without activating Anaconda base or
@@ -8,7 +10,7 @@ param(
 # the same healthy Python DLLs return 0xc0000022 inside that sandbox.
 $ErrorActionPreference = 'Stop'
 $taskRepo = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-$taskInterpreter = Join-Path $taskRepo '.venv-cuda-check/Scripts/python.exe'
+$taskInterpreter = if ($Interpreter) { [System.IO.Path]::GetFullPath($Interpreter) } else { Join-Path $taskRepo '.venv-cuda-check/Scripts/python.exe' }
 $taskCondaEnv = 'F:\anaconda3\envs\yoloe'
 if (-not (Test-Path -LiteralPath $taskInterpreter -PathType Leaf)) {
     throw 'Project CUDA interpreter missing; see docs/LOCAL_WINDOWS_CUDA_ENV_CN.md. Do not fall back to base.'
@@ -16,7 +18,7 @@ if (-not (Test-Path -LiteralPath $taskInterpreter -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath (Join-Path $taskCondaEnv 'python310.dll') -PathType Leaf)) {
     throw 'Existing yoloe runtime missing; do not silently download or use another environment.'
 }
-if (-not (Get-Content -LiteralPath (Join-Path $taskRepo '.venv-cuda-check/pyvenv.cfg') |
+if (-not (Get-Content -LiteralPath (Join-Path (Split-Path (Split-Path $taskInterpreter)) 'pyvenv.cfg') |
           Where-Object { $_ -ieq ('home = ' + $taskCondaEnv) })) {
     throw 'Project interpreter does not reference the verified yoloe runtime.'
 }
@@ -32,7 +34,7 @@ public static class SwfmLocalCudaErrorMode {
 $taskOldMode = [SwfmLocalCudaErrorMode]::SetErrorMode(3)
 $taskKeys = @('PATH','CONDA_PREFIX','PYTHONHOME','PYTHONPATH','PYTHONNOUSERSITE',
               'PYTHONDONTWRITEBYTECODE','OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS',
-              'PYTEST_DISABLE_PLUGIN_AUTOLOAD')
+              'PYTEST_DISABLE_PLUGIN_AUTOLOAD','CUBLAS_WORKSPACE_CONFIG')
 $taskSavedEnvironment = @{}
 foreach ($taskKey in $taskKeys) {
     $taskSavedEnvironment[$taskKey] = [System.Environment]::GetEnvironmentVariable($taskKey, 'Process')
@@ -43,12 +45,20 @@ try {
     $env:PATH = "$taskCondaEnv;$taskCondaEnv\Library\bin;$taskCondaEnv\DLLs;$taskCondaEnv\Scripts;$taskRestPath"
     $env:CONDA_PREFIX = $taskCondaEnv
     Remove-Item Env:PYTHONHOME,Env:PYTHONPATH -ErrorAction SilentlyContinue
+    $taskUpstream = if ($UpstreamPath) { [System.IO.Path]::GetFullPath($UpstreamPath) } else { Join-Path $taskRepo 'upstream_occfm' }
+    if (-not (Test-Path -LiteralPath (Join-Path $taskUpstream 'forecast') -PathType Container)) {
+        throw 'OccFM submodule missing; initialize it or explicitly reuse a verified upstream checkout with -UpstreamPath.'
+    }
+    $env:PYTHONPATH = "$taskRepo;$taskUpstream"
     $env:PYTHONNOUSERSITE = '1'
     $env:PYTHONDONTWRITEBYTECODE = '1'
     $env:OMP_NUM_THREADS = '1'
     $env:MKL_NUM_THREADS = '1'
     $env:OPENBLAS_NUM_THREADS = '1'
     $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
+    # Set BEFORE Python/CUDA initializes. Setting this inside a later pytest
+    # fixture is too late once an earlier test has created a cuBLAS handle.
+    if (-not $env:CUBLAS_WORKSPACE_CONFIG) { $env:CUBLAS_WORKSPACE_CONFIG = ':4096:8' }
     & $taskInterpreter @PythonArgs
     $taskCode = $LASTEXITCODE
     if ($taskCode -ne 0) {
