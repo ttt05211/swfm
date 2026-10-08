@@ -84,7 +84,7 @@ def _count_where(out,name,mask):
     out[name]+=int(np.count_nonzero(mask))
 
 
-def _static_diagnostic(count,base,gt,b,b_static,old,old_static,ccr,old_gen,old_refine,cid):
+def _static_diagnostic(count,base,gt,b,b_static,old,old_static,ccr,old_gen,old_refine,cid,ccr_projected=None):
     """Unique dense-voxel accounting, not duplicated candidate-query counts."""
     volume=base.size
     if any(x.size!=volume for x in (gt,b,b_static,old,old_static,ccr,old_gen,old_refine)):
@@ -93,6 +93,9 @@ def _static_diagnostic(count,base,gt,b,b_static,old,old_static,ccr,old_gen,old_r
     old_any=old_gen|old_refine
     _count_where(count,"GT_missing_on_V18_free",need)
     _count_where(count,"CCR_support_GT",need&ccr)
+    if ccr_projected is not None:
+        _count_where(count,"CCR_projected_GT",need&ccr_projected)
+        _count_where(count,"CCR_projected_but_illegal_GT",need&ccr_projected&~ccr)
     _count_where(count,"CCR_no_support_GT",need&~ccr)
     _count_where(count,"Old_GEN_support_GT",need&old_gen)
     _count_where(count,"Old_REFINE_support_GT",need&old_refine)
@@ -321,15 +324,20 @@ def main(argv=None):
 
                     volume=gt.size
                     for cid in CLASSES:
+                        static_role=(evidence.actor==-2)&(evidence.classes==cid)
                         ccr=_flatten_support(
                             plan.flat[:,h:h+1],plan.legal[:,h:h+1,0],
-                            (evidence.actor==-2)&(evidence.classes==cid),volume)
+                            static_role,volume)
+                        ccr_projected=_flatten_support(
+                            plan.flat[:,h:h+1],plan.flat[:,h:h+1]>=0,
+                            static_role,volume)
                         old_gen=_old_class_support(old_plan,cid,GENERATE,volume)
                         old_refine=_old_class_support(old_plan,cid,REFINE,volume)
                         _static_diagnostic(
                             rows[(cid,h)],baseline,gt,
                             np.asarray(B[h]).ravel(),np.asarray(B_static[h]).ravel(),
-                            old,old_static,ccr,old_gen,old_refine,cid)
+                            old,old_static,ccr,old_gen,old_refine,cid,
+                            ccr_projected=ccr_projected)
 
                 if wi==1 or wi%8==0 or wi==len(records):
                     print(f"CCR_STATIC_GAP {wi}/{len(records)}",flush=True)
