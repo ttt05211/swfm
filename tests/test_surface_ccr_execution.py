@@ -110,3 +110,40 @@ def test_multichunk_trained_geometry_and_changed_source_count_keep_bytes():
             frozen_b_probabilities(head, evidence, plan, output, device))
     assert session.counts['captures_verified'] == 2 and not session.failures
     session.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='actual CUDA required')
+def test_single_pass_variable_tails_never_capture_or_evict_full_chunk():
+    device = torch.device('cuda')
+    head = SurfaceCanonicalRepairHead(8, 16).to(device).eval().requires_grad_(False)
+    with torch.no_grad(): head.surface.weight.normal_(); head.phase.weight.normal_()
+    session = SurfaceExecution(head, device, capture_full_chunks_only=True)
+    try:
+        # More unique tails than the graph budget, changing input/source row
+        # on EVERY call: this covers the real one-pass workload, not hot repeats.
+        for i, tail in enumerate((41, 42, 43, 44, 45, 46)):
+            evidence, plan, output = inputs(device, n=8192+tail, sources=2+i)
+            output = {k: v+.1*i for k, v in output.items()}
+            plan = replace(plan, context=plan.context+.125*i)
+            np.testing.assert_array_equal(session(head, evidence, plan, output, device),
+                frozen_b_probabilities(head, evidence, plan, output, device))
+            assert session.counts['captures_verified'] == 1
+            assert session.counts['evictions'] == 0 and len(session.cache) == 1
+        assert session.counts['tail_eager_chunks'] == 6
+        assert session.counts['graph_replays'] == 6 and not session.failures
+    finally: session.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='actual CUDA required')
+def test_single_pass_small_populations_only_eager_with_empty_sources():
+    device = torch.device('cuda')
+    head = SurfaceCanonicalRepairHead(8, 16).to(device).eval().requires_grad_(False)
+    session = SurfaceExecution(head, device, capture_full_chunks_only=True)
+    try:
+        for n in (41, 42, 43, 44, 45):
+            args = inputs(device, n=n, sources=0)
+            np.testing.assert_array_equal(session(head, *args, device),
+                frozen_b_probabilities(head, *args, device))
+        assert not session.cache and session.counts['captures_verified'] == 0
+        assert session.counts['tail_eager_chunks'] == session.counts['eager_chunks'] == 5
+    finally: session.close()

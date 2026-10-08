@@ -49,6 +49,16 @@ from tools.real_motion.surface_ccr_validation_common import (
     PROTOCOL, Accumulator, load_progress, save_progress, paired_speed,
 )
 
+# Exact Linux/Windows-LF fingerprint of 36714f1, not an arbitrary resume bypass.
+# The head and all cache/scientific contracts must still be identical.
+LEGACY_EXECUTION_IMPLEMENTATION = '25a932b9dff199d3fcc47eb829d3741304ee5d121b4f996462b39fe176f5d17d'
+UNCHANGED_SURFACE_HEAD_SHA256 = '92dde104ff0930c521461bb83d5e6f5aa2bf2410ba44492ffe95b2c3cb6f4933'
+
+
+def compatible_execution_implementations(root):
+    return ((LEGACY_EXECUTION_IMPLEMENTATION,)
+            if sha256(Path(root)/'real_motion/surface_canonical_repair.py') == UNCHANGED_SURFACE_HEAD_SHA256 else ())
+
 
 def load_surface(saved, baseline, *, teacher_sha, config_fp, manifest_fp, device):
     c = saved.get('contract', {})
@@ -110,11 +120,16 @@ def summary(result):
                 difference = {k: errors['surface_CCR'][k] - errors['frozen_B'][k] for k in ('TP', 'FP', 'FN')}
                 lines.append(f'{h}s class{cls} TP/FP/FN vs_B: ' + str(difference))
     lines += ['completed_windows=' + str(result.get('completed_windows', 0)),
+              'quality_eval_execution=' + str(result.get('quality_eval_execution', 'not started')),
               'performance=' + str(result.get('performance', {})),
               'These subsets were already used in research: enlarged validation, NOT independent tests.',
               'Old Local comparator: same live transport, (.5,.5,REMOVE-off).',
               'Original weights/optimizer/RNG/caches unchanged. No automatic clean-joint training or promotion.']
     if result.get('error'): lines.append('error=' + result['error'])
+    if result.get('val_cache'):
+        cache = result['val_cache']
+        lines.append('VAL_CACHE ' + str({k: cache[k] for k in ('hits', 'misses', 'writes') if k in cache}))
+    if result.get('timing_note'): lines.append(result['timing_note'])
     return '\n'.join(lines) + '\n'
 
 
@@ -128,6 +143,8 @@ def parser():
     p.add_argument('--ccr-cpu-workers', type=int, default=4)
     p.add_argument('--ccr-val-history-cache-ram-mib', type=int, default=512)
     p.add_argument('--old-local-batch-size', type=int, default=256)
+    p.add_argument('--eval-surface-execution', choices=('eager', 'full_chunk_graph'), default='eager',
+                   help='quality eval only; warmed FPS never selects a cold variable-tail graph policy')
     p.add_argument('--resume-eval', help='previous evaluation_progress.pt; NEVER a training checkpoint')
     p.add_argument('--max-windows', type=int, default=0, help='planned safe stop; full population/selection unchanged')
     return p
@@ -154,6 +171,8 @@ def main(argv=None, stop_event=None):
     def persist():
         result['completed_windows'] = accumulator.cursor
         result['performance'] = dict(performance)
+        if fast is not None: result['speed_execution_full_eval'] = fast.stats()
+        if val_cache is not None: result['val_cache'] = val_cache.stats()
         write_json(out/'expanded_validation.json', result)
         (out/'summary.txt').write_text(summary(result), encoding='utf-8')
     def save():
@@ -223,18 +242,33 @@ def main(argv=None, stop_event=None):
                 'real_motion/surface_canonical_repair.py', 'real_motion/surface_ccr_execution.py',
                 'tools/real_motion/surface_ccr_validation_common.py', 'tools/real_motion/validate_p0_f9_surface_ccr_expanded.py')}))
         if a.resume_eval:
-            speed, performance = load_progress(a.resume_eval, contract, accumulator)
+            compatible = compatible_execution_implementations(root)
+            speed, performance = load_progress(a.resume_eval, contract, accumulator,
+                                                compatible_implementations=compatible)
+            result['resumed_from'] = str(Path(a.resume_eval).resolve())
+            result['execution_fix_compatible_implementations'] = list(compatible)
+            result['timing_note'] = ('performance includes the saved prefix; quality_eval_execution '
+                                     'and per-window progress describe this invocation, not a paired speedup')
             if accumulator.cursor > len(records): raise RuntimeError('invalid evaluation cursor')
             print(f'SURFACE_EVAL_RESUME {accumulator.cursor}/{len(records)} exact integer counts restored', flush=True)
         if speed is None:
             speed = paired_speed(provider, source, monitor, teacher, head, reference, stop_event=stop_event)
             result['speed'] = speed; save()
         result['speed'] = speed
-        fast = SurfaceExecution(head, device, graphs=speed['selected_execution'] == 'surface_graph')
+        # Hot single-window FPS does not justify recapturing variable shapes
+        # in a one-pass evaluation. Reference eager is the conservative default;
+        # the opt-in graph policy only captures fixed full chunks (at most two
+        # keys: with/without sources), leaving every variable tail unchanged.
+        result['quality_eval_execution'] = a.eval_surface_execution
+        fast = SurfaceExecution(head, device, graphs=a.eval_surface_execution == 'full_chunk_graph',
+                                capture_full_chunks_only=True)
+        print('QUALITY_EVAL_EXECUTION '+a.eval_surface_execution+
+              ' (separate from warmed FORMAL_FPS; no variable-tail capture)', flush=True)
         before = time.perf_counter()
         with (out/'progress.jsonl').open('x', encoding='utf-8') as log, ccr.old_execution(teacher, provider):
             for record, raw in prefetch_raw_columns(provider, source, records[accumulator.cursor:]):
-                tick = time.perf_counter(); performance['input_wait_seconds'] += tick - before
+                tick = time.perf_counter(); input_wait = tick - before
+                performance['input_wait_seconds'] += input_wait
                 if stop_event is not None and stop_event.is_set(): raise InterruptedError('safe window boundary stop')
                 window_stages = {}
                 def measure(name, fn):
@@ -255,7 +289,13 @@ def main(argv=None, stop_event=None):
                 plan = measure('live_projection_seconds', lambda: ccr.map_inputs(provider, plain, prep))
                 surface_plan = measure('live_surface_phase_seconds', lambda: augment_projection(
                     enriched, plan, prep.state['current_pose'], prep.state['world_to_future'], provider.pcfg.grid))
+                prior_execution = fast.stats()
                 new = measure('surface_probability_seconds', lambda: fast(head, enriched, surface_plan, output, device))
+                after_execution = fast.stats()
+                execution_seconds = {k: v-prior_execution['host_seconds'].get(k, 0.)
+                    for k, v in after_execution['host_seconds'].items()}
+                execution_counts = {k: v-prior_execution['counts'].get(k, 0)
+                    for k, v in after_execution['counts'].items()}
                 old_b = measure('B_probability_seconds', lambda: frozen_b_probabilities(reference, plain, plan, output, device))
                 # All validation windows, not just the FPS population: confirm the
                 # frozen dynamic scores before any GT-based metric computation.
@@ -265,7 +305,7 @@ def main(argv=None, stop_event=None):
                 for name, score in (('surface_CCR', new), ('frozen_B', old_b)):
                     predictions[name] = measure(name + '_compose_seconds', lambda score=score: compose_canonical(
                         prep.baseline, plain, plan, score[..., 0], score[..., 1], thresholds=(.5, None), role='all'))
-                target, valid = repair_targets(plain, plan, raw['future_gt_occ'])
+                target, valid = measure('repair_targets_seconds', lambda: repair_targets(plain, plan, raw['future_gt_occ']))
                 def old_predictions():
                     _attach_old_local_fixed_geometry(prep, provider, teacher)
                     rows = {}
@@ -284,10 +324,17 @@ def main(argv=None, stop_event=None):
                 if device.type == 'cuda': torch.cuda.synchronize(device)
                 before = time.perf_counter()
                 log.write(json.dumps(dict(event='surface_expanded', window=accumulator.cursor, windows=len(records),
-                                          stages_seconds=window_stages)) + '\n'); log.flush()
+                    stages_seconds=window_stages, input_wait_seconds=input_wait,
+                    ccr_history_cache_hit=bool(raw.get('_ccr_history_cache_hit')),
+                    canonical_points=len(plain), surface_execution=a.eval_surface_execution,
+                    surface_execution_host_seconds=execution_seconds,
+                    surface_execution_counts=execution_counts)) + '\n'); log.flush()
                 if accumulator.cursor % 32 == 0: save()
                 if accumulator.cursor == 1 or accumulator.cursor % 32 == 0:
-                    print(f'SURFACE_EXPANDED {accumulator.cursor}/{len(records)}', flush=True)
+                    print(f'SURFACE_EXPANDED {accumulator.cursor}/{len(records)} '
+                          f'cache_hit={bool(raw.get("_ccr_history_cache_hit"))} '
+                          f'points={len(plain)} readout_ms={1000*window_stages["surface_probability_seconds"]:.2f} '
+                          f'capture_ms={1000*execution_seconds.get("capture_and_parity",0.):.2f}', flush=True)
                 if a.max_windows and accumulator.cursor >= a.max_windows: break
         result.update(accumulator.report())
         result['speed_execution_full_eval'] = fast.stats()
@@ -302,7 +349,8 @@ def main(argv=None, stop_event=None):
         persist(); raise
     finally:
         result['elapsed_seconds_this_invocation'] = time.perf_counter() - begun
-        if fast is not None: fast.close()
+        if fast is not None:
+            result['speed_execution_full_eval'] = fast.stats(); fast.close()
         if val_cache is not None:
             result['val_cache'] = val_cache.stats(); val_cache.close()
         if execution is not None: execution.close()

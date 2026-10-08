@@ -6,6 +6,14 @@
 
 当前分支 `feature/v22-surface-aware-ccr`，独立工作副本 `swfm-surface-ccr`，基于别人最新实现 `feature/v22-final-dataflow-fps@b1507ed`。原 `swfm-v20utc` 有用户未提交改动，未动。用户已明确允许提交并推送新分支。
 
+## 当前运行问题与修复（2026-10-08）
+
+用户已停止扩大评估 `expanded_20261008_150128_838`。最近125窗口surface_probability2629ms/B8.35ms，输入等待1.41ms；不是输入等待造成。代码确定存在变长尾块按shape捕获CUDA Graph的单遍退化；本地合成变长6窗口head-only复现旧策略64.0ms/eager7.27ms，概率逐字节一致，但未证明服务器2629ms全部由此造成。
+
+修复：质量eval默认eager，与预热FPS后端选择分离；可选fixed-full-chunk graph，只捕获8192静态整块，尾块eager。正式FPS口径/模型/权重/候选/阈值均不变。逐窗口记录缓存命中、输入等待、points及graph upload/capture/forward/readback统计；JSON运行中也保存缓存/执行统计。仅allow-list原36714f1指纹且head文件SHA不变时允许整数eval断点迁移，其余科学合同继续严格检查；完成的FPS复用，旧prefix计时不能混算paired提速。相关本地回归65 passed，含真实CUDA变长窗口、不变动态/cache/dataflow及原实现指纹断点兼容；不是全仓CI或L40S实测。
+
+下一步先从 `/root/nas/occ/swfm/outputs/p0_f9_surface_ccr/expanded_20261008_150128_838/evaluation_progress.pt` 接续，读取新readout子计时确认异常是否消除。不重训，不重建缓存、不从头评估；Ctrl+C边界/kill-9周期区别保持。之后才按full质量/FPS决定干净联合训练。
+
 ## 已知结果（用户服务器报告）
 
 Surface-consistent CCR 已完成完整 TRAIN20430×3 冻结验证，第三轮 DEV512 mIoU40.418031 / MovingMicro31.052754；vs Frozen B +0.380824 / 0 pp，vs Old Local REMOVE-off +0.041886 / +0.941836 pp。三个时距 road11/sidewalk13 都改善。训练步0.053211秒/窗口（运动/动态冻结，不能称完整联合训练提速）。同20窗口×3正式对照：B49.696705 FPS/120.732ms，新CCR40.102844 FPS/149.615ms，达到40但余量很薄。

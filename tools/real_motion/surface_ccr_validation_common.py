@@ -153,10 +153,16 @@ def save_progress(path, contract, accumulator, speed, performance):
     os.replace(temporary, path)
 
 
-def load_progress(path, contract, accumulator):
+def load_progress(path, contract, accumulator, *, compatible_implementations=()):
     saved = torch.load(path, map_location='cpu', weights_only=False)
+    previous = saved.get('contract')
+    # Only the CLI's explicitly allow-listed byte-identical execution fix may
+    # migrate the implementation fingerprint. Everything else stays strict.
+    if (isinstance(previous, dict) and isinstance(contract, dict)
+            and previous.get('implementation') in compatible_implementations):
+        previous = {**previous, 'implementation': contract.get('implementation')}
     if (saved.get('protocol') != PROTOCOL
-            or stable_json_fingerprint(saved.get('contract')) != stable_json_fingerprint(contract)):
+            or stable_json_fingerprint(previous) != stable_json_fingerprint(contract)):
         raise RuntimeError('resume requires identical checkpoints/population/execution contract')
     accumulator.load_state_dict(saved['accumulator'])
     return saved['speed'], defaultdict(float, saved['performance'])

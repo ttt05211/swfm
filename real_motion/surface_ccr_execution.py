@@ -14,7 +14,8 @@ from .ccr_frozen_b import tensor
 
 
 class SurfaceExecution:
-    def __init__(self, head, device, *, graphs=True, max_graphs=4, chunk=8192):
+    def __init__(self, head, device, *, graphs=True, max_graphs=4, chunk=8192,
+                 capture_full_chunks_only=False):
         self.head, self.device = head, torch.device(device)
         if not 1 <= max_graphs <= 4 or chunk != 8192:
             raise ValueError('bounded graphs and unchanged reference chunk=8192 required')
@@ -23,6 +24,10 @@ class SurfaceExecution:
         self.versions = tuple(p._version for p in head.parameters())
         self.graphs = bool(graphs and self.device.type == 'cuda')
         self.max_graphs, self.chunk = max_graphs, chunk
+        # A single pass over variable windows must not capture each new tail
+        # shape. Keep the original policy for explicitly warmed paired FPS,
+        # with this opt-in restricted policy for continuous evaluation.
+        self.capture_full_chunks_only = bool(capture_full_chunks_only)
         self.cache = OrderedDict()
         self.rejected = set()
         self.counts = defaultdict(int)
@@ -98,7 +103,10 @@ class SurfaceExecution:
                 role = batch['_surface_inference_role']
                 key = (len(actors), bool(len(live['history_source_context'])))
                 entry = None
-                if self.graphs and role is True and key not in self.rejected:
+                eligible_shape = not self.capture_full_chunks_only or len(actors) == self.chunk
+                if self.graphs and role is True and not eligible_shape:
+                    self.counts['tail_eager_chunks'] += 1
+                if self.graphs and role is True and eligible_shape and key not in self.rejected:
                     entry = self.cache.get(key)
                     if entry is None:
                         try:
@@ -131,6 +139,7 @@ class SurfaceExecution:
 
     def stats(self):
         return dict(graphs_enabled=self.graphs, counts=dict(self.counts),
+                    capture_full_chunks_only=self.capture_full_chunks_only,
                     host_seconds=dict(self.seconds), resident_graphs=len(self.cache),
                     max_graphs=self.max_graphs, failures=list(self.failures),
                     scope='host stages, NOT CUDA active utilization; capture/parity separately recorded')

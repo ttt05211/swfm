@@ -67,6 +67,33 @@ def test_integer_progress_resume_subsets_and_scene_disjoint_selection(tmp_path):
     with pytest.raises(RuntimeError, match='integer'): resumed.load_state_dict(bad)
 
 
+def test_known_execution_fix_resume_still_rejects_every_scientific_change(tmp_path):
+    state = common.Accumulator(); one_window(state, ('devscene', '1'))
+    path = tmp_path/'progress.pt'
+    old = dict(implementation=cli.LEGACY_EXECUTION_IMPLEMENTATION, weights='same',
+               population=[('devscene','1')], thresholds=[.5, None], val_cache_namespace='same')
+    new = {**old, 'implementation': 'new execution logging'}
+    common.save_progress(path, old, state, {'fps_done': True}, {'seconds': 2.})
+    kwargs = dict(compatible_implementations=(cli.LEGACY_EXECUTION_IMPLEMENTATION,))
+    with pytest.raises(RuntimeError, match='identical'):
+        common.load_progress(path, new, common.Accumulator())
+    resumed = common.Accumulator()
+    speed, _ = common.load_progress(path, new, resumed, **kwargs)
+    compare_state(state.state_dict(), resumed.state_dict())
+    assert speed['fps_done']
+    for field, value in (('weights','changed'), ('population',[('other','1')]),
+                         ('thresholds',[.6,None]), ('val_cache_namespace','changed')):
+        with pytest.raises(RuntimeError, match='identical'):
+            common.load_progress(path, {**new,field:value}, common.Accumulator(), **kwargs)
+
+
+def test_legacy_execution_resume_requires_unchanged_head_file(monkeypatch):
+    monkeypatch.setattr(cli, 'sha256', lambda path: cli.UNCHANGED_SURFACE_HEAD_SHA256)
+    assert cli.compatible_execution_implementations('unused') == (cli.LEGACY_EXECUTION_IMPLEMENTATION,)
+    monkeypatch.setattr(cli, 'sha256', lambda path: 'modified head')
+    assert cli.compatible_execution_implementations('unused') == ()
+
+
 def surface_checkpoint():
     baseline = CanonicalRepairHead(8)
     head = SurfaceCanonicalRepairHead(8); head.initialize_from(baseline)
@@ -190,16 +217,27 @@ def test_actual_expanded_cli_count_resume_and_reuse_completed_fps(monkeypatch, t
     speed_calls = []
     def speed(*args, **kwargs):
         speed_calls.append(1)
-        return dict(selected_execution='surface_eager', six_frame_amortized_FPS={'surface_eager': 40.},
-            six_frame_mean_seconds={'surface_eager': .15}, p90_six_ms={'surface_eager': 160.},
-            stages_mean_ms={'surface_eager': {'test': 1.}}, boundary='test-only mock',
+        return dict(selected_execution='surface_graph', six_frame_amortized_FPS={'surface_graph': 40.},
+            six_frame_mean_seconds={'surface_graph': .15}, p90_six_ms={'surface_graph': 160.},
+            stages_mean_ms={'surface_graph': {'test': 1.}}, boundary='test-only mock',
             surface_descriptor_prepare_seconds_per_window=0.)
     monkeypatch.setattr(cli, 'paired_speed', speed)
+    execution_calls = []
+    execution_type = cli.SurfaceExecution
+    def execution(*args, **kwargs):
+        execution_calls.append(kwargs)
+        return execution_type(*args, **kwargs)
+    monkeypatch.setattr(cli, 'SurfaceExecution', execution)
     argv = [v for name, path in files.items() for v in ('--'+name, str(path))]
     argv += ['--ccr-cpu-execution', 'numpy', '--ccr-cpu-workers', '1']
     full, stop, resumed = [tmp_path/n for n in ('uninterrupted', 'stop', 'resumed')]
     assert cli.main(argv + ['--out-dir', str(full), '--max-windows', '4']) == 0
     assert cli.main(argv + ['--out-dir', str(stop), '--max-windows', '2']) == 0
+    # Reproduce a stopped ORIGINAL invocation, with its exact implementation
+    # fingerprint. Resume preserves integer counts and already completed FPS.
+    old_progress = torch.load(stop/'evaluation_progress.pt', weights_only=False)
+    old_progress['contract']['implementation'] = cli.LEGACY_EXECUTION_IMPLEMENTATION
+    torch.save(old_progress, stop/'evaluation_progress.pt')
     assert cli.main(argv + ['--out-dir', str(resumed), '--max-windows', '4', '--resume-eval', str(stop/'evaluation_progress.pt')]) == 0
     assert len(speed_calls) == 2  # third invocation reuses completed FPS
     a = torch.load(full/'evaluation_progress.pt', weights_only=False)
@@ -207,3 +245,15 @@ def test_actual_expanded_cli_count_resume_and_reuse_completed_fps(monkeypatch, t
     compare_state(a['accumulator'], b['accumulator'])
     assert b['accumulator']['cursor'] == 4
     assert (resumed/'ccr_checkpoint_snapshot.pt').is_file()
+    assert all(v['graphs'] is False for v in execution_calls)
+    import json
+    result = json.loads((resumed/'expanded_validation.json').read_text())
+    assert result['quality_eval_execution'] == 'eager'
+    assert result['speed']['selected_execution'] == 'surface_graph'
+    assert 'saved prefix' in result['timing_note']
+    assert result['val_cache'] == {}
+    row = json.loads((resumed/'progress.jsonl').read_text().splitlines()[-1])
+    assert row['surface_execution'] == 'eager'
+    assert row['surface_execution_counts']['eager_chunks'] > 0
+    assert row['surface_execution_counts'].get('captures_verified',0) == 0
+    assert row['input_wait_seconds'] >= 0 and row['canonical_points'] > 0

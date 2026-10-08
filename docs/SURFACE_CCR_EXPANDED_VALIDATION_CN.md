@@ -21,7 +21,17 @@ VAL     /root/nas/occ/swfm/cache/p0_f9_ccr_history_geometry_val_v1
 
 每个新形状首次捕获需与eager概率逐字节一致。图数量≤4，超过就淘汰；权重变化拒绝使用旧session；捕获不支持/字节不一致明确记录并回退原完整eager，不缩候选或batch。
 
-正式20窗口（全部dev64中18 scene-balanced +2 source-only压力窗口）×3轮，轮转B/eager/graph顺序。所有概率、六帧dense以及动态概率在计时外检查。graph只有实际执行、无拒绝并且paired mean至少快2%才被选择为质量评估的执行后端；不按mIoU挑方法。新形状也继续做首次capture byte gate。
+正式20窗口（全部dev64中18 scene-balanced +2 source-only压力窗口）×3轮，轮转B/eager/graph顺序。所有概率、六帧dense以及动态概率在计时外检查。graph只有实际执行、无拒绝并且paired mean至少快2%才被标记为该预热FPS实验的更快后端；不按mIoU挑方法。**此结论不再自动决定全量单遍质量评估的后端。**
+
+### 2026-10-08 变长单遍性能回归修复
+
+用户运行 `expanded_20261008_150128_838`：125窗口的surface读出2629ms/窗口，B8.35ms，输入等待1.41ms。缓存等待不是主要瓶颈；尚未拿到原运行的实时图子统计，不能直接把全部2629ms归因于建图。
+
+代码存在确定的图生命周期问题：graph以尾块实际长度为key，只有4个LRU槽；不同窗口的不同尾块会反复capture/校验/淘汰，而单窗口预热FPS没有包含这种单遍开销。本地RTX3050合成变长8192+尾块、6窗口、source数逐次变化的head-only实测（含全部capture）：旧策略平均64.0ms，固定大块图15.9ms，原始eager7.27ms，全部概率字节一致。这不是服务器全模型加速或正式FPS结果。
+
+修复后：全量质量评估默认 `eager`。可显式 `SURFACE_EVAL_EXECUTION=full_chunk_graph`，它只捕获8192的完整纯静态分块，变长尾块一律eager，不padding、不改矩阵batch形状/候选/阈值。该模式最多两个形状key（有/无source），不会因变长尾块反复建图。保留正式FPS的原实验路径/计时边界，结果中的 `speed.selected_execution` 只描述预热FPS；`quality_eval_execution` 描述本次质量评估。
+
+每窗口 `progress.jsonl` 新增cache_hit、input_wait、完整候选数、执行子计时/计数；每32窗口结果JSON也更新VAL缓存统计和图执行统计。Ctrl+C/失败的finally同样保存执行统计。每32窗口控制台打印读出和capture毫秒。计时子项是包含于surface_probability的主机计时，不能再与大项相加或称GPU利用率。
 
 FPS固定：CausalHistoryState→fresh Strong/KTA+live motion+learned CCR+**live投影相位**+六帧dense。不把future phase移到计时外，不缓存Strong、poses、labels或readout。历史表面表示准备另报，不称raw-input E2E FPS。统计六帧均值/P90、峰值/增量显存以及各host stage；host不是GPU活跃利用率，live phase是readout的嵌套子项，不能重复相加。
 
@@ -45,7 +55,7 @@ bash tools/real_motion/run_p0_f9_surface_ccr_expanded.sh
 
 一次先跑paired FPS，再跑full4369；不启动训练，也不自动部署。B SHA固定；candidate取用户已报告的具体第三轮路径，不自动扫描best。
 
-Ctrl+C/SIGTERM在当前窗口完成后保存到新输出 `evaluation_progress.pt`。kill-9只能恢复最近32窗口周期保存。恢复严格校验checkpoint、人口/顺序、缓存namespace、执行参数与实现指纹；从已完成的整数cursor接续。已完成的FPS直接复用，不重测，不碰训练游标。
+Ctrl+C/SIGTERM在当前窗口完成后保存到新输出 `evaluation_progress.pt`。kill-9只能恢复最近32窗口周期保存。恢复严格校验checkpoint、人口/顺序、缓存namespace、执行参数与实现指纹；从已完成的整数cursor接续。已完成的FPS直接复用，不重测，不碰训练游标。此次仅允许已知 `36714f1` 实现指纹在CCR head文件SHA完全未变时迁移到执行修复版；其余合同字段仍须完全相同，未知旧实现拒绝。新执行后端可改变但必须在结果中明示；累计performance包含旧版prefix，不能据此宣称同窗口paired提速。
 
 ```
 SURFACE_EVAL_RESUME=/root/nas/occ/swfm/outputs/p0_f9_surface_ccr/本次目录/evaluation_progress.pt \
@@ -55,6 +65,16 @@ SURFACE_EVAL_RESUME=/root/nas/occ/swfm/outputs/p0_f9_surface_ccr/本次目录/ev
 恢复也写新目录，不覆盖旧输出。需要计划暂停可设置 `SURFACE_EVAL_MAX_WINDOWS=32`；它只限制本次执行，不改变full人口或筛选checkpoint。
 
 结果为 `summary.txt`、`expanded_validation.json`（含180条paired FPS trial和完整分段/场景/类统计）及 `progress.jsonl`。失败保存错误，不能把未完成prefix当full结果。
+
+当前已停止的具体运行可续：
+
+```bash
+SURFACE_EVAL_EXECUTION=eager \
+SURFACE_EVAL_RESUME=/root/nas/occ/swfm/outputs/p0_f9_surface_ccr/expanded_20261008_150128_838/evaluation_progress.pt \
+  bash tools/real_motion/run_p0_f9_surface_ccr_expanded.sh
+```
+
+未保存该文件时拒绝恢复，不自动从零跑；kill-9仅恢复最后周期统计。
 
 ## 本地验收和下一步
 
