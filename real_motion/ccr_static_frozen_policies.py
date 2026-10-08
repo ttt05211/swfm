@@ -95,7 +95,7 @@ def static_policy_score(score,evidence,head,policy):
     if policy not in POLICIES:
         raise ValueError("unknown static policy")
     score=np.asarray(score,np.float32)
-    if score.shape!=(len(evidence),6,2):
+    if score.shape!=(len(np.asarray(evidence.actor)),6,2):
         raise ValueError("invalid frozen Point CCR scores")
     result=score.copy()
     result[...,1]=0.0
