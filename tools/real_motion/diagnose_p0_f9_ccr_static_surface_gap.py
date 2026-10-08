@@ -84,6 +84,70 @@ def _count_where(out,name,mask):
     out[name]+=int(np.count_nonzero(mask))
 
 
+
+def _static_surface_conflicts(evidence,plan,h,baseline):
+    """Dense unique-voxel conflict types, GT-independent.
+
+    A source is direct if its canonical lattice cell had occupancy at >=1
+    historical time (presence.any); pure face-halo has zero history presence.
+    Collision is tested in the PROJECTED future raster, not t0 lattice.
+    Only V18-free voxels can be added. Classes with both direct and halo at
+    one target are treated as direct (strongest support for that class).
+    """
+    base=np.asarray(baseline).ravel();volume=base.size
+    if volume==0:raise RuntimeError("empty forecast grid")
+    flat=np.asarray(plan.flat[:,h],np.int64)
+    valid=(flat>=0)&(flat<volume)
+    direct=np.asarray(evidence.presence,bool).any(axis=1)
+    static=np.asarray(evidence.actor)==-2
+    classes=np.asarray(evidence.classes)
+    group={}
+    for cid in (11,13):
+        for flag,label in ((True,"direct"),(False,"halo")):
+            mask=static&(classes==cid)&(direct==flag)&valid
+            dense=np.zeros(volume,bool)
+            dense[flat[mask]]=True
+            group[cid,label]=dense
+    d11,h11=group[11,"direct"],group[11,"halo"]
+    d13,h13=group[13,"direct"],group[13,"halo"]
+    conflict=(d11|h11)&(d13|h13)&(base==FREE)
+    typed={
+        "road_direct_sidewalk_pure_halo":conflict&d11&~d13,
+        "sidewalk_direct_road_pure_halo":conflict&d13&~d11,
+        "both_direct":conflict&d11&d13,
+        "both_pure_halo":conflict&~d11&~d13,
+    }
+    if not np.array_equal(
+        np.logical_or.reduce(tuple(typed.values())),conflict):
+        raise RuntimeError("unpartitioned surface-class conflict")
+    # In the frozen planner all projected colliding surface rows MUST be
+    # illegal for ADD. A failure means this audit is not seeing the same mask.
+    colliding=valid&static&conflict[flat.clip(0,volume-1)]
+    if np.any(plan.legal[colliding,h,0]):
+        raise RuntimeError("surface conflict and planner legality disagree")
+    typed["any"]=conflict
+    return typed
+
+
+def _count_surface_conflicts(count,base,gt,b,old_static,cid,conflicts):
+    """How many OLD-successful, B-missed GT voxels were conflict blocked?"""
+    need=(base==FREE)&(gt==cid)
+    win=need&(old_static==cid)&(b!=cid)
+    categories=(
+        "any","road_direct_sidewalk_pure_halo",
+        "sidewalk_direct_road_pure_halo","both_direct","both_pure_halo",
+    )
+    for name in categories:
+        conflict=conflicts[name]
+        _count_where(count,"blocked_"+name+"_all",conflict)
+        _count_where(count,"blocked_"+name+"_GT",need&conflict)
+        _count_where(count,"Old_static_win_blocked_"+name,win&conflict)
+    preferred=("road_direct_sidewalk_pure_halo" if cid==11 else
+               "sidewalk_direct_road_pure_halo")
+    _count_where(count,"own_real_vs_other_halo_GT",need&conflicts[preferred])
+    _count_where(count,"Old_static_win_own_real_vs_other_halo",win&conflicts[preferred])
+
+
 def _static_diagnostic(count,base,gt,b,b_static,old,old_static,ccr,old_gen,old_refine,cid,ccr_projected=None):
     """Unique dense-voxel accounting, not duplicated candidate-query counts."""
     volume=base.size
@@ -145,6 +209,10 @@ def _finish(raw):
     out=dict(sorted(raw.items()))
     need=out.get("GT_missing_on_V18_free",0)
     wins=out.get("Old_static_win_over_B_joint",0)
+    out["Old_wins_blocked_any_share"]=(
+        out.get("Old_static_win_blocked_any",0)/wins if wins else None)
+    out["Old_wins_own_real_vs_other_halo_share"]=(
+        out.get("Old_static_win_own_real_vs_other_halo",0)/wins if wins else None)
     out["GT_missing_CCR_support_recall"]=(
         out.get("CCR_support_GT",0)/need if need else None)
     out["GT_missing_Old_support_recall"]=(
@@ -175,7 +243,13 @@ def _summary(r):
                 f'old_wins_CCR_no_support={item["Old_static_win_CCR_no_support"]} '
                 f'old_wins_CCR_reachable_not_written={item["Old_static_win_CCR_reachable_not_written"]} '
                 f'B_static_FP_free={item["B_static_FP_free"]} '
-                f'B_static_FP_opposite={item["B_static_FP_opposite_surface"]}')
+                f'B_static_FP_opposite={item["B_static_FP_opposite_surface"]} '
+                f'blocked_conflict_GT={item["blocked_any_GT"]} '
+                f'blocked_own_real_vs_halo_GT={item["own_real_vs_other_halo_GT"]} '
+                f'old_wins_blocked_conflict={item["Old_static_win_blocked_any"]} '
+                f'old_wins_own_real_vs_halo={item["Old_static_win_own_real_vs_other_halo"]} '
+                f'blocked_both_direct_GT={item["blocked_both_direct_GT"]} '
+                f'blocked_both_halo_GT={item["blocked_both_pure_halo_GT"]}')
     if "error" in r:lines.append("error="+r["error"])
     lines.append("Read-only diagnostic on a known development subset, not new test evidence.")
     return "\n".join(lines)+"\n"
@@ -310,6 +384,7 @@ def main(argv=None):
                 for h in HORIZONS:
                     baseline=np.asarray(prep.baseline[h]).ravel()
                     gt=np.asarray(raw["future_gt_occ"][h]).ravel()
+                    conflicts=_static_surface_conflicts(evidence,plan,h,baseline)
                     old_plan=columns.candidate_plan(
                         prep,h,provider.pcfg.grid,teacher.columns.config)
                     prob=columns.predict_probabilities(
@@ -338,6 +413,9 @@ def main(argv=None):
                             np.asarray(B[h]).ravel(),np.asarray(B_static[h]).ravel(),
                             old,old_static,ccr,old_gen,old_refine,cid,
                             ccr_projected=ccr_projected)
+                        _count_surface_conflicts(
+                            rows[(cid,h)],baseline,gt,np.asarray(B[h]).ravel(),
+                            old_static,cid,conflicts)
 
                 if wi==1 or wi%8==0 or wi==len(records):
                     print(f"CCR_STATIC_GAP {wi}/{len(records)}",flush=True)
