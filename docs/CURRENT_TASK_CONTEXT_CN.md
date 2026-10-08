@@ -8,6 +8,10 @@
 
 ## 已知结果（用户服务器报告）
 
+Surface-consistent CCR 已完成完整 TRAIN20430×3 冻结验证，第三轮 DEV512 mIoU40.418031 / MovingMicro31.052754；vs Frozen B +0.380824 / 0 pp，vs Old Local REMOVE-off +0.041886 / +0.941836 pp。三个时距 road11/sidewalk13 都改善。训练步0.053211秒/窗口（运动/动态冻结，不能称完整联合训练提速）。同20窗口×3正式对照：B49.696705 FPS/120.732ms，新CCR40.102844 FPS/149.615ms，达到40但余量很薄。
+
+服务器新候选：`/root/nas/occ/swfm/outputs/p0_f9_surface_ccr/full20430x3_20261008_131503_838/last.pt`。固定第三轮，不再追加轮数/调阈值。目前用户同意继续：一次扩大验证并尝试输出一致的执行优化，仍不自动启动随机联合训练。
+
 Frozen B：4历史→6未来，epoch19 V18固定 + full TRAIN Point CCR epoch2；weighted ADD raw sigmoid@0.5，REMOVE-off。full4369 vs Transport mIoU +0.5576 / MovingMicro +1.5020 pp；vs Old Local −0.4056 / +0.8035 pp。正式 FPS47.522，六帧126.256ms。
 
 静态差距集中于 road11/sidewalk13。DEV512 B-only FP中 Direct约68%、Halo约32%，97.7% GT-free；不能仅据此确定几何错位的内因。七种轻量规则只追回+0.0326mIoU，不再继续阈值/halo小修补。正式 Frozen B 未被升级。
@@ -26,7 +30,11 @@ Frozen B：4历史→6未来，epoch19 V18固定 + full TRAIN Point CCR epoch2�
 
 `surface_ccr_screen_common.py` + `train_p0_f9_surface_ccr.py` + `run_p0_f9_surface_ccr_full.sh`：完整TRAIN20430×3，新静态optimizer/LR3e-4全周期余弦，复用B权重/正权重，dev64监控、final dev512、20×3 paired正式FPS，严格resume。
 
-最终集中本地回归124 passed/1 skipped；601个Python文件AST语法检查及Bash语法检查通过。覆盖CPU/CUDA实际更新、动态逐字节不变、cache/full/sample几何一致、无未来GT、next-update恢复、final-dev后中断只续做FPS、纯静态/动态/混合读出路由。修复旧测试mock的live-preflight、CUDA设备接口，测试入口提前设置cuBLAS确定性环境，不放宽容差。全仓库1437项重回归中途停止，未宣称完整CI通过。服务器训练尚未启动，本地没有完整nuScenes缓存。
+首次实现集中本地回归124 passed/1 skipped；601个Python文件AST语法检查及Bash语法检查通过。覆盖CPU/CUDA实际更新、动态逐字节不变、cache/full/sample几何一致、无未来GT、next-update恢复、final-dev后中断只续做FPS、纯静态/动态/混合读出路由。修复旧测试mock的live-preflight、CUDA设备接口，测试入口提前设置cuBLAS确定性环境，不放宽容差。全仓库1437项重回归中途停止，未宣称完整CI通过。本地没有完整nuScenes缓存。
+
+本次新增：`surface_ccr_execution.py`仅 pure-static chunk 的 CUDA Graph 执行，保留原8192分块/BF16/候选与算术，实际捕获后概率字节核对；动态/混合仍eager，最多4图，权重变化拒绝复用，不持久缓存 learned feature。`validate_p0_f9_surface_ccr_expanded.py` + `surface_ccr_validation_common.py` + `run_p0_f9_surface_ccr_expanded.sh` 一次运行固定20×3 paired B/eager/graph正式FPS，然后固定 full4369 验证。图模式通过字节检查且至少快2%才用于质量评估（按速度选执行，不按精度选方法）。报告full、DEV512、窗口/场景之外子集，所有类/时距IoU、MovingMacro/Micro、路面/人行道TP/FP/FN、场景变化、静态/动态ADD P/R。整数计数只计算一次供多个子集复用；Ctrl+C窗口边界恢复，kill-9恢复32窗口周期，完成FPS不会重测。参考/候选输入先快照，原optimizer/权重/缓存不写。
+
+本次相关本地回归81 passed/1 skipped，606个Python AST和Bash语法检查通过；包含真实CUDA图、非零几何权重/变化输入、8192+尾块/不同source数/road-sidewalk字节一致、图淘汰与拒绝回退、实际head/投影/合成/整数统计的CLI中断恢复（外部nuScenes IO和FPS mock）、原缓存/正式数据流回归。缓存namespace七个依赖文件仍与b1507ed逐字节相同。不是全仓CI。
 
 增加纯静态/动态分块的读出路由，保持批次大小和概率逐字节不变；冻结验证不保留无用旧读出的backward图。原Frozen B输入先快照；原文件不写。实现提交 `15a479a` 已推送到新分支 `feature/v22-surface-aware-ccr`，原分支未改动。
 
@@ -46,8 +54,8 @@ OccFM服务器单L40S，10核/80GiB。旧cached完整轮十几分钟为用户经
 
 ## 下一步与未解决问题
 
-1. 服务器拉取新分支，运行 `bash tools/real_motion/run_p0_f9_surface_ccr_full.sh`。本地合成head开销不是服务器FPS/精度证据。
-2. 一次跑完完整TRAIN×3、final dev512及同口径FPS，确认静态增益、Moving不退、≥40FPS；目前服务器训练未启动。
-3. 只有通过，才设计并启动同一结构的随机初始化完整联合训练；不能从冻结验证直接推断联合效果。
+1. 服务器拉取新分支，运行 `bash tools/real_motion/run_p0_f9_surface_ccr_expanded.sh`。不重训/重建缓存；已有第三轮结果不得重新反复筛选。
+2. 读取 expanded_validation.json/summary.txt 的 full4369、DEV512之外窗口/场景、road/sidewalk TP/FP/FN及同口径FPS。所有这些VAL数据已参与研究，不称独立测试。是否值得保留graph由L40S同窗口字节/速度检查决定，失败/不快保留eager。
+3. 扩大验证保持收益、速度不退后，再实现相同结构的干净随机初始化完整联合训练；当前入口不会启动。
 
-具体设计、风险与命令见 `docs/SURFACE_CONSISTENT_CCR_FULL_VALIDATION_CN.md`。历史失败方案不重启，不复刻重复日志，必要时按旧文档索引检索。
+具体设计、风险与命令见 `docs/SURFACE_CONSISTENT_CCR_FULL_VALIDATION_CN.md`、`docs/SURFACE_CCR_EXPANDED_VALIDATION_CN.md`。历史失败方案不重启，不复刻重复日志，必要时按旧文档索引检索。

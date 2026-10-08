@@ -15,6 +15,7 @@ import torch
 from real_motion.canonical_causal_repair import FEATURE_DIM, CanonicalRepairHead, CanonicalEvidence, RepairPlan
 from real_motion.ccr_frozen_b import frozen_b_probabilities
 from real_motion.surface_canonical_repair import SurfaceCanonicalRepairHead, SURFACE_DIM, PHASE_DIM
+from real_motion.surface_ccr_execution import SurfaceExecution
 
 
 def main():
@@ -46,16 +47,19 @@ def main():
             'future_transport_queries':torch.randn(32,6,128,device=device)}
     def sync():
         if device.type=='cuda':torch.cuda.synchronize(device)
-    times={name:[] for name in heads};expected={}
+    graph=SurfaceExecution(surface,device)
+    times={name:[] for name in (*heads,'surface_graph')};expected={}
     for name,head in heads.items():expected[name]=frozen_b_probabilities(head,*inputs(name!='frozen_B'),output,device)
+    expected['surface_graph']=graph(surface,*inputs(True),output,device)
     if any(not np.array_equal(expected['frozen_B'],rows) for rows in expected.values()):
         raise RuntimeError('zero-geometry initialization does not reproduce B')
     for repeat in range(a.repeats):
-        names=list(heads)
+        names=list(times)
         if repeat%2:names.reverse()
         for name in names:
             sync();tick=time.perf_counter()
-            actual=frozen_b_probabilities(heads[name],*inputs(name!='frozen_B'),output,device)
+            actual=(graph(surface,*inputs(True),output,device) if name=='surface_graph' else
+                    frozen_b_probabilities(heads[name],*inputs(name!='frozen_B'),output,device))
             sync();times[name].append(time.perf_counter()-tick)
             if not np.array_equal(actual,expected[name]):raise RuntimeError('repeated head probability bytes changed')
     result=dict(scope='synthetic_HEAD_ONLY_six_readouts_upload_D2H_NOT_forecast_FPS_NOT_quality',
@@ -63,7 +67,8 @@ def main():
         device=str(device),gpu=torch.cuda.get_device_name(device) if device.type=='cuda' else None,
         points=n,dynamic_fraction=float(dynamic.mean()),zero_init_probability_bytes_exact=True,
         milliseconds={name:1000*float(np.mean(rows)) for name,rows in times.items()},
-        repeats=a.repeats)
+        repeats=a.repeats,graph_execution=graph.stats())
+    graph.close()
     print(json.dumps(result,ensure_ascii=False,indent=2))
 
 
