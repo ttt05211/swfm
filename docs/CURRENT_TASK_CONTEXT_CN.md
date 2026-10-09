@@ -6,7 +6,7 @@ Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整�
 当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
 最新已完成：用户服务器跑完static_carry全集，明确确认作为最终论文6秒长时预测路线；avg4–6 IoU41.218153 / mIoU29.117864。
 记录在 `docs/SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md` 与 `docs/results/` 原始摘要/结构化转录。
-Waymo 2Hz已完成7998/7998：joint平均IoU61.209875 / mIoU52.152906，相对同模型Transport分别+0.957959 / +0.418007 pp；三个名义时距均提升，详见下文。10Hz用户已暂停（最近提供窗口1510，实际接续取state.json）；旧fast-v1最新256窗0.4739s。新增严格byte等价native准备/表面fit及有界双进程入口，本地大网格模拟真实CUDA完整eval0.723398→0.372681s/窗、1.941067×，不当L40S/真实Waymo或FPS。下一步服务器只跑16窗成对gate/测速，未获收益前不启动全评。10Hz仍按I²-World原native下标协议，尚无完整10Hz分数。
+Waymo 2Hz已完成7998/7998：joint平均IoU61.209875 / mIoU52.152906，相对同模型Transport分别+0.957959 / +0.418007 pp。10Hz双进程服务器16窗成对0.3506→0.1701s/窗，2.062×、六帧/概率/整数计数gate通过；已恢复全集，最新用户日志5088/39987，当前invocation累计0.235s/窗。下一步用户授权安全暂停后同64窗比较2×2与4×1，不自动改旧目录resume参数。10Hz仍按I²-World原native下标协议，尚无完整10Hz分数。
 
 ## 核心决策与约束
 
@@ -217,6 +217,13 @@ serial-v2本地整体仅1.035–1.047×，用户指出收益小，遂增加独�
 CPU相关回归97通过/3CUDA跳过；真实CUDA/native/双进程/Graph/Surface/Strong/旧递推回归147通过；Bash语法/CLI help/diff检查通过，不称全仓CI。含实际双进程概率/六帧/整数gate、source只读迁移、speed-only不推进计数、保存权重路径resume及拒绝更改参数。
 入口`run_p0_f9_joint_surface_waymo_10hz_parallel.sh`；文档`docs/WAYMO_10HZ_PARALLEL_EXECUTION_CN.md`。下一步显式`WAYMO10_PARALLEL_CONTINUE_FROM=.../waymo10_fast_20261010_040604` + `WAYMO10_PARALLEL_SPEED_ONLY=1`，先新目录短程比单/双进程。原前缀取真实保存cursor；用户发回`WAYMO10_PARALLEL_PAIRED_SPEED`后才判断是否值得完整resume；未代跑服务器或重启评估。
 并行progress打印吞吐seconds/window，worker_seconds及stage重叠不相加；平均128/256新窗口才判断稳定吞吐。独立单模型Dense Forecast FPS口径/论文方法不变。
+
+### 服务器双进程已验收与同v2布局探针（2026-10-10）
+
+服务器`waymo10_parallel_20261010_050832`短测单进程0.3506→双进程0.1701s/窗、2.062×，SIX/概率/整数gate通过；随后恢复原计数，最新5088/39987、累计吞吐0.235s/窗。剩余约2小时17分只是按当前负载外推，worker0.486–0.621s不是总吞吐。不拿16窗和全集累计不同人口算退化。
+用户授权比较4进程×1线程；新增独立`run_p0_f9_waymo10_worker_layout_probe.sh`，原并行实现/指纹一个文件都未改。新入口只读停止目录完整契约/实际cursor，在整个探针期间持有原kernel lease阻止并发resume。相同v2、相同64连续窗、AB/BA两遍，首窗warm与全六帧/概率/运动/整数gate计时外，每遍重置历史LRU，只写新receipt/speed/summary，不写科学state、不自动全评。两布局共6个worker常驻但一次只算一组，idle模型显存需公开，不把评估吞吐称FPS。
+4×1建议门槛为平均至少快10%且每遍快；不满足保留2×2。若换布局，新目录显式迁移原保存整数前缀；普通旧目录resume仍严格2×2。文档`docs/WAYMO_10HZ_WORKER_LAYOUT_PROBE_CN.md`。
+本地CPU相关47通过/2CUDA跳过；真实RTX3050 CUDA相关30通过，含实际2/4进程Graph/概率/六帧/计数一致、旧接续、源目录并发锁、只测不推进计数；CLI help/Bash语法通过。不是服务器布局提速证据，不称全仓CI。下一步服务器安全暂停后跑探针，发回最终summary，不动权重/阈值/训练/正式FPS/其他Camera任务。
 
 ## 新增：冻结6秒几何接续四路对照（2026-10-09）
 
