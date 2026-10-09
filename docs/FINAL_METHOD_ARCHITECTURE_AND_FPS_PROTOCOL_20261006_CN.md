@@ -1,5 +1,10 @@
 # 最终论文框架、统一数据流与 FPS 计时协议（2026-10-06）
 
+> 后续版本提示（2026-10-09）：本文保留10-06 Point CCR的历史接口/FPS讨论，不作为最新精度来源。
+> 当前方法为联合训练的 **V18 Transport + Surface-aware CCR**；最终6秒长时指标采用 **static_carry**。
+> 最新冻结结果与边界见 [Surface Static Carry最终结果](SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md)
+> 和 `CURRENT_TASK_CONTEXT_CN.md`，勿将本文历史候选误作当前最终网络或借用其速度。
+
 > 状态：**框架层级 / 数据接口 / FPS 边界冻结；Point CCR 的具体支持域与精度尚未冻结。**
 >
 > 目标：借数据流清理把“代码模块、论文 Fig.2、正式 FPS 口径”统一起来。当前阶段只做等价重构与测速协议收口，**不修改网络结构、已训练权重、阈值、支持域、监督目标或评价口径**。

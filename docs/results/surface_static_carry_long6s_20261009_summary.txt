@@ -1,0 +1,25 @@
+===== FROZEN SURFACE STATIC CARRY / FULL 1--6s =====
+Frozen mean5/6/8/12/14; ADD0.5 / REMOVEoff; no training; future GT ego poses conditioned.
+First 1--3s unchanged; stateful static carry affects second block only.
+selection_policy: explicit_user_static_carry_accepts_screen_small_Moving_decline_NOT_TRAIN_gate_pass
+Original TRAIN gate is NOT waived or relabeled as passed. Moving not evaluated in this run.
+population=all; windows=2569; scenes=150
+route             horizon       IoU      mIoU     dIoU    dmIoU
+baseline             1.0s 60.275510 52.882357 +0.000000 +0.000000
+baseline             2.0s 54.248655 43.136524 +0.000000 +0.000000
+baseline             3.0s 49.940189 37.103890 +0.000000 +0.000000
+baseline             4.0s 42.032229 30.572013 +0.000000 +0.000000
+baseline             5.0s 38.331931 27.095679 +0.000000 +0.000000
+baseline             6.0s 35.324381 24.488694 +0.000000 +0.000000
+baseline          avg1--3 54.821451 44.374257 +0.000000 +0.000000
+baseline          avg4--6 38.562847 27.385462 +0.000000 +0.000000
+static_carry         1.0s 60.275510 52.882357 +0.000000 +0.000000
+static_carry         2.0s 54.248655 43.136524 +0.000000 +0.000000
+static_carry         3.0s 49.940189 37.103890 +0.000000 +0.000000
+static_carry         4.0s 44.768673 32.350774 +2.736444 +1.778761
+static_carry         5.0s 41.083833 28.876602 +2.751902 +1.780924
+static_carry         6.0s 37.801952 26.126216 +2.477571 +1.637522
+static_carry      avg1--3 54.821451 44.374257 +0.000000 +0.000000
+static_carry      avg4--6 41.218153 29.117864 +2.655306 +1.732402
+Standard metrics above; official public-code population, paper Table-2 population not independently verified.
+No automatic method selection, threshold tuning or changes to the main1--3s table.

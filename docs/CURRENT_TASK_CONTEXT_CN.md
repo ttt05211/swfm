@@ -4,8 +4,9 @@
 
 Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整网等权平均已完成DEV512选择、full4369质量和256×3正式FPS验证。
 当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
-最新任务：用户选择与I²-World对齐的Occ3D-Waymo 2Hz zero-shot，实现冻结同一均值模型的评估入口。只改数据适配/评估，不训练、改权重/结构/阈值或重启失败方案，不冒称已跑真实Waymo。
-另一个已授权任务：冻结6秒推理的几何接续四路对照已实现，见下方新增章节；不改并行Waymo任务或原默认入口。
+最新已完成：用户服务器跑完static_carry全集，明确确认作为最终论文6秒长时预测路线；avg4–6 IoU41.218153 / mIoU29.117864。
+记录在 `docs/SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md` 与 `docs/results/` 原始摘要/结构化转录。
+并行Waymo 2Hz zero-shot数据适配/评估工作保留；不训练、改权重/阈值或重启失败方案，不冒称已跑真实Waymo。
 
 ## 核心决策与约束
 
@@ -204,7 +205,20 @@ all默认metrics-only，不读/计算Moving支持，结果标记未评估/null�
 不计算未用SE2分支；每时距dense整数指标只扫描一次复用dataset/scene。旧默认screen原样，严格同目录resume。
 本地专项和旧Surface/两段递推/官方人口/Strong/FPS回归130项通过、20项CUDA跳过；CLI help/Bash语法/diff检查通过。
 含metrics-only省略Moving标签访问、整数中断恢复、源screen/权重只读、固定静态路线逐字节一致；不冒充全仓CI/真实GPU或全集收益。
-新的全集未在本地运行，需服务器执行；预计同2569/150人口，最终按实际审计。
+本地不具备完整服务器数据，未代跑或下载完整评估产物；服务器结果现已收到，见下节。
+
+## 最终6秒论文指标已由用户确认（2026-10-09）
+
+用户粘贴完整all摘要：2569窗口/150场景，static_carry 4/5/6s IoU44.768673/41.083833/37.801952，
+mIoU32.350774/28.876602/26.126216；avg4–6 IoU41.218153 / mIoU29.117864。
+相对同人口baseline avg4–6增益+2.655306 IoU / +1.732402 mIoU pp；1–3s逐项不变。
+用户明确要求记录并将static_carry作为最终论文长时预测结果，baseline保留消融，不再加入SE2/combined。
+原full4369主表IoU55.211054/mIoU44.153241不变，不拿2569长人口1–3s均值替换。
+未来GT ego poses显式条件，保留历史静态几何的stateful causal rollout；不输入未来occupancy/mask/annotation。
+这是推理方法改动，不是无损执行；没有6s重训/阈值校准。全人口Moving/FPS未测，不借用screen或6帧FPS值。
+按GenieDrive公开代码metadata人口对齐；论文Table2实际起点集合未独立确认，不直接声称严格SOTA。
+档案为用户服务器摘要转录，非本地原evaluation.json；实际运行目录/HEAD/snapshot SHA未收到，不猜路径或指纹。
+此次仅文档/指标归档，不改变模型、训练、旧默认入口或其他Waymo改动。
 
 ## 仅按需检索的历史
 

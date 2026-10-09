@@ -1,0 +1,103 @@
+{
+  "record_schema": "user_reported_server_summary_transcription_v1",
+  "record_date": "2026-10-09",
+  "paper_role": "user_frozen_final_nuscenes_long_1_to_6s_validation_results",
+  "final_route": "static_carry",
+  "source": {
+    "kind": "user_pasted_server_summary",
+    "summary_file": "surface_static_carry_long6s_20261009_summary.txt",
+    "server_evaluation_directory": null,
+    "actual_server_git_head": null,
+    "snapshot_sha256": null,
+    "server_raw_counts_available_locally": false,
+    "independently_rerun_locally": false,
+    "entry_implementation_introduced_in": "af6d68d"
+  },
+  "population": {
+    "name": "all",
+    "windows": 2569,
+    "scenes": 150,
+    "split": "nuScenes_validation",
+    "alignment": "GenieDrive_official_public_code_4_history_20_future_metadata",
+    "metadata_revision": "17e37acfff5b10517393a669ecf471f75f34d43f",
+    "metadata_sha256": "0426072260a908260625c6dd91b9f06919726f5265c10849b87156d282547ded",
+    "reference_code_commit": "da48a529ffbe14136688e9b7a56f5d1061c366c5",
+    "paper_table2_population_independently_verified": false,
+    "independent_test_set": false
+  },
+  "inference": {
+    "method": "V18_Transport_plus_Surface_aware_CCR_plus_stateful_static_carry",
+    "source_epochs": [5, 6, 8, 12, 14],
+    "single_averaged_network": true,
+    "history_frames_per_block": 4,
+    "future_frames_per_block": 6,
+    "rollout_blocks": 2,
+    "predicted_future_frames": 12,
+    "nominal_keyframe_frequency_hz": 2,
+    "second_block_history_horizons_s": [1.5, 2.0, 2.5, 3.0],
+    "static_carry_changes_second_block_only": true,
+    "ADD_raw_sigmoid_threshold": 0.5,
+    "REMOVE_enabled": false,
+    "additional_training_or_recalibration": false,
+    "future_GT_ego_poses_conditioned_through_s": 6,
+    "future_GT_occupancy_mask_annotation_prediction_inputs": false
+  },
+  "selection_policy": "explicit_user_static_carry_accepts_screen_small_Moving_decline_NOT_TRAIN_gate_pass",
+  "original_TRAIN_gate_pass": false,
+  "metric_scope": "IoU_mIoU_only",
+  "metric_units": "percent",
+  "delta_units": "percentage_points",
+  "aggregation": "dataset_accumulated_counts_per_horizon_then_arithmetic_mean_of_horizon_metrics",
+  "standard_mIoU_includes_zero_IoU_union_valid_classes": true,
+  "mask_lidar": false,
+  "mask_camera": false,
+  "Moving_evaluated_this_run": false,
+  "MovingMacro": null,
+  "MovingMicro": null,
+  "long_rollout_FPS": null,
+  "routes": {
+    "baseline": {
+      "per_horizon": {
+        "1.0": {"IoU": 60.275510, "mIoU": 52.882357},
+        "2.0": {"IoU": 54.248655, "mIoU": 43.136524},
+        "3.0": {"IoU": 49.940189, "mIoU": 37.103890},
+        "4.0": {"IoU": 42.032229, "mIoU": 30.572013},
+        "5.0": {"IoU": 38.331931, "mIoU": 27.095679},
+        "6.0": {"IoU": 35.324381, "mIoU": 24.488694}
+      },
+      "average_1s_2s_3s": {"IoU": 54.821451, "mIoU": 44.374257},
+      "average_4s_5s_6s": {"IoU": 38.562847, "mIoU": 27.385462}
+    },
+    "static_carry": {
+      "per_horizon": {
+        "1.0": {"IoU": 60.275510, "mIoU": 52.882357, "dIoU_pp": 0.0, "dmIoU_pp": 0.0},
+        "2.0": {"IoU": 54.248655, "mIoU": 43.136524, "dIoU_pp": 0.0, "dmIoU_pp": 0.0},
+        "3.0": {"IoU": 49.940189, "mIoU": 37.103890, "dIoU_pp": 0.0, "dmIoU_pp": 0.0},
+        "4.0": {"IoU": 44.768673, "mIoU": 32.350774, "dIoU_pp": 2.736444, "dmIoU_pp": 1.778761},
+        "5.0": {"IoU": 41.083833, "mIoU": 28.876602, "dIoU_pp": 2.751902, "dmIoU_pp": 1.780924},
+        "6.0": {"IoU": 37.801952, "mIoU": 26.126216, "dIoU_pp": 2.477571, "dmIoU_pp": 1.637522}
+      },
+      "average_1s_2s_3s": {"IoU": 54.821451, "mIoU": 44.374257, "dIoU_pp": 0.0, "dmIoU_pp": 0.0},
+      "average_4s_5s_6s": {"IoU": 41.218153, "mIoU": 29.117864, "dIoU_pp": 2.655306, "dmIoU_pp": 1.732402}
+    }
+  },
+  "comparison_to_GenieDrive": {
+    "kind": "published_number_comparison_not_independently_verified_matched_paper_population",
+    "source": "https://arxiv.org/html/2512.12751v1#S4.T2",
+    "per_horizon": {
+      "4.0": {"IoU": 42.81, "mIoU": 31.16},
+      "5.0": {"IoU": 39.00, "mIoU": 27.17},
+      "6.0": {"IoU": 35.60, "mIoU": 23.66}
+    },
+    "average_4s_5s_6s": {"IoU": 39.14, "mIoU": 27.33},
+    "strict_fair_comparison_or_SOTA_claim_verified": false
+  },
+  "original_main_table": {
+    "population_windows": 4369,
+    "population_scenes": 150,
+    "horizons_s": [1, 2, 3],
+    "IoU": 55.211054,
+    "mIoU": 44.153241,
+    "changed_by_this_record": false
+  }
+}

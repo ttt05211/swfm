@@ -1,5 +1,9 @@
 # 冻结 Surface CCR 平均模型的 1–6 秒预测
 
+> 最终论文长时预测已固定为 **static_carry**，标准 avg4–6 IoU **41.218153** / mIoU **29.117864**。
+> 完整结果和协议见 [2026-10-09最终记录](SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md)。
+> 本文的 `reconciled` 入口及其服务器结果继续保留为baseline，不静默改变旧入口或混拼结果。
+
 ## 固定模型与口径
 
 只加载已完成 DEV512 对照中冻结的 5/6/8/12/14 轮整网等权平均文件。
