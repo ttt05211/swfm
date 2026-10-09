@@ -69,7 +69,15 @@ DEV64 关键 Joint 结果：
 平均的三个时距 mIoU/Macro/Micro均最高，但IoU略低，不称四项全面提升。
 收益主要体现于Transport；平均Transport mIoU39.362646 / Micro30.014088，CCR再增+1.069630 / +1.472431 pp。
 四候选512窗口合计705.52s，这是质量eval耗时，不是正式FPS。
-新平均 full4369/FPS尚未测，不能把DEV512约40与旧全集约44当作退化。
+新平均 full4369 已完成，正式 FPS 正在补测，不能沿用旧冻结模型的 FPS。
+
+2026-10-09 服务器全集报告：固定平均（5/6/8/12/14）在 full4369、150 场景上
+IoU55.211054 / mIoU44.153241 / MovingMacro28.256901 / MovingMicro32.214410。
+同模型 Transport：53.631093 / 43.218661 / 26.889216 / 30.729273；CCR 增益分别
++1.579960 / +0.934580 / +1.367684 / +1.485137 pp。
+相对旧 Local full4369：IoU-0.347217 / mIoU+0.124314 / Macro+0.968314 / Micro+0.974187 pp。
+耗时1649.02s是带GT/整数指标的质量评估，不是FPS；仍不称独立测试。
+结果：`outputs/p0_f9_joint_surface_ccr/mean_full4369_20261009_104036_848/full_validation.json`（服务器）。
 
 ## 本轮实现与验收
 
@@ -91,12 +99,18 @@ DEV64 关键 Joint 结果：
 只读已选来源，完整VAL4369不做DEV512筛选、不导入epoch20子集报告；新结果写full_validation.json，严格同目录整数resume。
 操作见 `docs/JOINT_SURFACE_MEAN_FULL_VALIDATION_CN.md`。121 项相关本地回归通过，包含完整人口、来源冻结/只读、真实共享CPU/CUDA路径和CLI续评等价；AST/Bash语法通过。模型/trainer/缓存依赖未改。服务器未运行，不冒充全集结果或完整CI。
 
+新增平均权重正式FPS入口；复用原 `paired_speed`（旧20×3默认兼容），不改训练/model/cache依赖。
+19项相关本地回归通过，含真实CPU/CUDA读出及六帧合成一致、均值FPS算法、权重只读、缺帧拒绝、计时内建图拒绝、旧入口回归；CLI help/Bash语法通过。
+这不是服务器实测FPS或全仓CI。服务器命令：`bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`；输出新 `mean_fps_*` 目录。
+可用 `SURFACE_MEAN_FPS_WINDOWS=512` 扩大人口；中断保留partial日志，不改断点，重测使用新输出，不混拼前次计时。
+
 ## 未解决问题与下一步
 
-1. 完成全集入口回归、提交推送，给用户 full4369 单候选命令；默认自动找已完成的同平均来源，有冲突停止。
-2. 等实际全集报告，比较四指标/三个时距以及相对当前Transport的CCR贡献；不承诺一定超过44。
-3. 新平均正式FPS尚未测，本次用户只要求全集质量，不自动加新实验。
-4. 均值已改善DEV512 mIoU/Moving；是否解决跨场景质量差距，仍待全集，不把训练原因说死。
+1. 用户已授权新平均的正式 FPS，要求更多窗口平均。新入口 `run_p0_f9_joint_surface_mean_fps.sh`：默认256场景均衡随机窗口×3，不按GT/错误/耗时选样，不重训或重跑全集质量。
+2. 只加载已完成DEV512对照中同一固定平均文件；原训练/权重/缓存不动。沿用正式边界，fresh Strong/KTA和六帧CCR全部实时计算；history/descriptor准备、预热/图捕获/一致性核对不计入FPS且单独报告。
+3. 普通及融合执行完整概率/六帧dense逐字节核对；正式固定fused_graph（完整8192块建图、尾块eager），禁止计时内建图。FPS=6/平均六帧延迟，P90/分段/显存同报，不按最小延迟挑结果。
+4. 本地回归只证明实现正确，实际L40S FPS仍待服务器运行。256随机窗口与旧20压力人口不同，不据跨次数字宣称成对提速。
+5. 全集已追回mIoU和Moving，IoU仍较旧Local略低；暂不改结构/阈值，不重启已淘汰支线。
 
 ## 仅按需检索的历史
 

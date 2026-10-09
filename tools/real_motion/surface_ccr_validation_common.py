@@ -170,13 +170,16 @@ def load_progress(path, contract, accumulator, *, compatible_implementations=())
 
 
 @torch.no_grad()
-def paired_speed(provider, source, records, teacher, head, reference, *, stop_event=None):
+def paired_speed(provider, source, records, teacher, head, reference, *, stop_event=None,
+                 windows=20, repeats=3, stress_windows=2, surface_only=False, progress=None):
+    if type(repeats) is not int or repeats < 1:
+        raise ValueError('positive integer FPS repeats required')
     selected, population = select_population(records, tuple((str(r['scene_name']), str(r['t0_token'])) for r in records),
-                                             windows=20, stress_windows=2)
-    if len(selected) != 20: raise RuntimeError('fixed 20 FPS windows required')
+                                             windows=windows, stress_windows=stress_windows)
     device = provider.device
-    graph = SurfaceExecution(head, device)
-    modes = ('frozen_B', 'surface_eager', 'surface_graph', 'surface_fused_eager', 'surface_fused_graph')
+    graph = SurfaceExecution(head, device, capture_full_chunks_only=surface_only)
+    modes = (('surface_fused_eager', 'surface_fused_graph') if surface_only else
+             ('frozen_B', 'surface_eager', 'surface_graph', 'surface_fused_eager', 'surface_fused_graph'))
     trials, parity, prepares, descriptors, optimized_descriptors = [], 0, 0., 0., 0.
     def sync(): torch.cuda.synchronize(device) if device.type == 'cuda' else None
     try:
@@ -224,49 +227,62 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                         incremental_peak=(torch.cuda.max_memory_allocated(device)-before)/2**20,
                         peak_reserved=torch.cuda.max_memory_reserved(device)/2**20) if device.type == 'cuda' else None)
                     return out, seconds, memory
-                expected = {name: run(name, False)[0] for name in modes}
-                if not np.array_equal(expected['surface_eager']['probability'], expected['surface_graph']['probability']):
-                    raise RuntimeError('optimized surface probabilities differ')
-                if any(not np.array_equal(a, b) for a, b in zip(expected['surface_eager']['dense'], expected['surface_graph']['dense'])):
-                    raise RuntimeError('optimized surface dense forecasts differ')
-                for mode in ('surface_fused_eager','surface_fused_graph'):
+                warm_modes = ('surface_eager', *modes) if surface_only else modes
+                expected = {name: run(name, False)[0] for name in warm_modes}
+                if any(len(value['dense']) != 6 for value in expected.values()):
+                    raise RuntimeError('FPS requires all SIX dense frames')
+                for mode in modes:
+                    if mode == 'frozen_B': continue
                     if (not np.array_equal(expected[mode]['probability'],expected['surface_eager']['probability'])
                             or any(not np.array_equal(a,b) for a,b in zip(expected[mode]['dense'],expected['surface_eager']['dense']))):
                         raise RuntimeError('fused projection probability/dense bytes differ; use reference execution')
                 dynamic = plain.actor >= 0
-                if not np.array_equal(expected['frozen_B']['probability'][dynamic], expected['surface_eager']['probability'][dynamic]):
+                if not surface_only and not np.array_equal(expected['frozen_B']['probability'][dynamic], expected['surface_eager']['probability'][dynamic]):
                     raise RuntimeError('frozen dynamic predictions changed')
+                if surface_only and np.any(expected['surface_eager']['probability'][..., 1] != 0):
+                    raise RuntimeError('formal ADD-only benchmark requires REMOVE disabled')
                 parity += 1
-                for repeat in range(3):
+                captures = (graph.counts['captures_verified'], graph.counts['capture_rejections'])
+                for repeat in range(repeats):
                     # Rotate all arms, do not always favour the same warm-order.
-                    order = modes[repeat:] + modes[:repeat]
+                    offset = (wi + repeat - 1) % len(modes)
+                    order = modes[offset:] + modes[:offset]
                     for mode in order:
                         out, seconds, memory = run(mode, True)
-                        if (not np.array_equal(out['probability'], expected[mode]['probability'])
+                        if surface_only and (graph.counts['captures_verified'], graph.counts['capture_rejections']) != captures:
+                            raise RuntimeError('graph captured inside FPS timer; reject this measurement')
+                        if (len(out['dense']) != 6 or not np.array_equal(out['probability'], expected[mode]['probability'])
                                 or any(not np.array_equal(a, b) for a, b in zip(out['dense'], expected[mode]['dense']))):
                             raise RuntimeError('repeated six-frame output bytes changed')
-                        trials.append(dict(mode=mode, window=wi, repeat=repeat+1, seconds=seconds,
-                                           stages_seconds=out['stages_seconds'], memory_mib=memory))
-                print(f'SURFACE_PAIRED_FPS {wi}/20 graph/eager/dynamic dense parity=PASS', flush=True)
+                        row = dict(mode=mode, window=wi, repeat=repeat+1, seconds=seconds,
+                                   stages_seconds=out['stages_seconds'], memory_mib=memory)
+                        trials.append(row)
+                        if progress is not None: progress(row)
+                print(f'SURFACE_PAIRED_FPS {wi}/{windows} graph/eager/six-dense parity=PASS', flush=True)
         means = {name: float(np.mean([r['seconds'] for r in trials if r['mode'] == name])) for name in modes}
         # Prefer reference unless the verified graph actually ran and its
         # paired mean is at least 2% faster; don't select on tiny timing noise.
-        eligible = ['surface_eager']
-        if (not graph.failures and graph.counts['graph_replays'] > 0
+        eligible = ['surface_fused_eager' if surface_only else 'surface_eager']
+        if surface_only:
+            # Fixed verified graph backend, not a fastest-arm winner picked on noise.
+            chosen = 'surface_fused_graph'
+        elif (not graph.failures and graph.counts['graph_replays'] > 0
                 and means['surface_graph'] < .98 * means['surface_eager']):
             eligible.append('surface_graph')
-        chosen = min(eligible, key=lambda k: means[k])
+        if not surface_only: chosen = min(eligible, key=lambda k: means[k])
         return dict(population=population, trials=trials, six_frame_mean_seconds=means,
             six_frame_amortized_FPS={k: 6/v for k, v in means.items()},
             p90_six_ms={k: float(np.percentile([r['seconds']*1000 for r in trials if r['mode'] == k], 90)) for k in modes},
             stages_mean_ms={k: {s: float(np.mean([r['stages_seconds'][s]*1000 for r in trials if r['mode'] == k]))
                 for s in trials[0]['stages_seconds'] if all(s in r['stages_seconds'] for r in trials if r['mode'] == k)} for k in modes},
-            probability_and_six_dense_parity_windows=parity, dynamic_byte_parity_windows=parity,
-            selected_execution=chosen, selection_basis='latency only after byte parity, NOT accuracy/method selection',
-            graph_execution=graph.stats(), history_prepare_seconds_per_window=prepares/20,
-            surface_descriptor_prepare_seconds_per_window=descriptors/20,
-            optimized_surface_descriptor_prepare_seconds_per_window=optimized_descriptors/20,
-            actual_cuda=device.type == 'cuda', fps_windows=20, repeats=3,
+            probability_and_six_dense_parity_windows=parity,
+            dynamic_byte_parity_windows=None if surface_only else parity,
+            selected_execution=chosen, selection_basis=('fixed fused_graph backend with eager fallbacks; no latency selection'
+                if surface_only else 'latency only after byte parity, NOT accuracy/method selection'),
+            graph_execution=graph.stats(), history_prepare_seconds_per_window=prepares/windows,
+            surface_descriptor_prepare_seconds_per_window=descriptors/windows,
+            optimized_surface_descriptor_prepare_seconds_per_window=optimized_descriptors/windows,
+            actual_cuda=device.type == 'cuda', fps_windows=windows, repeats=repeats,
             memory_mib={k: {field: max(r['memory_mib'][field] for r in trials if r['mode'] == k)
                 for field in ('peak_allocated', 'incremental_peak', 'peak_reserved')} for k in modes}
                 if device.type == 'cuda' else None,
