@@ -6,7 +6,7 @@ Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整�
 当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
 最新已完成：用户服务器跑完static_carry全集，明确确认作为最终论文6秒长时预测路线；avg4–6 IoU41.218153 / mIoU29.117864。
 记录在 `docs/SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md` 与 `docs/results/` 原始摘要/结构化转录。
-并行Waymo 2Hz zero-shot已在服务器运行（用户报1856/7998）；用户要求新增独立10Hz并按I²-World代码执行。不训练、改权重/阈值或重启失败方案，不冒称已有完整真实Waymo分数。
+Waymo 2Hz在服务器继续运行（最新用户报窗口3641）；用户已停止10Hz，授权实现无损加速，等2Hz完成后用新版接续。10Hz仍按I²-World原native下标协议，不训练、改权重/阈值，不冒称已有完整真实Waymo分数。
 
 ## 核心决策与约束
 
@@ -172,6 +172,19 @@ GenieDrive全集入口下载官方metadata时报网络Errno101，尚未进入评
 独立`waymo_i2world_10hz.py`及`run_p0_f9_joint_surface_waymo_10hz.sh`，原2Hz实现/指纹不改，运行/续评保持兼容。全native人口按实际metadata计算（当前39987），共用一次六帧模型预测评分三下标，不重复三次。保留训练slot clock、同冻结均值/四历史/阈值；未训练或插值适配10Hz，不能称物理长时距或同历史预算比较。
 同一份metadata/NPZ，无新下载/大缓存；只读源数据/权重，六预测后才读未来GT，完整窗口整数resume拒绝2Hz/10Hz混拼。默认10Hz进程2worker，用户可同卡并发但资源竞争不保证总耗时更短；不干预现有2Hz进程。
 本地合成元数据/实际小网格CPU及native模型、旧2Hz/Surface/FPS/递推回归78通过、16项CUDA跳过；Bash语法和CLI help通过，未跑真实10Hz或正式测速。服务器下一步更新后独立后台启动10Hz，发回各自summary。协议解释和audit/full/nohup/resume命令见Waymo文档。
+
+最新服务器分段：2Hz约0.800s/窗，其中历史/搬运准备0.290s、证据构建与投影0.437s、head0.020s；10Hz约1.004s/窗，对应0.479/0.448/0.020s。前两段占总耗时91%/92%，I/O约0.010s，不应继续把原始帧读盘或显存当首要瓶颈。`evidence_projection`包含canonical support、Surface Atlas描述及实时投影，尚无内部细分，不能宣称全部耗时来自投影。
+历史component在state构建和causal_source_history内重复提取，相邻窗口四历史亦重叠。用户授权后已实现独立10Hz fast入口，旧2Hz/10Hz实现文件及指纹不改；不干预正在跑的2Hz。
+
+## 新增：Waymo 10Hz无损执行与接续（2026-10-10）
+
+`run_p0_f9_joint_surface_waymo_10hz_fast.sh`：1024MiB/32帧只读内容键component/世界点LRU、取消同窗口重复提取、相同K16/半径2.5/FP64算式的4096行Surface描述并行、最多一个next-history纯CPU预取。
+配准/Strong/support/Atlas/learned features/未来投影均live，不写大缓存；预取只在当前六预测完成后调度，无未来GT进入预测。缓存single-flight短锁，日志不能隐式阻塞worker；线程累计耗时不与wall time相加。
+默认先做同连续16窗、两遍交替旧/new实际六帧+概率byte gate及测速；每计时pass清几何LRU只暖首窗，不拿全小人口暖命中冒充真实吞吐，再开始全native39987固定评估。
+`WAYMO10_CONTINUE_FROM`显式读原停止目录，原contract/state SHA+JSON快照保存新输出；原实现/数据/权重/语义全同才迁移整数前缀，允许仅CPU worker与新增执行信息变化。新目录常规resume仍严格契约；kill -9只恢复最后周期保存窗口，不假装恢复progress尾条。
+本地相关CPU回归135通过/18跳过，RTX3050 CUDA/native/真实静态Graph重放及Surface/Strong/递推回归105通过；实际模型运动输入/配准/evidence/plan/概率/六帧/整数指标一致、CLI原结果只读和迁移/续评验收。Bash语法/CLI help通过，不声称全仓CI或真实Waymo/L40S验收。
+本地12万合成表面点相同4worker：describe625.588→207.769ms、3.011×、全部bytes相同；只是内部CPU微基准，不是完整eval/FPS。服务器提速待`WAYMO10_PAIRED_SPEED`及新progress实测。
+操作见`docs/WAYMO_10HZ_FAST_EXECUTION_CN.md`。原10Hz锚点`outputs/p0_f9_joint_surface_ccr/waymo10_20261009_233328`，新输出`waymo10_fast_*`，等2Hz结束后执行新命令；不改旧权重、nuScenes缓存或长6s结果。
 
 ## 新增：冻结6秒几何接续四路对照（2026-10-09）
 
