@@ -12,11 +12,12 @@ from real_motion.waymo_i2world import (LABEL_MAP, SHAPE, WaymoI2WorldSource, Way
 from tools.real_motion.waymo_zero_shot_common import evaluate_windows, restore
 
 
-def source_fixture(tmp_path, lengths=(21, 21), shape=(8, 8, 4)):
+def source_fixture(tmp_path, lengths=(21, 21), shape=(8, 8, 4), *, timestamp_gaps=None):
     infos = []; poses = {}; timestamp = 0
     for scene, length in enumerate(lengths):
         poses[scene] = {}
         for frame in range(length):
+            timestamp += (timestamp_gaps or {}).get((scene, frame), 0)
             sample = 1000000 + 1000*scene + frame
             infos.append(dict(timestamp=timestamp, image=dict(image_idx=sample),
                               annos='MUST NOT be passed to predictor'))
@@ -59,6 +60,47 @@ def test_global_stride_and_exact_official_boundary_padding(tmp_path):
     assert source.windows[5].history == (5, 5, 5, 5)
     assert len(source.windows) == len(source.frames) == 9  # no boundary window dropped
     assert source.metadata['actual_report_dt_s_including_padded_targets']['3']['zero_time_targets'] == 2
+
+
+def test_real_release_timestamp_gaps_preserve_official_anchors_and_spans(tmp_path):
+    # Observed public metadata has frame_step=5 but rare 0.7--1.2s spans.
+    normal = source_fixture(tmp_path/'normal', lengths=(61,))
+    source = source_fixture(tmp_path/'gaps', lengths=(61,),
+        timestamp_gaps={(0, 10): 200690, (0, 30): 699943})
+    assert [(r.sample, r.scene, r.frame) for r in source.frames] == [
+        (r.sample, r.scene, r.frame) for r in normal.frames]
+    assert source.windows == normal.windows  # no anchors, padding or links changed
+    audit = source.metadata['timestamp_gap_audit']
+    assert audit['pair_count'] == 12 and audit['outlier_count'] == 2
+    assert audit['outliers_by_scene'] == {'0': 2}
+    assert audit['frame_step_histogram'] == {'5': 12}
+    assert audit['resampled'] is False and audit['dropped_windows'] == 0
+    assert source.metadata['actual_adjacent_dt_s']['median'] == .5
+    assert source.metadata['actual_adjacent_dt_s']['max'] == pytest.approx(1.199943)
+    assert [r['dt_s'] for r in audit['examples']] == pytest.approx([.70069, 1.199943])
+    assert source.frames[2].timestamp_us-source.frames[1].timestamp_us == 700690
+    spans = source.metadata['actual_report_dt_s_including_padded_targets']
+    assert spans['3']['max'] == pytest.approx(3.900633)  # actual time, not a fake 3s
+    assert normal.metadata['timestamp_gap_audit']['outlier_count'] == 0
+
+
+@pytest.mark.parametrize('native_dt_us', [20000, 50000, 200000, .1, 100000000])
+def test_wrong_overall_cadence_or_units_still_rejected(tmp_path, native_dt_us):
+    poses = {0: {i: [dict(ego2global=np.eye(4))] for i in range(61)}}
+    infos = [dict(timestamp=i*native_dt_us, image=dict(image_idx=1000000+i)) for i in range(61)]
+    with pytest.raises(ValueError, match='nominal 2Hz.*median_dt_s'):
+        WaymoI2WorldSource(infos, poses, tmp_path)
+
+
+@pytest.mark.parametrize('backward_frame', [False, True])
+def test_zero_time_or_backward_frames_not_hidden_by_gap_audit(tmp_path, backward_frame):
+    poses = {0: {i: [dict(ego2global=np.eye(4))] for i in range(16)}}
+    infos = [dict(timestamp=i*100000 if backward_frame else 0,
+                  image=dict(image_idx=1000000+i)) for i in range(16)]
+    if backward_frame:
+        infos[10]['image']['image_idx'] = 1000004  # unique sampled ID, but goes 5 -> 4
+    with pytest.raises(ValueError, match='not ordered: scene=0'):
+        WaymoI2WorldSource(infos, poses, tmp_path)
 
 
 def test_prediction_only_loads_history_and_uses_no_visibility_annotations(tmp_path, monkeypatch):
@@ -169,9 +211,11 @@ def test_official_metadata_file_reader_strips_annotations_and_records_hashes(tmp
     assert not hasattr(restored.frames[0], 'annos')
 
 
-def test_audit_cli_does_not_load_model_or_future_gt(tmp_path, monkeypatch):
+@pytest.mark.parametrize('gapped', [False, True])
+def test_audit_cli_does_not_load_model_or_future_gt(tmp_path, monkeypatch, capsys, gapped):
     from tools.real_motion import eval_p0_f9_joint_surface_waymo as cli
-    source = source_fixture(tmp_path/'data')
+    source = source_fixture(tmp_path/'data',
+                            timestamp_gaps={(0, 10): 699943} if gapped else None)
     monkeypatch.setattr(cli.WaymoI2WorldSource, 'from_files', lambda *a, **k: source)
     monkeypatch.setattr(cli, 'load_evaluation_model', lambda *a, **k: (_ for _ in ()).throw(AssertionError('model loaded')))
     monkeypatch.setattr(source, 'metric_targets', lambda w: (_ for _ in ()).throw(AssertionError('future GT loaded')))
@@ -180,6 +224,8 @@ def test_audit_cli_does_not_load_model_or_future_gt(tmp_path, monkeypatch):
     assert cli.main(argv=args) == 0
     audit = json.loads((out/'audit.json').read_text())
     assert audit['future_GT_loaded'] is False and audit['model_loaded'] is False
+    assert audit['data']['timestamp_gap_audit']['outlier_count'] == int(gapped)
+    assert ('WAYMO_TIMING_AUDIT' in capsys.readouterr().out) is gapped
     with pytest.raises(SystemExit):
         cli.main(argv=args)  # never replace a completed audit/result
 

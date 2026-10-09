@@ -101,6 +101,8 @@ def text_report(result):
             lines.append(f'{name+"/"+h:24s} {fmt(row["IoU"]):>10} {fmt(row["i2world_mIoU"]):>10} '
                          +f'{fmt(row["standard_mIoU"]):>13}')
     lines += ['I2_mIoU excludes exactly-zero class IoU (upstream behavior); standard includes valid zero classes.',
+              'Timestamp gap audit: '+json.dumps(result['contract']['data'].get('timestamp_gap_audit', {})),
+              '1/2/3s are nominal index-based horizons; actual timestamp spans are reported separately, not retimed.',
               'Raw labels: '+str(result['contract']['data']['label_encoding']),
               'Metrics use no lidar/camera visibility mask. Moving metrics are NOT measured for this protocol.',
               'Future ego poses are supplied conditioning; future occupancy is read only AFTER prediction.',
@@ -127,6 +129,12 @@ def main(stop_event=None, argv=None):
         p.error('new output required; never overwrite an existing experiment')
     source = WaymoI2WorldSource.from_files(data_root, info_file=a.info_file, pose_file=a.pose_file,
                                          raw_free_label=a.raw_free_label, cache_mib=a.frame_cache_mib)
+    timing = source.metadata['timestamp_gap_audit']
+    if timing['outlier_count']:
+        print(f"WAYMO_TIMING_AUDIT: {timing['outlier_count']}/{timing['pair_count']} same-sequence links "
+              f"outside typical 2Hz bounds; median_dt_s={source.metadata['actual_adjacent_dt_s']['median']:.6f}; "
+              f"max_dt_s={source.metadata['actual_adjacent_dt_s']['max']:.6f}. "
+              'Official global-sort/stride5 anchors unchanged; NO resampling or dropped windows.', flush=True)
     if a.expected_scenes and source.metadata['scenes'] != a.expected_scenes:
         p.error(f"Waymo scene count {source.metadata['scenes']} != {a.expected_scenes}; check official metadata")
     if a.max_windows > len(source.windows):

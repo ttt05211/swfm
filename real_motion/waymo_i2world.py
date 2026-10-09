@@ -3,7 +3,7 @@
 Metadata is reduced to timestamps, identities and ego poses before prediction.
 Future labels have a separate API, and no visibility/annotation mask is used.
 """
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 import hashlib
 import json
@@ -124,17 +124,36 @@ class WaymoI2WorldSource:
             starts.append(begin)
         ends.extend([len(self.frames)-1] * (len(self.frames)-begin))
         self.windows = []
-        intervals = []
+        intervals = []; frame_steps = Counter(); timing_outliers = []
         for i, row in enumerate(self.frames):
             if i > starts[i]:
-                dt = (row.timestamp_us - self.frames[i-1].timestamp_us) / 1e6
-                if not .35 <= dt <= .65 or row.frame <= self.frames[i-1].frame:
-                    raise ValueError('sampled Waymo frames are not ordered 2Hz; do not silently retime the model')
+                previous = self.frames[i-1]
+                dt = (row.timestamp_us - previous.timestamp_us) / 1e6
+                frame_step = row.frame - previous.frame
+                if dt <= 0 or frame_step <= 0:
+                    raise ValueError(f'sampled Waymo frames are not ordered: scene={row.scene}, '
+                                     f'frames={previous.frame}->{row.frame}, dt_s={dt}; '
+                                     'do not silently reorder or retime the model')
                 intervals.append(dt)
+                frame_steps[frame_step] += 1
+                if not .35 <= dt <= .65:
+                    timing_outliers.append(dict(scene=row.scene,
+                        frame_pair=[previous.frame, row.frame], dt_s=dt,
+                        timestamp_pair_us=[previous.timestamp_us, row.timestamp_us],
+                        frame_step=frame_step))
             hist = tuple(max(starts[i], i-j) for j in (3, 2, 1, 0))
             future = tuple(min(ends[i], i+j) for j in range(1, 7))
             self.windows.append(WaymoWindow(i, hist, future, max(0, 3-(i-starts[i])),
                                             max(0, 6-(ends[i]-i))))
+        # The official loader uses GLOBAL timestamp sort + stride 5, not a
+        # timestamp-uniform resampler. Real release files contain rare gaps
+        # (e.g. five native frames can span 0.7--1.2s). Preserve those anchors
+        # and their real poses/timestamps; audit, never interpolate/drop them.
+        # Still reject a dataset with a different overall cadence or units.
+        median_dt = float(np.median(intervals)) if intervals else None
+        if median_dt is not None and not .35 <= median_dt <= .65:
+            raise ValueError(f'sampled Waymo frames are not nominal 2Hz: median_dt_s={median_dt}; '
+                             'check timestamp units/native frame rate, do not silently retime the model')
         self.metadata = dict(protocol=PROTOCOL, upstream_commit=UPSTREAM_COMMIT,
             native_frames=self.native_frames, sampled_frames=len(self.frames),
             scenes=len({row.scene for row in self.frames}), load_interval=5, sample_hz=2,
@@ -142,8 +161,17 @@ class WaymoI2WorldSource:
             scene_boundary='repeat_nearest_valid_frame_including_future_targets',
             history_padded_windows=sum(w.history_padding > 0 for w in self.windows),
             future_padded_windows=sum(w.future_padding > 0 for w in self.windows),
-            actual_adjacent_dt_s=(dict(min=min(intervals), max=max(intervals), mean=float(np.mean(intervals)))
+            actual_adjacent_dt_s=(dict(min=min(intervals), max=max(intervals), mean=float(np.mean(intervals)),
+                                      median=median_dt)
                                   if intervals else None), raw_free_label=raw_free_label,
+            timestamp_gap_audit=dict(pair_count=len(intervals), nominal_dt_s=.5,
+                typical_bounds_s=[.35, .65], outlier_count=len(timing_outliers),
+                outlier_fraction=len(timing_outliers)/len(intervals) if intervals else 0.,
+                outliers_by_scene=dict(Counter(str(r['scene']) for r in timing_outliers)),
+                examples=timing_outliers[:20],
+                frame_step_histogram={str(k): v for k, v in sorted(frame_steps.items())},
+                validation='positive ordered links; median nominal 2Hz; rare gaps audited',
+                resampled=False, dropped_windows=0),
             label_encoding='author_free23' if raw_free_label == 23 else 'explicit_Occ3D_free15_normalization',
             label_map={str(k): v for k, v in LABEL_MAP.items() if k != 23},
             history_visibility='dense_input_all_true; no extra sensor mask',

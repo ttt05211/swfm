@@ -17,6 +17,8 @@ V18/CCR 权重、weighted ADD raw sigmoid@0.5、REMOVE-off 均不变。
 在 2Hz 下未来下标1/3/5为名义1/2/3秒。记录实际时间跨度和补帧数量；补帧目标的实际时间可以短于名义时距。
 官方配置注释显示39962原始帧/7994抽样锚点/202场景；本入口从实际文件计算人口，默认检查202场景，不凭注释制造样本。
 
+**时间间隔审计：** stride5 是名义2Hz的按下标抽样，不是严格每0.5秒重采样。用户下载的官方 metadata 实测39987原始帧、7998锚点；7796个同场景相邻链接全部frame step=5，其中15个真实时间间隔超出0.35–0.65秒，最大1.199943秒。入口保留全部锚点、实际pose/timestamp和原边界行为，不插帧、删窗或把真实间隔改写成0.5秒。`timestamp_gap_audit` 报告数量、比例、场景、例子和frame step直方图；仍拒绝非正时间/倒退帧号，以及中位数偏离名义2Hz的错频率/错时间单位。名义1/2/3秒标签沿用官方index定义，实际跨度另报，可能长于名义时距。
+
 **明确的不可等同之处：** 我们固定四帧总历史（包括t0），沿用已训练模型。I²-World 的 temporal tokenizer/cache 配置含previous/current语义，不能宣称输入预算或架构完全相同。
 我们使用未来 ego poses 作为条件，不声称同时预测 ego trajectory。未来 occupancy 不参与 source 提取、motion 或 CCR；六帧预测完成后才读取 GT。
 历史 `history_observed` 为全真，表示与官方 dense occupancy 输入一致；不读取额外 Waymo observation mask。评价也不使用这些 mask。
@@ -111,5 +113,6 @@ binary IoU是所有非free类的occupied IoU，不是18类semantic mIoU；均不
 ## 本地验收范围
 
 合成metadata/NPZ覆盖全局抽样、边界、映射、无future标签泄露、空/零类别、官方整数计数与四舍五入、中断恢复。
+时间跳变回归同时检查锚点/窗口完全不变、实际跨度保留、audit不加载模型或未来GT，以及错频率/错单位/非正时间/倒退帧号仍被拒绝。
 小网格真实V18+Surface网络运行六帧并与reference逐字节比较；原Surface/递推相关回归亦运行。
 本地没有真实Waymo完整数据或本次CUDA环境，不能将这些测试当作Waymo分数、L40S速度或全仓CI。

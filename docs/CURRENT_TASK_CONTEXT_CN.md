@@ -164,7 +164,8 @@ GenieDrive全集入口下载官方metadata时报网络Errno101，尚未进入评
 默认256MiB不可变原始帧LRU；不使用nuScenes几何cache、不存learned features/预测。每8完整窗口整数checkpoint，Ctrl-C/SIGTERM边界保存；严格同目录、模型/metadata/人口/NPZstat/实现/执行契约resume。
 数据仅需validation0.4m NPZ、可信官方 `waymo_infos_val.pkl`、`cam_infos_vali.pkl`；下载链接、目录和audit/full/resume命令在上述文档，不自动下载大数据。
 本地新协议与旧Surface/四历史递推相关回归运行，真实小网格CPU模型预测覆盖早期/中间/末端；未跑真实Waymo或本次CUDA服务器，不宣称zero-shot精度/速度或全仓CI。
-下一步服务器准备这三项数据，先WAYMO_AUDIT_ONLY=1检查编码/人口/文件，再运行完整zero-shot；发回summary.txt。只实现2Hz，10Hz源码名义时距歧义未静默复制。
+数据已下载并解压；服务器只读metadata统计39987原始帧→7998锚点，7796同场景链接全部stride5，15个timestamp跳变（最大1.199943s）。原逐对0.35–0.65s硬检查误拒绝官方数据；现保留官方人口/实际pose/timestamp，将跳变记入`timestamp_gap_audit`，仍拒绝非正时间/倒退帧及总体错频率/错单位。不重采样、不丢窗、不改模型时间步。
+此次修复的Waymo/Surface/FPS CPU回归42通过、12项GPU/native相关跳过；不冒称真实Waymo质量或CUDA验收。下一步服务器更新代码，重新WAYMO_AUDIT_ONLY=1检查编码/人口/文件，再运行完整zero-shot并发回summary.txt。只实现2Hz，10Hz源码名义时距歧义未静默复制。
 
 ## 新增：冻结6秒几何接续四路对照（2026-10-09）
 
