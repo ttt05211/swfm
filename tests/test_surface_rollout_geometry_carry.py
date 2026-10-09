@@ -156,7 +156,7 @@ def orchestration(monkeypatch):
     monkeypatch.setattr(carry,'verify_first_block',lambda *a:None)
     monkeypatch.setattr(cli.old,'handoff_from_prepared',lambda *a,**k:None)
     monkeypatch.setattr(common,'synthetic_preparation',lambda *a,**k:NS())
-    monkeypatch.setattr(carry,'candidates',lambda *a:({r:NS() for r in carry.ROUTES},{'static':{'voxels':1}}))
+    monkeypatch.setattr(carry,'candidates',lambda *a,**k:({r:NS() for r in carry.ROUTES},{'static':{'voxels':1}}))
     def moving(*a,**k):
         assert calls.count('predict')==5*(calls.count('moving')+1)
         calls.append('moving');return [(np.zeros(gt.shape,bool),[],{})]*6
@@ -190,6 +190,26 @@ def selection_reports():
     metric=dict(average_4s_5s_6s=dict(mIoU=10.,IoU=20.,MovingMicro=5.),
                 per_horizon={str(h):dict(mIoU=10.) for h in (4.,5.,6.)})
     return {r:dict(metrics=copy.deepcopy(metric)) for r in carry.ROUTES}
+
+
+def test_metrics_only_integer_resume_and_no_moving_read(monkeypatch):
+    def no_moving(*a,**k):pytest.fail('omitted Moving support was accessed')
+    p,s,jobs,e,c,event,stop=orchestration(monkeypatch)
+    monkeypatch.setattr(cli.old,'gt_moving_support_sequence',no_moving)
+    c['metric_scope']='IoU_mIoU_only';saved=[];stop[0]=True
+    with pytest.raises(InterruptedError):
+        cli.evaluate(p,s,{},jobs,e,c,save=lambda v:saved.append(copy.deepcopy(v)),stop_event=event)
+    assert saved[-1]['completed_windows']==1
+    stop[0]=False;event.clear();done=cli.evaluate(p,s,{},jobs,e,c,saved=saved[-1])
+    p,s,jobs,e,c,_,_=orchestration(monkeypatch);c['metric_scope']='IoU_mIoU_only'
+    monkeypatch.setattr(cli.old,'gt_moving_support_sequence',no_moving)
+    reference=cli.evaluate(p,s,{},jobs,e,c)
+    for key in ('counts','scene_counts','comparison_quality','candidate_audit','edits'):
+        assert done[key]==reference[key]
+    corrupt=copy.deepcopy(done);corrupt.pop('fingerprint')
+    corrupt['counts']['train64:baseline']['mov_union'][0][0]=1
+    corrupt['fingerprint']=cli.old.stable_json_fingerprint(corrupt)
+    with pytest.raises(RuntimeError,match='Moving counts'):cli.restore(corrupt,c,jobs)
 
 
 def test_train_only_fixed_gate_and_recipe_integrity():
@@ -296,6 +316,57 @@ def test_complete_cli_frozen_snapshot_resume_output_and_fail_closed(tmp_path,mon
     assert full['candidate_routes']==['baseline','combined'] and set(full['reports'])=={'all'}
     assert set(full['geniedrive_code_compatibility'])=={'baseline','combined'}
     assert full['selected_train_route']=='combined' and mean.read_bytes()==original
+    # User accepts the small Moving decline: separate explicit choice, never
+    # change the completed screen or relabel its failed original TRAIN gate.
+    recipe_bytes=(out/'evaluation.json').read_bytes()
+    def no_moving(*a,**k):pytest.fail('metrics-only run read future moving annotations')
+    monkeypatch.setattr(cli.old,'gt_moving_support_sequence',no_moving)
+    approved_out=tmp_path/'approved_all'
+    approved_args=argv+['--experiment','all','--population','all',
+        '--population-alignment','geniedrive_code10s','--geniedrive-info',str(metadata),
+        '--approved-route','static_carry','--iou-miou-only','--out-dir',str(approved_out)]
+    assert cli.main(event,approved_args)==0
+    approved=json.loads((approved_out/'evaluation.json').read_text())
+    assert approved['candidate_routes']==['baseline','static_carry']
+    assert approved['selected_train_route'] is None and approved['user_approved_route']=='static_carry'
+    assert 'NOT_TRAIN_gate_pass' in approved['selection_policy']
+    for route,row in approved['reports']['all'].items():
+        metrics=row['metrics'];reference=full['reports']['all']['baseline']['metrics']
+        for group in ('per_horizon','average_1s_2s_3s','average_4s_5s_6s'):
+            items=metrics[group].values() if group=='per_horizon' else [metrics[group]]
+            for v in items:assert v['MovingMicro'] is None and v['MovingMacro'] is None
+        # Same fixture predictions: IoU/mIoU counts are identical even though
+        # Moving support is omitted; never present omitted Moving as zero.
+        for h,v in metrics['per_horizon'].items():
+            for key in ('IoU','mIoU'):assert v[key]==reference['per_horizon'][h][key]
+    compact=(approved_out/'summary.txt').read_text()
+    assert '1.0s' in compact and '6.0s' in compact and 'avg4--6' in compact
+    assert 'dMovingMicro=' not in compact and 'Moving not evaluated' in compact
+    assert (out/'evaluation.json').read_bytes()==recipe_bytes and mean.read_bytes()==original
+    with pytest.raises(SystemExit):cli.main(event,approved_args+['--selection-from',str(selection)])
+    with pytest.raises(SystemExit):cli.main(event,argv+['--approved-route','static_carry'])
+
+
+@torch.no_grad()
+def test_static_only_full_skips_se2_and_matches_screen_predictions(monkeypatch):
+    threads=torch.get_num_threads();torch.set_num_threads(1)
+    provider,w,r,raw=provider_fixture()
+    exe=common.SurfaceBlockExecution(provider,mode='numpy',workers=2,query_workers=2,graphs=False)
+    try:
+        first=provider.prepare_columns(None,r,include_gt=False,raw_window=raw)
+        pred,_,_,_=exe.predict(first);pred_before=[v.copy() for v in pred]
+        handoff=common.handoff_from_prepared(first,pred[-1]);poses=[np.eye(4)]*12
+        second=common.synthetic_preparation(pred,raw,poses,w,provider,handoff=handoff)
+        all_views,_=carry.candidates(first,pred,second,poses[6:],provider)
+        expected,_,_,scores=exe.predict(all_views['static_carry'])
+        monkeypatch.setattr(carry,'predicted_rigid_registrations',lambda *a:pytest.fail('unused SE2 branch computed'))
+        views,audit=carry.candidates(first,pred,second,poses[6:],provider,routes=['baseline','static_carry'])
+        actual,_,_,scores2=exe.predict(views['static_carry'])
+        assert set(views)=={'baseline','static_carry'} and 'se2' not in audit
+        assert np.array_equal(scores,scores2) and all(np.array_equal(a,b) for a,b in zip(expected,actual))
+        assert all(np.array_equal(a,b) for a,b in zip(pred,pred_before))
+        with pytest.raises(ValueError):carry.candidates(first,pred,second,poses[6:],provider,routes=['typo'])
+    finally:exe.close();torch.set_num_threads(threads)
 
 
 def legacy_upgrade_case():

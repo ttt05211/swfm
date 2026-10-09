@@ -198,11 +198,18 @@ def predicted_rigid_registrations(first, predictions, second, grid):
     return replace(second, registrations=registrations), audit
 
 
-def candidates(first, predictions, second, target_poses, provider):
-    """Four isolated views; first block/state/model tensors never mutated."""
-    backgrounds, static_audit = direct_static_backgrounds(first, predictions, target_poses, provider)
-    stat, static_changes = apply_static_backgrounds(second, backgrounds)
-    rigid, rigid_audit = predicted_rigid_registrations(first, predictions, second, provider.pcfg.grid)
-    both = replace(stat, registrations=rigid.registrations)
-    return dict(baseline=second, static_carry=stat, se2_carry=rigid, combined=both), {
-        'static':{**static_audit, **static_changes}, 'se2':rigid_audit}
+def candidates(first, predictions, second, target_poses, provider, *, routes=ROUTES):
+    """Isolated requested views; never compute unused full-evaluation branches."""
+    if not routes or len(set(routes)) != len(routes) or any(r not in ROUTES for r in routes):
+        raise ValueError('invalid carry routes')
+    views = {'baseline':second}; audit = {}
+    if any(r in routes for r in ('static_carry','combined')):
+        backgrounds, static_audit = direct_static_backgrounds(first, predictions, target_poses, provider)
+        stat, static_changes = apply_static_backgrounds(second, backgrounds)
+        views['static_carry'] = stat
+        audit['static'] = {**static_audit, **static_changes}
+    if any(r in routes for r in ('se2_carry','combined')):
+        rigid, rigid_audit = predicted_rigid_registrations(first, predictions, second, provider.pcfg.grid)
+        views['se2_carry'] = rigid; audit['se2'] = rigid_audit
+    if 'combined' in routes: views['combined'] = replace(stat, registrations=rigid.registrations)
+    return {r:views[r] for r in routes}, audit

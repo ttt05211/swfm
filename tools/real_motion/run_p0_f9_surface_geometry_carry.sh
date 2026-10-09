@@ -34,10 +34,21 @@ if [[ "$MODE" == screen ]]; then
   REQUIRED+=("$TRAIN_CACHE" "$TRAIN_INFO")
   EXTRA+=(--train-cache "$TRAIN_CACHE" --train-info "$TRAIN_INFO")
 else
-  [[ -n "${SURFACE_CARRY_SELECTION:-}" ]] || { echo 'all须设置已完成screen的evaluation.json实际路径：SURFACE_CARRY_SELECTION' >&2; exit 2; }
-  REQUIRED+=("$SURFACE_CARRY_SELECTION")
+  if [[ -n "${SURFACE_CARRY_APPROVED_ROUTE:-}" ]]; then
+    [[ "$SURFACE_CARRY_APPROVED_ROUTE" == static_carry ]] || { echo '用户指定只支持static_carry；不是原TRAIN gate通过' >&2; exit 2; }
+    EXTRA+=(--approved-route "$SURFACE_CARRY_APPROVED_ROUTE")
+  else
+    [[ -n "${SURFACE_CARRY_SELECTION:-}" ]] || { echo 'all须设置SURFACE_CARRY_SELECTION；或显式SURFACE_CARRY_APPROVED_ROUTE=static_carry' >&2; exit 2; }
+    REQUIRED+=("$SURFACE_CARRY_SELECTION")
+    EXTRA+=(--selection-from "$SURFACE_CARRY_SELECTION")
+  fi
+  case "${SURFACE_CARRY_METRICS_ONLY:-1}" in
+    1) EXTRA+=(--iou-miou-only) ;;
+    0) ;;
+    *) echo 'SURFACE_CARRY_METRICS_ONLY须为0/1' >&2; exit 2 ;;
+  esac
   GENIE_INFO="${GENIEDRIVE_INFO:-$ROOT/data/geniedrive/world-nuscenes_infos_val.pkl}"
-  EXTRA+=(--selection-from "$SURFACE_CARRY_SELECTION" --geniedrive-info "$GENIE_INFO"
+  EXTRA+=(--geniedrive-info "$GENIE_INFO"
     --population all --population-alignment geniedrive_code10s)
 fi
 for path in "${REQUIRED[@]}"; do
@@ -55,6 +66,9 @@ fi
 mkdir -p "$(dirname -- "$OUT")"
 echo '冻结平均5/6/8/12/14，阈值不变：baseline / static carry / predicted SE(2) carry / combined。'
 echo 'screen一趟TRAIN64+dev64，共享首段；只用TRAIN规则选择候选。all只复测冻结候选+baseline。'
+if [[ "$MODE" == all && -n "${SURFACE_CARRY_APPROVED_ROUTE:-}" ]]; then
+  echo '显式用户选择static_carry，接受screen小幅Moving下降；不宣称原TRAIN门槛通过。'
+fi
 echo "模式=$MODE；原始4历史+自预测几何状态，未来仅GT ego poses；输出：$OUT"
 "$PY" -u tools/real_motion/eval_p0_f9_surface_geometry_carry.py \
   --config "$ROOT/configs/real_motion_occfm.yaml" --run-dir "$RUN" \

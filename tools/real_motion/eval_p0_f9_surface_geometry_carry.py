@@ -62,6 +62,9 @@ def restore(saved, contract, jobs):
     state = old.new_state(contract['routes']) if saved is None else old.restore_state(saved, contract, len(jobs))
     if saved is None:
         state.update(scene_counts={}, candidate_audit={}, comparison_quality={})
+    if contract.get('metric_scope') == 'IoU_mIoU_only' and any(
+            np.any(row[k]) for row in state['counts'].values() for k in ('mov_inter','mov_union')):
+        raise RuntimeError('metrics-only state contains Moving counts')
     for name, scenes in state['scene_counts'].items():
         if name not in contract['routes']: raise RuntimeError('saved scene route changed')
         total = {k:np.zeros_like(v) for k,v in old.rollout.legacy._new_raw().items()}
@@ -119,7 +122,8 @@ def evaluate(provider, sources, caches, jobs, execution, contract, *, saved=None
                         max_speed_mps=provider.strong.max_match_speed_mps)
                     t=time.perf_counter(); second=old.surface.synthetic_preparation(pred1,raw,poses,w,provider,handoff=handoff)
                     stages['second_shared_prepare']=time.perf_counter()-t
-                    t=time.perf_counter(); candidates,audit=carry.candidates(first,pred1,second,poses[6:],provider)
+                    t=time.perf_counter(); candidates,audit=carry.candidates(first,pred1,second,poses[6:],provider,
+                        routes=contract['candidate_routes'])
                     stages['carry_prepare']=time.perf_counter()-t
                     prediction={}; edit_rows={}
                     for route in contract['candidate_routes']:
@@ -131,16 +135,27 @@ def evaluate(provider, sources, caches, jobs, execution, contract, *, saved=None
                     # GT occupancy + original-t0 GT moving support only NOW,
                     # after all candidate predictions. Nothing below feeds back.
                     t=time.perf_counter(); tokens=tuple(w.future_tokens[i] for i in (1,3,5,7,9,11))
-                    moving=old.gt_moving_support_sequence(source.nusc,w.t0_token,tokens,old.rollout.REPORT_HORIZONS,
-                        grid=provider.pcfg.grid,workers=provider.workers)
+                    metrics_only = contract.get('metric_scope') == 'IoU_mIoU_only'
+                    if metrics_only:
+                        # No annotation-based support calculation. Empty support
+                        # keeps raw Moving counts zero and reported values NA.
+                        mask=np.zeros_like(pred1[0],dtype=bool)
+                        moving=[(mask,None,None)]*6
+                    else:
+                        moving=old.gt_moving_support_sequence(source.nusc,w.t0_token,tokens,old.rollout.REPORT_HORIZONS,
+                            grid=provider.pcfg.grid,workers=provider.workers)
                     for hi,(idx,token) in enumerate(zip((1,3,5,7,9,11),tokens)):
                         gt=source.load_semantics(w.scene_name,token)
                         for route in contract['candidate_routes']:
                             name=split+':'+route
-                            old.rollout.update_metrics(counts[name],hi,prediction[route][idx],gt,moving[hi][0],17)
+                            values=old.rollout.columns.Metrics.counts(prediction[route][idx],gt,moving[hi][0],17)
+                            # Reuse exact same integer counts for dataset/scene;
+                            # do not scan the dense prediction twice.
+                            fields=('occ_inter','occ_union','sem_inter','sem_union','mov_inter','mov_union')
+                            for key,value in zip(fields,values):counts[name][key][hi]+=value
                             scenes=state['scene_counts'].setdefault(name,{})
                             row={k:np.asarray(v,np.int64) for k,v in scenes.get(w.scene_name,zero_counts()).items()}
-                            old.rollout.update_metrics(row,hi,prediction[route][idx],gt,moving[hi][0],17)
+                            for key,value in zip(fields,values):row[key][hi]+=value
                             scenes[w.scene_name]={k:v.tolist() for k,v in row.items()}
                             if hi >= 3:
                                 before=prediction['baseline'][idx]; after=prediction[route][idx]
@@ -197,6 +212,28 @@ def reports(state, populations, routes):
 
 
 def summary(result):
+    if result.get('metric_scope') == 'IoU_mIoU_only':
+        lines=['===== FROZEN SURFACE STATIC CARRY / FULL 1--6s =====',
+            'Frozen mean5/6/8/12/14; ADD0.5 / REMOVEoff; no training; future GT ego poses conditioned.',
+            'First 1--3s unchanged; stateful static carry affects second block only.',
+            'selection_policy: '+result['selection_policy'],
+            'Original TRAIN gate is NOT waived or relabeled as passed. Moving not evaluated in this run.']
+        for split,rows in result['reports'].items():
+            pop=result['populations'][split]
+            lines.append(f'population={split}; windows={pop["selected_windows"]}; scenes={pop.get("scenes", "see evaluation.json")}')
+            lines.append('route             horizon       IoU      mIoU     dIoU    dmIoU')
+            for route,row in rows.items():
+                base=rows['baseline']['metrics'];metric=row['metrics']
+                groups=[(h+'s',metric['per_horizon'][h],base['per_horizon'][h])
+                        for h in ('1.0','2.0','3.0','4.0','5.0','6.0')]
+                groups += [(tag,metric[key],base[key]) for tag,key in
+                    (('avg1--3','average_1s_2s_3s'),('avg4--6','average_4s_5s_6s'))]
+                for tag,v,b in groups:
+                    lines.append(f'{route:16s} {tag:>8s} {v["IoU"]:9.6f} {v["mIoU"]:9.6f} '
+                        f'{v["IoU"]-b["IoU"]:+9.6f} {v["mIoU"]-b["mIoU"]:+9.6f}')
+        lines += ['Standard metrics above; official public-code population, paper Table-2 population not independently verified.',
+                  'No automatic method selection, threshold tuning or changes to the main1--3s table.']
+        return '\n'.join(lines)+'\n'
     lines=['===== FROZEN SURFACE GEOMETRY CARRY =====','protocol: '+PROTOCOL,
         'One frozen mean 5/6/8/12/14; ADD raw0.5 / REMOVEoff; NO training/GT prediction inputs.',
         'Inference algorithm ablation, NOT byte-identical lossless optimization.',
@@ -217,7 +254,9 @@ def summary(result):
                 mm=f'{p["MovingMicro"]:.6f}' if p['MovingMicro'] is not None else 'NA'
                 lines.append(f'  {h}s mIoU={p["mIoU"]:.6f} IoU={p["IoU"]:.6f} MovingMicro={mm}')
             lines.append('  quality='+json.dumps(row['change_quality'])+' scenes='+json.dumps({k:v for k,v in row['scene_delta'].items() if k!='by_scene'}))
-    lines += ['TRAIN-only eligible candidate: '+str(result['selected_train_route']),
+    lines += ['selection_policy: '+result.get('selection_policy','original_TRAIN_gate'),
+        'user_approved_route: '+str(result.get('user_approved_route')),
+        'TRAIN-only eligible candidate: '+str(result['selected_train_route']),
         'TRAIN gate: avg dMiOU>=0.05pp, avg IoU/MovingMicro nonnegative, 4/5/6s mIoU each nonnegative.',
         'DEV diagnostic ONLY; no automatic promotion/retry, original results untouched.',
         'candidate_audit: '+json.dumps(result['candidate_audit']), 'stage_seconds: '+json.dumps(result['stage_seconds'])]
@@ -244,10 +283,12 @@ def main(stop_event=None,argv=None):
     p.add_argument('--train-cache');p.add_argument('--train-info')
     p.add_argument('--experiment',choices=('screen','all'),default='screen')
     p.add_argument('--selection-from',help='completed screen evaluation.json; TRAIN-selected recipe ONLY')
+    p.add_argument('--approved-route',choices=('static_carry',),help='explicit USER choice for all, not a passed TRAIN gate')
+    p.add_argument('--iou-miou-only',action='store_true',help='all only: skip Moving support; compact IoU/mIoU summary')
     p.add_argument('--majority-workers',type=int,default=4)
     a=p.parse_args(argv);root=Path(__file__).resolve().parents[2];out=Path(a.out_dir).resolve()
-    if a.experiment=='screen' and (not a.train_cache or not a.train_info or a.selection_from):p.error('screen requires TRAIN inputs, no selection-from')
-    if a.experiment=='all' and (not a.selection_from or not a.geniedrive_info):p.error('all requires frozen TRAIN screen recipe + official metadata')
+    if a.experiment=='screen' and (not a.train_cache or not a.train_info or a.selection_from or a.approved_route or a.iou_miou_only):p.error('screen requires TRAIN inputs, no selection-from/approval/metric omission')
+    if a.experiment=='all' and (bool(a.selection_from)==bool(a.approved_route) or not a.geniedrive_info):p.error('all requires exactly ONE of TRAIN recipe / explicit approved-route, plus official metadata')
     if a.experiment=='screen' and (a.population!='dev64' or a.population_alignment!='legacy_cache6s' or a.geniedrive_info):
         p.error('screen population is fixed TRAIN64 + dev64')
     if a.experiment=='all' and (a.population!='all' or a.population_alignment!='geniedrive_code10s'):
@@ -260,7 +301,8 @@ def main(stop_event=None,argv=None):
         if (out/'evaluation.json').exists():p.error('already completed; read summary')
     elif out.exists():p.error('new output required')
     for name in ('config','dev_cache','dev_info','base_checkpoint','population_manifest',
-                 *(('train_cache','train_info') if a.experiment=='screen' else ('selection_from','geniedrive_info'))):
+                 *(('train_cache','train_info') if a.experiment=='screen' else
+                   (('selection_from','geniedrive_info') if a.selection_from else ('geniedrive_info',)))):
         if not Path(getattr(a,name) or '').is_file():p.error('missing '+name)
     if any((d/'training.json').exists() for d in (out,*out.parents)):p.error('output outside training required')
     bundle=(json.loads((out/'bundle.json').read_text(encoding='utf-8')) if a.resume else
@@ -295,10 +337,15 @@ def main(stop_event=None,argv=None):
         if saved_model['source_epochs']!=list(old.AVERAGE_EPOCHS) or joint.transport.config.history_frames!=4 or saved_model['weight_fingerprint']!=row['weight_fingerprint'] or old.stable_json_fingerprint(saved_model['training_contract'])!=old.stable_json_fingerprint(trained):raise RuntimeError('frozen mean recipe changed')
         del saved_model
         routes=list(carry.ROUTES);selection_digest=None;selected_train=None
+        selection_policy='original_TRAIN_gate'
         if a.experiment=='all':
-            recipe=json.loads(Path(a.selection_from).read_text(encoding='utf-8'));selection_digest=old.sha256(a.selection_from)
-            selected_train=validate_recipe(recipe,digest,implementation(root))
-            routes=['baseline',selected_train]
+            if a.approved_route:
+                routes=['baseline',a.approved_route]
+                selection_policy='explicit_user_static_carry_accepts_screen_small_Moving_decline_NOT_TRAIN_gate_pass'
+            else:
+                recipe=json.loads(Path(a.selection_from).read_text(encoding='utf-8'));selection_digest=old.sha256(a.selection_from)
+                selected_train=validate_recipe(recipe,digest,implementation(root))
+                routes=['baseline',selected_train]
         sources={};populations={};jobs=[]
         splits=('train64','dev64') if a.experiment=='screen' else ('all',)
         for split in splits:
@@ -330,6 +377,8 @@ def main(stop_event=None,argv=None):
                 routes=[split+':'+route for split in splits for route in routes],candidate_routes=routes,populations=populations,
                 future_tokens=[list(w.future_tokens) for _,w,_ in jobs],timestamp_audit=old.rollout.summarize_timestamps(timestamps),
                 thresholds=[.5,None],static_protocol=carry.PROTOCOL,selection_sha256=selection_digest,
+                selection_policy=selection_policy,user_approved_route=a.approved_route,
+                metric_scope='IoU_mIoU_only' if a.iou_miou_only else 'IoU_mIoU_Moving',
                 initial_observations=4,future_frames_per_block=6,original_static_state_retained=True,
                 future_GT_prediction_inputs=False,future_ego_poses='GT_through6s',val_namespace=namespace,
                 strong_warp_backend=selected_backend(),integer_cpu_backend=backend_name(),
@@ -360,6 +409,7 @@ def main(stop_event=None,argv=None):
                 timestamp_audit=contract['timestamp_audit'],source_epochs=list(old.AVERAGE_EPOCHS),
                 snapshot_sha256=row['sha256'],weight_fingerprint=row['weight_fingerprint'],
                 implementation=contract['implementation'],candidate_routes=routes,
+                selection_policy=selection_policy,user_approved_route=a.approved_route,metric_scope=contract['metric_scope'],
                 majority_execution=None if majority is None else majority.stats())
             result['selected_train_route']=choose_train_candidate(result['reports']['train64']) if a.experiment=='screen' else selected_train
             if a.experiment=='all':result['geniedrive_code_compatibility']={r:old.genie.compatibility_metrics({k:np.asarray(v,np.int64) for k,v in result['counts']['all:'+r].items()}) for r in routes}

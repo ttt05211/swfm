@@ -51,7 +51,8 @@ TRAIN 和 DEV 场景必须不相交。无需重建 prototype 或大几何缓存�
 
 通过者中取 TRAIN 平均 mIoU 最高者；同分保持上述路线顺序。没有通过者就停止，不自动调阈值或重试。
 TRAIN64 是 in-sample 诊断，不能证明泛化。dev64 全部报告，但不用于选择路线。
-`all` 只接受同权重、同代码、完整校验通过的 screen evaluation.json，跑冻结的 TRAIN 候选和 baseline。
+`all` 默认只接受同权重、同代码、完整校验通过的 screen evaluation.json，跑冻结的 TRAIN 候选和 baseline。
+另有下述**显式用户选择**入口，不能混称原 TRAIN 门槛通过。
 人口由官方固定 GenieDrive metadata 决定（当前2569、150场景），仍报告标准指标与公开代码兼容指标，不混换口径。
 
 ## 服务器运行
@@ -105,3 +106,44 @@ stdout记录 `legacy_cache_upgrade_KTA_arithmetic_verified` 和实际最大差�
 
 实现指纹改变后不要混续旧评估。此次服务器在第一窗口输入检查处退出，尚未完成该窗口；
 保留原失败目录，使用新输出目录重跑即可，无需重建缓存、平均权重或训练。
+
+## 用户固定 static_carry 的全集复测（2026-10-09）
+
+真实 screen 的 static_carry：TRAIN64 avg4–6 mIoU+1.469280pp、IoU+2.499484pp、MovingMicro-0.025451pp；
+dev64 +1.553857pp、+2.611150pp、-0.022158pp。SE(2) carry未改善mIoU，combined也不优于static_carry。
+原 TRAIN 规则要求 Moving 不下降，因此没有候选通过。用户随后明确接受这点下降，选择只保留静态接续。
+这是研究者在看过screen结果后的显式选择，**不是原门槛通过、预注册选择或独立测试**。
+
+新入口将 `user_approved_route=static_carry` 和独立 `selection_policy` 写入契约与结果；
+`selected_train_route` 仍为 null，绝不改写旧screen或放宽 `choose_train_candidate`。
+仅复测 baseline + static_carry，仍同冻结平均/阈值/官方 metadata/key order；不重新构建均值或训练。
+不计算无关 SE(2) 候选；数据集和场景复用同一份整数指标，避免重复扫描dense输出。
+第一段六张预测共享且不改，新增实际小网络测试确认精简候选与四路screen逐字节一致。
+
+用户这次只需 IoU/mIoU：all wrapper 默认 `SURFACE_CARRY_METRICS_ONLY=1`，不计算/读取未来 Moving annotation support，
+摘要仅列1–6s及avg1–3/avg4–6的两项标准指标和baseline差值。JSON标记 `metric_scope=IoU_mIoU_only`，
+Moving值为null（未评估），不是0；计数/来源/时间/损伤审计仍保留。设0可保留完整指标。
+公开代码兼容的零类排除/round2指标另存JSON，不混称标准指标或论文Table2精确复现。
+
+```bash
+conda activate OccFM
+cd /root/nas/occ/swfm
+git fetch https://ghfast.top/https://github.com/ttt05211/swfm.git feature/v22-surface-aware-ccr
+git merge --ff-only FETCH_HEAD
+
+export SURFACE_CARRY_APPROVED_ROUTE=static_carry
+export SURFACE_CARRY_METRICS_ONLY=1
+OUT="$PWD/outputs/p0_f9_joint_surface_ccr/static_carry_all_$(date +%Y%m%d_%H%M%S)"
+bash tools/real_motion/run_p0_f9_surface_geometry_carry.sh all "$OUT"
+cat "$OUT/summary.txt"
+```
+
+同一版本/开关/目录可续评，不能切指标范围或路线混拼：
+
+```bash
+export SURFACE_CARRY_APPROVED_ROUTE=static_carry SURFACE_CARRY_METRICS_ONLY=1
+bash tools/real_motion/run_p0_f9_surface_geometry_carry.sh all "$OUT" --resume
+```
+
+人口沿用此前官方公开代码metadata（预计2569窗口/150场景，以实际审计为准），不改成4369短未来窗口。
+服务器真实新全集尚未运行；45–65分钟仅由旧全集38.8分钟加一次第二段候选读出估算，不是实测或承诺。

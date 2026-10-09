@@ -192,6 +192,19 @@ CLI help、Bash语法通过；真实服务器候选精度及本次CUDA路径尚�
 本地真实Surface大坐标fixture复现微米级缓存舍入；误改KTA/类别/mask拒绝。扩大相关回归142项通过、20项CUDA跳过。
 代码指纹改变，原失败目录保留，新输出重跑，不使用旧目录resume，不重建缓存或训练。
 
+## 用户选择静态接续并授权全集复测（2026-10-09）
+
+真实四路screen：static_carry TRAIN64 avg4–6 mIoU+1.469280pp/IoU+2.499484pp/Micro-0.025451pp；
+dev64 +1.553857/+2.611150/-0.022158pp。combined略差，SE2无益；原TRAIN Moving非负规则未通过。
+用户明确接受小幅Moving下降，固定static_carry，要求跑同官方人口全集并只报告IoU/mIoU。
+新增显式 `SURFACE_CARRY_APPROVED_ROUTE=static_carry` all入口：记录用户选择，不改旧screen/门槛，selected_train_route仍null。
+同冻结均值/阈值/官方metadata，仅baseline+static，第一段共享不改；不训练、不用未来标签预测。
+all默认metrics-only，不读/计算Moving支持，结果标记未评估/null，摘要报告1–6s及1–3/4–6平均的IoU/mIoU。
+不计算未用SE2分支；每时距dense整数指标只扫描一次复用dataset/scene。旧默认screen原样，严格同目录resume。
+本地专项和旧Surface/两段递推/官方人口/Strong/FPS回归130项通过、20项CUDA跳过；CLI help/Bash语法/diff检查通过。
+含metrics-only省略Moving标签访问、整数中断恢复、源screen/权重只读、固定静态路线逐字节一致；不冒充全仓CI/真实GPU或全集收益。
+新的全集未在本地运行，需服务器执行；预计同2569/150人口，最终按实际审计。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
