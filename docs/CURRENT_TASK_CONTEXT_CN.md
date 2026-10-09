@@ -5,6 +5,7 @@
 Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整网等权平均已完成DEV512选择、full4369质量和256×3正式FPS验证。
 当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
 最新任务：用户选择与I²-World对齐的Occ3D-Waymo 2Hz zero-shot，实现冻结同一均值模型的评估入口。只改数据适配/评估，不训练、改权重/结构/阈值或重启失败方案，不冒称已跑真实Waymo。
+另一个已授权任务：冻结6秒推理的几何接续四路对照已实现，见下方新增章节；不改并行Waymo任务或原默认入口。
 
 ## 核心决策与约束
 
@@ -164,6 +165,26 @@ GenieDrive全集入口下载官方metadata时报网络Errno101，尚未进入评
 数据仅需validation0.4m NPZ、可信官方 `waymo_infos_val.pkl`、`cam_infos_vali.pkl`；下载链接、目录和audit/full/resume命令在上述文档，不自动下载大数据。
 本地新协议与旧Surface/四历史递推相关回归运行，真实小网格CPU模型预测覆盖早期/中间/末端；未跑真实Waymo或本次CUDA服务器，不宣称zero-shot精度/速度或全仓CI。
 下一步服务器准备这三项数据，先WAYMO_AUDIT_ONLY=1检查编码/人口/文件，再运行完整zero-shot；发回summary.txt。只实现2Hz，10Hz源码名义时距歧义未静默复制。
+
+## 新增：冻结6秒几何接续四路对照（2026-10-09）
+
+用户已授权尝试提高6秒精度；保留并行 Waymo 工作和旧6秒入口，单独新增 `run_p0_f9_surface_geometry_carry.sh`。
+真实 GenieDrive 公开代码人口2569/150已跑完：4/5/6s mIoU30.572013/27.095679/24.488694、平均27.385462；IoU42.032229/38.331931/35.324381、平均38.562847；2330.31s，不是FPS。
+既有接续匹配31783/33451来源，不能再把身份匹配率低当作主要原因；论文Table2实际人口仍未独立确认。
+
+新实验一趟 TRAIN64+dev64 跑 baseline/static_carry/se2_carry/combined，冻结同均值、阈值和原第二段 motion forward。
+static_carry 原始t0静态直接投影到第二段，保留首段CCR静态新增；动态foreground/重叠动态fallback不变。
+se2_carry 只将过去预测形状按首段预测中心/yaw对齐到3s，可靠唯一身份才替换ICP；split/merge/错语义/4m质心异常回退。
+这是改变第二段输出的推理算法候选，不是无损后端；相对baseline可能删除/重标静态背景，单独报告corrected/damaged/removed。
+四张初始真实历史之外不新增观测；保留causal几何状态必须公开说明stateful rollout；未来GT ego poses仍显式条件。
+
+仅TRAIN64固定规则选择：avg4–6 mIoU+0.05pp、avgIoU/Micro非负、4/5/6mIoU分别非负；DEV64全报告不选路线。
+all需要同权重/代码、内容指纹完整的screen recipe，仅冻结候选+baseline官方2569人口，默认不自动启动。
+第一段共享且不变；未来GT occupancy/Moving仅全部候选预测之后读取。每8完整窗口整数状态，Ctrl-C/SIGTERM边界保存，严格同目录resume。
+native fused projection/graph+4线程无损多数投票；现有VAL几何只读，不写大缓存，原权重/训练/cache namespace不改。
+138项相关本地回归通过、20项CUDA跳过，包含真实CPU Surface四路参考字节一致、动态保护/歧义回退、CLI snapshot只读/中断恢复、全集入口和旧long/projection/graph/FPS回归。
+CLI help、Bash语法通过；真实服务器候选精度及本次CUDA路径尚未跑，不宣称提分/正式FPS/全仓CI。
+操作与比较边界见 `docs/SURFACE_LONG_GEOMETRY_CARRY_CN.md`。下一步服务器跑screen并发summary，无需重建prototype/重训。
 
 ## 仅按需检索的历史
 
