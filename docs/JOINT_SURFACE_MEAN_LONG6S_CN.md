@@ -45,6 +45,27 @@ bash tools/real_motion/run_p0_f9_joint_surface_geniedrive_long6s.sh
 ```
 
 复用现有安全下载器的 pinned revision/size/SHA 校验；只有身份/时间/序列用于 population。
+下载器默认先访问 Hugging Face，网络失败时尝试第三方 HF-Mirror；不发送 HF token，
+固定 revision、103781328 bytes 与 SHA256 始终不变，任何不一致都停止、不反序列化。
+可只在本次命令指定镜像（不修改 shell 全局代理）：
+
+```bash
+GENIEDRIVE_DOWNLOAD_ENDPOINT=https://hf-mirror.com SURFACE_LONG_REDETECT=0 \
+bash tools/real_motion/run_p0_f9_joint_surface_geniedrive_long6s.sh
+```
+
+`--endpoint` 优先于 `GENIEDRIVE_DOWNLOAD_ENDPOINT`，其次 `HF_ENDPOINT`；标准 `HTTPS_PROXY` 由 urllib 使用。
+镜像也不可达时不会启动评估，不能用 ghfast 的 Git URL 代理套在 HF 下载 URL 上。
+完全离线服务器可在联网机器下载下列固定文件后上传，已有正确文件会离线校验并复用：
+
+```
+https://huggingface.co/ANIYA673/GenieDrive/resolve/17e37acfff5b10517393a669ecf471f75f34d43f/world-nuscenes_infos_val.pkl
+默认服务器位置：/root/nas/occ/swfm/data/geniedrive/world-nuscenes_infos_val.pkl
+SHA256：0426072260a908260625c6dd91b9f06919726f5265c10849b87156d282547ded
+```
+
+也可将 `GENIEDRIVE_INFO` 设为上传的实际文件位置；不能用当前 V18 info 或不同 revision 替代。
+下载失败发生在新评估输出目录创建前，修复连接后重跑即可，不使用 `--resume`。
 4历史+20未来 metadata 用于选起点，网络只预测12未来帧，不读取多出的八帧 labels/ego poses。
 固定公开代码 population 为2569窗口/150场景，包括原六历史 cache 中缺少的300个早期起点。
 这些起点只用四张真实历史重建，不能因缓存缺失删掉。仅称公开代码对齐，不能声称已验证论文 Table2 population。

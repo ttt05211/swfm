@@ -127,6 +127,22 @@ RTX3050上只读真实replay.zip：6窗口×5，六帧逆变换32.848→24.410ms
 159项相关本地回归通过、28项跳过（CUDA相关未在本次CPU环境复现），包含实际Surface网络、native CPU/NumPy两段一致、早期起点、预测历史cache隔离、完整CLI snapshot/中断恢复。Bash语法和CLI help通过；不冒充全仓CI或服务器6s精度。
 操作见 `docs/JOINT_SURFACE_MEAN_LONG6S_CN.md`。服务器下一步跑新dev64入口，发回summary；不用重建prototype/cache、重新平均或恢复训练。
 
+## 6秒服务器验收与下载修复（2026-10-09）
+
+Surface平均dev64真实6秒已完成，first/second exactness通过。接续主路径4–6s平均mIoU23.305861/Micro8.004605，
+redetect对照23.148164/7.179412，接续增益+0.157697/+0.825193 pp；64窗口103.21s，不称FPS。
+601/630当前source成功接续；长期预测仍衰减，不与旧dev512不同人口直接比较。
+结果服务器：`outputs/p0_f9_joint_surface_ccr/long6s_mean_dev64_20261009_170347_837`。
+
+GenieDrive全集入口下载官方metadata时报网络Errno101，尚未进入评估、未创建评估状态。
+修复下载器：默认官网→网络失败尝试HF-Mirror；可显式`GENIEDRIVE_DOWNLOAD_ENDPOINT`或`HF_ENDPOINT`，
+仍固定revision/size/SHA，校验错误不重试、不发布/反序列化、不覆盖原文件。标准HTTPS_PROXY兼容，
+所有地址不可达时明确离线上传指引，无长traceback；只移除本次自己创建的.part。
+76项下载/人口/Surface两段/接续相关回归通过，4项CUDA跳过；服务器镜像连通性未验证。
+下一步更新后显式镜像重跑全集，`SURFACE_LONG_REDETECT=0`可省对照；下载阶段失败不使用resume。
+完全离线时上传同一官方固定metadata到`data/geniedrive/world-nuscenes_infos_val.pkl`，再离线校验。
+无模型/权重/阈值/训练/cache namespace变更；约2569窗口60–80分钟仅是dev64外推估算。
+
 ## 未解决问题与下一步
 
 1. buffered Strong已提交并实测：L40S151.236→149.391ms，整网仅1.0124×；逆变换12.061→10.407ms，多数投票66.047→65.949ms。该路线收益小，不继续单独抠warp。

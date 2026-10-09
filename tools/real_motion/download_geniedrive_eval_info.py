@@ -4,12 +4,33 @@ import sys
 from pathlib import Path
 if __package__ in (None, ''): sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import argparse
+import http.client
+import math
 import os
+import urllib.error
+import urllib.parse
 import urllib.request
 from tools.real_motion.geniedrive_eval_alignment import INFO_URL, INFO_BYTES, verify_info
 
 
-def download(path):
+class DownloadNetworkError(RuntimeError):
+    """All configured transports failed; no official artifact was published."""
+
+
+def download_urls(endpoint=None):
+    """Only change the transport origin; keep the pinned repo/revision/file."""
+    if endpoint is None:
+        endpoint = os.environ.get('GENIEDRIVE_DOWNLOAD_ENDPOINT') or os.environ.get('HF_ENDPOINT')
+    if not endpoint:
+        return (INFO_URL, 'https://hf-mirror.com'+urllib.parse.urlsplit(INFO_URL).path)
+    parsed = urllib.parse.urlsplit(endpoint)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or parsed.path not in ('', '/')):
+        raise ValueError('download endpoint must be an HTTPS origin without credentials/path/query')
+    return (endpoint.rstrip('/')+urllib.parse.urlsplit(INFO_URL).path,)
+
+
+def _download_one(path, url, timeout):
     path = Path(path).resolve()
     if path.exists():
         verify_info(path)  # Never overwrite a wrong or user-owned artifact.
@@ -23,8 +44,8 @@ def download(path):
     try:
         with temporary.open('xb') as target:
             owned = True
-            request = urllib.request.Request(INFO_URL, headers={'User-Agent': 'swfm-geniedrive-alignment/1'})
-            with urllib.request.urlopen(request, timeout=60) as response:
+            request = urllib.request.Request(url, headers={'User-Agent': 'swfm-geniedrive-alignment/1'})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 size = 0
                 while True:
                     chunk = response.read(2**20)
@@ -45,10 +66,43 @@ def download(path):
         if owned and temporary.is_file(): temporary.unlink()
 
 
+def download(path, *, endpoint=None, timeout=30):
+    path = Path(path).resolve()
+    if path.exists():
+        verify_info(path)  # Offline reuse; never download over existing files.
+        print(f'OFFICIAL INFO already verified: {path}', flush=True)
+        return path
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('download timeout must be finite and positive')
+    failures = []
+    for url in download_urls(endpoint):
+        host = urllib.parse.urlsplit(url).netloc
+        print(f'OFFICIAL INFO download: {host}; pinned revision, size and SHA256 enforced', flush=True)
+        try:
+            return _download_one(path, url, timeout)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+            # Integrity errors and local filesystem failures are NOT retried or
+            # disguised as network errors. Each owned .part is already removed.
+            reason = getattr(exc, 'reason', exc)
+            failures.append(f'{host}: {reason}')
+            print(f'OFFICIAL INFO network failed: {host}: {reason}', flush=True)
+    raise DownloadNetworkError(
+        '无法下载官方 metadata（评估尚未启动）：'+'; '.join(failures)
+        +'\n可设置 GENIEDRIVE_DOWNLOAD_ENDPOINT=https://可访问的镜像域名，'
+        '或配置服务器 HTTPS_PROXY；完全离线时在可联网机器下载固定 revision 文件，'
+        f'再上传至 {path}，脚本将先校验并直接复用。不要替换为其他 metadata。')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', required=True)
-    download(parser.parse_args().out)
+    parser.add_argument('--endpoint', help='HTTPS origin; overrides GENIEDRIVE_DOWNLOAD_ENDPOINT / HF_ENDPOINT')
+    parser.add_argument('--timeout', type=float, default=30, help='per-connection timeout in seconds')
+    args = parser.parse_args()
+    try:
+        download(args.out, endpoint=args.endpoint, timeout=args.timeout)
+    except (DownloadNetworkError, ValueError) as exc:
+        parser.exit(2, f'{exc}\n')
 
 
 if __name__ == '__main__': main()
