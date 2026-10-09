@@ -212,6 +212,37 @@ def test_metric_deltas_preserve_absent_classes_and_reject_schema_changes():
         metric_delta(current,reference)
 
 
+def test_full_requires_completed_same_population_comparison_and_unchanged_sources(tmp_path):
+    from tools.real_motion import eval_p0_f9_joint_surface_mean_full as full_cli
+    from tools.real_motion import compare_p0_f9_joint_surface_checkpoints as cli
+    run,_,_,_=runs_fixture(tmp_path)
+    with pytest.raises(RuntimeError,match='no completed DEV512'):
+        full_cli.find_frozen_bundle(run.parent,run)
+    out=run.parent/'completed_dev512';out.mkdir()
+    bundle=select.build_bundle(select.discover(run,run.parent),out)
+    bundle.update(run_directory=str(run.resolve()),runs_root=str(run.parent.resolve()))
+    bundle['fingerprint']=select.stable_json_fingerprint(bundle);write_json(out/'bundle.json',bundle)
+    result=dict(protocol=cli.EVALUATION_PROTOCOL,status='complete',population='dev512',windows=512,
+        bundle_fingerprint=bundle['fingerprint'],reports={select.AVERAGE_NAME:report(40.,512)})
+    write_json(out/'comparison.json',result)
+    frozen=full_cli.find_frozen_bundle(run.parent,run)
+    assert frozen['population']=='full4369' and frozen['selection_frozen'] is True
+    assert list(frozen['candidates'])==[select.AVERAGE_NAME]
+    assert frozen['candidates'][select.AVERAGE_NAME]['path']==bundle['candidates'][select.AVERAGE_NAME]['path']
+    result['windows']=4369;write_json(out/'comparison.json',result)
+    with pytest.raises(RuntimeError,match='completed same-bundle DEV512'):
+        full_cli.read_frozen_bundle(out,run)
+    result['windows']=512;result['note']='changed after freezing';write_json(out/'comparison.json',result)
+    # Changing the original report after freezing invalidates the evaluation.
+    with pytest.raises(RuntimeError,match='source comparison changed'):
+        cli.verify_sources(frozen)
+    bad=copy.deepcopy(bundle);bad['candidates'][select.AVERAGE_NAME]['source_epochs']=[5,6,8,12,15]
+    bad.pop('fingerprint');bad['fingerprint']=select.stable_json_fingerprint(bad);write_json(out/'bundle.json',bad)
+    result['bundle_fingerprint']=bad['fingerprint'];write_json(out/'comparison.json',result)
+    with pytest.raises(RuntimeError,match='frozen mean recipe'):
+        full_cli.read_frozen_bundle(out,run)
+
+
 def test_cli_real_average_shared_inference_and_readonly_interruption_resume(monkeypatch,tmp_path):
     from tools.real_motion import compare_p0_f9_joint_surface_checkpoints as cli
     from real_motion.canonical_repair_context import FixedCanonicalCache
@@ -286,3 +317,45 @@ def test_cli_real_average_shared_inference_and_readonly_interruption_resume(monk
     forbidden=run/'must_not_be_created'
     with pytest.raises(SystemExit):cli.main(argv=argv+['--out-dir',str(forbidden)])
     assert not forbidden.exists()
+    # Expand beyond DEV512 and evaluate ONLY the frozen mean; no re-averaging,
+    # subset reference reuse or implicit single-epoch/full population mixture.
+    from tools.real_motion import eval_p0_f9_joint_surface_mean_full as full_cli
+    source_before={path:sha256(path) for path in full.iterdir() if path.is_file()}
+    discovered=full_cli.find_frozen_bundle(tmp_path,run)
+    assert list(discovered['candidates'])==[select.AVERAGE_NAME]
+    outside=[{**records[0],'t0_token':'outside'+str(i),'scene_name':'outside'} for i in range(2)]
+    expanded=records+outside
+    monkeypatch.setattr(cli,'VAL_WINDOWS',6);monkeypatch.setattr(cli,'load_cache',lambda _:({},expanded))
+    stop_full=Event()
+    def interrupt_full(*args,**kwargs):
+        log=kwargs['progress']
+        def progress(row):
+            log(row)
+            if row['event']=='all_model_window' and row['window']==3:stop_full.set()
+        kwargs['progress']=progress
+        return actual(*args,**kwargs)
+    monkeypatch.setattr(cli,'evaluate_group',interrupt_full)
+    all_val=tmp_path/'all_val_interrupted'
+    full_args=argv+['--source-bundle-dir',str(full)]
+    assert full_cli.main(stop_full,full_args+['--out-dir',str(all_val)])==130
+    prefix=json.loads((all_val/'evaluation_state.json').read_text())
+    assert prefix['completed_windows']==3 and list(prefix['states'])==[select.AVERAGE_NAME]
+    monkeypatch.setattr(cli,'evaluate_group',actual)
+    assert full_cli.main(argv=full_args+['--out-dir',str(all_val),'--resume'])==0
+    uninterrupted=tmp_path/'all_val_full'
+    assert full_cli.main(argv=full_args+['--out-dir',str(uninterrupted)])==0
+    restored=json.loads((all_val/'full_validation.json').read_text())
+    complete=json.loads((uninterrupted/'full_validation.json').read_text())
+    assert restored['reports']==complete['reports']
+    assert complete['population']=='full4369' and complete['windows']==6
+    assert complete['performance']['model_windows']==6 and complete['performance']['raw_windows']==6
+    assert complete['reports'][select.AVERAGE_NAME]['scenes']==3
+    assert 'epoch_0020_existing' not in complete['reports'] and 'best_per_metric' not in complete
+    assert 'delta_joint_vs_epoch20' not in complete and not (uninterrupted/'comparison.json').exists()
+    for path,digest in source_before.items():assert sha256(path)==digest
+    for path,digest in before.items():assert sha256(path)==digest
+    weights=json.loads((full/'bundle.json').read_text())['candidates'][select.AVERAGE_NAME]['path']
+    _,only_mean=select.load_evaluation_model(weights)
+    expected,_=evaluation.evaluate_group(p,source,expanded,{select.AVERAGE_NAME:only_mean})
+    assert finite_json(expected)==complete['reports']
+    with pytest.raises(SystemExit):full_cli.main(argv=full_args+['--out-dir',str(uninterrupted),'--resume'])

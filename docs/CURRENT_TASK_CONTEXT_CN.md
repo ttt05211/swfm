@@ -5,6 +5,7 @@
 Clean Joint Surface CCR 已完整随机联合训练 20 轮。现在比较优秀单轮和固定权重平均，选出下一次质量验证候选；不重启失败结构、不继续堆修正器。
 用户同意按 DEV64 Joint mIoU top5，第 5/6/8/12/14 轮整网等权平均，并与第 6/8/12 轮在 DEV512 一次性对照。
 第 20 轮复用已经完成的 DEV512 结果。不要额外试“末五轮平均”或扫描融合系数。
+DEV512 对照已完成，用户现在明确批准只评估固定平均模型的 full4369；不重跑其他单轮、不重新平均、不自动增加 FPS/训练。
 
 ## 核心决策与约束
 
@@ -16,7 +17,7 @@ Clean Joint Surface CCR 已完整随机联合训练 20 轮。现在比较优秀�
 - 评估共享确定性历史/几何和 Moving 区域，不能共享候选之间 learned poses/features/输出。
 - 固定 Dense Forecast FPS 边界：CausalHistoryState→fresh Strong/KTA+live motion+CCR+实时投影+六帧 dense。历史表示准备另报，不称 raw-input E2E。
 - 新平均权重的 FPS 尚未测；不能沿用旧冻结 Surface 或 Frozen B 的 FPS。
-- DEV64/DEV512 和 VAL 扩大人口均已参与研究，不称独立测试；不自动 full4369/重训/部署。
+- DEV64/DEV512 和 VAL 扩大人口均已参与研究，不称独立测试；本次已授权固定平均的 full4369，不自动重训/部署。
 
 ## 当前进度与服务器锚点
 
@@ -56,6 +57,20 @@ DEV64 关键 Joint 结果：
 | dynamic_repair | 50.628250 | 39.324149 | 24.779588 | 30.681102 |
 | joint | 52.543060 | 40.043394 | 24.779588 | 30.681102 |
 
+## 最新已完成 DEV512 对照与冻结选择
+
+| candidate | IoU | mIoU | MovingMacro | MovingMicro |
+| --- | --- | --- | --- | --- |
+| epoch6 | 52.451547 | 40.248853 | 24.912767 | 30.599135 |
+| epoch8 | 52.488365 | 40.300115 | 25.243657 | 30.535807 |
+| epoch12 | 52.506929 | 40.199564 | 25.281199 | 30.875808 |
+| mean5/6/8/12/14 | 52.372722 | 40.432276 | 25.718056 | 31.486519 |
+
+平均的三个时距 mIoU/Macro/Micro均最高，但IoU略低，不称四项全面提升。
+收益主要体现于Transport；平均Transport mIoU39.362646 / Micro30.014088，CCR再增+1.069630 / +1.472431 pp。
+四候选512窗口合计705.52s，这是质量eval耗时，不是正式FPS。
+新平均 full4369/FPS尚未测，不能把DEV512约40与旧全集约44当作退化。
+
 ## 本轮实现与验收
 
 独立分支 `feature/v22-surface-aware-ccr`，工作副本 `swfm-surface-ccr`。原 `swfm-v20utc` 的用户未提交改动不动。
@@ -72,13 +87,16 @@ DEV64 关键 Joint 结果：
 操作与风险见 `docs/JOINT_SURFACE_CHECKPOINT_AVERAGING_CN.md`。
 服务器运行 `bash tools/real_motion/run_p0_f9_joint_surface_checkpoint_comparison.sh`；结果在新 comparison 目录，不覆盖训练。
 中断后指定原 comparison 输出目录和 `SURFACE_COMPARE_RESUME=1`，不是恢复训练。
+本次增加 `eval_p0_f9_joint_surface_mean_full.py` 与 wrapper，复用同一评估引擎，仅加载已完成对照中的平均文件。
+只读已选来源，完整VAL4369不做DEV512筛选、不导入epoch20子集报告；新结果写full_validation.json，严格同目录整数resume。
+操作见 `docs/JOINT_SURFACE_MEAN_FULL_VALIDATION_CN.md`。121 项相关本地回归通过，包含完整人口、来源冻结/只读、真实共享CPU/CUDA路径和CLI续评等价；AST/Bash语法通过。模型/trainer/缓存依赖未改。服务器未运行，不冒充全集结果或完整CI。
 
 ## 未解决问题与下一步
 
-1. 完成相关回归、提交推送后，用户在服务器跑固定 DEV512 对照。
-2. 同时看四指标/三个时距和 Transport，确认平均是否真正更好；均值差则选优秀单轮，不自动增加搜索。
-3. 新候选选定后才能按用户授权做后续完整质量或正式 FPS；不要自动执行。
-4. 联合 epoch20 低于早先冻结验证，可能与训练动态/晚期权重有关；当前单轮对照尚无真实结果，不把原因说死。
+1. 完成全集入口回归、提交推送，给用户 full4369 单候选命令；默认自动找已完成的同平均来源，有冲突停止。
+2. 等实际全集报告，比较四指标/三个时距以及相对当前Transport的CCR贡献；不承诺一定超过44。
+3. 新平均正式FPS尚未测，本次用户只要求全集质量，不自动加新实验。
+4. 均值已改善DEV512 mIoU/Moving；是否解决跨场景质量差距，仍待全集，不把训练原因说死。
 
 ## 仅按需检索的历史
 

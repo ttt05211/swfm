@@ -32,6 +32,7 @@ from tools.real_motion.train_p0_f9_v18_xy_trajectory import DEV64_FP
 from tools.real_motion.static_evidence_selector_common import CLEAN_SHA256,write_json,finite_json
 
 EVALUATION_PROTOCOL = 'p0_f9_joint_surface_checkpoint_comparison_v1'
+FULL_EVALUATION_PROTOCOL = 'p0_f9_joint_surface_frozen_mean_full4369_v1'
 DEV64_WINDOWS, DEV512_WINDOWS, VAL_WINDOWS = 64, 512, 4369
 
 
@@ -78,13 +79,19 @@ def verify_sources(bundle):
     for row in bundle['candidates'].values():
         if sha256(row['path'])!=row['sha256']:
             raise RuntimeError('evaluation snapshot changed: '+row['path'])
+    for row in bundle.get('source_comparison_files',[]):
+        if sha256(row['path'])!=row['sha256']:
+            raise RuntimeError('source comparison changed: '+row['path'])
 
 
 def summary(result):
-    lines=['===== CLEAN JOINT SURFACE CCR / CHECKPOINT COMPARISON =====',
-        'dev512 DEVELOPMENT/selection scores, not independent test; fixed weighted ADD raw0.5 / REMOVEoff.',
+    full=result.get('population')=='full4369'
+    lines=['===== CLEAN JOINT SURFACE CCR / '+('FROZEN MEAN FULL4369' if full else 'CHECKPOINT COMPARISON')+' =====',
+        ('full4369 validation includes the development subset; NOT an independent test.' if full else
+         'dev512 DEVELOPMENT/selection scores, not independent test;')+' fixed weighted ADD raw0.5 / REMOVEoff.',
         'Mean: epoch5/6/8/12/14, dev64 mIoU top5, equal named-parameter weights, fixed buffers unchanged.',
-        'Original checkpoints/optimizer/RNG/caches READ ONLY; no training/threshold search/full4369/promotion.',
+        'Original checkpoints/optimizer/RNG/caches READ ONLY; no training/threshold search/promotion.',
+        'population='+result.get('population','dev512')+' windows='+str(result.get('windows','unknown')),
         'candidate                       IoU       mIoU MovingMacro MovingMicro']
     reports=result.get('reports',{})
     for name,report in reports.items():
@@ -100,8 +107,16 @@ def summary(result):
         lines.append('===== TRANSPORT four metrics (repair contribution isolation) =====')
         for name,report in reports.items():
             m=report['baseline'];lines.append(f'{name:28s} '+' '.join(f'{m[k]:10.6f}' for k in METRICS))
+        if full:
+            lines.append('===== BRANCHES: four metrics / changes relative to CURRENT Transport =====')
+            for report in reports.values():
+                lines.append('scenes='+str(report['scenes']))
+                for name,row in report['variants'].items():
+                    lines.append(f'{name:28s} '+' '.join(f'{row["metrics"][k]:10.6f}' for k in METRICS))
+                    lines.append('  delta_pp='+json.dumps({k:row['delta_vs_v18_pp'][k] for k in METRICS}))
     lines += ['status='+result['status'],
-              'Epoch20 reuses its completed same-contract dev512 report, NOT another inference pass.',
+              ('ONE frozen mean evaluated; no single-epoch reruns or imported dev512 scores.' if full else
+               'Epoch20 reuses its completed same-contract dev512 report, NOT another inference pass.'),
               'Averaged model is ONE evaluation-only model, not a runtime ensemble or training resume.',
               'Performance='+json.dumps(result.get('performance',{}),ensure_ascii=False)]
     return '\n'.join(lines)+'\n'
@@ -150,6 +165,11 @@ def main(stop_event=None,argv=None):
 
 def evaluate(a,out,bundle,stop_event):
     root=Path(__file__).resolve().parents[2];contract=bundle['audit']['contract']
+    population=getattr(a,'population','dev512')
+    if population not in ('dev512','full4369'):raise RuntimeError('unsupported evaluation population')
+    protocol=FULL_EVALUATION_PROTOCOL if population=='full4369' else EVALUATION_PROTOCOL
+    if population=='full4369' and (set(bundle['candidates'])!={AVERAGE_NAME} or bundle.get('selection_frozen') is not True):
+        raise RuntimeError('full4369 requires ONE explicitly frozen mean from a completed comparison')
     for name in ('config','dev_cache','dev_info','base_checkpoint','population_manifest'):
         if not Path(getattr(a,name) or '').is_file(): raise RuntimeError('missing '+name)
     if not Path(a.dataroot).is_dir() or not a.ccr_val_history_cache or not Path(a.ccr_val_history_cache).is_dir():
@@ -169,9 +189,12 @@ def evaluate(a,out,bundle,stop_event):
         raise RuntimeError('frozen dev64/dev512 manifest mismatch')
     _,records=load_cache(a.dev_cache);record_keys(records)
     if len(records)!=VAL_WINDOWS: raise RuntimeError('complete original VAL4369 records required')
-    records=align_records(records,chosen)
-    reference=finite_json(bundle['audit']['final_dev512'])
-    if reference.get('windows')!=len(records): raise RuntimeError('existing epoch20 report population mismatch')
+    if population=='dev512':
+        records=align_records(records,chosen)
+        reference=finite_json(bundle['audit']['final_dev512'])
+        if reference.get('windows')!=len(records): raise RuntimeError('existing epoch20 report population mismatch')
+    else:
+        chosen=tuple(record_keys(records));reference=None
     device=require_cuda(a.device);torch.set_num_threads(1);pcfg=make_prepare_config(cfg)
     models={}
     for name,row in bundle['candidates'].items():
@@ -182,7 +205,7 @@ def evaluate(a,out,bundle,stop_event):
     provider=PilotProvider(a.base_checkpoint,CLEAN_SHA256,pcfg,device,a.cpu_workers,next(iter(models.values())),None)
     source=CachedColumnSource(NuScenesWindowSource(a.dataroot,info_pkl=a.dev_info,verbose=False),a.frame_cache_mib)
     provider.ccr_val_history_cache_source=source
-    result=dict(status='running',protocol=EVALUATION_PROTOCOL,population='dev512',windows=len(records),
+    result=dict(status='running',protocol=protocol,population=population,windows=len(records),
                 bundle_fingerprint=bundle['fingerprint'],reports={},performance={})
     begun=time.perf_counter();accumulated=0.;cursor=0;resumed=None
     try:
@@ -194,7 +217,7 @@ def evaluate(a,out,bundle,stop_event):
         provider.ccr_batched_motion=False;provider.ccr_motion_streams=1
         provider.raw_prefetch_workers=provider.raw_prefetch_depth=min(4,a.ccr_prefetch_workers,a.cpu_workers)
         provider.raw_io_workers=1
-        execution=dict(protocol=EVALUATION_PROTOCOL,bundle=bundle['fingerprint'],
+        execution=dict(protocol=protocol,population=population,bundle=bundle['fingerprint'],
             population_key_fingerprint=stable_json_fingerprint(chosen),thresholds=[.5,None],
             val_history_namespace=provider.ccr_val_history_cache.namespace,
             torch_version=str(torch.__version__),cpu_workers=a.cpu_workers,
@@ -207,6 +230,8 @@ def evaluate(a,out,bundle,stop_event):
                 'tools/real_motion/joint_surface_checkpoint_evaluation.py',
                 'tools/real_motion/compare_p0_f9_joint_surface_checkpoints.py',
                 'tools/real_motion/eval_p0_f9_v21_stage0_upper_bounds.py')}))
+        if population=='full4369':
+            execution['full_entry_sha256']=sha256(root/'tools/real_motion/eval_p0_f9_joint_surface_mean_full.py')
         if bool(a.surface_reference_execution)!=contract['reference_execution']:
             raise RuntimeError('use the original training reference/fused execution mode')
         if a.resume and (out/'evaluation_state.json').is_file():
@@ -224,7 +249,8 @@ def evaluate(a,out,bundle,stop_event):
             def progress(row):
                 log.write(json.dumps(finite_json(row),allow_nan=False)+'\n');log.flush()
                 if row['event']=='all_model_window' and (row['window']==1 or row['window']%16==0 or row['window']==len(records)):
-                    print(f"SURFACE_COMPARE {row['window']}/{len(records)} candidates={len(models)} all-model boundary",flush=True)
+                    label='SURFACE_MEAN_FULL' if population=='full4369' else 'SURFACE_COMPARE'
+                    print(f"{label} {row['window']}/{len(records)} candidates={len(models)} all-model boundary",flush=True)
             try:
                 reports,performance=evaluate_group(provider,source,records,models,
                     saved=resumed['states'] if resumed else None,start_window=cursor,
@@ -234,21 +260,23 @@ def evaluate(a,out,bundle,stop_event):
                 write_json(out/'evaluation_status.json',result)
                 print('Stopped at saved all-model boundary; --resume continues evaluation, NOT training.',flush=True)
                 return 130
-        reports['epoch_0020_existing']=reference
+        if reference is not None:reports['epoch_0020_existing']=reference
         result.update(status='complete',reports=reports,execution=execution,performance=performance)
         if any(not isinstance(r['variants']['joint']['metrics'].get(k),(int,float))
                or not math.isfinite(r['variants']['joint']['metrics'][k])
                for r in reports.values() for k in METRICS):
             raise RuntimeError('missing/nonfinite aggregate comparison metric')
-        result['best_per_metric']={k:max(reports,key=lambda n:reports[n]['variants']['joint']['metrics'][k]) for k in METRICS}
-        reference_metrics=reference['variants']['joint']['metrics']
-        result['delta_joint_vs_epoch20']={n:metric_delta(r['variants']['joint']['metrics'],reference_metrics) for n,r in reports.items()}
+        if reference is not None:
+            result['best_per_metric']={k:max(reports,key=lambda n:reports[n]['variants']['joint']['metrics'][k]) for k in METRICS}
+            reference_metrics=reference['variants']['joint']['metrics']
+            result['delta_joint_vs_epoch20']={n:metric_delta(r['variants']['joint']['metrics'],reference_metrics) for n,r in reports.items()}
         verify_sources(bundle)
     finally:
         ccr.close(provider,result)
         result['performance'].update(elapsed_seconds_this_invocation=time.perf_counter()-begun,
                                     accumulated_seconds=accumulated+time.perf_counter()-begun,reused_prefix_windows=cursor)
-    write_json(out/'comparison.json',result);(out/'summary.txt').write_text(summary(finite_json(result)),encoding='utf-8')
+    filename='full_validation.json' if population=='full4369' else 'comparison.json'
+    write_json(out/filename,result);(out/'summary.txt').write_text(summary(finite_json(result)),encoding='utf-8')
     write_json(out/'evaluation_status.json',dict(status='complete',no_promotion=True))
     print(summary(finite_json(result)),flush=True)
     return 0
