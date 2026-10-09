@@ -114,6 +114,19 @@ RTX3050上只读真实replay.zip：6窗口×5，六帧逆变换32.848→24.410ms
 33项相关本地CPU/CUDA回归通过，含越界/边界、跨6网格批次、Strong anchor/components/CLEAR、旧FPS和graph读出；Bash语法通过。
 同一正式入口设`SURFACE_MEAN_FPS_COMPARE_STRONG=1`，成对测原fused_graph与buffered Strong/fused_graph，默认仍256×3同seed/同人口，不自动采用候选。
 
+## 新增：冻结平均 Surface CCR 的6秒递推（2026-10-09）
+
+用户已授权实现新版6s评估；旧Local epoch19入口原样保留。不重训，不改变权重/阈值。
+新入口 `run_p0_f9_joint_surface_long6s.sh`（默认dev64）及 `run_p0_f9_joint_surface_geniedrive_long6s.sh`（官方公开代码2569人口）。
+只读同一已完成DEV512对照的5/6/8/12/14平均文件；严格4→6→最后4预测→6，报告1–6秒。
+固定接续reconciled为主结果、redetect同人口对照，共享第一段；无GT身份接续、不按分数挑路线。
+每段实时Surface Atlas/phase/source读出，ADD raw0.5/REMOVEoff；第二段禁止真实未来缓存/adapter读取，保留handed velocity。
+第一段已有VAL cache只读核验；官方早期300窗口实时四历史重建，不丢样。省掉旧Local memory/frontier计算；native融合投影、4窗口预取、8192完整块静态CUDA graph有界复用。
+未来标签/Moving support仅在所有路线预测完成后读取，Moving保留原始t0；第一段四历史/六张Transport/六张Surface逐字节gate，第二段完整概率/六帧gate。
+同目录整数断点恢复：每8个完整窗口周期保存，SIGINT/SIGTERM窗口边界保存；模型/人口/实现/执行开关变更拒绝resume。
+159项相关本地回归通过、28项跳过（CUDA相关未在本次CPU环境复现），包含实际Surface网络、native CPU/NumPy两段一致、早期起点、预测历史cache隔离、完整CLI snapshot/中断恢复。Bash语法和CLI help通过；不冒充全仓CI或服务器6s精度。
+操作见 `docs/JOINT_SURFACE_MEAN_LONG6S_CN.md`。服务器下一步跑新dev64入口，发回summary；不用重建prototype/cache、重新平均或恢复训练。
+
 ## 未解决问题与下一步
 
 1. 完成Strong无损候选提交/推送；请服务器运行`SURFACE_MEAN_FPS_COMPARE_STRONG=1 bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`，返回summary。原/新版按同256×3人口轮换计时及六帧byte parity；不重训/不重评全集。
