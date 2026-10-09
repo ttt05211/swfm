@@ -7,15 +7,51 @@ second block; its motion encoder and all learned future poses stay authoritative
 from dataclasses import replace
 import numpy as np
 import torch
+import json
 
 from real_motion.geometry import relative_transform
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.strong_w2det import inverse_warp, majority_fill
 from real_motion.source_evidence_audit import transform_points
 from tools.real_motion.joint_surface_long_rollout_common import require_history_only
+from tools.real_motion import joint_surface_long_rollout_common as surface
 
 PROTOCOL = 'causal_static_background_and_predicted_se2_history_carry_v1'
 ROUTES = ('baseline', 'static_carry', 'se2_carry', 'combined')
+
+
+def verify_first_block(provider, record, prep, dense, probability, execution):
+    """Recognize old cache KTA arithmetic; never change actual model inputs.
+
+    upgrade_v1_record_targets subtracts rounded anchors and feature-derived
+    centers. Rebuilding v*dt is not byte-equal to that old representation.
+    Only that EXACT known formula is accepted; every other field still uses
+    the old strict gate, and all six transport/Surface outputs stay byte-gated.
+    """
+    rebuilt=surface.rollout.build_four_history_state(prep.raw['history_occ'],prep.raw['history_poses'],
+        prep.raw['future_poses'],provider.pcfg,provider.strong,provider.device)
+    diagnostic_record=record
+    try:
+        surface.rollout.assert_four_inputs_equal(record,rebuilt['rec'])
+    except RuntimeError as error:
+        if not str(error).startswith('four-history input 4: max abs mismatch'):raise
+        from real_motion.motion_transport_v2 import SOURCE_XY_FEATURE_SCALE_M
+        def array(value):return torch.as_tensor(value).detach().cpu().float().numpy()
+        source=array(record['features'])[:,:2].astype(np.float64)*SOURCE_XY_FEATURE_SCALE_M
+        anchors=array(record['anchors_xy_t0_m']).astype(np.float64)
+        upgraded=(anchors-source[:,None,:]).astype(np.float32)
+        actual=array(record['kta_displacement_xy_m'])
+        if not np.isfinite(actual).all() or not np.array_equal(actual,upgraded):
+            raise RuntimeError('KTA mismatch is NOT the exact legacy cache-upgrade arithmetic') from error
+        # A diagnostic-only record. prep/record/model Tensor values are never
+        # replaced; subsequent exact transport rendering still independently
+        # compares canonical live reconstruction against the ORIGINAL forecast.
+        diagnostic_record={**record,'kta_displacement_xy_m':rebuilt['rec']['kta_displacement_xy_m']}
+        surface.rollout.assert_four_inputs_equal(diagnostic_record,rebuilt['rec'])
+        print(json.dumps(dict(first_block_input_audit='legacy_cache_upgrade_KTA_arithmetic_verified',
+            max_abs_kta_difference_m=float(np.max(np.abs(actual-array(rebuilt['rec']['kta_displacement_xy_m'])))),
+            prediction_inputs_unchanged=True,transport_and_surface_byte_gate_required=True)),flush=True)
+    surface.verify_first_block(provider,diagnostic_record,prep,dense,probability,execution)
 
 
 def static_mask(labels):

@@ -93,3 +93,15 @@ bash tools/real_motion/run_p0_f9_surface_geometry_carry.sh all
 
 汇总 `summary.txt`；原始整数指标、类别4–6秒IoU、场景delta、候选保护/回退计数、损伤、分段计时在 `evaluation.json`。
 实际服务器收益和 GPU 路径需这次运行确认，本地 CPU 单元结果不能代替。
+
+## 旧 TRAIN 缓存 KTA 算术兼容
+
+旧 `upgrade_v1_record_targets` 用 FP32 anchor 转 FP64，再减 FP32 normalized feature×40 得到 KTA；
+实时重建直接使用 FP64 速度×时间后转 FP32，可能相差约微米量级，超过原绝对1e-6输入诊断。
+新入口只对 KTA 严格识别**完全等于旧升级公式**的值；其他六类输入保持原检查，非法位移/类别/mask仍报错。
+兼容只改变诊断用记录，不替换实际预测输入，六帧 Transport 与 Surface 的逐字节检查仍必须通过。
+stdout记录 `legacy_cache_upgrade_KTA_arithmetic_verified` 和实际最大差值，不能把它称为输入字节一致。
+原公共检查器、模型/trainer/cache依赖文件均未改。
+
+实现指纹改变后不要混续旧评估。此次服务器在第一窗口输入检查处退出，尚未完成该窗口；
+保留原失败目录，使用新输出目录重跑即可，无需重建缓存、平均权重或训练。

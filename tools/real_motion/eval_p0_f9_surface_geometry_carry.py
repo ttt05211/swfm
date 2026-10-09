@@ -111,7 +111,7 @@ def evaluate(provider, sources, caches, jobs, execution, contract, *, saved=None
                     t=time.perf_counter(); first=provider.prepare_columns(source,record,include_gt=False,raw_window=raw)
                     pred1,first_edits,_,prob=execution.predict(first); stages['first_block']=time.perf_counter()-t
                     if split not in checked:
-                        old.surface.verify_first_block(provider,first.state['rec'],first,pred1,prob,execution)
+                        carry.verify_first_block(provider,first.state['rec'],first,pred1,prob,execution)
                         state['first_block_exactness_passed']=True
                     del prob
                     poses=[source.pose(token) for token in w.future_tokens]

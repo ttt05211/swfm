@@ -186,6 +186,12 @@ native fused projection/graph+4线程无损多数投票；现有VAL几何只读�
 CLI help、Bash语法通过；真实服务器候选精度及本次CUDA路径尚未跑，不宣称提分/正式FPS/全仓CI。
 操作与比较边界见 `docs/SURFACE_LONG_GEOMETRY_CARRY_CN.md`。下一步服务器跑screen并发summary，无需重建prototype/重训。
 
+服务器首次screen在TRAIN首窗口 four-history input4(KTA)差1.9967556e-6退出，未完成窗口。
+本次补旧缓存升级算术兼容：仅KTA严格等于 `float64(FP32 anchor)-float64(FP32 normalized xy)*40` 后转FP32时接受。
+诊断副本使用实时KTA，实际prep/record输入、权重不改；其他输入原严检、六帧Transport及Surface byte gate继续。
+本地真实Surface大坐标fixture复现微米级缓存舍入；误改KTA/类别/mask拒绝。扩大相关回归142项通过、20项CUDA跳过。
+代码指纹改变，原失败目录保留，新输出重跑，不使用旧目录resume，不重建缓存或训练。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。

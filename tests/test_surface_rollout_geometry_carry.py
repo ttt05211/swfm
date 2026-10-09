@@ -153,7 +153,7 @@ def orchestration(monkeypatch):
         def verify(self,*args):calls.append('verify')
     provider.prepare_columns=lambda *a,**k:NS(state={'rec':a[1]},raw=k['raw_window'])
     monkeypatch.setattr(cli.old,'prefetch_raw_columns',lambda p,s,rows,**k:((r,copy.deepcopy(raw)) for r in rows))
-    monkeypatch.setattr(common,'verify_first_block',lambda *a:None)
+    monkeypatch.setattr(carry,'verify_first_block',lambda *a:None)
     monkeypatch.setattr(cli.old,'handoff_from_prepared',lambda *a,**k:None)
     monkeypatch.setattr(common,'synthetic_preparation',lambda *a,**k:NS())
     monkeypatch.setattr(carry,'candidates',lambda *a:({r:NS() for r in carry.ROUTES},{'static':{'voxels':1}}))
@@ -296,4 +296,47 @@ def test_complete_cli_frozen_snapshot_resume_output_and_fail_closed(tmp_path,mon
     assert full['candidate_routes']==['baseline','combined'] and set(full['reports'])=={'all'}
     assert set(full['geniedrive_code_compatibility'])=={'baseline','combined'}
     assert full['selected_train_route']=='combined' and mean.read_bytes()==original
+
+
+def legacy_upgrade_case():
+    from dataclasses import replace
+    provider,w,record,raw=provider_fixture()
+    provider.pcfg=replace(provider.pcfg,grid=replace(provider.pcfg.grid,x_min=30.,y_min=30.))
+    state=common.rollout.build_four_history_state(raw['history_occ'],raw['history_poses'],raw['future_poses'],
+        provider.pcfg,provider.strong,provider.device)
+    rec={**state['rec'],**{k:record[k] for k in ('scene_name','t0_token','history_tokens','future_tokens')}}
+    # Reproduce upgrade_v1_record_targets exactly, including NumPy FP64
+    # multiplication of the FP32 normalized features (NOT torch *40).
+    source=rec['features'][:,:2].numpy().astype(np.float64)*40.
+    upgrade=(rec['anchors_xy_t0_m'].numpy().astype(np.float64)-source[:,None,:]).astype(np.float32)
+    assert np.max(np.abs(upgrade-rec['kta_displacement_xy_m'].numpy()))>1e-6
+    rec['kta_displacement_xy_m']=torch.from_numpy(upgrade)
+    raw['_column_causal_preparation']=common.causal_geometry(raw,state,provider)
+    return provider,w,rec,raw
+
+
+@torch.no_grad()
+def test_exact_legacy_upgrade_kta_gate_real_forecast_is_unchanged(capsys):
+    threads=torch.get_num_threads();torch.set_num_threads(1)
+    p,w,r,raw=legacy_upgrade_case();before=r['kta_displacement_xy_m'].clone()
+    exe=common.SurfaceBlockExecution(p,mode='numpy',workers=2,query_workers=2,graphs=False)
+    try:
+        first=p.prepare_columns(None,r,include_gt=False,raw_window=raw)
+        pred,_,_,prob=exe.predict(first)
+        carry.verify_first_block(p,r,first,pred,prob,exe)
+        assert 'legacy_cache_upgrade_KTA_arithmetic_verified' in capsys.readouterr().out
+        assert torch.equal(before,r['kta_displacement_xy_m'])
+        again,_,_,prob2=exe.predict(first)
+        assert all(np.array_equal(a,b) for a,b in zip(pred,again)) and np.array_equal(prob,prob2)
+    finally:exe.close();torch.set_num_threads(threads)
+
+
+@pytest.mark.parametrize('corruption',['kta','semantic_class','mask'])
+def test_cache_rounding_compatibility_does_not_hide_other_input_errors(corruption,monkeypatch):
+    p,_,r,raw=legacy_upgrade_case();wrong=copy.deepcopy(r)
+    if corruption=='kta':wrong['kta_displacement_xy_m'][0,0,0]+=.001
+    elif corruption=='semantic_class':wrong['source_class_id'][0]=7
+    else:wrong['target_source_mask_tube'][0,-1,0,0]^=True
+    monkeypatch.setattr(common,'verify_first_block',lambda *a:pytest.fail('invalid input reached dense verification'))
+    with pytest.raises(RuntimeError):carry.verify_first_block(p,wrong,NS(raw=raw),None,None,None)
 
