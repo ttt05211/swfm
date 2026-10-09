@@ -6,7 +6,7 @@ Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整�
 当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
 最新已完成：用户服务器跑完static_carry全集，明确确认作为最终论文6秒长时预测路线；avg4–6 IoU41.218153 / mIoU29.117864。
 记录在 `docs/SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md` 与 `docs/results/` 原始摘要/结构化转录。
-并行Waymo 2Hz zero-shot数据适配/评估工作保留；不训练、改权重/阈值或重启失败方案，不冒称已跑真实Waymo。
+并行Waymo 2Hz zero-shot已在服务器运行（用户报1856/7998）；用户要求新增独立10Hz并按I²-World代码执行。不训练、改权重/阈值或重启失败方案，不冒称已有完整真实Waymo分数。
 
 ## 核心决策与约束
 
@@ -166,7 +166,12 @@ GenieDrive全集入口下载官方metadata时报网络Errno101，尚未进入评
 数据仅需validation0.4m NPZ、可信官方 `waymo_infos_val.pkl`、`cam_infos_vali.pkl`；下载链接、目录和audit/full/resume命令在上述文档，不自动下载大数据。
 本地新协议与旧Surface/四历史递推相关回归运行，真实小网格CPU模型预测覆盖早期/中间/末端；未跑真实Waymo或本次CUDA服务器，不宣称zero-shot精度/速度或全仓CI。
 数据已下载并解压；服务器只读metadata统计39987原始帧→7998锚点，7796同场景链接全部stride5，15个timestamp跳变（最大1.199943s）。原逐对0.35–0.65s硬检查误拒绝官方数据；现保留官方人口/实际pose/timestamp，将跳变记入`timestamp_gap_audit`，仍拒绝非正时间/倒退帧及总体错频率/错单位。不重采样、不丢窗、不改模型时间步。
-此次修复的Waymo/Surface/FPS CPU回归42通过、12项GPU/native相关跳过；不冒称真实Waymo质量或CUDA验收。下一步服务器更新代码，重新WAYMO_AUDIT_ONLY=1检查编码/人口/文件，再运行完整zero-shot并发回summary.txt。只实现2Hz，10Hz源码名义时距歧义未静默复制。
+时间检查修复的Waymo/Surface/FPS CPU回归42通过、12项GPU/native相关跳过；2Hz服务器已运行至1856/7998，等完整summary，不称已完成质量验收。
+
+用户明确要求10Hz按I²-World代码做：同固定提交load_interval=1/eval_metric=miou，模型forward_test取六未来零基下标eval_time=1/3/5，即native第2/4/6帧，实际名义0.2/0.4/0.6s，不照抄配置注释的错误物理1/2/3s标签。
+独立`waymo_i2world_10hz.py`及`run_p0_f9_joint_surface_waymo_10hz.sh`，原2Hz实现/指纹不改，运行/续评保持兼容。全native人口按实际metadata计算（当前39987），共用一次六帧模型预测评分三下标，不重复三次。保留训练slot clock、同冻结均值/四历史/阈值；未训练或插值适配10Hz，不能称物理长时距或同历史预算比较。
+同一份metadata/NPZ，无新下载/大缓存；只读源数据/权重，六预测后才读未来GT，完整窗口整数resume拒绝2Hz/10Hz混拼。默认10Hz进程2worker，用户可同卡并发但资源竞争不保证总耗时更短；不干预现有2Hz进程。
+本地合成元数据/实际小网格CPU及native模型、旧2Hz/Surface/FPS/递推回归78通过、16项CUDA跳过；Bash语法和CLI help通过，未跑真实10Hz或正式测速。服务器下一步更新后独立后台启动10Hz，发回各自summary。协议解释和audit/full/nohup/resume命令见Waymo文档。
 
 ## 新增：冻结6秒几何接续四路对照（2026-10-09）
 

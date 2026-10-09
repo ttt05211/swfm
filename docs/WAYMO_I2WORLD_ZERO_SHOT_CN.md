@@ -107,8 +107,48 @@ JSON同时给出官方逐horizon四舍五入后的均值，方便核对其打印
 binary IoU是所有非free类的occupied IoU，不是18类semantic mIoU；均不使用visibility mask。
 不把nuScenes的MovingMacro/Micro定义硬搬到Waymo，当前协议没有这两项。
 
-当前只实现2Hz。官方10Hz注释的`eval_time=1/3/5`与实际帧时间存在歧义，不能把0.2/0.4/0.6s标成1/2/3s；本入口不提供静默切换。
+2Hz入口不提供静默切换。另有独立10Hz入口，按下述官方index规则执行，不能把0.2/0.4/0.6s标成物理1/2/3s。
 本入口不测正式FPS，eval wall time含读盘/历史表示/GT/metrics。正式FPS继续用既有冻结边界。
+
+## 独立10Hz：严格按官方代码的帧下标协议
+
+用户要求10Hz直接照I²-World代码评估。已核对同一固定提交的配置和
+[模型 `forward_test`](https://github.com/lzzzzzm/II-World/blob/661d830f9b34ee03ce368db164a72753ab8764a3/mmdet3d/models/ii_world/world_model/ii_world.py)：
+`load_interval=1`，`eval_metric='miou'`，分别设置 `eval_time=1/3/5`，预测与GT都取六未来中的**零基下标** `[eval_time]`。
+因此是native未来第2/4/6帧，名义0.2/0.4/0.6秒；配置注释中的“1s/2s/3s”不能当物理时距。
+输出用 `eval_time_1/3/5` 标识并同时报native step、名义秒数及实际timestamp跨度，不制造物理1/2/3秒对齐。
+
+数据使用同一份metadata/NPZ，不需再下载10Hz数据；检查全部native帧文件，缺失停止、不跳过。
+官方全局排序后stride1、场景边界重复有效历史/未来、标签映射、无mask和零IoU排除逻辑保持。
+用户当前39987原始帧对应39987个10Hz锚点（最终以实际文件审计为准），约为2Hz人口的5倍。
+
+复用同一冻结均值、四总历史→六预测、ADD raw0.5/REMOVEoff；不训练/调参/改权重。
+与官方冻结逐帧模型一样，保留训练时的输出slot语义，不插值、缩放或偷偷改模型时钟；我们的内部0.5秒slot clock/嵌入保持，数据实际是0.1秒帧步。
+这是**原始帧下标zero-shot协议复现**，不是声称模型训练过10Hz或物理1/2/3秒准确率公平比较；四总历史预算仍与官方previous/current预算不同。
+
+新adapter/CLI/wrapper独立新增，原2Hz实现文件及fingerprint不变；并发2Hz完成或原目录续评不受本次代码添加影响。
+一次六帧预测同时累计三个独立horizon整数计数，等价于同一个确定性预测器的三个eval_time单独评分，但不重复推理三次。
+仍只在六帧预测完成后读取未来GT；不持久化learned feature/预测或使用nuScenes缓存。每8完整窗口保存，SIGINT/SIGTERM窗口边界保存，禁止2Hz/10Hz状态混拼。
+
+```bash
+conda activate OccFM
+cd /root/nas/occ/swfm
+
+# 审计使用独立新输出；不加载模型、不读未来GT。
+WAYMO10_AUDIT_ONLY=1 bash tools/real_motion/run_p0_f9_joint_surface_waymo_10hz.sh
+
+# 可与已有2Hz并行，同一张卡资源会竞争，不保证总耗时更短。
+WAYMO10_OUT="$PWD/outputs/p0_f9_joint_surface_ccr/waymo10_$(date +%Y%m%d_%H%M%S)"
+nohup env WAYMO10_OUT="$WAYMO10_OUT" WAYMO10_CPU_WORKERS=2 \
+  bash tools/real_motion/run_p0_f9_joint_surface_waymo_10hz.sh \
+  > "$WAYMO10_OUT.log" 2>&1 < /dev/null &
+echo "10Hz PID=$!；输出=$WAYMO10_OUT；日志=$WAYMO10_OUT.log"
+```
+
+默认2个CPU worker及最多2线程Strong majority，保守留出并行任务资源；显式`WAYMO10_CPU_WORKERS=4`可恢复4线程预算，但不称并发加速。
+若有空闲第二张卡，单独设置 `CUDA_VISIBLE_DEVICES=1`（这是进程选择，不是改全局batch或双卡训练）。
+中断后使用 `WAYMO10_OUT=/原10Hz输出 WAYMO10_RESUME=1 bash tools/real_motion/run_p0_f9_joint_surface_waymo_10hz.sh`；不要传2Hz目录。
+完整eval wall time不是FPS；本地测试不是本次L40S/真实Waymo精度验收。
 
 ## 本地验收范围
 
