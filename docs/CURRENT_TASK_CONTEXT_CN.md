@@ -3,8 +3,8 @@
 ## 当前目标
 
 Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整网等权平均已完成DEV512选择、full4369质量和256×3正式FPS验证。
-当前主候选mIoU44.153241 / MovingMicro32.214410 / Dense Forecast FPS40.250。用户只要求做简单、无损的执行提速，不改结构/权重/阈值，不重训或重跑全集精度，不重启失败方案。
-最新已定位Strong多数投票约66ms为主瓶颈；优先无损并行及减少回退全网格扫描。原路径继续保留，用同人口成对核对和测速，不能拿本地内部耗时冒充L40S整网FPS。
+当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
+最新任务：用户选择与I²-World对齐的Occ3D-Waymo 2Hz zero-shot，实现冻结同一均值模型的评估入口。只改数据适配/评估，不训练、改权重/结构/阈值或重启失败方案，不冒称已跑真实Waymo。
 
 ## 核心决策与约束
 
@@ -149,8 +149,21 @@ GenieDrive全集入口下载官方metadata时报网络Errno101，尚未进入评
 2. 用户授权试多数投票：新增显式4线程分块+紧凑临界坐标+仅在回退邻域取类别，仍原native整数投票及SciPy float32决胜。原路径保留默认，训练/缓存指纹及native ABI未改。
 3. 本地真实6窗口×7六帧多数投票59.873→19.949ms（3.001×），完整SciPy/native/新路径byte parity；仅内部CPU阶段，不声称整网FPS、L40S或训练提速。详情`docs/STRONG_MAJORITY_EXECUTION_CN.md`。
    93项相关CPU/CUDA回归通过（含旧FPS及最新6秒递推），CLI/Bash/diff检查通过；不冒充全仓CI或服务器结果。
-4. 下一步服务器同256×3成对验收：`SURFACE_MEAN_FPS_COMPARE_MAJORITY=1 bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`。固定4线程，两臂warp仍reference，完整概率/六帧parity；summary直接报Strong四段。不自动升级、重训或重评全集。
-5. 全集已追回mIoU/Moving，IoU仍略低、40FPS余量小；不增加重模块、不改网络/阈值。
+4. 服务器同256×3成对验收已完成：原155.390ms/38.613FPS，新109.200ms/54.945FPS、P90=145.082ms，整网1.423×；概率及六帧dense byte parity256/256。多数投票67.410→21.910ms，Strong84.759→39.042ms。显存allocated253.885MiB不变，不改权重/阈值，不自动修改旧默认或重训。
+5. 全集已追回mIoU/Moving，IoU仍略低；不增加重模块，不改结构/阈值。
+
+## 新增：I²-World Waymo 2Hz zero-shot（2026-10-09）
+
+用户选择按I²-World对齐并授权实现。新入口 `run_p0_f9_joint_surface_waymo.sh`，文档 `docs/WAYMO_I2WORLD_ZERO_SHOT_CN.md`。
+官方源码固定 `II-World@661d830f9b34ee03ce368db164a72753ab8764a3`；全局timestamp排序后stride5、202validation场景，未来index1/3/5报告名义1/2/3s，场景边界重复有效历史/未来，不静默丢样。实际时间/补帧数量另报。
+固定同一5/6/8/12/14均值，四总历史（含t0），ADD raw0.5/REMOVEoff；用原Surface预测路径及无损native/majority执行，逐进程重做输入/Transport/概率/六帧exactness。
+只读历史voxel_label及ego poses；未来pose是显式条件，未来occupancy在六帧预测完成后才读取。无未来annotations/mask，历史dense visibility全真与官方输入一致，不加额外mask信息。
+复现官方Waymo→nuScenes18类映射；默认raw free23，已确认文档发布free15时显式切换并记报告，未知/混合编码拒绝。不能再映射模型预测。
+同时报告官方零IoU排除的mIoU和union有效类保留零分的标准mIoU；binary occupied IoU，无camera/lidar mask，per-horizon累计后求均值，官方逐时距round2均值另给。不硬搬nuScenes Moving指标，不把eval时间称FPS。
+默认256MiB不可变原始帧LRU；不使用nuScenes几何cache、不存learned features/预测。每8完整窗口整数checkpoint，Ctrl-C/SIGTERM边界保存；严格同目录、模型/metadata/人口/NPZstat/实现/执行契约resume。
+数据仅需validation0.4m NPZ、可信官方 `waymo_infos_val.pkl`、`cam_infos_vali.pkl`；下载链接、目录和audit/full/resume命令在上述文档，不自动下载大数据。
+本地新协议与旧Surface/四历史递推相关回归运行，真实小网格CPU模型预测覆盖早期/中间/末端；未跑真实Waymo或本次CUDA服务器，不宣称zero-shot精度/速度或全仓CI。
+下一步服务器准备这三项数据，先WAYMO_AUDIT_ONLY=1检查编码/人口/文件，再运行完整zero-shot；发回summary.txt。只实现2Hz，10Hz源码名义时距歧义未静默复制。
 
 ## 仅按需检索的历史
 
