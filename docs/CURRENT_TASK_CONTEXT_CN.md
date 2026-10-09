@@ -4,7 +4,7 @@
 
 Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整网等权平均已完成DEV512选择、full4369质量和256×3正式FPS验证。
 当前主候选mIoU44.153241 / MovingMicro32.214410 / Dense Forecast FPS40.250。用户只要求做简单、无损的执行提速，不改结构/权重/阈值，不重训或重跑全集精度，不重启失败方案。
-优先减少Strong内部同步/回传；原路径继续保留，用同人口成对核对和测速，不能拿本地内部耗时冒充L40S整网FPS。
+最新已定位Strong多数投票约66ms为主瓶颈；优先无损并行及减少回退全网格扫描。原路径继续保留，用同人口成对核对和测速，不能拿本地内部耗时冒充L40S整网FPS。
 
 ## 核心决策与约束
 
@@ -129,10 +129,12 @@ RTX3050上只读真实replay.zip：6窗口×5，六帧逆变换32.848→24.410ms
 
 ## 未解决问题与下一步
 
-1. 完成Strong无损候选提交/推送；请服务器运行`SURFACE_MEAN_FPS_COMPARE_STRONG=1 bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`，返回summary。原/新版按同256×3人口轮换计时及六帧byte parity；不重训/不重评全集。
-2. 实际L40S成对增益尚未知；只有通过一致性且确实有收益后才建议采用buffered。原路径不删除、不默认升级，计时内捕获拒绝规则保持。
-3. 固定DenseForecast边界和6/均值算法。不要用局部warp的1.346×夸大整网FPS；历史准备排除且明报。
-4. 全集已追回mIoU/Moving，IoU仍略低、40FPS余量小；不增加重模块、不改网络/阈值。
+1. buffered Strong已提交并实测：L40S151.236→149.391ms，整网仅1.0124×；逆变换12.061→10.407ms，多数投票66.047→65.949ms。该路线收益小，不继续单独抠warp。
+2. 用户授权试多数投票：新增显式4线程分块+紧凑临界坐标+仅在回退邻域取类别，仍原native整数投票及SciPy float32决胜。原路径保留默认，训练/缓存指纹及native ABI未改。
+3. 本地真实6窗口×7六帧多数投票59.873→19.949ms（3.001×），完整SciPy/native/新路径byte parity；仅内部CPU阶段，不声称整网FPS、L40S或训练提速。详情`docs/STRONG_MAJORITY_EXECUTION_CN.md`。
+   93项相关CPU/CUDA回归通过（含旧FPS及最新6秒递推），CLI/Bash/diff检查通过；不冒充全仓CI或服务器结果。
+4. 下一步服务器同256×3成对验收：`SURFACE_MEAN_FPS_COMPARE_MAJORITY=1 bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`。固定4线程，两臂warp仍reference，完整概率/六帧parity；summary直接报Strong四段。不自动升级、重训或重评全集。
+5. 全集已追回mIoU/Moving，IoU仍略低、40FPS余量小；不增加重模块、不改网络/阈值。
 
 ## 仅按需检索的历史
 

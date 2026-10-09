@@ -172,12 +172,18 @@ def load_progress(path, contract, accumulator, *, compatible_implementations=())
 @torch.no_grad()
 def paired_speed(provider, source, records, teacher, head, reference, *, stop_event=None,
                  windows=20, repeats=3, stress_windows=2, surface_only=False, progress=None,
-                 compare_strong_warp=False):
+                 compare_strong_warp=False, compare_strong_majority=False, majority_workers=4):
     if type(repeats) is not int or repeats < 1:
         raise ValueError('positive integer FPS repeats required')
-    if compare_strong_warp and not surface_only:
+    if (compare_strong_warp or compare_strong_majority) and not surface_only:
         raise ValueError('Strong comparison requires ONE frozen Surface model')
+    if compare_strong_warp and compare_strong_majority:
+        raise ValueError('compare ONE Strong optimization at a time')
+    if compare_strong_majority and (type(majority_workers) is not int
+            or not 1 <= majority_workers <= min(8, provider.workers)):
+        raise ValueError('majority workers exceed CPU budget')
     from real_motion.strong_warp_execution import strong_warp_execution
+    from real_motion.strong_majority_execution import ParallelNativeMajority, strong_majority_execution
     selected, population = select_population(records, tuple((str(r['scene_name']), str(r['t0_token'])) for r in records),
                                              windows=windows, stress_windows=stress_windows)
     device = provider.device
@@ -186,6 +192,9 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
              ('frozen_B', 'surface_eager', 'surface_graph', 'surface_fused_eager', 'surface_fused_graph'))
     if compare_strong_warp:
         modes = ('surface_fused_graph', 'surface_fused_buffered_graph')
+    if compare_strong_majority:
+        modes = ('surface_fused_graph', 'surface_fused_majority_graph')
+    majority = ParallelNativeMajority(majority_workers) if compare_strong_majority else None
     trials, parity, prepares, descriptors, optimized_descriptors = [], 0, 0., 0., 0.
     def sync(): torch.cuda.synchronize(device) if device.type == 'cuda' else None
     try:
@@ -224,7 +233,8 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                     if timed and device.type == 'cuda': torch.cuda.reset_peak_memory_stats(device)
                     before = torch.cuda.memory_allocated(device) if device.type == 'cuda' else 0
                     tick = time.perf_counter()
-                    with strong_warp_execution('buffered' if mode == 'surface_fused_buffered_graph' else 'reference'):
+                    with strong_warp_execution('buffered' if mode == 'surface_fused_buffered_graph' else 'reference'), \
+                            strong_majority_execution(majority if mode == 'surface_fused_majority_graph' else None):
                         out = forecast_six(history, provider, teacher.transport, model,
                             lambda *args: probability(*args, mode), kernels=ccr.execution_kernels(provider), executor=pool,
                             projection_fn=map_surface_evidence if mode.startswith('surface_fused') else None)
@@ -263,7 +273,7 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                             raise RuntimeError('repeated six-frame output bytes changed')
                         row = dict(mode=mode, window=wi, repeat=repeat+1, seconds=seconds,
                                    stages_seconds=out['stages_seconds'], memory_mib=memory)
-                        if compare_strong_warp:
+                        if compare_strong_warp or compare_strong_majority:
                             row['strong_profile_ms'] = out.get('strong_profile_ms', {})
                         trials.append(row)
                         if progress is not None: progress(row)
@@ -289,6 +299,8 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
             selected_execution=chosen, selection_basis=('fixed fused_graph backend with eager fallbacks; no latency selection'
                 if surface_only else 'latency only after byte parity, NOT accuracy/method selection'),
             strong_warp_comparison=bool(compare_strong_warp),
+            strong_majority_comparison=bool(compare_strong_majority),
+            majority_execution=None if majority is None else majority.stats(),
             graph_execution=graph.stats(), history_prepare_seconds_per_window=prepares/windows,
             surface_descriptor_prepare_seconds_per_window=descriptors/windows,
             optimized_surface_descriptor_prepare_seconds_per_window=optimized_descriptors/windows,
@@ -298,4 +310,6 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                 if device.type == 'cuda' else None,
             boundary='CausalHistoryState -> fresh Strong/KTA + live motion + learned CCR + live projection conditioning + SIX dense outputs',
             excludes='history-only representation/I-O/GT/metrics/capture/parity checks; NOT raw-input E2E FPS')
-    finally: graph.close()
+    finally:
+        graph.close()
+        if majority is not None: majority.close()

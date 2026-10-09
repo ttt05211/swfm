@@ -97,3 +97,34 @@ def test_strong_comparison_uses_scope_and_restores_default(monkeypatch):
     assert all('strong_profile_ms' in row for row in report['trials'])
     report['scenes'] = 2
     assert 'SAME-WINDOW whole-forecast speedup=' in cli.summary(report)
+
+
+def test_majority_comparison_scoped_no_promotion_and_no_warp_change(monkeypatch):
+    from real_motion.strong_majority_execution import selected_execution
+    from real_motion.strong_warp_execution import selected_backend
+    provider, records, teacher, head = setup(monkeypatch)
+    actual = common.forecast_six; observed = []; executors = []
+    def forecast(*args, **kwargs):
+        executor = selected_execution()
+        observed.append((executor is not None, selected_backend()))
+        if executor is not None: executors.append(executor)
+        return actual(*args, **kwargs)
+    monkeypatch.setattr(common, 'forecast_six', forecast)
+    report = common.paired_speed(provider, None, records, teacher, head, None,
+        windows=2, repeats=2, stress_windows=0, surface_only=True,
+        compare_strong_majority=True, majority_workers=2)
+    assert sum(active for active, _ in observed) == 6
+    assert all(backend == 'reference' for _, backend in observed)
+    assert selected_execution() is None and all(executor.closed for executor in executors)
+    assert report['strong_majority_comparison'] is True
+    assert report['selected_execution'] == 'surface_fused_graph'
+    assert set(report['six_frame_mean_seconds']) == {'surface_fused_graph', 'surface_fused_majority_graph'}
+    assert all('strong_profile_ms' in row for row in report['trials'])
+    report['scenes'] = 2
+    assert '(majority execution ONLY)' in cli.summary(report)
+    with pytest.raises(ValueError, match='ONE Strong'):
+        common.paired_speed(provider, None, records, teacher, head, None,
+            surface_only=True, compare_strong_warp=True, compare_strong_majority=True)
+    with pytest.raises(ValueError, match='CPU budget'):
+        common.paired_speed(provider, None, records, teacher, head, None,
+            surface_only=True, compare_strong_majority=True, majority_workers=4)

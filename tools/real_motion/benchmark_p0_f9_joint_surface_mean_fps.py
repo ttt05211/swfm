@@ -42,6 +42,18 @@ def summary(speed):
         buffered = speed['six_frame_mean_seconds']['surface_fused_buffered_graph']
         lines += [f'SAME-WINDOW whole-forecast speedup={original/buffered:.4f} (Strong scheduling ONLY); no automatic backend promotion.',
                   'buffered_host_stage_ms=' + json.dumps(speed['stages_mean_ms']['surface_fused_buffered_graph'])]
+    if speed.get('strong_majority_comparison'):
+        original = speed['six_frame_mean_seconds']['surface_fused_graph']
+        parallel = speed['six_frame_mean_seconds']['surface_fused_majority_graph']
+        lines += [f'SAME-WINDOW whole-forecast speedup={original/parallel:.4f} (majority execution ONLY); no automatic backend promotion.',
+                  'majority_host_stage_ms=' + json.dumps(speed['stages_mean_ms']['surface_fused_majority_graph']),
+                  'majority_execution=' + json.dumps(speed['majority_execution'])]
+        for mode in ('surface_fused_graph', 'surface_fused_majority_graph'):
+            rows = [row.get('strong_profile_ms', {}) for row in speed['trials'] if row['mode'] == mode]
+            keys = ('precompute_ms', 'inverse_warp_ms', 'majority_fill_ms', 'dynamic_transport_scatter_ms')
+            means = {key: float(np.mean([row[key] for row in rows])) for key in keys
+                     if rows and all(key in row for row in rows)}
+            lines.append(mode+' Strong_substage_ms='+json.dumps(means))
     lines += [f'probability + SIX dense byte parity: {speed["probability_and_six_dense_parity_windows"]}/{speed["fps_windows"]}',
         'fixed_execution=' + speed['selected_execution'],
         'graph_execution=' + json.dumps(speed['graph_execution']),
@@ -65,12 +77,19 @@ def main(argv=None, stop_event=None):
     p.add_argument('--seed', type=int, default=1729)
     p.add_argument('--compare-strong-warp', action='store_true',
                    help='paired original/fused_graph vs buffered Strong/fused_graph; no automatic promotion')
+    p.add_argument('--compare-strong-majority', action='store_true',
+                   help='paired unchanged warp: original majority vs exact parallel majority; no automatic promotion')
+    p.add_argument('--majority-workers', type=int, default=4)
     p.add_argument('--device', default='cuda')
     p.add_argument('--cpu-workers', type=int, default=10)
     a = p.parse_args(argv); out = Path(a.out_dir).resolve()
     if out.exists(): p.error('new output required; never overwrite an experiment')
     if not 1 <= a.windows <= VAL_WINDOWS or not 1 <= a.repeats <= 10 or not 1 <= a.cpu_workers <= 16:
         p.error('invalid windows/repeats/CPU budget')
+    if a.compare_strong_warp and a.compare_strong_majority:
+        p.error('choose one Strong comparison')
+    if a.compare_strong_majority and not 1 <= a.majority_workers <= min(8, a.cpu_workers):
+        p.error('majority workers exceed CPU budget')
     if any((directory/'training.json').is_file() for directory in (out, *out.parents)):
         p.error('FPS output must be outside training directories')
     bundle = find_frozen_bundle(a.runs_root, a.run_dir, a.source_bundle_dir)
@@ -111,7 +130,10 @@ def main(argv=None, stop_event=None):
                 log.write(json.dumps(row, allow_nan=False)+'\n'); log.flush()
             speed = paired_speed(provider, source, records, joint, joint.columns, None,
                 stop_event=stop_event, windows=a.windows, repeats=a.repeats, stress_windows=0,
-                surface_only=True, progress=progress, compare_strong_warp=a.compare_strong_warp)
+                surface_only=True, progress=progress, compare_strong_warp=a.compare_strong_warp,
+                compare_strong_majority=a.compare_strong_majority, majority_workers=a.majority_workers)
+        if a.compare_strong_majority and speed['majority_execution']['calls'] != 6*a.windows*(a.repeats+1):
+            raise RuntimeError('parallel majority did not execute on EVERY full six-frame forecast; reject timing')
         verify_sources(bundle)
         if weight_fingerprint(joint.state_dict()) != saved['weight_fingerprint']:
             raise RuntimeError('in-memory mean weights changed during read-only FPS')
@@ -124,6 +146,7 @@ def main(argv=None, stop_event=None):
             persistent_forecast_cache=False,
             execution_implementation={name: sha256(root/name) for name in (
                 'real_motion/strong_warp_execution.py', 'real_motion/runtime_fastpath.py',
+                'real_motion/strong_majority_execution.py', 'real_motion/v18_execution_trial.py',
                 'real_motion/final_dataflow.py', 'tools/real_motion/surface_ccr_validation_common.py')})
         write_json(out/'speed.json', speed)
         text = summary(speed); (out/'summary.txt').write_text(text, encoding='utf-8'); print(text, flush=True)

@@ -123,6 +123,13 @@ def _scipy_edges(out, semantics, known, coordinates, classes, min_fraction):
     x, y = x.clip(0, out.shape[0]-1), y.clip(0, out.shape[1]-1)
     seen = (valid & known[x, y, z]).reshape(-1, 5, 5)
     labels = semantics[x, y, z].reshape(-1, 5, 5)
+    if classes is None:
+        # Only opt-in execution supplies None. Classes absent from ALL replay
+        # patches have identically zero scores and cannot win a positive .3
+        # threshold. Keep ascending order and the SAME float32 filtering.
+        classes = np.unique(labels[seen]).astype(np.int64)
+        if not len(classes):
+            return
     denominator = uniform_filter(seen.astype(np.float32), (1, 5, 5), mode='constant')[:, 2, 2]
     masks = ((labels[:, None] == classes[None, :, None, None]) & seen[:, None]).astype(np.float32)
     scores = uniform_filter(masks, (1, 1, 5, 5), mode='constant')[:, :, 2, 2]
@@ -135,6 +142,10 @@ def _scipy_edges(out, semantics, known, coordinates, classes, min_fraction):
 
 def majority_fill_native_exact(semantics, unknown_mask, *, kernel=(5, 5, 1),
                                min_fraction=.3, device=None):
+    from .strong_majority_execution import selected_execution
+    execution = selected_execution()
+    if execution is not None:
+        return execution(semantics, unknown_mask, kernel=kernel, min_fraction=min_fraction, device=device)
     from .native_column_cpu import get_prepared_native
     if tuple(kernel) != (5, 5, 1) or abs(float(min_fraction)-.3) > 1e-12:
         raise ValueError('native majority is frozen to kernel=(5,5,1), threshold=.3')

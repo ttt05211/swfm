@@ -12,6 +12,8 @@ E14="${E14:-$ROOT/outputs/p0_f9_v18_se2_clean_tail15/epoch_0014.pt}"
 EXTRA=()
 [[ -z "${SURFACE_MEAN_SOURCE:-}" ]] || EXTRA+=(--source-bundle-dir "$SURFACE_MEAN_SOURCE")
 [[ "${SURFACE_MEAN_FPS_COMPARE_STRONG:-0}" != 1 ]] || EXTRA+=(--compare-strong-warp)
+[[ "${SURFACE_MEAN_FPS_COMPARE_MAJORITY:-0}" != 1 ]] || EXTRA+=(--compare-strong-majority --majority-workers "${SURFACE_MEAN_FPS_MAJORITY_WORKERS:-4}")
+[[ "${SURFACE_MEAN_FPS_COMPARE_STRONG:-0}" != 1 || "${SURFACE_MEAN_FPS_COMPARE_MAJORITY:-0}" != 1 ]] || { echo 'Strong warp/majority 比较请选择一个，不能混改。' >&2; exit 2; }
 [[ ! -e "$OUT" && ! -e "$OUT.log" ]] || { echo "拒绝覆盖 $OUT" >&2; exit 2; }
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
@@ -21,6 +23,7 @@ export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 echo '仅测已选平均模型FPS：默认256窗口×3次；场景内随机、场景均衡，不按耗时挑窗口。'
 echo '固定4历史→6未来，ADD raw0.5/REMOVEoff；Strong和六帧输出实时计算，不读取预测缓存。'
 [[ "${SURFACE_MEAN_FPS_COMPARE_STRONG:-0}" != 1 ]] || echo '同窗口成对核对/计时：原Strong vs 合并回传Strong；六帧逐字节一致才报告。'
+[[ "${SURFACE_MEAN_FPS_COMPARE_MAJORITY:-0}" != 1 ]] || echo '同窗口成对核对/计时：原投票 vs 分块并行/局部类别投票；逆变换不变；报告整网FPS及Strong各分段。'
 echo "输出 $OUT；普通/加速执行逐字节核对；不重训、不跑全集精度。"
 mkdir -p "$(dirname -- "$OUT")"
 "$PY" -u tools/real_motion/benchmark_p0_f9_joint_surface_mean_fps.py \
