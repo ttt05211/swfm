@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="345" viewBox="0 0 1200 345" role="img" aria-labelledby="title desc">
+  <title id="title">Camera and predicted ego trajectory table template</title>
+  <desc id="desc">Four proposed evaluation settings. Only existing full4369 GT occupancy and GT ego averages are filled. All new results are unmeasured.</desc>
+  <rect width="1200" height="345" fill="white"/>
+  <g fill="#111" font-family="Times New Roman, Times, serif" font-size="22">
+    <text x="24" y="33">Occupancy forecasting: Camera / 3D-Occ × Pred. / GT ego</text>
+    <text x="24" y="59" font-size="16" fill="#666">DRAFT TEMPLATE — pending measurements; fixed 4-history → 6-future setting</text>
+    <rect x="690" y="75" width="70" height="201" fill="#f1f1f1"/>
+    <rect x="1040" y="75" width="82" height="201" fill="#f1f1f1"/>
+    <g stroke="#111" fill="none">
+      <path d="M24 75 H1165 M24 137 H1165 M24 141 H1165 M24 211 H1165 M24 276 H1165"/>
+      <path d="M335 75 V276 M525 75 V276 M790 75 V276" stroke="#aaa"/>
+    </g>
+    <text x="30" y="116">Method</text><text x="349" y="116">Input</text><text x="432" y="116">Ego</text>
+    <text x="611" y="99">mIoU (%) ↑</text><text x="942" y="99">IoU (%) ↑</text>
+    <g text-anchor="middle" font-size="20">
+      <text x="564" y="128">1s</text><text x="618" y="128">2s</text><text x="670" y="128">3s</text><text x="729" y="128">Avg.</text>
+      <text x="837" y="128">1s</text><text x="905" y="128">2s</text><text x="974" y="128">3s</text><text x="1080" y="128">Avg.</text>
+    </g>
+    <text x="30" y="170">Surface CCR-STC</text><text x="349" y="170">Camera</text><text x="435" y="170">Pred.*</text>
+    <text x="30" y="199">Surface CCR-STC</text><text x="349" y="199">Camera</text><text x="435" y="199">GT</text>
+    <text x="30" y="237">Surface CCR</text><text x="349" y="237">3D-Occ</text><text x="435" y="237">Pred.*</text>
+    <text x="30" y="266">Surface CCR</text><text x="349" y="266">3D-Occ</text><text x="435" y="266">GT</text>
+    <g text-anchor="middle" font-size="20">
+      <text x="564" y="170">—</text><text x="618" y="170">—</text><text x="670" y="170">—</text><text x="729" y="170">—</text>
+      <text x="837" y="170">—</text><text x="905" y="170">—</text><text x="974" y="170">—</text><text x="1080" y="170">—</text>
+      <text x="564" y="199">—</text><text x="618" y="199">—</text><text x="670" y="199">—</text><text x="729" y="199">—</text>
+      <text x="837" y="199">—</text><text x="905" y="199">—</text><text x="974" y="199">—</text><text x="1080" y="199">—</text>
+      <text x="564" y="237">—</text><text x="618" y="237">—</text><text x="670" y="237">—</text><text x="729" y="237">—</text>
+      <text x="837" y="237">—</text><text x="905" y="237">—</text><text x="974" y="237">—</text><text x="1080" y="237">—</text>
+      <text x="564" y="266">†</text><text x="618" y="266">†</text><text x="670" y="266">†</text><text x="729" y="266">44.15</text>
+      <text x="837" y="266">†</text><text x="905" y="266">†</text><text x="974" y="266">†</text><text x="1080" y="266">55.21</text>
+    </g>
+    <text x="24" y="302" font-size="16">* External planner; disclose its sensor/status inputs. No new results have been measured.</text>
+    <text x="24" y="325" font-size="16">† Extract per-horizon scores from original full4369 result. Existing averages only; not the 6s population.</text>
+  </g>
+</svg>

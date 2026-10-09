@@ -270,6 +270,15 @@ mIoU32.350774/28.876602/26.126216；avg4–6 IoU41.218153 / mIoU29.117864。
 档案为用户服务器摘要转录，非本地原evaluation.json；实际运行目录/HEAD/snapshot SHA未收到，不猜路径或指纹。
 此次仅文档/指标归档，不改变模型、训练、旧默认入口或其他Waymo改动。
 
+## Camera / Pred ego 当前决定（2026-10-10）
+
+用户只做 STCOcc Camera，不做 BEVStereo。按 I²-World-STC 官方历史完整 semantics + 无 camera/lidar metric mask，不额外借用 GT 历史 visibility，不进行 mask 选优。需要的 known 是预测网格有效性，不是真实 sensor visibility。
+服务器旧 `new_code/cache/come_main_table/camera_pred` 与 `camera_gt` 各4219窗/150场景，四历史及六 `future_e2g` 保留；原 BEVStereo/planner 路径已失效。仅考虑复用严格对齐的 camera_pred 预测世界 ego pose，绝不复用 BEVStereo 历史/latent/搬运结果；六未来 XY 世界坐标、yaw 相对 t0 非累积。四设置使用共同人口并同人口重算 Occ+GT，不混旧4369分数。
+STC包扫描尚未确认存在，官方 I²-World 下载链接已核实；现已实现官方ZIP下载检查、逐值无损uint8紧凑解压、冻结Surface四设置 evaluator。四设置同planner-covered人口（all预计4219），一趟完整六帧后才读未来GT语义，报告1/2/3s与均值标准IoU/mIoU并附官方排除零类诊断，不混旧4369数字。
+严格身份/order/tag、当前z/tilt与独立yaw、文件/pose指纹及固定mean检查；Pred全部未来几何用预测pose，无GT回退/事后对齐；Camera无GT visibility/cache复用。每8完整窗口整数保存，Ctrl-C/SIGTERM安全停、同输出目录严格resume，旧训练与缓存只读。
+本地STC+Waymo+geometry-carry相关回归63 passed/4 CUDA skipped；实际小模型NumPy/native四设置概率/六帧exactness、无future GT读入、错序/缺失fail-closed、compact逐值相等和中断不重计通过。CLI help/Bash语法通过，不称全仓CI/真实STC精度。
+未下载完整STC数据、未训练/代跑服务器。入口 `run_p0_f9_joint_surface_stc.sh`；顺序命令见 `docs/SURFACE_STC_CAMERA_PRED_EGO_CN.md`，调研见 `docs/CAMERA_PRED_EGO_RESEARCH_20261010_CN.md`。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
