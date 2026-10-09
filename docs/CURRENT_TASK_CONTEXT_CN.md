@@ -2,10 +2,9 @@
 
 ## 当前目标
 
-Clean Joint Surface CCR 已完整随机联合训练 20 轮。现在比较优秀单轮和固定权重平均，选出下一次质量验证候选；不重启失败结构、不继续堆修正器。
-用户同意按 DEV64 Joint mIoU top5，第 5/6/8/12/14 轮整网等权平均，并与第 6/8/12 轮在 DEV512 一次性对照。
-第 20 轮复用已经完成的 DEV512 结果。不要额外试“末五轮平均”或扫描融合系数。
-DEV512 对照已完成，用户现在明确批准只评估固定平均模型的 full4369；不重跑其他单轮、不重新平均、不自动增加 FPS/训练。
+Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整网等权平均已完成DEV512选择、full4369质量和256×3正式FPS验证。
+当前主候选mIoU44.153241 / MovingMicro32.214410 / Dense Forecast FPS40.250。用户只要求做简单、无损的执行提速，不改结构/权重/阈值，不重训或重跑全集精度，不重启失败方案。
+优先减少Strong内部同步/回传；原路径继续保留，用同人口成对核对和测速，不能拿本地内部耗时冒充L40S整网FPS。
 
 ## 核心决策与约束
 
@@ -16,7 +15,7 @@ DEV512 对照已完成，用户现在明确批准只评估固定平均模型的 
 - 同训练契约、同模型配置、同 TRAIN 正权重；只平均可学习参数，固定 buffers 不平均。
 - 评估共享确定性历史/几何和 Moving 区域，不能共享候选之间 learned poses/features/输出。
 - 固定 Dense Forecast FPS 边界：CausalHistoryState→fresh Strong/KTA+live motion+CCR+实时投影+六帧 dense。历史表示准备另报，不称 raw-input E2E。
-- 新平均权重的 FPS 尚未测；不能沿用旧冻结 Surface 或 Frozen B 的 FPS。
+- 新平均正式FPS已测40.250（256窗口/150场景×3）；不能沿用旧冻结Surface/Frozen B的FPS。
 - DEV64/DEV512 和 VAL 扩大人口均已参与研究，不称独立测试；本次已授权固定平均的 full4369，不自动重训/部署。
 
 ## 当前进度与服务器锚点
@@ -69,7 +68,7 @@ DEV64 关键 Joint 结果：
 平均的三个时距 mIoU/Macro/Micro均最高，但IoU略低，不称四项全面提升。
 收益主要体现于Transport；平均Transport mIoU39.362646 / Micro30.014088，CCR再增+1.069630 / +1.472431 pp。
 四候选512窗口合计705.52s，这是质量eval耗时，不是正式FPS。
-新平均 full4369 已完成，正式 FPS 正在补测，不能沿用旧冻结模型的 FPS。
+新平均 full4369 和正式FPS均已完成。
 
 2026-10-09 服务器全集报告：固定平均（5/6/8/12/14）在 full4369、150 场景上
 IoU55.211054 / mIoU44.153241 / MovingMacro28.256901 / MovingMicro32.214410。
@@ -78,6 +77,11 @@ IoU55.211054 / mIoU44.153241 / MovingMacro28.256901 / MovingMicro32.214410。
 相对旧 Local full4369：IoU-0.347217 / mIoU+0.124314 / Macro+0.968314 / Micro+0.974187 pp。
 耗时1649.02s是带GT/整数指标的质量评估，不是FPS；仍不称独立测试。
 结果：`outputs/p0_f9_joint_surface_ccr/mean_full4369_20261009_104036_848/full_validation.json`（服务器）。
+
+正式FPS（同均值，256窗口/150场景×3，actualCUDA）：fused_eager152.852ms/39.254FPS；fused_graph149.067ms/40.250FPS，P90=186.348ms，256/256六帧和概率byte parity。
+仅2个图捕获，计时外；无拒绝。Strong82.109ms是主瓶颈；读出24.515ms已包含实时phase14.053ms，不能重复相加。峰值allocated253.885MiB。
+历史准备149.995ms、surface descriptor104.183ms单独排除，不称raw-input端到端FPS。
+服务器结果：`outputs/p0_f9_joint_surface_ccr/mean_fps_20261009_113139_838/speed.json`。
 
 ## 本轮实现与验收
 
@@ -104,13 +108,18 @@ IoU55.211054 / mIoU44.153241 / MovingMacro28.256901 / MovingMicro32.214410。
 这不是服务器实测FPS或全仓CI。服务器命令：`bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`；输出新 `mean_fps_*` 目录。
 可用 `SURFACE_MEAN_FPS_WINDOWS=512` 扩大人口；中断保留partial日志，不改断点，重测使用新输出，不混拼前次计时。
 
+本轮简单无损候选：`real_motion/strong_warp_execution.py`。保留原FP32逐时距GEMM、5e-3边界判定及FP64 NumPy纠错；合并边界索引与标签/known回传，去掉每时距any/变长gather同步。只保留本次最多6网格的临时buffer，不缓存预测。
+默认仍reference；ContextVar显式scope可选buffered，异常自动恢复、不会改其他线程。7个历史几何namespace文件、10个训练指纹文件及native ABI都未改；旧权重/缓存继续兼容。
+RTX3050上只读真实replay.zip：6窗口×5，六帧逆变换32.848→24.410ms（1.346×），与旧CUDA及CPU FP64参考逐字节一致。这不是整网FPS或L40S预测。
+33项相关本地CPU/CUDA回归通过，含越界/边界、跨6网格批次、Strong anchor/components/CLEAR、旧FPS和graph读出；Bash语法通过。
+同一正式入口设`SURFACE_MEAN_FPS_COMPARE_STRONG=1`，成对测原fused_graph与buffered Strong/fused_graph，默认仍256×3同seed/同人口，不自动采用候选。
+
 ## 未解决问题与下一步
 
-1. 用户已授权新平均的正式 FPS，要求更多窗口平均。新入口 `run_p0_f9_joint_surface_mean_fps.sh`：默认256场景均衡随机窗口×3，不按GT/错误/耗时选样，不重训或重跑全集质量。
-2. 只加载已完成DEV512对照中同一固定平均文件；原训练/权重/缓存不动。沿用正式边界，fresh Strong/KTA和六帧CCR全部实时计算；history/descriptor准备、预热/图捕获/一致性核对不计入FPS且单独报告。
-3. 普通及融合执行完整概率/六帧dense逐字节核对；正式固定fused_graph（完整8192块建图、尾块eager），禁止计时内建图。FPS=6/平均六帧延迟，P90/分段/显存同报，不按最小延迟挑结果。
-4. 本地回归只证明实现正确，实际L40S FPS仍待服务器运行。256随机窗口与旧20压力人口不同，不据跨次数字宣称成对提速。
-5. 全集已追回mIoU和Moving，IoU仍较旧Local略低；暂不改结构/阈值，不重启已淘汰支线。
+1. 完成Strong无损候选提交/推送；请服务器运行`SURFACE_MEAN_FPS_COMPARE_STRONG=1 bash tools/real_motion/run_p0_f9_joint_surface_mean_fps.sh`，返回summary。原/新版按同256×3人口轮换计时及六帧byte parity；不重训/不重评全集。
+2. 实际L40S成对增益尚未知；只有通过一致性且确实有收益后才建议采用buffered。原路径不删除、不默认升级，计时内捕获拒绝规则保持。
+3. 固定DenseForecast边界和6/均值算法。不要用局部warp的1.346×夸大整网FPS；历史准备排除且明报。
+4. 全集已追回mIoU/Moving，IoU仍略低、40FPS余量小；不增加重模块、不改网络/阈值。
 
 ## 仅按需检索的历史
 

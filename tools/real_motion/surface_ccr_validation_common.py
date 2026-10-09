@@ -171,15 +171,21 @@ def load_progress(path, contract, accumulator, *, compatible_implementations=())
 
 @torch.no_grad()
 def paired_speed(provider, source, records, teacher, head, reference, *, stop_event=None,
-                 windows=20, repeats=3, stress_windows=2, surface_only=False, progress=None):
+                 windows=20, repeats=3, stress_windows=2, surface_only=False, progress=None,
+                 compare_strong_warp=False):
     if type(repeats) is not int or repeats < 1:
         raise ValueError('positive integer FPS repeats required')
+    if compare_strong_warp and not surface_only:
+        raise ValueError('Strong comparison requires ONE frozen Surface model')
+    from real_motion.strong_warp_execution import strong_warp_execution
     selected, population = select_population(records, tuple((str(r['scene_name']), str(r['t0_token'])) for r in records),
                                              windows=windows, stress_windows=stress_windows)
     device = provider.device
     graph = SurfaceExecution(head, device, capture_full_chunks_only=surface_only)
     modes = (('surface_fused_eager', 'surface_fused_graph') if surface_only else
              ('frozen_B', 'surface_eager', 'surface_graph', 'surface_fused_eager', 'surface_fused_graph'))
+    if compare_strong_warp:
+        modes = ('surface_fused_graph', 'surface_fused_buffered_graph')
     trials, parity, prepares, descriptors, optimized_descriptors = [], 0, 0., 0., 0.
     def sync(): torch.cuda.synchronize(device) if device.type == 'cuda' else None
     try:
@@ -218,9 +224,10 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                     if timed and device.type == 'cuda': torch.cuda.reset_peak_memory_stats(device)
                     before = torch.cuda.memory_allocated(device) if device.type == 'cuda' else 0
                     tick = time.perf_counter()
-                    out = forecast_six(history, provider, teacher.transport, model,
-                        lambda *args: probability(*args, mode), kernels=ccr.execution_kernels(provider), executor=pool,
-                        projection_fn=map_surface_evidence if mode.startswith('surface_fused') else None)
+                    with strong_warp_execution('buffered' if mode == 'surface_fused_buffered_graph' else 'reference'):
+                        out = forecast_six(history, provider, teacher.transport, model,
+                            lambda *args: probability(*args, mode), kernels=ccr.execution_kernels(provider), executor=pool,
+                            projection_fn=map_surface_evidence if mode.startswith('surface_fused') else None)
                     sync(); seconds = time.perf_counter() - tick
                     out['stages_seconds']['live_surface_phase_INCLUDED_in_readout'] = phase_time[0]
                     memory = (dict(peak_allocated=torch.cuda.max_memory_allocated(device)/2**20,
@@ -256,6 +263,8 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
                             raise RuntimeError('repeated six-frame output bytes changed')
                         row = dict(mode=mode, window=wi, repeat=repeat+1, seconds=seconds,
                                    stages_seconds=out['stages_seconds'], memory_mib=memory)
+                        if compare_strong_warp:
+                            row['strong_profile_ms'] = out.get('strong_profile_ms', {})
                         trials.append(row)
                         if progress is not None: progress(row)
                 print(f'SURFACE_PAIRED_FPS {wi}/{windows} graph/eager/six-dense parity=PASS', flush=True)
@@ -279,6 +288,7 @@ def paired_speed(provider, source, records, teacher, head, reference, *, stop_ev
             dynamic_byte_parity_windows=None if surface_only else parity,
             selected_execution=chosen, selection_basis=('fixed fused_graph backend with eager fallbacks; no latency selection'
                 if surface_only else 'latency only after byte parity, NOT accuracy/method selection'),
+            strong_warp_comparison=bool(compare_strong_warp),
             graph_execution=graph.stats(), history_prepare_seconds_per_window=prepares/windows,
             surface_descriptor_prepare_seconds_per_window=descriptors/windows,
             optimized_surface_descriptor_prepare_seconds_per_window=optimized_descriptors/windows,

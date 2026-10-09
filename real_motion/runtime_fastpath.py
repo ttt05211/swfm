@@ -500,6 +500,10 @@ def inverse_warp_sequence_cuda_exact(
     the frozen CPU Strong/KTA implementation on multiple real validation
     windows.  CPU devices intentionally fall back to the reference caller.
     """
+    from .strong_warp_execution import selected_backend, inverse_warp_sequence_buffered_exact
+    if selected_backend() == 'buffered':
+        return inverse_warp_sequence_buffered_exact(semantics, src_to_dst_seq,
+            grid=grid, free_label=free_label, device=device, boundary_tol_vox=boundary_tol_vox)
     if torch.device(device).type != "cuda":
         raise ValueError("CUDA exact-corrected inverse warp requires a CUDA device")
 

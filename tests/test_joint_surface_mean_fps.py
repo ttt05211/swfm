@@ -78,3 +78,22 @@ def test_capture_inside_timing_rejected(monkeypatch):
     with pytest.raises(RuntimeError, match='inside FPS timer'):
         common.paired_speed(provider, None, records, teacher, head, None,
             windows=1, repeats=1, stress_windows=0, surface_only=True)
+
+
+def test_strong_comparison_uses_scope_and_restores_default(monkeypatch):
+    from real_motion.strong_warp_execution import selected_backend
+    provider, records, teacher, head = setup(monkeypatch)
+    actual = common.forecast_six; observed = []
+    def forecast(*args, **kwargs):
+        observed.append(selected_backend())
+        return actual(*args, **kwargs)
+    monkeypatch.setattr(common, 'forecast_six', forecast)
+    report = common.paired_speed(provider, None, records, teacher, head, None,
+        windows=2, repeats=2, stress_windows=0, surface_only=True, compare_strong_warp=True)
+    assert observed.count('buffered') == 6 and observed.count('reference') == 8
+    assert selected_backend() == 'reference' and report['strong_warp_comparison'] is True
+    assert report['selected_execution'] == 'surface_fused_graph'  # original, not silently promoted
+    assert set(report['six_frame_mean_seconds']) == {'surface_fused_graph', 'surface_fused_buffered_graph'}
+    assert all('strong_profile_ms' in row for row in report['trials'])
+    report['scenes'] = 2
+    assert 'SAME-WINDOW whole-forecast speedup=' in cli.summary(report)

@@ -37,6 +37,11 @@ def summary(speed):
     for mode, seconds in speed['six_frame_mean_seconds'].items():
         lines.append(f'{mode}: six_ms={1000*seconds:.3f} FPS={6/seconds:.3f} '
                      f'P90_ms={speed["p90_six_ms"][mode]:.3f}')
+    if speed.get('strong_warp_comparison'):
+        original = speed['six_frame_mean_seconds']['surface_fused_graph']
+        buffered = speed['six_frame_mean_seconds']['surface_fused_buffered_graph']
+        lines += [f'SAME-WINDOW whole-forecast speedup={original/buffered:.4f} (Strong scheduling ONLY); no automatic backend promotion.',
+                  'buffered_host_stage_ms=' + json.dumps(speed['stages_mean_ms']['surface_fused_buffered_graph'])]
     lines += [f'probability + SIX dense byte parity: {speed["probability_and_six_dense_parity_windows"]}/{speed["fps_windows"]}',
         'fixed_execution=' + speed['selected_execution'],
         'graph_execution=' + json.dumps(speed['graph_execution']),
@@ -58,6 +63,8 @@ def main(argv=None, stop_event=None):
     p.add_argument('--windows', type=int, default=256)
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--seed', type=int, default=1729)
+    p.add_argument('--compare-strong-warp', action='store_true',
+                   help='paired original/fused_graph vs buffered Strong/fused_graph; no automatic promotion')
     p.add_argument('--device', default='cuda')
     p.add_argument('--cpu-workers', type=int, default=10)
     a = p.parse_args(argv); out = Path(a.out_dir).resolve()
@@ -104,7 +111,7 @@ def main(argv=None, stop_event=None):
                 log.write(json.dumps(row, allow_nan=False)+'\n'); log.flush()
             speed = paired_speed(provider, source, records, joint, joint.columns, None,
                 stop_event=stop_event, windows=a.windows, repeats=a.repeats, stress_windows=0,
-                surface_only=True, progress=progress)
+                surface_only=True, progress=progress, compare_strong_warp=a.compare_strong_warp)
         verify_sources(bundle)
         if weight_fingerprint(joint.state_dict()) != saved['weight_fingerprint']:
             raise RuntimeError('in-memory mean weights changed during read-only FPS')
@@ -114,7 +121,10 @@ def main(argv=None, stop_event=None):
             population_fingerprint=stable_json_fingerprint(speed['population']),
             weights_sha256=bundle['candidates'][AVERAGE_NAME]['sha256'],
             source_bundle_fingerprint=bundle['fingerprint'], graph_capture_inside_timing=False,
-            persistent_forecast_cache=False)
+            persistent_forecast_cache=False,
+            execution_implementation={name: sha256(root/name) for name in (
+                'real_motion/strong_warp_execution.py', 'real_motion/runtime_fastpath.py',
+                'real_motion/final_dataflow.py', 'tools/real_motion/surface_ccr_validation_common.py')})
         write_json(out/'speed.json', speed)
         text = summary(speed); (out/'summary.txt').write_text(text, encoding='utf-8'); print(text, flush=True)
     except InterruptedError:
