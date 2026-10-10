@@ -355,6 +355,30 @@ CCR改对/损坏、t0感知质量、pose误差、因果track统计及GT/Pred mot
 signed-zero/NaN位模式及四设置BF16读出回归；相关90 passed、1 CUDA skipped。
 代码指纹已变，保留失败目录，使用新STC_DIAG_OUT重跑，不迁移旧契约或重建输入缓存。
 
+## 原始 planner JSON 的 t0 起点审计（2026-10-10）
+
+服务器dev64分支诊断：Strong→Transport→Joint均值mIoU：OccGT38.616→40.848→41.896，
+OccPred17.477→17.834→18.350，STCGT15.970→16.770→16.995，STCPred10.930→11.825→11.960。
+各设置CCR增益正，但主要掉分在Strong之前。STC t0占据precision51.542%/recall47.295%；
+Pred 3s XY median/P90=1.237/2.371m，yaw=2.247/12.717°；z误差0，不继续把z当主要掉分来源。
+GT/Pred motion bytes一致64窗；原始JSON当时缺失，起点审计未核验，不据缓存声明判定无错位。
+
+本地父目录`_received/bevplanner_ego_in_bev_with_yaw.json`已找回：2,651,124 bytes、
+6019行/150场景/每行7×3；官方SHA与旧cache声明一致（19c04eaf…6783afb）。
+数字suffix是排序索引，非场景内零基ordinal。旧builder/COME皆按scene排序后用当前帧ordinal取行，
+但原构建器没有独立核对row0 XY。不能仅从六缓存位姿可重建宣称t0正确。
+
+新增独立`run_p0_f9_original_planner_t0_audit.sh`：只读全部4219缓存identity/6位姿、
+完整场景row0及nuScenes ego/identity元数据，不需STC/GT occupancy/模型/GPU。
+行排序/全链→t0 row0 XY（2cm）及邻行诊断→非累积yaw重建（1e-6）三重核验；
+停车/重访XY显式标兼容有歧义，JSON无sample token，不冒充唯一身份证明。
+严格官方SHA，重复key/suffix/场景行数/缓存order拒绝；源文件读前后核验，报告新目录，
+不自动重索引、改pose或aligned修分；旧四设置/shared/branch/protocol实现指纹保持不变。
+本地相关回归112 passed / 1 CUDA skipped（新专项22项），Bash/CLI help通过；
+最初旧native默认缓存权限失败，显式复用tmp验证缓存后已通过，不是诊断实现故障。
+实际服务器t0核验尚未跑；用户上传这个小JSON后运行新入口发回summary。操作见
+`docs/ORIGINAL_PLANNER_T0_AUDIT_CN.md`。不重启失败适配或新训练。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
