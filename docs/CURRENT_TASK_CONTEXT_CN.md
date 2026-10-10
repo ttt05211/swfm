@@ -428,6 +428,20 @@ OCC mIoU external/old320/A/B18.350472/16.760100/12.844141/13.600391；STC11.9600
 本地专项及相关回归166 passed / 4 skipped（CUDA），尚未跑真实服务器TRAIN64，不能据合成测试宣布已排除全部接口问题。
 文档 `docs/SURFACE_EGO_TRAIN_REPLAY_CN.md`。
 
+## ego 头扩大 TRAIN 的单轮试训（2026-10-10）
+
+服务器TRAIN接口复核完成：bank/TRAIN实时/eval实时的七字段64窗逐字节一致，标签/cmd/train-eval一致，完整TRAIN1024报告复现。
+原batch64/单窗严预算仍失败：maxXY2.09mm、yaw0.010deg，原失败保留；不能解释米级TRAIN/dev差距，不据此保证扩训成功。
+用户授权扩大规模，随后明确只训一轮；不执行原先拟议20轮，不自动续训。
+新 `tools/ego_experiments/` 独立入口覆盖完整TRAIN20430身份人口，固定SHA256(seed:scene)留出10%场景，其余fit窗口只优化一次。
+WM已见过这些TRAIN留出场景，明确仅ego优化器场景不重叠。原约0.43M头/同原初始化/单项R10m几何，batch64单轮余弦；WM/CCR完全冻结。
+只读复用旧1024 bank，其余历史特征一次提取；有界4线程/原帧及纯几何各512MiB，GPU一次打包，不运行未来Strong，不写旧缓存。
+固定第1轮 `head_epoch1.pt`（不按留出/dev挑best），TRAIN留出仅诊断；最终固定dev64六路OCC/STC×GT/external/internal。
+`last.pt` 含Adam/余弦/游标/RNG/整轮均值；bank逐shard/评估整窗恢复；完成resume不再训练、不重写导出SHA。
+Python不放旧bank哈希覆盖的顶层目录，不改变旧head/提取/协议。入口 `run_p0_f9_surface_ego_full.sh`，输出新目录，恢复须同一EGO_FULL_OUT。
+本地180 passed / 5 CUDA skipped，含实际CPU冻结WM历史bank、原文件保护、部分恢复/破坏拒绝；未启动服务器、没有真实扩大训练指标。
+只需发 `_eval_dev64/summary.txt`，训练/构建耗时分开；文档 `docs/SURFACE_EGO_EXPANDED_ONE_EPOCH_CN.md`。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
