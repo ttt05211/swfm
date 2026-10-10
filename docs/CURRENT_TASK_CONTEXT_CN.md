@@ -393,6 +393,24 @@ GT/Pred motion bytes一致64窗；原始JSON当时缺失，起点审计未核验
 本地全量非集成验收1789 passed / 75 skipped / 4 deselected；CUDA专项本地跳过，不是实际L40S精度/FPS结论。
 文档 `docs/SURFACE_FROZEN_EGO_HEAD_CN.md`。
 
+## ego头失败后的单次预算/几何监督对照（2026-10-10）
+
+原头服务器已完成：TRAIN1024、batch64、20轮共320步，330.11s；WM/CCR未更新。
+固定dev64：Occ外部/内部mIoU18.350472/16.760100、STC11.960050/10.928355，内部头不采用。
+OCC内部1/2/3s平均XY误差0.565/1.668/2.875m，明显逊于外部0.339/0.611/1.341m；
+末batch损失不证明收敛，320步不足与yaw尺度问题都是待检假说，不据此保证扩训会成功。
+原来源 `outputs/p0_f9_joint_surface_ccr/ego_head_screen_20261010_194309_837`。
+
+用户授权同bank单次对照：历史外推prior/已有old320/原目标A2000步/几何目标B2000步；只训头，不重提特征或重训WM/CCR。
+A/B同原初始化（原seed+冻结模型构造，CPU RNG见证严格核验）、逐步同样本/Adam/余弦/clip；batch64约125轮。
+B单项五个固定中心/±10m轴参考点的SE(2)坐标Smooth-L1，无GT形状/体素反传；不是再加多个loss。
+整轮加权均值、每200步完整TRAIN1024误差与cmd计数；TRAIN是IN-SAMPLE。最终一趟dev64共12路：OCC/STC×GT/external/prior/old320/A/B。
+只在原代码完整匹配时排除新增三份工具文件复原旧manifest，逐shard/SHA核验只读bank；新实验锁定当前完整指纹。
+新成对断点存两头Adam/游标/RNG/均值累积；完成训练resume不改权重SHA；dev整窗原子续评，无aligned/阈值选优/自动推广。
+入口 `run_p0_f9_surface_ego_ablation.sh`，最终`_eval_dev64/summary.txt`含训练与评估，不启动服务器。
+本地专项及相关回归156 passed / 9 skipped；含实际小网格冻结WM/CCR的CPU几何路径、成对Adam/RNG续训、整窗续评与只读保护。
+两个CLI帮助及Bash语法通过；CUDA专项本地跳过，尚无服务器A/B精度或FPS结论。文档 `docs/SURFACE_EGO_BUDGET_GEOMETRY_ABLATION_CN.md`。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
