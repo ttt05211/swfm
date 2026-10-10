@@ -79,3 +79,12 @@ EGO_AB_RESUME=1 bash tools/real_motion/run_p0_f9_surface_ego_ablation.sh
 覆盖成对Adam/order/RNG/部分整轮均值的续训一致性、完成后resume不改pair SHA、源bank与旧实现指纹、
 12路历史共享/未来几何live重算、未来标签读取顺序、整窗原子续评，以及实际小网格冻结WM/CCR的CPU路径。
 CUDA相关测试因本地环境跳过；尚未运行服务器TRAIN1024/dev64，不宣称新头改善或实际GPU提速。
+
+## 服务器已返回结果（2026-10-10，后续追加）
+
+`ego_ablation_20261010_214909_837`完成A/B各2000步/125轮，已有同名`_eval_dev64`报告。
+A/B TRAIN 3s XY0.257947/0.292980m，但dev64 OCC为4.087419/3.167395m，
+均逊于old320的2.875380m和外部planner的1.341432m；B的TRAIN/dev 3s yaw0.880/8.747deg。
+A/B OCC平均mIoU12.844141/13.600391，STC9.243519/10.042540；不采用、不自动追加训练。
+上面的“尚未运行”仅描述当时本地验收状态，不是当前服务器状态。
+当前用户授权的同TRAIN窗口缓存/实时提取只读复核见`docs/SURFACE_EGO_TRAIN_REPLAY_CN.md`。

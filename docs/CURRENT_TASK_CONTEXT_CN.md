@@ -409,7 +409,24 @@ B单项五个固定中心/±10m轴参考点的SE(2)坐标Smooth-L1，无GT形状
 新成对断点存两头Adam/游标/RNG/均值累积；完成训练resume不改权重SHA；dev整窗原子续评，无aligned/阈值选优/自动推广。
 入口 `run_p0_f9_surface_ego_ablation.sh`，最终`_eval_dev64/summary.txt`含训练与评估，不启动服务器。
 本地专项及相关回归156 passed / 9 skipped；含实际小网格冻结WM/CCR的CPU几何路径、成对Adam/RNG续训、整窗续评与只读保护。
-两个CLI帮助及Bash语法通过；CUDA专项本地跳过，尚无服务器A/B精度或FPS结论。文档 `docs/SURFACE_EGO_BUDGET_GEOMETRY_ABLATION_CN.md`。
+两个CLI帮助及Bash语法通过；CUDA专项本地跳过。文档 `docs/SURFACE_EGO_BUDGET_GEOMETRY_ABLATION_CN.md`。
+
+## A/B服务器失败结果与单次TRAIN接口复核（2026-10-10）
+
+真实A/B完成：各2000步/125轮，同TRAIN1024。原/A/B的TRAIN 3s XY2.285891/0.257947/0.292980m，
+dev64 OCC 2.875380/4.087419/3.167395m；外部planner1.341432m。B的TRAIN/dev yaw3s0.880/8.747deg。
+OCC mIoU external/old320/A/B18.350472/16.760100/12.844141/13.600391；STC11.960050/10.928355/9.243519/10.042540。
+预算扩大只改善IN-SAMPLE，泛化变差；不采用新头，不自动继续扩训。原四设置/GT权重不变。
+成对源目录 `ego_ablation_20261010_214909_837`，已有评估同名`_eval_dev64`。
+
+用户授权只读同TRAIN64接口诊断：缓存 vs TRAIN式实时提取 vs dev OCC式实时提取，
+逐字段/标签/导航核验；batch64 vs 单窗、train/eval no_grad前向；完整TRAIN1024报告复现并引用现有dev64报告。
+固定导航/scene均衡64窗来自原bank，不以误差筛选，不称代表性总体；不新训练、不跑稠密预测、不读未来occupancy。
+原Torch/CUDA/精度/SWFM环境与旧实现必须匹配；源bank/元数据/历史NPZ/权重SHA核验，新输出支持完整窗口resume。
+新Python独立放 `tools/ego_diagnostics/surface_train_replay.py`，不影响旧bank绑定的顶层工具/real_motion指纹。
+入口 `run_p0_f9_surface_ego_train_replay.sh`，发新输出`summary.txt`即可；门槛固定，不自动修缓存/推广头。
+本地专项及相关回归166 passed / 4 skipped（CUDA），尚未跑真实服务器TRAIN64，不能据合成测试宣布已排除全部接口问题。
+文档 `docs/SURFACE_EGO_TRAIN_REPLAY_CN.md`。
 
 ## 仅按需检索的历史
 
