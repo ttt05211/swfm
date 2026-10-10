@@ -328,6 +328,26 @@ Strong/未来变换/owner/fallback/phase/prob/dense各自重算；不训练/改�
 新规则是待验证因果推理候选，不是COME已有方法或官方原planner reproduction；不保证收益、不自动全集或调参。无清晰增益就停止此路线。详见 `docs/STC_TRAJECTORY_YAW_SCREEN_CN.md`；下一步只需服务器运行新入口、发回summary。
 本地新yaw+旧STC协议/共享执行/失败geometry回归57 passed、1 CUDA skipped；实际CPU小模型原六帧/概率byte parity及权重不变、未来GT隔离、首次延后真实修正仍exactness、严格整数续评/CLI输出保护通过，Bash语法/help/diff通过。不声称全仓CI、CUDA或真实dev64收益；windows-python-env-guard仅使用已验证项目解释器。
 
+## 最新：四设置完整结果后的单次分支归因（2026-10-10）
+
+用户 full4219/150 场景四设置均值 mIoU/IoU：OccGT44.105025/55.113841、
+OccPred22.418912/30.061409、STCGT18.231871/27.683236、STCPred12.900742/21.671181。
+同 planner-covered 人口、full-grid、原 mean；不混旧4369或早期约千窗前缀。
+之前路面/时序适配失败；yaw screen OccPred mIoU+0.183663但IoU−0.334617、
+STCPred+0.023148/−0.063691，无足够增益，均不采用/不重启。
+用户最新授权一次集中诊断，不换网络、不重训、不aligned修分：新增独立
+`run_p0_f9_stc_branch_diagnostic.sh`，固定dev64四设置每窗四次forward，
+直接取同次Strong anchors / Transport baseline / Joint六帧，报告12路指标、类组FP/FN、
+CCR改对/损坏、t0感知质量、pose误差、因果track统计及GT/Pred motion字节一致。
+未来真值只在所有预测后用于评分/审计；原始planner JSON有则核查原ordinal/row0/非累积yaw重建，
+缺失明确未核验，不把cache声明当独立证据，不修改/纠正planner或历史。
+另建输出/契约/整数窗口状态，支持严格同目录resume，旧四设置源码及full结果指纹不变。
+操作与统计边界见 `docs/STC_BRANCH_DIAGNOSTIC_CN.md`；服务器只需运行此入口发回summary。
+本地新专项+既有STC协议/共享执行/geometry/yaw回归70 passed、1 CUDA skipped；
+包含真实CPU小模型原概率/六帧字节一致、权重不变、GT读取边界、原JSON非累积yaw重建、
+错误整窗原子提交及整数/身份/order续评；CLI help、Bash语法通过。
+没有真实服务器输入，不宣称已找到掉分的量化主因或真实增益；未改旧STC实现指纹。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
