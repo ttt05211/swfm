@@ -1,0 +1,29 @@
+===== SURFACE CCR / I2-WORLD WAYMO 10HZ INDEX ZERO-SHOT =====
+status=complete
+windows=39987/39987
+load_interval=1; official eval_metric=miou; eval_time=1/3/5 (zero-based future indices).
+Native +2/+4/+6 frames = nominal 0.2/0.4/0.6s, NOT physical 1/2/3s.
+ONE six-frame probability pass; three independent horizon counts, instead of three model reruns.
+Frozen FOUR-total-history mean; trained slot embeddings/clock retained, NO temporal rescaling/training/tuning.
+branch/horizon                IoU   I2_mIoU standard_mIoU
+transport/average             74.762743  66.111438  66.111438
+transport/eval_time_1         78.856326  71.631700  71.631700
+transport/eval_time_3         74.238185  65.532694  65.532694
+transport/eval_time_5         71.193718  61.169922  61.169922
+joint/average                 75.100701  65.997882  65.997882
+joint/eval_time_1             78.768551  71.074143  71.074143
+joint/eval_time_3             74.689365  65.526547  65.526547
+joint/eval_time_5             71.844188  61.392958  61.392958
+Actual target timestamps: {"eval_time_1": {"nominal_seconds": 0.2, "min": 0.0, "mean": 0.19893245067146823, "max": 0.699997, "zero_time_targets": 202}, "eval_time_3": {"nominal_seconds": 0.4, "min": 0.0, "mean": 0.3958439374796809, "max": 1.099955, "zero_time_targets": 202}, "eval_time_5": {"nominal_seconds": 0.6, "min": 0.0, "mean": 0.5907344247880562, "max": 1.299967, "zero_time_targets": 202}}
+Timestamp gap audit: {"pair_count": 39785, "nominal_dt_s": 0.1, "typical_bounds_s": [0.07, 0.13], "outlier_count": 82, "outlier_fraction": 0.0020610782958401406, "outliers_by_scene": {"85": 4, "152": 2, "62": 1, "16": 1, "67": 1, "63": 17, "50": 1, "11": 7, "30": 1, "118": 1, "184": 1, "191": 1, "145": 2, "136": 1, "177": 1, "47": 4, "72": 1, "188": 1, "21": 1, "101": 1, "110": 1, "6": 16, "20": 1, "95": 1, "192": 1, "15": 1, "42": 6, "58": 1, "92": 3, "173": 1}, "examples": [{"scene": 85, "frame_pair": [36, 37], "timestamp_pair_us": [1506907169011969.0, 1506907169213222.0], "dt_s": 0.201253, "frame_step": 1}, {"scene": 85, "frame_pair": [44, 45], "timestamp_pair_us": [1506907169916602.0, 1506907170117267.0], "dt_s": 0.200665, "frame_step": 1}, {"scene": 85, "frame_pair": [79, 80], "timestamp_pair_us": [1506907173516434.0, 1506907173716133.0], "dt_s": 0.199699, "frame_step": 1}, {"scene": 85, "frame_pair": [140, 141], "timestamp_pair_us": [1506907179712925.0, 1506907179913213.0], "dt_s": 0.200288, "frame_step": 1}, {"scene": 152, "frame_pair": [161, 162], "timestamp_pair_us": [1507165352339430.0, 1507165352539398.0], "dt_s": 0.199968, "frame_step": 1}, {"scene": 152, "frame_pair": [172, 173], "timestamp_pair_us": [1507165353539410.0, 1507165353739480.0], "dt_s": 0.20007, "frame_step": 1}, {"scene": 62, "frame_pair": [76, 77], "timestamp_pair_us": [1507242776550015.0, 1507242776750026.0], "dt_s": 0.200011, "frame_step": 1}, {"scene": 16, "frame_pair": [57, 58], "timestamp_pair_us": [1507247214388563.0, 1507247214588452.0], "dt_s": 0.199889, "frame_step": 1}, {"scene": 67, "frame_pair": [14, 15], "timestamp_pair_us": [1507320705305953.0, 1507320705506024.0], "dt_s": 0.200071, "frame_step": 1}, {"scene": 63, "frame_pair": [47, 48], "timestamp_pair_us": [1507338344132575.0, 1507338344332717.0], "dt_s": 0.200142, "frame_step": 1}, {"scene": 63, "frame_pair": [48, 49], "timestamp_pair_us": [1507338344332717.0, 1507338344532941.0], "dt_s": 0.200224, "frame_step": 1}, {"scene": 63, "frame_pair": [50, 51], "timestamp_pair_us": [1507338344633085.0, 1507338344833338.0], "dt_s": 0.200253, "frame_step": 1}, {"scene": 63, "frame_pair": [51, 52], "timestamp_pair_us": [1507338344833338.0, 1507338345033591.0], "dt_s": 0.200253, "frame_step": 1}, {"scene": 63, "frame_pair": [52, 53], "timestamp_pair_us": [1507338345033591.0, 1507338345233814.0], "dt_s": 0.200223, "frame_step": 1}, {"scene": 63, "frame_pair": [56, 57], "timestamp_pair_us": [1507338345534111.0, 1507338345734287.0], "dt_s": 0.200176, "frame_step": 1}, {"scene": 63, "frame_pair": [57, 58], "timestamp_pair_us": [1507338345734287.0, 1507338345934470.0], "dt_s": 0.200183, "frame_step": 1}, {"scene": 63, "frame_pair": [58, 59], "timestamp_pair_us": [1507338345934470.0, 1507338346134731.0], "dt_s": 0.200261, "frame_step": 1}, {"scene": 63, "frame_pair": [60, 61], "timestamp_pair_us": [1507338346234843.0, 1507338346435131.0], "dt_s": 0.200288, "frame_step": 1}, {"scene": 63, "frame_pair": [61, 62], "timestamp_pair_us": [1507338346435131.0, 1507338346635355.0], "dt_s": 0.200224, "frame_step": 1}, {"scene": 63, "frame_pair": [62, 63], "timestamp_pair_us": [1507338346635355.0, 1507338346835468.0], "dt_s": 0.200113, "frame_step": 1}], "frame_step_histogram": {"1": 39785}, "validation": "positive ordered links; median nominal 10Hz; gaps audited", "resampled": false, "dropped_windows": 0}
+Scene boundaries repeat nearest valid history/future frames, poses and targets; all anchors retained.
+I2_mIoU excludes exactly-zero class IoU; standard includes valid zero classes; no visibility mask.
+Future poses are supplied conditioning; future GT occupancy read only AFTER SIX predictions.
+This is literal public index-protocol reproduction, NOT a physically matched 1/2/3s comparison.
+Wall time includes history I/O/GT/metrics; NOT formal FPS. Concurrent jobs may contend for CPU/GPU.
+Original 2Hz code/contracts/results, weights and nuScenes caches unchanged; no automatic promotion.
+details=waymo_validation.json; integer recovery=state.json
+PARALLEL: reused_prefix_windows=35959; execution={'processes': 4, 'threads_per_worker': 1, 'chunk': 8, 'worker_startup_seconds': 22.514327936805785}
+
+RESULT: /root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo10_parallel4_20261010_055012/summary.txt
+^C

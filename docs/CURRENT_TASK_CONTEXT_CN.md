@@ -6,7 +6,7 @@ Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整�
 当前主候选mIoU44.153241 / MovingMicro32.214410；同256×3无损并行Strong多数投票正式FPS已到54.945，详见下文，旧路径保留默认。
 最新已完成：用户服务器跑完static_carry全集，明确确认作为最终论文6秒长时预测路线；avg4–6 IoU41.218153 / mIoU29.117864。
 记录在 `docs/SURFACE_STATIC_CARRY_LONG6S_FINAL_RESULTS_20261009_CN.md` 与 `docs/results/` 原始摘要/结构化转录。
-Waymo 2Hz已完成7998/7998：joint平均IoU61.209875 / mIoU52.152906，相对同模型Transport分别+0.957959 / +0.418007 pp。10Hz双进程服务器16窗成对0.3506→0.1701s/窗，2.062×、六帧/概率/整数计数gate通过；已恢复全集，最新用户日志5088/39987，当前invocation累计0.235s/窗。下一步用户授权安全暂停后同64窗比较2×2与4×1，不自动改旧目录resume参数。10Hz仍按I²-World原native下标协议，尚无完整10Hz分数。
+Waymo两套zero-shot已全部完成并归档：2Hz 7998/7998，joint平均IoU61.209875 / mIoU52.152906；10Hz 39987/39987，joint平均IoU75.100701 / mIoU65.997882。2Hz相对同模型Transport为+0.957959 / +0.418007 pp；10Hz为+0.337958 / −0.113556 pp，不能称两协议全面提升。10Hz按原native+2/+4/+6，即0.2/0.4/0.6s，不是物理1/2/3s；不与2Hz绝对分数直接比较。档案`docs/WAYMO_ZERO_SHOT_FINAL_RESULTS_20261010_CN.md`及`docs/results/surface_ccr_waymo_2hz_10hz_20261010.json`；无需再resume或重跑Waymo。
 
 ## 核心决策与约束
 
@@ -185,6 +185,14 @@ raw free23、无camera/lidar metric mask，未来ego pose显式条件；未来oc
 可确认CCR在该zero-shot人口上三个时距有正增益；没有逐场景统计/置信区间，不能声称所有场景提升、动态指标提升或优于I²-World论文。
 服务器摘要：`/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo_i2world_2hz_20261009_225100_83458/summary.txt`，详细`waymo_validation.json`。
 这是用户粘贴服务器摘要，不是本地原JSON；未提供累计wall time或snapshot SHA，不猜测。评估wall time不等于正式Dense Forecast FPS。
+
+### Waymo两协议最终归档（2026-10-10）
+
+用户提供10Hz完整摘要：status=complete、39987/39987；四进程同目录恢复后完成，最后invocation复用保存前缀35959。原BrokenProcessPool原因未确认，不记录为OOM。
+2Hz/10Hz完整Transport+Joint、全部三个时距/两种mIoU口径、timestamp gap/目标跨度和源目录已记录到独立结果文档、两份摘要及结构化转录JSON；只是用户服务器结果归档，未本地复跑或下载原counts/contract。
+2Hz三时距IoU/mIoU全正收益。10Hz Joint平均75.100701/65.997882，Transport74.762743/66.111438；最短0.2s mIoU−0.557557、0.4s−0.006147、0.6s+0.223036pp。不据此再调阈值/重训/挑权重，不称SOTA。
+最终10Hz目录`outputs/p0_f9_joint_surface_ccr/waymo10_parallel4_20261010_055012`。两协议均无Moving或正式FPS；没有跨全部invocation总wall time或服务器实际HEAD/snapshot SHA，未知保持null。
+详细索引`docs/WAYMO_ZERO_SHOT_FINAL_RESULTS_20261010_CN.md`。以下Waymo入口/测速/接续内容为已完成阶段的实施历史，不是新的待跑任务；后续仅按需收集既有原JSON/契约作复现记录。
 
 用户明确要求10Hz按I²-World代码做：同固定提交load_interval=1/eval_metric=miou，模型forward_test取六未来零基下标eval_time=1/3/5，即native第2/4/6帧，实际名义0.2/0.4/0.6s，不照抄配置注释的错误物理1/2/3s标签。
 独立`waymo_i2world_10hz.py`及`run_p0_f9_joint_surface_waymo_10hz.sh`，原2Hz实现/指纹不改，运行/续评保持兼容。全native人口按实际metadata计算（当前39987），共用一次六帧模型预测评分三下标，不重复三次。保留训练slot clock、同冻结均值/四历史/阈值；未训练或插值适配10Hz，不能称物理长时距或同历史预算比较。

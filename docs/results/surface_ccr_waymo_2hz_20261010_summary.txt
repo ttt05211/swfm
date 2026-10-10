@@ -1,0 +1,26 @@
+===== SURFACE CCR / I2-WORLD WAYMO 2HZ ZERO-SHOT =====
+status=complete
+windows=7998/7998
+Frozen nuScenes mean; NO Waymo training/calibration/threshold search.
+4 history frames including t0 -> 6 futures; report future indices 1/3/5 = nominal 1/2/3s.
+Scene boundaries repeat valid frames/targets, as in official code.
+branch/horizon             IoU   I2_mIoU standard_mIoU
+transport/average         60.251916  51.734899     51.734899
+transport/1               67.552118  59.487389     59.487389
+transport/2               59.659763  50.866556     50.866556
+transport/3               53.543867  44.850752     44.850752
+joint/average             61.209875  52.152906     52.152906
+joint/1                   68.209418  59.602591     59.602591
+joint/2                   60.669601  51.381103     51.381103
+joint/3                   54.750606  45.475025     45.475025
+I2_mIoU excludes exactly-zero class IoU (upstream behavior); standard includes valid zero classes.
+Timestamp gap audit: {"pair_count": 7796, "nominal_dt_s": 0.5, "typical_bounds_s": [0.35, 0.65], "outlier_count": 15, "outlier_fraction": 0.0019240636223704464, "outliers_by_scene": {"63": 6, "11": 2, "6": 5, "42": 1, "92": 1}, "examples": [{"scene": 63, "frame_pair": [45, 50], "dt_s": 0.70069, "timestamp_pair_us": [1507338343932395.0, 1507338344633085.0], "frame_step": 5}, {"scene": 63, "frame_pair": [50, 55], "dt_s": 0.800955, "timestamp_pair_us": [1507338344633085.0, 1507338345434040.0], "frame_step": 5}, {"scene": 63, "frame_pair": [55, 60], "dt_s": 0.800803, "timestamp_pair_us": [1507338345434040.0, 1507338346234843.0], "frame_step": 5}, {"scene": 63, "frame_pair": [60, 65], "dt_s": 0.900622, "timestamp_pair_us": [1507338346234843.0, 1507338347135465.0], "frame_step": 5}, {"scene": 63, "frame_pair": [65, 70], "dt_s": 0.699957, "timestamp_pair_us": [1507338347135465.0, 1507338347835422.0], "frame_step": 5}, {"scene": 63, "frame_pair": [70, 75], "dt_s": 0.799943, "timestamp_pair_us": [1507338347835422.0, 1507338348635365.0], "frame_step": 5}, {"scene": 11, "frame_pair": [98, 103], "dt_s": 0.702908, "timestamp_pair_us": [1507944310800978.0, 1507944311503886.0], "frame_step": 5}, {"scene": 11, "frame_pair": [168, 173], "dt_s": 0.699919, "timestamp_pair_us": [1507944318221130.0, 1507944318921049.0], "frame_step": 5}, {"scene": 6, "frame_pair": [59, 64], "dt_s": 0.700004, "timestamp_pair_us": [1521827616378370.0, 1521827617078374.0], "frame_step": 5}, {"scene": 6, "frame_pair": [64, 69], "dt_s": 0.900356, "timestamp_pair_us": [1521827617078374.0, 1521827617978730.0], "frame_step": 5}, {"scene": 6, "frame_pair": [69, 74], "dt_s": 0.899946, "timestamp_pair_us": [1521827617978730.0, 1521827618878676.0], "frame_step": 5}, {"scene": 6, "frame_pair": [74, 79], "dt_s": 0.699829, "timestamp_pair_us": [1521827618878676.0, 1521827619578505.0], "frame_step": 5}, {"scene": 6, "frame_pair": [139, 144], "dt_s": 0.699903, "timestamp_pair_us": [1521827625778712.0, 1521827626478615.0], "frame_step": 5}, {"scene": 42, "frame_pair": [119, 124], "dt_s": 0.699983, "timestamp_pair_us": [1547699966897337.0, 1547699967597320.0], "frame_step": 5}, {"scene": 92, "frame_pair": [6, 11], "dt_s": 1.199943, "timestamp_pair_us": [1557197732448514.0, 1557197733648457.0], "frame_step": 5}], "frame_step_histogram": {"5": 7796}, "validation": "positive ordered links; median nominal 2Hz; rare gaps audited", "resampled": false, "dropped_windows": 0}
+1/2/3s are nominal index-based horizons; actual timestamp spans are reported separately, not retimed.
+Raw labels: author_free23
+Metrics use no lidar/camera visibility mask. Moving metrics are NOT measured for this protocol.
+Future ego poses are supplied conditioning; future occupancy is read only AFTER prediction.
+Wall evaluation timings include preparation/GT/metrics, NOT formal Dense Forecast FPS.
+Weights and all nuScenes caches unchanged. No automatic promotion.
+details=waymo_validation.json; resume integer counts in state.json
+
+RESULT: /root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo_i2world_2hz_20261009_225100_83458/summary.txt

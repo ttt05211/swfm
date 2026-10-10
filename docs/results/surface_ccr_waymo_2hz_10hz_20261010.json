@@ -1,0 +1,862 @@
+{
+  "record_schema": "user_reported_server_summary_transcription_v1",
+  "record_date": "2026-10-10",
+  "scope": "completed Occ3D-Waymo validation zero-shot archival; no new model execution or selection",
+  "metric_unit": "percent",
+  "delta_unit": "percentage_points",
+  "not_original_server_validation_json": true,
+  "common_protocol": {
+    "reference_code_commit": "661d830f9b34ee03ce368db164a72753ab8764a3",
+    "reference_repository": "https://github.com/lzzzzzm/II-World",
+    "model": "clean_joint_V18_Transport_plus_Surface_CCR",
+    "source_epochs": [
+      5,
+      6,
+      8,
+      12,
+      14
+    ],
+    "single_averaged_network": true,
+    "total_history_frames_including_t0": 4,
+    "future_prediction_frames": 6,
+    "weighted_ADD_raw_sigmoid_threshold": 0.5,
+    "REMOVE_enabled": false,
+    "dataset": "Occ3D-Waymo validation 0.4m",
+    "dataset_frame_order": "global_timestamp_sort_then_stride",
+    "eval_metric": "miou",
+    "future_indices_zero_based": [
+      1,
+      3,
+      5
+    ],
+    "mean_definition": "arithmetic mean of three population-level horizon scores",
+    "I2_mIoU_definition": "exclude exactly-zero class IoU before semantic averaging",
+    "standard_mIoU_definition": "include union-valid zero-IoU semantic classes",
+    "equality_of_two_mIoU_definitions_on_these_results_only": true,
+    "visibility_metric_mask": "none",
+    "scene_boundaries": "repeat nearest valid history/future frame, pose and target; keep all anchors",
+    "Waymo_training_or_calibration_or_threshold_search": false,
+    "trained_slot_clock_seconds": 0.5,
+    "temporal_rescaling_or_interpolation": false,
+    "future_ego_poses_supplied_conditioning": true,
+    "future_GT_occupancy_read_only_after_six_predictions": true,
+    "reuse_nuscenes_geometry_caches_for_Waymo": false
+  },
+  "results": [
+    {
+      "name": "Waymo_2Hz_index_zero_shot",
+      "status": "complete",
+      "completed_windows": 7998,
+      "total_windows": 7998,
+      "official_native_metadata_frames": 39987,
+      "load_interval": 5,
+      "scene_count": 202,
+      "scene_count_source": "existing official metadata audit; not reaudited locally this turn",
+      "nominal_report_horizons_seconds": [
+        1,
+        2,
+        3
+      ],
+      "native_future_frame_offsets": [
+        10,
+        20,
+        30
+      ],
+      "source": {
+        "kind": "user_reported_server_summary",
+        "summary_file": "surface_ccr_waymo_2hz_20261010_summary.txt",
+        "attached_text_sha256": null,
+        "server_evaluation_directory": "/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo_i2world_2hz_20261009_225100_83458",
+        "server_summary_file": "/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo_i2world_2hz_20261009_225100_83458/summary.txt",
+        "server_validation_json": "/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo_i2world_2hz_20261009_225100_83458/waymo_validation.json",
+        "actual_server_git_head": null,
+        "checkpoint_sha256": null,
+        "metadata_sha256": null,
+        "server_raw_counts_available_locally": false,
+        "independently_rerun_locally": false
+      },
+      "metric_rows": [
+        {
+          "branch": "transport",
+          "horizon_key": "average",
+          "IoU": 60.251916,
+          "I2_mIoU": 51.734899,
+          "standard_mIoU": 51.734899
+        },
+        {
+          "branch": "transport",
+          "horizon_key": "1",
+          "IoU": 67.552118,
+          "I2_mIoU": 59.487389,
+          "standard_mIoU": 59.487389
+        },
+        {
+          "branch": "transport",
+          "horizon_key": "2",
+          "IoU": 59.659763,
+          "I2_mIoU": 50.866556,
+          "standard_mIoU": 50.866556
+        },
+        {
+          "branch": "transport",
+          "horizon_key": "3",
+          "IoU": 53.543867,
+          "I2_mIoU": 44.850752,
+          "standard_mIoU": 44.850752
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "average",
+          "IoU": 61.209875,
+          "I2_mIoU": 52.152906,
+          "standard_mIoU": 52.152906
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "1",
+          "IoU": 68.209418,
+          "I2_mIoU": 59.602591,
+          "standard_mIoU": 59.602591
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "2",
+          "IoU": 60.669601,
+          "I2_mIoU": 51.381103,
+          "standard_mIoU": 51.381103
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "3",
+          "IoU": 54.750606,
+          "I2_mIoU": 45.475025,
+          "standard_mIoU": 45.475025
+        }
+      ],
+      "delta_joint_minus_transport_pp": [
+        {
+          "horizon_key": "average",
+          "IoU": 0.957959,
+          "I2_mIoU": 0.418007,
+          "standard_mIoU": 0.418007
+        },
+        {
+          "horizon_key": "1",
+          "IoU": 0.6573,
+          "I2_mIoU": 0.115202,
+          "standard_mIoU": 0.115202
+        },
+        {
+          "horizon_key": "2",
+          "IoU": 1.009838,
+          "I2_mIoU": 0.514547,
+          "standard_mIoU": 0.514547
+        },
+        {
+          "horizon_key": "3",
+          "IoU": 1.206739,
+          "I2_mIoU": 0.624273,
+          "standard_mIoU": 0.624273
+        }
+      ],
+      "timestamp_gap_audit": {
+        "pair_count": 7796,
+        "nominal_dt_s": 0.5,
+        "typical_bounds_s": [
+          0.35,
+          0.65
+        ],
+        "outlier_count": 15,
+        "outlier_fraction": 0.0019240636223704464,
+        "outliers_by_scene": {
+          "6": 5,
+          "11": 2,
+          "42": 1,
+          "63": 6,
+          "92": 1
+        },
+        "examples": [
+          {
+            "scene": 63,
+            "frame_pair": [
+              45,
+              50
+            ],
+            "dt_s": 0.70069,
+            "timestamp_pair_us": [
+              1507338343932395,
+              1507338344633085
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              50,
+              55
+            ],
+            "dt_s": 0.800955,
+            "timestamp_pair_us": [
+              1507338344633085,
+              1507338345434040
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              55,
+              60
+            ],
+            "dt_s": 0.800803,
+            "timestamp_pair_us": [
+              1507338345434040,
+              1507338346234843
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              60,
+              65
+            ],
+            "dt_s": 0.900622,
+            "timestamp_pair_us": [
+              1507338346234843,
+              1507338347135465
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              65,
+              70
+            ],
+            "dt_s": 0.699957,
+            "timestamp_pair_us": [
+              1507338347135465,
+              1507338347835422
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              70,
+              75
+            ],
+            "dt_s": 0.799943,
+            "timestamp_pair_us": [
+              1507338347835422,
+              1507338348635365
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 11,
+            "frame_pair": [
+              98,
+              103
+            ],
+            "dt_s": 0.702908,
+            "timestamp_pair_us": [
+              1507944310800978,
+              1507944311503886
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 11,
+            "frame_pair": [
+              168,
+              173
+            ],
+            "dt_s": 0.699919,
+            "timestamp_pair_us": [
+              1507944318221130,
+              1507944318921049
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 6,
+            "frame_pair": [
+              59,
+              64
+            ],
+            "dt_s": 0.700004,
+            "timestamp_pair_us": [
+              1521827616378370,
+              1521827617078374
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 6,
+            "frame_pair": [
+              64,
+              69
+            ],
+            "dt_s": 0.900356,
+            "timestamp_pair_us": [
+              1521827617078374,
+              1521827617978730
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 6,
+            "frame_pair": [
+              69,
+              74
+            ],
+            "dt_s": 0.899946,
+            "timestamp_pair_us": [
+              1521827617978730,
+              1521827618878676
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 6,
+            "frame_pair": [
+              74,
+              79
+            ],
+            "dt_s": 0.699829,
+            "timestamp_pair_us": [
+              1521827618878676,
+              1521827619578505
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 6,
+            "frame_pair": [
+              139,
+              144
+            ],
+            "dt_s": 0.699903,
+            "timestamp_pair_us": [
+              1521827625778712,
+              1521827626478615
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 42,
+            "frame_pair": [
+              119,
+              124
+            ],
+            "dt_s": 0.699983,
+            "timestamp_pair_us": [
+              1547699966897337,
+              1547699967597320
+            ],
+            "frame_step": 5
+          },
+          {
+            "scene": 92,
+            "frame_pair": [
+              6,
+              11
+            ],
+            "dt_s": 1.199943,
+            "timestamp_pair_us": [
+              1557197732448514,
+              1557197733648457
+            ],
+            "frame_step": 5
+          }
+        ],
+        "frame_step_histogram": {
+          "5": 7796
+        },
+        "validation": "positive ordered links; median nominal 2Hz; rare gaps audited",
+        "resampled": false,
+        "dropped_windows": 0
+      },
+      "actual_target_timestamp_spans": null,
+      "moving_metrics_measured": false,
+      "formal_Dense_Forecast_FPS_measured": false,
+      "cumulative_wall_seconds_all_invocations": null,
+      "completed_resume": null,
+      "reading": "Joint improves IoU and semantic mIoU at all three nominal report horizons"
+    },
+    {
+      "name": "Waymo_10Hz_index_zero_shot",
+      "status": "complete",
+      "completed_windows": 39987,
+      "total_windows": 39987,
+      "official_native_metadata_frames": 39987,
+      "load_interval": 1,
+      "scene_count": 202,
+      "scene_count_source": "existing official metadata audit; not reaudited locally this turn",
+      "nominal_report_horizons_seconds": [
+        0.2,
+        0.4,
+        0.6
+      ],
+      "native_future_frame_offsets": [
+        2,
+        4,
+        6
+      ],
+      "source": {
+        "kind": "user_reported_server_summary",
+        "summary_file": "surface_ccr_waymo_10hz_20261010_summary.txt",
+        "attached_text_sha256": "c902313ccb63b6d81965b227396771309785dc78f2cf50ac18436203f926b296",
+        "server_evaluation_directory": "/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo10_parallel4_20261010_055012",
+        "server_summary_file": "/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo10_parallel4_20261010_055012/summary.txt",
+        "server_validation_json": "/root/nas/occ/swfm/outputs/p0_f9_joint_surface_ccr/waymo10_parallel4_20261010_055012/waymo_validation.json",
+        "actual_server_git_head": null,
+        "checkpoint_sha256": null,
+        "metadata_sha256": null,
+        "server_raw_counts_available_locally": false,
+        "independently_rerun_locally": false
+      },
+      "metric_rows": [
+        {
+          "branch": "transport",
+          "horizon_key": "average",
+          "IoU": 74.762743,
+          "I2_mIoU": 66.111438,
+          "standard_mIoU": 66.111438
+        },
+        {
+          "branch": "transport",
+          "horizon_key": "eval_time_1",
+          "IoU": 78.856326,
+          "I2_mIoU": 71.6317,
+          "standard_mIoU": 71.6317
+        },
+        {
+          "branch": "transport",
+          "horizon_key": "eval_time_3",
+          "IoU": 74.238185,
+          "I2_mIoU": 65.532694,
+          "standard_mIoU": 65.532694
+        },
+        {
+          "branch": "transport",
+          "horizon_key": "eval_time_5",
+          "IoU": 71.193718,
+          "I2_mIoU": 61.169922,
+          "standard_mIoU": 61.169922
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "average",
+          "IoU": 75.100701,
+          "I2_mIoU": 65.997882,
+          "standard_mIoU": 65.997882
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "eval_time_1",
+          "IoU": 78.768551,
+          "I2_mIoU": 71.074143,
+          "standard_mIoU": 71.074143
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "eval_time_3",
+          "IoU": 74.689365,
+          "I2_mIoU": 65.526547,
+          "standard_mIoU": 65.526547
+        },
+        {
+          "branch": "joint",
+          "horizon_key": "eval_time_5",
+          "IoU": 71.844188,
+          "I2_mIoU": 61.392958,
+          "standard_mIoU": 61.392958
+        }
+      ],
+      "delta_joint_minus_transport_pp": [
+        {
+          "horizon_key": "average",
+          "IoU": 0.337958,
+          "I2_mIoU": -0.113556,
+          "standard_mIoU": -0.113556
+        },
+        {
+          "horizon_key": "eval_time_1",
+          "IoU": -0.087775,
+          "I2_mIoU": -0.557557,
+          "standard_mIoU": -0.557557
+        },
+        {
+          "horizon_key": "eval_time_3",
+          "IoU": 0.45118,
+          "I2_mIoU": -0.006147,
+          "standard_mIoU": -0.006147
+        },
+        {
+          "horizon_key": "eval_time_5",
+          "IoU": 0.65047,
+          "I2_mIoU": 0.223036,
+          "standard_mIoU": 0.223036
+        }
+      ],
+      "timestamp_gap_audit": {
+        "pair_count": 39785,
+        "nominal_dt_s": 0.1,
+        "typical_bounds_s": [
+          0.07,
+          0.13
+        ],
+        "outlier_count": 82,
+        "outlier_fraction": 0.0020610782958401406,
+        "outliers_by_scene": {
+          "6": 16,
+          "11": 7,
+          "15": 1,
+          "16": 1,
+          "20": 1,
+          "21": 1,
+          "30": 1,
+          "42": 6,
+          "47": 4,
+          "50": 1,
+          "58": 1,
+          "62": 1,
+          "63": 17,
+          "67": 1,
+          "72": 1,
+          "85": 4,
+          "92": 3,
+          "95": 1,
+          "101": 1,
+          "110": 1,
+          "118": 1,
+          "136": 1,
+          "145": 2,
+          "152": 2,
+          "173": 1,
+          "177": 1,
+          "184": 1,
+          "188": 1,
+          "191": 1,
+          "192": 1
+        },
+        "examples": [
+          {
+            "scene": 85,
+            "frame_pair": [
+              36,
+              37
+            ],
+            "timestamp_pair_us": [
+              1506907169011969,
+              1506907169213222
+            ],
+            "dt_s": 0.201253,
+            "frame_step": 1
+          },
+          {
+            "scene": 85,
+            "frame_pair": [
+              44,
+              45
+            ],
+            "timestamp_pair_us": [
+              1506907169916602,
+              1506907170117267
+            ],
+            "dt_s": 0.200665,
+            "frame_step": 1
+          },
+          {
+            "scene": 85,
+            "frame_pair": [
+              79,
+              80
+            ],
+            "timestamp_pair_us": [
+              1506907173516434,
+              1506907173716133
+            ],
+            "dt_s": 0.199699,
+            "frame_step": 1
+          },
+          {
+            "scene": 85,
+            "frame_pair": [
+              140,
+              141
+            ],
+            "timestamp_pair_us": [
+              1506907179712925,
+              1506907179913213
+            ],
+            "dt_s": 0.200288,
+            "frame_step": 1
+          },
+          {
+            "scene": 152,
+            "frame_pair": [
+              161,
+              162
+            ],
+            "timestamp_pair_us": [
+              1507165352339430,
+              1507165352539398
+            ],
+            "dt_s": 0.199968,
+            "frame_step": 1
+          },
+          {
+            "scene": 152,
+            "frame_pair": [
+              172,
+              173
+            ],
+            "timestamp_pair_us": [
+              1507165353539410,
+              1507165353739480
+            ],
+            "dt_s": 0.20007,
+            "frame_step": 1
+          },
+          {
+            "scene": 62,
+            "frame_pair": [
+              76,
+              77
+            ],
+            "timestamp_pair_us": [
+              1507242776550015,
+              1507242776750026
+            ],
+            "dt_s": 0.200011,
+            "frame_step": 1
+          },
+          {
+            "scene": 16,
+            "frame_pair": [
+              57,
+              58
+            ],
+            "timestamp_pair_us": [
+              1507247214388563,
+              1507247214588452
+            ],
+            "dt_s": 0.199889,
+            "frame_step": 1
+          },
+          {
+            "scene": 67,
+            "frame_pair": [
+              14,
+              15
+            ],
+            "timestamp_pair_us": [
+              1507320705305953,
+              1507320705506024
+            ],
+            "dt_s": 0.200071,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              47,
+              48
+            ],
+            "timestamp_pair_us": [
+              1507338344132575,
+              1507338344332717
+            ],
+            "dt_s": 0.200142,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              48,
+              49
+            ],
+            "timestamp_pair_us": [
+              1507338344332717,
+              1507338344532941
+            ],
+            "dt_s": 0.200224,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              50,
+              51
+            ],
+            "timestamp_pair_us": [
+              1507338344633085,
+              1507338344833338
+            ],
+            "dt_s": 0.200253,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              51,
+              52
+            ],
+            "timestamp_pair_us": [
+              1507338344833338,
+              1507338345033591
+            ],
+            "dt_s": 0.200253,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              52,
+              53
+            ],
+            "timestamp_pair_us": [
+              1507338345033591,
+              1507338345233814
+            ],
+            "dt_s": 0.200223,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              56,
+              57
+            ],
+            "timestamp_pair_us": [
+              1507338345534111,
+              1507338345734287
+            ],
+            "dt_s": 0.200176,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              57,
+              58
+            ],
+            "timestamp_pair_us": [
+              1507338345734287,
+              1507338345934470
+            ],
+            "dt_s": 0.200183,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              58,
+              59
+            ],
+            "timestamp_pair_us": [
+              1507338345934470,
+              1507338346134731
+            ],
+            "dt_s": 0.200261,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              60,
+              61
+            ],
+            "timestamp_pair_us": [
+              1507338346234843,
+              1507338346435131
+            ],
+            "dt_s": 0.200288,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              61,
+              62
+            ],
+            "timestamp_pair_us": [
+              1507338346435131,
+              1507338346635355
+            ],
+            "dt_s": 0.200224,
+            "frame_step": 1
+          },
+          {
+            "scene": 63,
+            "frame_pair": [
+              62,
+              63
+            ],
+            "timestamp_pair_us": [
+              1507338346635355,
+              1507338346835468
+            ],
+            "dt_s": 0.200113,
+            "frame_step": 1
+          }
+        ],
+        "frame_step_histogram": {
+          "1": 39785
+        },
+        "validation": "positive ordered links; median nominal 10Hz; gaps audited",
+        "resampled": false,
+        "dropped_windows": 0
+      },
+      "actual_target_timestamp_spans": {
+        "eval_time_1": {
+          "nominal_seconds": 0.2,
+          "min": 0,
+          "mean": 0.19893245067146823,
+          "max": 0.699997,
+          "zero_time_targets": 202
+        },
+        "eval_time_3": {
+          "nominal_seconds": 0.4,
+          "min": 0,
+          "mean": 0.3958439374796809,
+          "max": 1.099955,
+          "zero_time_targets": 202
+        },
+        "eval_time_5": {
+          "nominal_seconds": 0.6,
+          "min": 0,
+          "mean": 0.5907344247880562,
+          "max": 1.299967,
+          "zero_time_targets": 202
+        }
+      },
+      "moving_metrics_measured": false,
+      "formal_Dense_Forecast_FPS_measured": false,
+      "cumulative_wall_seconds_all_invocations": null,
+      "completed_resume": {
+        "reused_prefix_windows_last_invocation": 35959,
+        "processes": 4,
+        "threads_per_worker": 1,
+        "chunk": 8,
+        "worker_startup_seconds_last_invocation": 22.514327936805785,
+        "prior_worker_failure_type": "BrokenProcessPool",
+        "prior_worker_failure_cause": null
+      },
+      "reading": "Joint raises mean occupancy IoU but slightly lowers mean semantic mIoU; 0.2s both decline, 0.4s mIoU nearly flat, 0.6s both improve"
+    }
+  ],
+  "comparison_limits": [
+    "2Hz nominal1/2/3s and10Hz nominal0.2/0.4/0.6s are different tasks/populations/history time coverage",
+    "10Hz literal public index protocol is not a physically matched1/2/3s comparison",
+    "Same data/score rules do not imply I2-World previous/current temporal-tokenizer history budget is matched",
+    "No local raw counts/contract/hash verification and no external same-protocol baseline reproduction this turn",
+    "No Waymo Moving metrics or formal single-window FPS; multi-process eval throughput is not FPS",
+    "No claim of SOTA, every-scene improvement or independent-test performance"
+  ],
+  "archival_verification": "displayed score rows and derived deltas checked against archived summaries; originals preserved; no model rerun"
+}

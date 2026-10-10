@@ -1,5 +1,12 @@
 # 冻结 Surface CCR：对齐 I²-World 的 Occ3D-Waymo zero-shot
 
+## 完整结果已归档（2026-10-10）
+
+2Hz完整7998锚点：Joint IoU61.209875 / mIoU52.152906；10Hz完整39987锚点：Joint IoU75.100701 / mIoU65.997882。
+两个协议时距/人口不同，不直接比较绝对分数；2Hz修复双指标提升，10Hz平均IoU提升但mIoU略降。
+全部Transport/Joint、三个horizon、指标与时间审计见[最终结果](WAYMO_ZERO_SHOT_FINAL_RESULTS_20261010_CN.md)。
+下文为协议与复现操作，不表示需要重新启动已完成的评估。
+
 ## 当前定义
 
 只评估现有 **epoch5/6/8/12/14 单一均值模型**，不训练、蒸馏或使用 Waymo 调阈值。
