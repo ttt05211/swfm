@@ -320,6 +320,14 @@ Strong/未来变换/owner/fallback/phase/prob/dense各自重算；不训练/改�
 本地相关回归109 passed/2 CUDA skipped，含真实CPU九路推理、原四基线六帧字节一致、权重不变、GT读取边界、地面向量化参考一致、鲁棒平面拒绝、CLI只读/中断恢复；Bash语法/help通过。
 操作与限制见 `docs/STC_CAUSAL_GEOMETRY_SCREEN_CN.md`。本地CPU回归不代表真实服务器候选增益；尚未跑L40S/dev64，不自动扩大到4219全集。
 
+## 最新：失败适配后的单次 yaw 一致性 screen（2026-10-10）
+
+服务器九路dev64已完成：历史路面z/tilt OccPred mIoU−1.212540pp、STCPred−0.403252pp；STC时序地面Pred−0.306691pp、组合−0.644499pp，均失败。156.23s/64包含九路，不是单网络FPS变慢。基线OccPred18.350472/28.307956、STCPred11.960050/21.202278（mIoU/IoU），不能与此前约千窗混拼。
+用户授权再试一次无训练方案：新增独立 `run_p0_f9_stc_trajectory_yaw.sh`，固定dev64 OccPred/STCPred原版与候选共四路；原网络、mean、XY/z/body tilt/阈值不变，可靠历史heading校准预测XY切线yaw，低速/倒车/不稳定/大修正原pose回退。
+仅四历史pose/timestamp与六预测pose进入适配；全部预测完成后才读未来GT用于审计。没有aligned、GT mask、未来真值校正，不重复失败ground分支。不改旧STC实现指纹/结果，单独整数状态/严格resume；候选全pose不变复用原预测，首次真实改yaw仍验完整六帧/概率。
+新规则是待验证因果推理候选，不是COME已有方法或官方原planner reproduction；不保证收益、不自动全集或调参。无清晰增益就停止此路线。详见 `docs/STC_TRAJECTORY_YAW_SCREEN_CN.md`；下一步只需服务器运行新入口、发回summary。
+本地新yaw+旧STC协议/共享执行/失败geometry回归57 passed、1 CUDA skipped；实际CPU小模型原六帧/概率byte parity及权重不变、未来GT隔离、首次延后真实修正仍exactness、严格整数续评/CLI输出保护通过，Bash语法/help/diff通过。不声称全仓CI、CUDA或真实dev64收益；windows-python-env-guard仅使用已验证项目解释器。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
