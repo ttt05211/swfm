@@ -348,6 +348,13 @@ CCR改对/损坏、t0感知质量、pose误差、因果track统计及GT/Pred mot
 错误整窗原子提交及整数/身份/order续评；CLI help、Bash语法通过。
 没有真实服务器输入，不宣称已找到掉分的量化主因或真实增益；未改旧STC实现指纹。
 
+服务器首次分支诊断在 motion fingerprint 直接 `.numpy()` BF16 时报不支持dtype；
+这是新诊断兼容性问题，不是模型预测/数据报错，尚未发布完整首窗计数。
+已改 detach/CPU/contiguous/flatten 后 uint8 reinterpret，哈希包含原dtype/shape/bytes，
+不转FP32、不修改模型/原推理路径。追加BF16/FP16/FP32/FP64/int/bool、标量/空/非连续、
+signed-zero/NaN位模式及四设置BF16读出回归；相关90 passed、1 CUDA skipped。
+代码指纹已变，保留失败目录，使用新STC_DIAG_OUT重跑，不迁移旧契约或重建输入缓存。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。

@@ -11,7 +11,7 @@ import torch
 from real_motion.stc_camera_protocol import SETTINGS
 from real_motion.waymo_i2world import fingerprint, file_sha256
 from tools.real_motion.stc_branch_diagnostic import (ROUTES, PlannerOriginAudit,
-    confusion, quality, edit_counts, evaluate, restore, summary)
+    confusion, quality, edit_counts, output_digest, evaluate, restore, summary)
 from test_stc_camera_protocol import fixture
 
 
@@ -31,6 +31,48 @@ class ModelFixture:
         prep=SimpleNamespace(state=dict(anchors=[strong]*6,current=[]),baseline=[transport]*6,
                              outputs=outputs,raw=raw)
         return prep,[joint]*6,None,{}
+
+
+@pytest.mark.parametrize('dtype',[torch.bfloat16,torch.float16,torch.float32,torch.float64,
+                                 torch.int64,torch.bool])
+@pytest.mark.parametrize('shape',[(2,3),(),(0,3)])
+def test_output_digest_raw_bytes_scalar_empty_and_dtypes(dtype,shape):
+    value=torch.zeros(shape,dtype=dtype,requires_grad=dtype.is_floating_point)
+    before=value.detach().clone()
+    digest=output_digest(dict(motion=value))
+    assert digest==output_digest(dict(motion=value.detach().clone()))
+    assert torch.equal(value,before) and value.grad is None
+    assert digest!=output_digest(dict(other=value))
+    other_dtype=torch.float32 if dtype!=torch.float32 else torch.float64
+    assert digest!=output_digest(dict(motion=value.detach().to(other_dtype)))
+    if value.numel():
+        changed=value.detach().clone(); changed.reshape(-1)[0]=1
+        assert digest!=output_digest(dict(motion=changed))
+
+
+def test_bfloat16_digest_noncontiguous_and_bit_exact():
+    value=torch.arange(12,dtype=torch.bfloat16).reshape(3,4).T
+    assert not value.is_contiguous()
+    assert output_digest(dict(motion=value))==output_digest(dict(motion=value.contiguous()))
+    assert output_digest(dict(motion=value))!=output_digest(dict(motion=value.reshape(-1)))
+    # Equal numerical values, distinct bit patterns (signed zero / NaN payload).
+    for bits in ((0,-32768),(32704,32705)):
+        a=torch.tensor([bits[0]],dtype=torch.int16).view(torch.bfloat16)
+        b=torch.tensor([bits[1]],dtype=torch.int16).view(torch.bfloat16)
+        assert output_digest(dict(motion=a))!=output_digest(dict(motion=b))
+
+
+def test_four_setting_diagnostic_accepts_bfloat16_motion_outputs(tmp_path):
+    source=fixture(tmp_path); windows=source.windows[:1]; source.preflight(windows)
+    predictor=ModelFixture(); full=predictor.full
+    def bfloat16(*args,**kwargs):
+        prep,pred,prob,detail=full(*args,**kwargs)
+        prep.outputs={k:v.to(torch.bfloat16) for k,v in prep.outputs.items()}
+        return prep,pred,prob,detail
+    predictor.full=bfloat16
+    result=evaluate(source,windows,predictor,dict(windows=1))
+    assert result['status']=='complete' and predictor.calls==4
+    assert result['audits'][0]['paired_motion_identical']
 
 
 def test_confusion_orientation_group_semantic_difference_and_edit_accounting():

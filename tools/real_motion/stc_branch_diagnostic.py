@@ -66,8 +66,13 @@ def output_digest(outputs):
     if not outputs: raise RuntimeError('missing motion outputs for paired geometry check')
     for key, value in sorted(outputs.items()):
         if not isinstance(value, torch.Tensor): continue
-        a = value.detach().cpu().contiguous().numpy()
-        h.update(key.encode()); h.update(str((a.dtype.str, a.shape)).encode()); h.update(a.tobytes())
+        tensor = value.detach().cpu().contiguous()
+        # NumPy cannot represent BF16. Reinterpret bytes instead of converting
+        # values to FP32: preserve dtype, signed zero and NaN payload bits too.
+        # Flatten first so scalar tensors can also be viewed as uint8.
+        raw = tensor.reshape(-1).view(torch.uint8).numpy()
+        h.update(key.encode()); h.update(str((str(tensor.dtype), tuple(tensor.shape))).encode())
+        h.update(raw.tobytes())
     return h.hexdigest()
 
 
