@@ -451,6 +451,15 @@ Python不放旧bank哈希覆盖的顶层目录，不改变旧head/提取/协议�
 专项partial+full本地22 passed / 1 CUDA skipped；含active-parent拒绝、无新提取、来源字节不变、部分训练恢复、父bank增长而人口冻结，以及原eval导出兼容。
 加入历史ego/STC/planner相关回归后188 passed / 5 CUDA skipped；真实服务器半量训练尚未运行，未承诺效果。
 
+最新半量服务器已完成：10129窗/fit8998/holdout1131，1轮141步，读取16.76s、训练6.47s；留出prior/learned 3s XY2.268/2.242m。
+dev64 Occ内部/外部mIoU18.861/18.350但IoU26.824/28.308；STC11.133/11.960，内部头尚不采用。
+用户明确要求相同缓存训3轮并评dev512，且快速实现、不做大量额外验证。
+新 `train_surface_ego_three.py` / `eval_surface_ego_three.py` / `run_p0_f9_surface_ego_three.sh`，旧full/partial绑定代码完全不改。
+只读上述completed pilot固定receipt/population/split，从同随机初始化训完整3轮余弦（423步），WM/CCR冻结，无新增提取；固定epoch3。
+复用旧六路评估engine，选manifest完整parent512 keys并严格512窗；无aligned/mask/阈值选优。
+新输出 `_three_epochs` + `_eval_dev512`，支持同目录EGO_THREE_RESUME=1，源bank/原一轮结果不写。
+仅3项针对性CPU测试通过（3轮最终导出/精确Adam-RNG恢复/来源不改/512人口），CLI/Bash通过；未代跑服务器或声称效果。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。

@@ -100,3 +100,23 @@ cat "${EGO_PARTIAL_PARENT}_partial_screen_eval_dev64/summary.txt"
 原完整训练的三份绑定文件完全未改，既有缓存和 `training.json` 都不写入；新试训自己的代码单独绑定，不破坏原 `EGO_FULL_RESUME=1`。如果需要完整实验，原入口继续补完 bank 并按原完整人口训一轮；只能复用 bank，**不能将半量头/Adam 当全量续训断点**，两次余弦总步数及人口不同。
 
 没有按 dev 自动挑权重、调阈值或启动全量，也不据半量结果断言完整训练一定有效/无效。发回新的合并 summary 后再决定。
+
+## 复用相同缓存训3轮，再评 dev512
+
+用户已要求此对照。新的 `run_p0_f9_surface_ego_three.sh` 默认只读已完成的
+`ego_one_epoch_full_20261010_231306_partial_screen` 契约，复用其10129窗口（fit8998/holdout1131）和完全相同的缓存 receipt。
+不补剩余窗口、不重提特征、不更换WM/CCR；原全量及一轮入口/文件完全不改，旧断点保持兼容。
+
+从原随机初始化重新训练3轮，batch64、同R10m目标、3e-4→3e-6整段余弦；预计423次更新。
+不是在一轮最低学习率的断点续两轮。固定第3轮 `head_epoch3.pt`，不挑 dev-best。
+然后固定dev512，OCC/STC × GT/external/internal 六路；直接复用原评估引擎，无aligned、mask或阈值调整。
+默认沿用dev64 manifest中的完整512个 `parent_keys`，检查实际选中恰好512，不只评64也不静默丢窗。
+
+```bash
+bash tools/real_motion/run_p0_f9_surface_ego_three.sh
+cat outputs/p0_f9_joint_surface_ccr/ego_one_epoch_full_20261010_231306_partial_screen_three_epochs_eval_dev512/summary.txt
+```
+
+输出默认为原pilot目录旁的 `_three_epochs`；源路径可用 `EGO_THREE_SOURCE`，输出可用 `EGO_THREE_OUT` 指定。
+中断后同输出设置 `EGO_THREE_RESUME=1` 重跑入口，恢复Adam/随机数/游标；训练完成只接续评估，不重复训练。
+本地仅3项必要测试及CLI/Bash检查；未运行真实L40S或承诺增益。评估时间不是FPS。
