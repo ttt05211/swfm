@@ -306,6 +306,20 @@ Strong/未来变换/owner/fallback/phase/prob/dense各自重算；不训练/改�
 相关回归69 passed/7 CUDA skipped；含新终端launcher原SWFM环境安全恢复，无shell eval。
 真实CUDA/STC数据速度与质量仍待服务器内建检查；详见 `docs/SURFACE_STC_SHARED_EXECUTION_CN.md`。
 
+## 冻结 Pred ego / STC 因果适配集中对照（2026-10-10）
+
+用户明确不做 aligned 修分；优先查 Pred 几何误差与 STC 时序噪声，不改网络、不重训。
+最新约千窗前缀四设置平均 mIoU：OccGT42.723579 / OccPred21.645784 / STCGT20.107599 / STCPred14.205545；未完成全集，不能混早期64窗数字。
+新增独立 `run_p0_f9_stc_causal_geometry.sh`，只跑固定dev64：四基线、各自历史路面z/tilt补偿、STC地面列稳定及组合，共九路。
+路面补偿保留planner世界XY/yaw；历史区域不足、查询在内点凸包外、>0.8m高度或>3度倾斜修正均回退。不修复真实XY/yaw规划误差，不使用未来GT位姿对齐。
+地面稳定只改历史一致支持的class11/12/13/14既有1–3格地面列，最大1格；不把缺失当free、不新增列、动态/其他占据逐字节保护，history masks不变。
+动态组件速度暂不覆盖，只报告同类因果匹配/初速/质心抖动，避免与网络residual冲突；不宣称已解决动态噪声或能恢复二十点落差。
+同mean5/6/8/12/14、ADD0.5/REMOVEoff、4→6、无mask/阈值/epoch搜索；GT-conditioned基线仍仅按原协议读GT ego。
+全部九路预测后才读未来语义与审计GT；每8完整窗口整数保存、同目录严格resume，新终端恢复本次SWFM flags。旧四设置入口/数据/cache/权重/训练/前缀不改。
+摘要一趟输出九路1/2/3s及均值IoU/mIoU、位姿误差分解、STC t0质量、修正支持/拒绝和动态抖动；详细契约/原始计数保留。
+本地相关回归109 passed/2 CUDA skipped，含真实CPU九路推理、原四基线六帧字节一致、权重不变、GT读取边界、地面向量化参考一致、鲁棒平面拒绝、CLI只读/中断恢复；Bash语法/help通过。
+操作与限制见 `docs/STC_CAUSAL_GEOMETRY_SCREEN_CN.md`。本地CPU回归不代表真实服务器候选增益；尚未跑L40S/dev64，不自动扩大到4219全集。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
