@@ -468,6 +468,34 @@ dev评估被我新增的硬512检查拒绝，尚未预测/写评估目录；日�
 公开parent/requested/covered/missing和selection_rule，缺行则标dev512_planner_covered_intersection；parent不足512仍失败。
 5项人口小测试通过，CLI/Bash通过，原three三文件无diff；当前只需服务器运行新增eval-only入口，发summary。
 
+## 内部ego三轮结果与运动学控制集中试验（2026-10-11）
+
+最新服务器完成：原parent512取planner交集495、missing17，所有六设置同人口。
+内部/外部平均mIoU：OCC18.040683/19.990703，STC11.293439/12.210279；
+平均IoU26.548403/28.578451及21.598709/22.622076。OCC 3s XY2.465m，外部1.384m。
+旧内部头不替换planner；不继续自动加轮数，正式WM/CCR/GT/Waymo/6s指标不变。
+
+用户授权认真改内部头、先本地模拟后给服务器集中试验。新增仅在tools/ego_experiments：
+history_state从三历史secant拟合瞬时速度/一致加速度/角速度；小MLP读同七字段/六导航，
+输出三个accel/yaw-rate knot并统一积分六XY/yaw；历史8710参数，场景attention版34502。
+仍固定R10m单项loss，WM/CCR冻结，无新CANbus/地图/未来连续GT/visibility/aligned。
+导航同原GT派生destination命令，不能称navigation-free。静止启动使用ego+X，不混LiDAR导航轴。
+
+本地独立NumPy模拟、固定两seed、各2048train/512same/512shift、各3轮96步：
+原CV/旧Transformer/纯运动学/历史控制/场景控制 FDEsame约3.737/3.510/1.103/1.113/1.105m，
+shift约3.915/3.655/1.355/1.350/1.348m。收益主要是运动学初值，不是神经头已超过prior；
+未来不可观测突变仍5m级，匀速带噪声仍会小幅退化，不保证真实planner收益。
+初始无约束加速度拟合放大噪声，故增加相邻趋势一致保护；全部原始模拟试次/负对照保留。
+
+服务器入口 `bash tools/ego_experiments/run_ego_kinematic.sh`：复用已有三轮来源和10129窗bank，
+不补缓存；同fit8998/holdout1131，两头各3轮423步整周期余弦，固定最终，两头均报告。
+默认一次DEV64共12路：OCC/STC×GT/external/old_epoch3/kinematic_prior/control_history/control_scene。
+自动同目录两Adam/RNG训练恢复和整窗整数续评；新代码单独绑定，不改旧指纹/权重/银行。
+新输出原three_epochs目录同级后缀_kinematic，再_eval_dev64；用户显式可改dev512取planner交集。
+本地31项CPU验收通过（含实际小网格12路线、输入未来隔离、两头精确恢复、旧三轮/partial/人口），
+不宣称实际CUDA/L40S、真实nuScenes涨点或完整CI。详细模拟限制/命令见 `docs/EGO_KINEMATIC_CONTROL_SCREEN_CN.md`。
+本轮未代跑服务器、没有自动推广/扩训；下一步只需上述集中screen摘要。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
