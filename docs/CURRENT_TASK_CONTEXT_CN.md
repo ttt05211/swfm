@@ -294,6 +294,18 @@ STC包扫描尚未确认存在，官方 I²-World 下载链接已核实；现已
 本地STC+Waymo+geometry-carry相关回归63 passed/4 CUDA skipped；实际小模型NumPy/native四设置概率/六帧exactness、无future GT读入、错序/缺失fail-closed、compact逐值相等和中断不重计通过。CLI help/Bash语法通过，不称全仓CI/真实STC精度。
 未下载完整STC数据、未训练/代跑服务器。入口 `run_p0_f9_joint_surface_stc.sh`；顺序命令见 `docs/SURFACE_STC_CAMERA_PRED_EGO_CN.md`，调研见 `docs/CAMERA_PRED_EGO_RESEARCH_20261010_CN.md`。
 
+## STC四设置执行提速（2026-10-10）
+
+用户服务器421–484窗四设置1.7103s/窗；准备0.8247s、证据/投影0.7111s、head0.0406s。
+新增独立 `run_p0_f9_joint_surface_stc_shared.sh`：复用原生CPU warp/Surface fit；
+同一实际历史GT/Pred共享history-only tube/运动与canonical Surface证据，单bundle、内容/pose/visibility key。
+Strong/未来变换/owner/fallback/phase/prob/dense各自重算；不训练/改阈值，不跨模型/历史复用learned输出。
+初次8相同窗口四路六帧逐字节检查+AB/BA实测，>1%提速才接着剩余窗口；不能预告真实L40S倍数。
+显式只读旧STC状态桥接到新输出，源/新租约全程持有、契约与integer counts校验，原入口/源码/旧结果不改。
+本地CPU小模型byte与整数恢复、不同历史失效、科学变更拒绝、CLI源只读/严格恢复、租约及篡改检查通过。
+相关回归69 passed/7 CUDA skipped；含新终端launcher原SWFM环境安全恢复，无shell eval。
+真实CUDA/STC数据速度与质量仍待服务器内建检查；详见 `docs/SURFACE_STC_SHARED_EXECUTION_CN.md`。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
