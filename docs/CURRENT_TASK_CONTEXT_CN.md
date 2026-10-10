@@ -376,8 +376,22 @@ GT/Pred motion bytes一致64窗；原始JSON当时缺失，起点审计未核验
 不自动重索引、改pose或aligned修分；旧四设置/shared/branch/protocol实现指纹保持不变。
 本地相关回归112 passed / 1 CUDA skipped（新专项22项），Bash/CLI help通过；
 最初旧native默认缓存权限失败，显式复用tmp验证缓存后已通过，不是诊断实现故障。
-实际服务器t0核验尚未跑；用户上传这个小JSON后运行新入口发回summary。操作见
-`docs/ORIGINAL_PLANNER_T0_AUDIT_CN.md`。不重启失败适配或新训练。
+实际服务器t0核验已完成：4219/4219缓存pose重建通过；3600 unique-XY、619 compatible-ambiguous。
+完整6019行origin均兼容，最大XY误差0.000171m，没有row-shift证据；停车/重访不冒充唯一身份。
+不重启失败的无训练适配。详情 `docs/ORIGINAL_PLANNER_T0_AUDIT_CN.md`。
+
+## 冻结共享历史特征的内部ego头（2026-10-10）
+
+用户已授权实现；本轮不自动启动服务器训练。现有mean5/6/8/12/14、GT版本、原四设置和原代码路径不改。
+新增独立0.43M ego头：V18历史物体context（最多64，只限头池化）、CCR历史encode的8×8静态空间token、
+四帧实际历史ego运动→6时间query×right/left/straight→相对t0绝对XY/yaw；不是物体WM残差。
+只训头，XY Smooth-L1+周期yaw，特征先于未来投影生成；训练bank明确绑定冻结权重/历史数据/代码指纹。
+输出pose统一进入Strong/搬运/CCR投影及phase；保留t0 z/tilt，无future GT occupancy/mask/CANbus输入或aligned评分。
+导航采用I² converter的LiDAR末端x±2m规则、GAST未来destination行；显式GT派生navigation-conditioned，不称无导航预测。
+新入口 `run_p0_f9_surface_ego_head.sh` 默认TRAIN1024头20轮余弦 + 一次固定dev64六路（OCC/STC×GT/external/internal）。
+最终轮头、不选dev-best、不自动重试/扩训；bank、Adam/LR/RNG/游标/整窗计数严格续训续评，输出互斥lease。
+本地全量非集成验收1789 passed / 75 skipped / 4 deselected；CUDA专项本地跳过，不是实际L40S精度/FPS结论。
+文档 `docs/SURFACE_FROZEN_EGO_HEAD_CN.md`。
 
 ## 仅按需检索的历史
 
