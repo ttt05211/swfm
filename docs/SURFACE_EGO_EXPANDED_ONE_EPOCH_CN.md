@@ -72,3 +72,31 @@ bash tools/real_motion/run_p0_f9_surface_ego_full.sh
 只需发回 `${EGO_FULL_OUT}_eval_dev64/summary.txt` 内容：它合并 TRAIN 留出集、最终轮、先验、OCC/STC 三种轨迹条件的 IoU/mIoU 和轨迹误差。若效果不好，不自动重试、扩训或替换正式指标。
 
 本地专项与相关回归：180 passed / 5 CUDA skipped；覆盖真实 CPU 小网格冻结 WM 的历史提取、旧 bank 只读复用、部分 bank/训练/评估恢复、短 batch 加权、源码/游标/导出破坏拒绝，以及最终轮而非 best 选择。CUDA 测试跳过，不等于已验证真实 L40S 指标。
+
+## 已建到一半时先试训（追加，不改变原全量契约）
+
+`EGO_FULL_BANK window=7168/20430` 表示完成了 7,168 个历史特征窗口，不是完成了这些窗口的头训练。旧任务要等 bank 完整才开始训练。为了省掉没有必要的剩余提取，增加独立的 `run_p0_f9_surface_ego_partial.sh`。
+
+先在原终端按一次 Ctrl-C 并等待安全保存及提示符。新入口会持有原目录的内核 lease；如果原进程仍运行，它会拒绝启动，不自动杀进程。
+
+```bash
+conda activate OccFM
+cd /root/nas/occ/swfm
+bash tools/real_motion/run_p0_f9_surface_ego_partial.sh
+```
+
+它只读已落盘的连续 bank 前缀，最多 10,240 窗；如果现在只有 7,168 窗，就用这 7,168 窗，不补齐、不重建、不复制大 bank。沿用原全量场景的 fit/holdout 身份，固定随机初始化、batch64/R10m/单轮余弦，固定第1轮头，然后同一个 dev64 六设置评估。此快筛是按场景排序的已有前缀，不是均衡抽样、不能冒充完整 TRAIN 的代表性指标。
+
+默认新输出为 `原全量目录_partial_screen`，结果为 `原全量目录_partial_screen_eval_dev64/summary.txt`。如果只找到一个全量任务，入口自动识别；多于一个时拒绝猜测，请显式指定：
+
+```bash
+export EGO_PARTIAL_PARENT="原全量任务的完整路径"
+bash tools/real_motion/run_p0_f9_surface_ego_partial.sh
+cat "${EGO_PARTIAL_PARENT}_partial_screen_eval_dev64/summary.txt"
+```
+
+半量试训中断后，用同一父目录和 `EGO_PARTIAL_RESUME=1` 恢复。人口/receipt固定，不会因父 bank 以后增长而偷偷扩大 pilot 数据。
+
+原完整训练的三份绑定文件完全未改，既有缓存和 `training.json` 都不写入；新试训自己的代码单独绑定，不破坏原 `EGO_FULL_RESUME=1`。如果需要完整实验，原入口继续补完 bank 并按原完整人口训一轮；只能复用 bank，**不能将半量头/Adam 当全量续训断点**，两次余弦总步数及人口不同。
+
+没有按 dev 自动挑权重、调阈值或启动全量，也不据半量结果断言完整训练一定有效/无效。发回新的合并 summary 后再决定。

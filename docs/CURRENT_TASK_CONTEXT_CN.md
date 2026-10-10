@@ -442,6 +442,15 @@ Python不放旧bank哈希覆盖的顶层目录，不改变旧head/提取/协议�
 本地180 passed / 5 CUDA skipped，含实际CPU冻结WM历史bank、原文件保护、部分恢复/破坏拒绝；未启动服务器、没有真实扩大训练指标。
 只需发 `_eval_dev64/summary.txt`，训练/构建耗时分开；文档 `docs/SURFACE_EGO_EXPANDED_ONE_EPOCH_CN.md`。
 
+用户服务器已建到7168/20430，尚未开始ego优化；最新要求先用半量试训，有效才处理余量，已同意Ctrl-C安全暂停。
+新增独立 `screen_surface_ego_partial.py` / `run_p0_f9_surface_ego_partial.sh`，原full三份指纹文件完全不改。
+只读连续已完成bank前缀、最多10240，少于此数量则直接用现有，不补特征、不复制大bank；原全量场景fit/holdout身份保持。
+一轮原初始化/R10m/batch64余弦，固定第1轮导出，再复用原dev64六路 evaluator。前缀按scene排序，不称代表性完整TRAIN。
+源/新目录lease隔离、原契约/receipt/权重只读，pilot恢复人口不随源bank增长；完成不自动恢复全量。
+原full可继续复用所有bank，但pilot头/Adam不是full断点；不静默改变原一轮的总步数。入口唯一父任务自动识别，多任务须显式EGO_PARTIAL_PARENT。
+专项partial+full本地22 passed / 1 CUDA skipped；含active-parent拒绝、无新提取、来源字节不变、部分训练恢复、父bank增长而人口冻结，以及原eval导出兼容。
+加入历史ego/STC/planner相关回归后188 passed / 5 CUDA skipped；真实服务器半量训练尚未运行，未承诺效果。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
