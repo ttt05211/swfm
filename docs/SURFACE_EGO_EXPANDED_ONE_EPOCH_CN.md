@@ -120,3 +120,20 @@ cat outputs/p0_f9_joint_surface_ccr/ego_one_epoch_full_20261010_231306_partial_s
 输出默认为原pilot目录旁的 `_three_epochs`；源路径可用 `EGO_THREE_SOURCE`，输出可用 `EGO_THREE_OUT` 指定。
 中断后同输出设置 `EGO_THREE_RESUME=1` 重跑入口，恢复Adam/随机数/游标；训练完成只接续评估，不重复训练。
 本地仅3项必要测试及CLI/Bash检查；未运行真实L40S或承诺增益。评估时间不是FPS。
+
+### 3轮已完成后的512人口检查修复（仅评估）
+
+服务器已经成功完成3轮423步，留出FDE2.219904m。旧 evaluator 将manifest父集合、请求512和planner可用集合硬要求同为512而拒绝评估。
+日志未给出具体父集合/覆盖数量，不能断言缺多少行。使用新增 `run_p0_f9_surface_ego_three_eval.sh`，直接读取既有 `head_epoch3.pt`，不重新训练或读取TRAIN bank。
+为保持checkpoint绑定的代码SHA，原3份three文件一个都不改；新人口修复 evaluator 单独绑定评估契约，旧导出仍通过原验证。
+
+若manifest已有selected512则原样用；否则从不少于512的冻结parent按原scene-balanced规则固定512，再求planner交集。
+不补行、不pad、不在缺行后重抽凑512。全部六设置同一交集；少于512时显式称 `dev512_planner_covered_intersection`，报告父集合/请求/实际/缺失数量和完整身份，不冒充完整512。
+若parent本身少于512仍拒绝，并明确提示换完整parent manifest。
+
+```bash
+bash tools/real_motion/run_p0_f9_surface_ego_three_eval.sh
+```
+
+默认原three输出旁的 `_eval_dev512`，读取源training.json恢复原SWFM环境。已有state时自动接续同一评估，不写训练文件。
+仅5項人口专项测试以及CLI/Bash检查；真实服务器父集合/覆盖数量等待实际输出，未重新训练或宣称dev效果。

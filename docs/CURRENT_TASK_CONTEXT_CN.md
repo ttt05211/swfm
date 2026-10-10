@@ -460,6 +460,14 @@ dev64 Occ内部/外部mIoU18.861/18.350但IoU26.824/28.308；STC11.133/11.960，
 新输出 `_three_epochs` + `_eval_dev512`，支持同目录EGO_THREE_RESUME=1，源bank/原一轮结果不写。
 仅3项针对性CPU测试通过（3轮最终导出/精确Adam-RNG恢复/来源不改/512人口），CLI/Bash通过；未代跑服务器或声称效果。
 
+2026-10-11服务器3轮423步已完成，TRAIN holdout FDE2.219904（prior2.267768），WM/CCR未更新。
+dev评估被我新增的硬512检查拒绝，尚未预测/写评估目录；日志没有parent/覆盖数，具体原因未可区分。
+新增独立 `eval_surface_ego_three_population.py` / `run_p0_f9_surface_ego_three_eval.sh`，只评既有head_epoch3，不跑fit/重缓存。
+保留原three绑定3文件字节不变以避免checkpoint SHA拒绝；修复evaluator自身SHA纳入新eval契约。
+选manifest已有selected512，否则parent>=512按固定round-robin请求512；先固定名单再取planner交集，不补样本。
+公开parent/requested/covered/missing和selection_rule，缺行则标dev512_planner_covered_intersection；parent不足512仍失败。
+5项人口小测试通过，CLI/Bash通过，原three三文件无diff；当前只需服务器运行新增eval-only入口，发summary。
+
 ## 仅按需检索的历史
 
 冻结 Surface CCR 完整 TRAIN×3 DEV512 mIoU40.418031/Micro31.052754；扩大 VAL4369 mIoU43.991199/Micro32.043717。
