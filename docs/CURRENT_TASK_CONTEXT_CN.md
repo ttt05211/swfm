@@ -2,6 +2,19 @@
 
 ## 最新任务：最终占据监督 + 内部 ego 的独立联合试训
 
+2026-10-11最新用户授权实现软推理提速，不新训练/不重跑DEV512。新增隔离 `soft_inference/fast.py`：三未来合批、六张byte网格单次CPU回传、单forward合法actor/action索引与常量复用、ADD-only跳过恒零REMOVE、推理scratch原位合成不存反传中间量；18类/全网格/float64几何/原插值/owner/fallback/覆盖顺序不变。
+新增 `run_optimized.sh`：自动找到已完成soft_dev512质量目录并校验source快照/整数计数/精确人口；只读复用512指标，新目录测同32窗×2交替五路（hard、旧soft ADD/ADD+REMOVE、新soft ADD/ADD+REMOVE）。新路径六帧byte gate必须通过，两遍更快/≥1.1×/10%VRAM余量才pass，无自动部署/新训练。首窗另作串行分段定位，不计吞吐。
+计时边界v2保持历史extract/match/H2D在外，live Strong/KTA/网络/投影/六帧CPU输出在内；精确识别直接KTA和旧upgrade缓存舍入公式，再实时重建保持原冻结输入，不放宽输入/输出gate。未知编码拒绝。训练源码/恢复指纹/历史缓存内容不变；Ctrl-C完整测速窗后保存，同SOFT_OUT+SOFT_RESUME恢复，旧质量/权重AdamRNG只读。
+本地41项专项及loss/action/fast回归通过，CLI/help/Bash/diff检查通过。CPU合成单源640000体素render+argmax微测ADD3.292→3.460s、ADD+REMOVE3.410→3.246s，没稳定通用加速；不能外推L40S/整网FPS，当前尚无新版服务器性能。旧正式54.945FPS及GT3质量原数据不改；详见 `docs/JOINT_OCC_FROZEN_SOFT_DEV512_CN.md`，仅执行新的短测速入口，不执行旧retime-only或完整run.sh。
+
+最新用户问软推理能否提速及两路线优先级，纠正涨点分解：最终soft ADD-only−hard ADD-only=2.431369pp，其中Transport读出差1.071885，CCR净增益差0.776828−(−0.582656)=1.359484；后者不能混称2.43或当严格因果份额。
+只读代码确认当前软推理逐horizon render_group([h])并逐帧CPU回传；每帧重新选合法actor/action行，per-actor/action unique排序+scatter，18类dense static grid_sample/合成，且走保存反传中间量的通用训练compositor。推理专用、两/三未来合批+统一回传、单forward索引复用/跳过ADD-only零REMOVE、再必要时GPU融合是具体候选，尚无分段CUDA证据或新版实测，不能承诺倍率/无损。
+建议先有限预算优化冻结soft推理，因为40.321095已真实验证，硬前向重训收益未知且算法重采样差不一定可追回；若优化后仍显著慢，再转硬前向连续代理训练。旧计时接口用户取消重测；本轮只分析/更新记忆，没有新的执行后端、训练或服务器测评。
+
+最新用户已返回GT三轮DEV512六读出：hard Transport/ADD/ADD+REMOVE mIoU38.472382/37.889726/37.908709，soft39.544267/40.321095/40.211083；soft ADD收益+0.776828pp，hard ADD收益−0.582656pp。soft REMOVE增量−0.110012pp/Moving−1.141919pp。实测硬106.159ms、软334.836/334.674ms六帧；不能将慢软输出直接替换快速推理，亦不能把旧正式54.945FPS赋给此GT三轮模型。
+最新用户明确取消接口重测，当前只讨论如何朝硬合成优化训练；没有授权这轮启动新训练。计时边界已在本地隔离soft_inference代码修正：历史extract/match/H2D在外，fresh Strong/KTA/live网络/投影/六帧CPU输出在内；已有512整数质量可新目录只读复用，旧timing丢弃。4项本地专项通过，未重测服务器、未推送、未改变原训练/缓存指纹；复测入口目前不执行。
+训练侧候选：前向对齐部署Strong背景、source硬落格/覆盖、owner/fallback/合法动作与固定ADD0.5/REMOVE0.95，反向连续代理/直通近似；保留CE+Lovász和source geometry/existence，Pred再经连续pose代理回ego。不是将uint8/one-hot直接CE即可；必须处理概率平滑/错误体素梯度及离散竞争代理偏差，不能承诺稳定性/涨点。推理仍旧硬后端，无额外soft pass；尚未实现硬前向训练器，需微调/重训才能评估。
+
 2026-10-11最新用户要求冻结当前GT三轮，先DEV512软输出并同窗软/硬推理测速，不新训练。
 新增独立 `soft_inference/` 入口，默认source `gt3_horizon_float_resume_20261011_151144/last.pt`（epoch3/update3088）。
 源快照只读、精确源eval_keys512；hard/soft各Transport、ADD-only、ADD+REMOVE，完整六帧机制不改，报告1/2/3s全网格IoU/mIoU/Moving。soft仍既有连续context/概率合成argmax；hard固定ADD0.5/REMOVE0.95，无dev选路/阈值搜索。

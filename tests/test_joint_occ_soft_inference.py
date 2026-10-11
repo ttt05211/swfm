@@ -38,16 +38,22 @@ def test_fresh_timing_rebuilds_strong_and_composes_only_one_hard_route(monkeypat
     session = BothActionsExecution(model.columns, provider.device)
     provider.paired_eval_sessions = {id(model.columns): session}
     provider.strong.max_match_speed_mps = 30
+    # A stationary causal prior, unlike the original artificial fixture's
+    # constant displacement at every future horizon.
+    row[0]['kta_displacement_xy_m'] = torch.zeros(1, 6, 2)
+    row[0]['anchors_xy_t0_m'] = row[0]['source_centroid_xy_t0_m'][:, None].expand(-1, 6, -1)
     backgrounds = copy.deepcopy(row[1]['_column_causal_preparation']['prepared_state']['column_backgrounds'])
     expected = engine.quality_predictions(model, provider, row, horizons=range(6))
     calls = []
-    monkeypatch.setattr(runtime, 'extract_instances_cropped_exact', lambda *a, **kw: [])
-    monkeypatch.setattr(runtime, 'match_instances', lambda *a, **kw: {})
+    historical = []
+    def extract(*a, **kw): historical.append('extract'); return []
+    def match(*a, **kw): historical.append('match'); return {}
+    monkeypatch.setattr(runtime, 'extract_instances_cropped_exact', extract)
+    monkeypatch.setattr(runtime, 'match_instances', match)
     def fresh(*a, **kw):
         calls.append(kw); return backgrounds, [[] for _ in range(6)]
     monkeypatch.setattr(runtime, '_strong_all_horizons', fresh)
-    from tools.joint_occ_experiments import data
-    monkeypatch.setattr(data, 'compose_component_replacements_fast_exact', lambda anchor, *a, **kw: anchor.copy())
+    monkeypatch.setattr(engine, 'compose_component_replacements_fast_exact', lambda anchor, *a, **kw: anchor.copy())
     monkeypatch.setattr(runtime, 'baseline_clear_flat_indices', lambda *a, **kw: np.empty(0, np.int64))
     row[1]['_column_causal_preparation']['prepared_state']['column_backgrounds'] = 'POISON_CACHED_STRONG'
     row[1]['future_gt_occ'] = 'POISON_LABELS'
@@ -55,10 +61,14 @@ def test_fresh_timing_rebuilds_strong_and_composes_only_one_hard_route(monkeypat
     def compose(*a, **kw): compositions.append(kw); return original(*a, **kw)
     monkeypatch.setattr(engine, 'compose_canonical', compose)
     try:
+        prepared, _ = engine.prepare_speed_row(provider, row)
+        assert historical == ['extract', 'match'] and not calls
         for route in engine.SPEED_ROUTES:
-            actual = engine.infer(model, provider, row, route)
+            actual = engine.infer(model, provider, prepared, route)
             assert engine.mismatch_voxels(expected[route], actual) == 0
+        assert historical == ['extract', 'match']  # no matching inside infer
         assert len(calls) == 3 and len(compositions) == 1
+        assert '_speed_history' not in row[1]  # original raw/cache untouched
         assert compositions[0]['thresholds'] == (.5, .95)
     finally: session.close()
 
@@ -68,15 +78,20 @@ def test_timing_alternates_complete_routes_and_retains_failures(monkeypatch):
     volume = np.zeros((2, 2, 2), np.uint8)
     expected = {r: [volume]*6 for r in engine.ROUTES}
     monkeypatch.setattr(engine, 'quality_predictions', lambda *a, **kw: expected)
+    preparations = []
+    def prepare(*a): preparations.append('prepare'); return row, .03
+    monkeypatch.setattr(engine, 'prepare_speed_row', prepare)
     order = []
     def infer(*args, **kwargs):
         route = args[3]; order.append(route); return [volume.copy() for _ in range(6)]
     monkeypatch.setattr(engine, 'infer', infer)
     timing = engine.measure_window(None, provider, row, 0)
+    assert preparations == ['prepare'] and timing['excluded_history_prepare_seconds'] == .03
     assert order == list(engine.SPEED_ROUTES)*2+list(reversed(engine.SPEED_ROUTES))
     assert timing['six_frame_byte_parity']
     report = engine.speed_summary([timing], actual_cuda=True)
     assert report['valid_same_quality_route_timing']
+    assert report['timing_boundary_version'] == 2
     assert all(r['measurements'] == 2 for r in report['routes'].values())
     assert not engine.speed_summary([timing], actual_cuda=False)['valid_same_quality_route_timing']
     def wrong(*args, **kwargs): return [np.ones_like(volume)]*6
@@ -142,10 +157,11 @@ def test_cli_quality_then_speed_stop_resume_512_and_source_rng_unchanged(monkeyp
     event.clear(); monkeypatch.setattr(run, 'quality_predictions', lambda *a, **kw: predictions)
     def speed(m, p, r, index, **kw):
         event.set()
+        routes = engine.OPTIMIZED_SPEED_ROUTES if kw.get('compare_optimized') else engine.SPEED_ROUTES
         return dict(key=[r[0]['scene_name'], r[0]['t0_token']], six_frame_byte_parity=True,
-            mismatched_voxels={r: 0 for r in engine.SPEED_ROUTES},
+            mismatched_voxels={r: 0 for r in routes},
             samples=[dict(route=r, repeat=j, seconds=.1, peak_reserved_mib=None, peak_allocated_mib=None)
-                     for j in range(2) for r in engine.SPEED_ROUTES])
+                     for j in range(2) for r in routes])
     monkeypatch.setattr(run, 'measure_window', speed)
     assert run.main(args+['--resume-evaluation'], event) == 0
     second = json.loads((out/'state.json').read_text())
@@ -166,3 +182,40 @@ def test_cli_quality_then_speed_stop_resume_512_and_source_rng_unchanged(monkeyp
     contract = json.loads((out/'contract.json').read_text())
     second['speed_windows'][0]['key'] = ['WRONG', 'WINDOW']
     with pytest.raises(RuntimeError, match='population'): run.validate_state(second, contract)
+    # A separate speed-only output uses old integer counts, not old timing.
+    from tools.joint_occ_experiments.soft_inference.receipts import completed_quality, discover_completed
+    original_files = {name: (out/name).read_bytes() for name in
+                      ('contract.json', 'state.json', 'evaluation.json', 'source_snapshot.pt')}
+    def forbidden(*a, **kw): raise AssertionError('512-window scoring must NOT run again')
+    monkeypatch.setattr(run, 'quality_predictions', forbidden)
+    monkeypatch.setattr(run, 'gt_moving_support_sequence', forbidden)
+    retime = tmp_path/'speed_only'
+    retime_args = args.copy(); retime_args[retime_args.index('--out-dir')+1] = str(retime)
+    assert run.main(retime_args+['--reuse-quality-from', str(out), '--compare-optimized-speed']) == 0
+    reused = json.loads((retime/'evaluation.json').read_text())
+    assert reused['status'] == 'complete' and reused['metrics'] == final['metrics']
+    assert reused['contract']['quality_reuse']['old_timing_discarded']
+    assert reused['contract']['compare_optimized_speed'] and len(reused['speed']['routes']) == 5
+    with pytest.raises(RuntimeError, match='contract changed'):
+        run.main(retime_args+['--resume-evaluation', '--compare-optimized-speed', '--fast-horizons', '2'])
+    assert json.loads((retime/'state.json').read_text())['metric_counts'] == counts
+    assert all((out/name).read_bytes() == value for name, value in original_files.items())
+    # v1 receipts remain usable despite their old timing implementation.
+    old_contract = json.loads((out/'contract.json').read_text())
+    old_contract['protocol'] = 'joint_occ_frozen_soft_hard_dev512_paired_inference_v1'
+    old_contract['implementation'] = 'OLD_BOUNDARY_SOURCE'
+    old_result = json.loads((out/'evaluation.json').read_text())
+    old_result['contract'] = old_contract
+    (out/'contract.json').write_text(json.dumps(old_contract))
+    (out/'evaluation.json').write_text(json.dumps(old_result))
+    _, imported, receipt = completed_quality(out)
+    assert imported['windows'] == 512 and not imported['speed_windows']
+    assert receipt['old_timing_discarded']
+    bad_contract = copy.deepcopy(old_contract); bad_contract['thresholds'] = [.6, .95]
+    with pytest.raises(RuntimeError, match='differs: thresholds'):
+        completed_quality(out, bad_contract)
+    old_result['status'] = 'stopped'
+    (out/'evaluation.json').write_text(json.dumps(old_result))
+    with pytest.raises(RuntimeError, match='completed compatible'): completed_quality(out)
+    with pytest.raises(RuntimeError, match='no completed'): discover_completed(tmp_path)
+    assert (source/'last.pt').read_bytes() == original and torch.equal(original_rng, torch.get_rng_state())

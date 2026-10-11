@@ -14,7 +14,7 @@ SOFT_OUT="${SOFT_OUT:-$ROOT/outputs/p0_f9_joint_occ_ego/soft_dev512_$(date +%Y%m
 DATAROOT="${DATAROOT:-/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes}"
 extra=()
 if [[ "${SOFT_RESUME:-0}" == 1 ]]; then extra+=(--resume-evaluation); fi
-echo 'Frozen GT three-epoch pilot: exact DEV512 six readouts; then same 32 windows x2 soft/hard six-frame inference.'
+echo 'Frozen GT three-epoch pilot: DEV512 readouts OR verified count reuse; fixed short same-window six-frame inference.'
 echo 'No training/new bank; old history caches read only. Fresh Strong in timing; raw history/I/O excluded.'
 echo "Source: $SOFT_CHECKPOINT; Output: $SOFT_OUT"
 exec "$PY" -u -m tools.joint_occ_experiments.soft_inference.run \

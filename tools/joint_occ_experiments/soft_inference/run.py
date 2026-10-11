@@ -13,14 +13,15 @@ from ..execution import BothActionsExecution
 from ..performance.probe import legacy_fingerprint
 from ..horizons.probe import execution_fingerprint
 from ..diagnostics.run import model_digest, metric_state, restore_metrics
-from .engine import ROUTES, SPEED_ROUTES, quality_predictions, measure_window, speed_summary
+from .engine import ROUTES, SPEED_ROUTES, OPTIMIZED_SPEED_ROUTES, quality_predictions, measure_window, speed_summary
+from .receipts import completed_quality
 from tools.real_motion.joint_training_recovery import snapshot_checkpoint, preserve_training_rng
 from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
 from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from tools.real_motion.shared_evidence_pilot_common import moving_support_masks
 from real_motion.nuscenes_adapter import gt_moving_support_sequence
 
-EVAL_PROTOCOL = 'joint_occ_frozen_soft_hard_dev512_paired_inference_v1'
+EVAL_PROTOCOL = 'joint_occ_frozen_soft_hard_dev512_paired_inference_v3'
 
 
 def validate_state(state, contract):
@@ -31,17 +32,18 @@ def validate_state(state, contract):
         raise RuntimeError('quality cursor/count mismatch')
     restore_metrics(state['metric_counts'])
     speed = state['speed_windows']
+    routes = contract['speed_routes']
     if len(speed) > len(contract['speed_keys']) or (speed and n != len(contract['dev_keys'])):
         raise RuntimeError('invalid timing cursor')
     for i, row in enumerate(speed):
-        if row['key'] != contract['speed_keys'][i] or len(row['samples']) != 3*contract['speed_repeats']:
+        if row['key'] != contract['speed_keys'][i] or len(row['samples']) != len(routes)*contract['speed_repeats']:
             raise RuntimeError('timing population/repeats differ')
         pairs = {(s['route'], s['repeat']) for s in row['samples']}
-        if pairs != {(r, j) for r in SPEED_ROUTES for j in range(contract['speed_repeats'])}:
+        if pairs != {(r, j) for r in routes for j in range(contract['speed_repeats'])}:
             raise RuntimeError('incomplete paired timing window')
         if any(not np.isfinite(s['seconds']) or s['seconds'] <= 0 for s in row['samples']):
             raise RuntimeError('invalid inference latency')
-        if set(row['mismatched_voxels']) != set(SPEED_ROUTES): raise RuntimeError('missing timing parity')
+        if set(row['mismatched_voxels']) != set(routes): raise RuntimeError('missing timing parity')
         if row['six_frame_byte_parity'] != (not any(row['mismatched_voxels'].values())):
             raise RuntimeError('inconsistent timing parity')
 
@@ -52,6 +54,8 @@ def summarize(result):
         f"source={result['source_checkpoint']}; epoch={result['source_epochs']}; update={result['source_updates']}",
         'FOUR histories -> SIX futures; future GT ego conditioned; no future occupancy/mask/annotation inputs.',
         'Same frozen weights/population/full-grid metrics. Hard ADD0.5 / REMOVE0.95; soft probabilities -> argmax, no threshold tuning.']
+    if result['contract'].get('quality_reuse'):
+        lines.append('DEV512 quality reused from verified integer counts; NO 512-window re-scoring; old timing NOT reused.')
     if result['windows']:
         lines += ['route                  mIoU        IoU MovingMicro',
             *[f"{name:20s} {m['mIoU']:10.6f} {m['IoU']:10.6f} {m['MovingMicro']:11.6f}"
@@ -65,6 +69,7 @@ def summarize(result):
             lines.append(f"soft_minus_hard {variant}: dMiOU={b['mIoU']-a['mIoU']:+.6f} dIoU={b['IoU']-a['IoU']:+.6f}")
     speed = result['speed']
     lines += ['===== SAME-WINDOW WARM INFERENCE / ALL SIX FRAMES =====',
+        'Timing boundary v2: historical instance extraction/matching/H2D OUTSIDE, fresh Strong/KTA INSIDE (same old FPS boundary).',
         f"windows={speed['windows']}; repeats={result['contract']['speed_repeats']}; "
         f"fresh_Strong_vs_quality_six_frame_byte_parity={speed['six_frame_byte_parity']}; "
         f"valid_same_quality_route_timing={speed['valid_same_quality_route_timing']}"]
@@ -72,6 +77,10 @@ def summarize(result):
         lines.append(f"{name:20s} six_frame_ms={r['six_frame_latency_ms']:.3f} "
             f"output_frames/s={r['output_frames_per_second']:.3f} p90_ms={r['p90_ms']:.3f} "
             f"peak_reserved_MiB={r['peak_reserved_mib']}")
+    if speed.get('optimization_comparison'):
+        lines.append('SOFT_OPTIMIZATION '+json.dumps(speed['optimization_comparison']))
+        lines.append('SERIALIZED_FIRST_WINDOW_PROFILE_NOT_THROUGHPUT '+json.dumps(speed['serialized_profile_NOT_latency']))
+        lines.append('FAST keeps interpolation/source order; three-horizon grouping + one CPU transfer + no backward buffers; NO automatic promotion.')
     lines += [speed['scope'], 'EXCLUDES: '+', '.join(speed['excludes']), speed['notes'],
         'Timing parity failures remain FAIL, never waived. Both soft variants reported; no automatic selection/promotion.',
         'Original weights/Adam/RNG/history caches are read only. Resume SAME output directory.']
@@ -86,9 +95,14 @@ def main(argv=None, stop_event=None):
 def _main(argv, stop_event):
     p = legacy.parser(); p.description = __doc__
     p.add_argument('--resume-evaluation', action='store_true')
+    p.add_argument('--reuse-quality-from', help='completed frozen DEV512 evaluation; only remeasure speed in NEW output')
     p.add_argument('--speed-windows', type=int, default=32)
     p.add_argument('--speed-repeats', type=int, default=2)
+    p.add_argument('--compare-optimized-speed', action='store_true', help='compare both old/fast soft variants on SAME short population')
+    p.add_argument('--fast-horizons', type=int, choices=(1, 2, 3), default=3)
     a = p.parse_args(argv)
+    if a.compare_optimized_speed and not (a.reuse_quality_from or a.resume_evaluation):
+        raise ValueError('optimization probe REUSES completed quality; no automatic 512-window scoring')
     if a.mode != 'gt' or a.training_backend != 'fused' or a.eval_population != 'dev512':
         raise ValueError('frozen GT-only fused pilot and exact DEV512 required')
     if not 1 <= a.speed_windows <= 64 or not 2 <= a.speed_repeats <= 4:
@@ -99,11 +113,18 @@ def _main(argv, stop_event):
         raise ValueError('bounded CPU/RAM budgets required')
     device = legacy.require_cuda(a.device); torch.set_num_threads(1)
     root, out = Path(__file__).resolve().parents[3], Path(a.out_dir).resolve()
+    quality_parent = Path(a.reuse_quality_from).resolve() if a.reuse_quality_from else None
     if a.resume_evaluation:
         if not out.is_dir(): raise RuntimeError('existing evaluation directory required')
     else:
-        if not a.resume: raise ValueError('explicit frozen source --resume checkpoint required')
-        source = Path(a.resume).resolve()
+        if quality_parent is not None:
+            quality_contract, _, _ = completed_quality(quality_parent)
+            source = Path(quality_contract['source_checkpoint']).resolve()
+            if out == quality_parent or quality_parent in out.parents:
+                raise RuntimeError('NEW timing directory OUTSIDE old quality directory required')
+        else:
+            if not a.resume: raise ValueError('explicit frozen source --resume checkpoint required')
+            source = Path(a.resume).resolve()
         if out == source.parent or source.parent in out.parents:
             raise RuntimeError('NEW evaluation directory OUTSIDE original training directory required')
         out.mkdir(parents=True, exist_ok=False)
@@ -111,8 +132,11 @@ def _main(argv, stop_event):
         if a.resume_evaluation:
             prior = json.loads((out/'contract.json').read_text(encoding='utf-8'))
             source = Path(prior['source_checkpoint'])
+            if quality_parent is None and prior.get('quality_reuse'):
+                quality_parent = Path(prior['quality_reuse']['directory'])
         else:
-            snapshot_checkpoint(source, out/'source_snapshot.pt')
+            snapshot_checkpoint(quality_parent/'source_snapshot.pt' if quality_parent else source,
+                                out/'source_snapshot.pt')
         digest = legacy.sha256(out/'source_snapshot.pt')
         saved = torch.load(out/'source_snapshot.pt', map_location='cpu', weights_only=False)
         c = saved['contract']
@@ -159,18 +183,26 @@ def _main(argv, stop_event):
             contract = dict(protocol=EVAL_PROTOCOL, source_checkpoint=str(source), source_sha256=digest,
                 source_epochs=saved['epoch'], source_updates=saved['updates'], model_digest=initial,
                 dev_keys=keys, speed_keys=speed_keys, speed_repeats=a.speed_repeats,
-                thresholds=c['thresholds'], quality_routes=ROUTES, speed_routes=SPEED_ROUTES,
+                thresholds=c['thresholds'], quality_routes=ROUTES,
+                speed_routes=OPTIMIZED_SPEED_ROUTES if a.compare_optimized_speed else SPEED_ROUTES,
+                compare_optimized_speed=a.compare_optimized_speed, fast_horizons=a.fast_horizons,
                 implementation=legacy.stable_json_fingerprint({f.name: legacy.sha256(f) for f in Path(__file__).parent.glob('*.py')}),
                 source_implementation=c['implementation'], data=c['data'], cache_namespace=c['cache_namespace'],
                 runtime=dict(actual_cuda=device.type == 'cuda', cpu_workers=a.cpu_workers,
                     prefetch_workers=a.prefetch_workers, config_sha256=legacy.sha256(a.config), overrides=a.override))
             contract = json.loads(json.dumps(contract))
+            imported = None
+            if quality_parent is not None:
+                _, imported, receipt = completed_quality(quality_parent, contract)
+                contract['quality_reuse'] = receipt
+            contract['timing_boundary_version'] = 2
             if a.resume_evaluation:
                 if contract != prior: raise RuntimeError('frozen evaluation contract changed; use NEW output')
                 state = json.loads((out/'state.json').read_text(encoding='utf-8'))
             else:
                 legacy.write_json(out/'contract.json', contract)
-                state = dict(windows=0, metric_counts=None, speed_windows=[], quality_seconds=0., input_wait_seconds=0.)
+                state = imported if imported is not None else dict(windows=0, metric_counts=None,
+                    speed_windows=[], quality_seconds=0., input_wait_seconds=0.)
             validate_state(state, contract)
             metrics = restore_metrics(state['metric_counts'])
             descriptors = HistoryInputs(provider, ram_mib=a.descriptor_ram_mib)
@@ -213,7 +245,8 @@ def _main(argv, stop_event):
                 for rows in prefetched_batches(provider, source_dev, [[r] for r in speed_records[len(state['speed_windows']):]],
                                                descriptors, workers=a.prefetch_workers):
                     if halted(): break
-                    timing = measure_window(model, provider, rows[0], len(state['speed_windows']), repeats=a.speed_repeats)
+                    timing = measure_window(model, provider, rows[0], len(state['speed_windows']), repeats=a.speed_repeats,
+                        compare_optimized=a.compare_optimized_speed, fast_horizons=a.fast_horizons)
                     state['speed_windows'].append(timing); save()
                     progress('PAIRED_SIX_FRAME_SPEED', windows=len(state['speed_windows']),
                         total=a.speed_windows, byte_parity=timing['six_frame_byte_parity'])
@@ -225,7 +258,7 @@ def _main(argv, stop_event):
                 source_checkpoint=str(source), source_epochs=saved['epoch'], source_updates=saved['updates'],
                 source_sha256=digest, windows=state['windows'], scientific_updates=0, source_read_only=True,
                 metrics={k: m.compute() for k, m in metrics.items()} if state['windows'] else {},
-                speed=speed_summary(state['speed_windows'], actual_cuda=device.type == 'cuda'),
+                speed=speed_summary(state['speed_windows'], actual_cuda=device.type == 'cuda', routes=contract['speed_routes']),
                 quality_seconds=state['quality_seconds'], input_wait_seconds=state['input_wait_seconds'],
                 seconds_this_invocation=time.perf_counter()-begun,
                 route='frozen_readouts_no_automatic_selection_or_promotion')
