@@ -27,6 +27,21 @@ Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived
 新probe数值超标不再丢剩余速度：报告参数名/count/max、warm真实1s概率loss梯度、两遍原版replay及原预算；任一parity失败候选gate仍False，结构/数据/非有限错误仍停止。
 只改performance子目录与其测试/文档，旧GT resume指纹不变；新progress保留每阶段结果，不自动接入训练。下一步新目录重测同一已知GT source，不重建cache。
 修复后新loss/probe及原fused/模型专项92项CPU通过（非全仓CI）；实际L40S仍待重测，旧失败目录保留。
+服务器重测已完成：current_fused/combined/sparse分别0.636582/0.647168/0.663386s/窗，两候选均更慢，不采用、不自动接入训练。
+两候选抽查真实1s概率loss及11520000个逐体素梯度全部一致；八步最终参数/Adam按原预算通过，maxabs分别7.934868e-7/2.928078e-6。
+原版自身第二遍八步replay失败：62781个元素/34张量，maxabs0.001094939；保留FAIL，不能归咎新loss或据此宣称训练无效。具体原因未定位，不能把抽查loss梯度一致扩展为全训练确定性。
+只读检查确认每遍重载model、深拷贝Adam及恢复Torch/CUDA/NumPy/Python RNG；未发现直接源state别名污染。CUDA归约/反传非确定性只是候选解释，未在当前数据定位，勿当结论。
+旧GT训练源码相对c57未改，原last.pt未被测速更新；建议停止无收益loss后端测速，保留current_fused接续既有GT-only三轮试训，不重建cache、不重置LR/RNG。
+用户已恢复原GT-only，贴L40S瞬时GPU19%/3507MiB；top显示的是约1TiB宿主机，不是容器80GiB/10核，未贴训练进程CPU占用，不能据此认定具体CPU瓶颈。
+只读代码确认global batch4为逐窗口梯度累积，六未来逐horizon render/loss/backward；增加window_batch只延长这个循环且改变优化步数，不等于真实GPU合批。CPU历史/raw已经4worker、depth2预取；本地未改执行或运行中训练。
+潜在下一步是同global batch4内真正合批WM/CCR/有界多horizon渲染，以及CPU模型依赖几何与GPU工作重叠；这仍需实现/实测，不保证提速或精确一致。先读取当前最近64更新的既有分段与input_wait，不另跑训练/大测速、不重启失败loss方案。
+
+用户提供最近64更新56–119：输入等待0.0000044s/窗，计算0.762005；render/loss0.364405、occupancy backward0.262491，约82%。用户明确同意实现执行合批，并已停止服务器训练。
+新增独立 `batching/`：同global batch4/source128合批WM和CCR，窗口actor偏移隔离；CPU投影最多4worker、一次XY/yaw读回；未来两帧并行full-grid soft renderer/CE/Lovasz，每帧类别均值仍独立；四窗边界VJP一次共享网络反传。
+仅GT opt-in；原top-level GT trainer/依赖/缓存签名保持不变，不采用已慢的prepared/sparse loss。原hard推理/评估/FPS边界未改。
+服务器入口 `bash tools/joint_occ_experiments/batching/run.sh probe`：同原last.pt/RNG八批，两遍原版/packed_h1/h2真实Adam只读测速。原容差、原版repeat、实际首窗概率/梯度、显存10%余量、两遍均快且≥1.1倍均需通过；未通过不允许新续训，不放宽容差/自动推广。
+续训入口同script `resume`，显式成功speed.json且新目录导入；仅implementation更改，weights/Adam/RNG/cursor/LR/科学contract其余字段完全保持。新checkpoint绑定执行源码/group，后续同入口同目录恢复；原source从不写入，旧run_gt仍恢复旧断点。
+详细命令及CUDA未验证限制见 `docs/JOINT_OCC_GT_BATCHING_CN.md`。本地17项新合批/恢复/只读测速+43项原fused/模型/probe回归共60项CPU通过，Bash语法检查通过；不是完整CI，尚未测L40S/BF16吞吐或精度，不保证真实服务器加速。
 
 ## 当前目标
 

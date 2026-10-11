@@ -71,3 +71,17 @@ RUN_DIR="$GT_RUN_DIR" RESUME="$GT_RUN_DIR/last.pt" bash tools/joint_occ_experime
 ```
 
 上面的 resume **不会自动使用新 loss**。新后端需要服务器测速有效后另行显式接入，并记录执行 provenance；不能把 synthetic 收益当作已经优化了真实训练。
+
+## L40S 实际结果与决定（2026-10-11）
+
+用户提供修复后的完整服务器摘要，source_update=8，源目录仍是 `outputs/p0_f9_joint_occ_ego/gt3_fast_20261011_123726`；本次测速输出目录未提供，不猜路径。
+
+| 后端 | 秒/窗 | 相对原版耗时 | 最终参数/Adam 数值检查 |
+| --- | ---: | ---: | --- |
+| current_fused | 0.636582 | 基准 | 第二遍自身 replay 失败 |
+| prepared_combined | 0.647168 | +1.66% | 通过，maxabs 7.934868e-7 |
+| prepared_sparse | 0.663386 | +4.21% | 通过，maxabs 2.928078e-6 |
+
+两候选第一批真实1s概率图的 loss 一致；11520000个逐体素梯度逐值一致，maxabs=0。此为抽查，不是全部窗口/全部层确定性的证明。
+原版第二遍与第一遍相差62781个元素、34个张量，maxabs=0.001094939；按原预算保持FAIL。代码只读检查未发现重载权重、深拷贝Adam、恢复随机状态的明显遗漏，但未定位此次CUDA差异的起点或根因，不能直接称为无害舍入或新loss错误。
+**不采用两候选、不放宽预算、不继续自动测速。** 旧GT代码、训练断点、RNG与缓存不改；接续原 `current_fused` GT-only 三轮试训。CPU synthetic 收益没有转化为本次 L40S 完整训练提速。
