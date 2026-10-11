@@ -2,6 +2,20 @@
 
 ## 最新任务：最终占据监督 + 内部 ego 的独立联合试训
 
+2026-10-11最新用户要求冻结当前GT三轮，先DEV512软输出并同窗软/硬推理测速，不新训练。
+新增独立 `soft_inference/` 入口，默认source `gt3_horizon_float_resume_20261011_151144/last.pt`（epoch3/update3088）。
+源快照只读、精确源eval_keys512；hard/soft各Transport、ADD-only、ADD+REMOVE，完整六帧机制不改，报告1/2/3s全网格IoU/mIoU/Moving。soft仍既有连续context/概率合成argmax；hard固定ADD0.5/REMOVE0.95，无dev选路/阈值搜索。
+随后固定DEV512内scene-balanced32窗×2交替暖测速：hard ADD+REMOVE、soft ADD-only、soft ADD+REMOVE，每路线独立重算Strong/WM/CCR/六帧CPU输出。排除I/O/历史表示/描述/labels/metrics/预热；不是旧54.945FPS或原始输入端到端。六帧必须与缓存质量路线byte parity，失败保留FAIL。
+无优化器/新bank/旧缓存写入；原训练/执行指纹覆盖源码完全不改。新out/state整数计数与完整测速窗口支持Ctrl-C后同SOFT_OUT+SOFT_RESUME=1恢复，来源契约/快照变动拒绝。
+本地4项新测试+原loss/action/fast相关27 passed；涵盖真实小网格与先前audit一致、未来labels毒化、fresh Strong而非缓存、单次硬合成、AB/BA完整六帧、失败保留、512质量及测速中断恢复/原权重AdamRNG字节不改。CLI/help/Bash检查通过，无本地nuScenes/L40S，尚未代跑DEV512或声称真实速度/涨点。
+入口 `bash tools/joint_occ_experiments/soft_inference/run.sh`，新summary即可；详见 `docs/JOINT_OCC_FROZEN_SOFT_DEV512_CN.md`。原正式SurfaceCCR模型及数据表/FPS均不变。
+
+2026-10-11用户已返回只读loss/action诊断：source3088步/3轮，TRAIN16四批+DEV64，不是DEV512。
+WM占据/source梯度平均cosine+0.1821，仅1/4负；共享history近0且2/4负，yaw占据norm约source三倍；不能据局部统计认定普遍梯度冲突或删运动loss。existence占据梯度为0，当前仍依赖直接BCE。
+同DEV64硬Transport/ADD/ADD+REMOVE mIoU39.892867/39.842671/39.867367；软40.910045/41.755960/41.598596。无CCR已有1.017178pp软硬gap，ADD增益软+0.845915/硬−0.050197；头score平均绝对差约3.07e-7，证据更指向合成/插值/阈值语义差，不是大规模头读出不一致；未进一步量化各机制因果份额。
+硬ADD587262体素，改对195396/损坏377191/错到错14675；REMOVE8907，改对7272/损坏999，触发占合法unique约0.494%，静态仅2。REMOVE非失效；391866个ADD错误按owner规则不可同pass撤销。soft REMOVE增量−0.157364，不把降低0.95阈值当已证实改法。
+建议下一步优先训练/硬推理合成对齐（硬Strong背景/owner与动作阈值，连续几何梯度仍保留），保留CE+Lovász/source/existence；不是已实现或已验证收益，不自动新训练/阈值搜索/改旧FPS。用户仅返回摘要，本轮只解读和更新任务记忆，无训练源码变更。
+
 最新用户已完成 GT-only TRAIN20%×3：3088步，DEV512 Transport mIoU38.472382/IoU50.435229；ADD-only37.889726/50.679728；ADD+REMOVE37.908709/50.697061。
 新CCR净mIoU−0.563673，REMOVE相对ADD-only仅+0.018983，Moving−0.127278；FIRST8软硬mIoU差1.697028pp不是全人口或CCR专属差距。原正式模型/指标保持不动。
 用户授权一次集中诊断，非新训练：新增独立 `diagnostics/` TRAIN16原batch/source全六帧梯度 + 固定DEV64软硬三路。
