@@ -42,6 +42,16 @@ Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived
 服务器入口 `bash tools/joint_occ_experiments/batching/run.sh probe`：同原last.pt/RNG八批，两遍原版/packed_h1/h2真实Adam只读测速。原容差、原版repeat、实际首窗概率/梯度、显存10%余量、两遍均快且≥1.1倍均需通过；未通过不允许新续训，不放宽容差/自动推广。
 续训入口同script `resume`，显式成功speed.json且新目录导入；仅implementation更改，weights/Adam/RNG/cursor/LR/科学contract其余字段完全保持。新checkpoint绑定执行源码/group，后续同入口同目录恢复；原source从不写入，旧run_gt仍恢复旧断点。
 详细命令及CUDA未验证限制见 `docs/JOINT_OCC_GT_BATCHING_CN.md`。本地17项新合批/恢复/只读测速+43项原fused/模型/probe回归共60项CPU通过，Bash语法检查通过；不是完整CI，尚未测L40S/BF16吞吐或精度，不保证真实服务器加速。
+服务器合批测速已完成，source update149，未发布科学更新：原版0.703916、packed_h1 0.754875、packed_h2 0.475507s/窗；h2两遍均快、1.48035倍且显存余量通过，h1反而慢。
+首窗固定边界原/组renderer概率、loss、poses/targets/yaws/mapped/actions梯度全部通过；不代表packed网络或多步Adam一致。两合批版本warm/八步model+Adam失败，h2 maxabs0.00184412；原版自身repeat仍失败maxabs0.00071803，失败门槛不放宽、不自动续训推广。
+收益在h1→h2增加未来帧分组时出现；不能将数值漂移直接等同精度下降或无害，不采用失败packed版本。
+
+用户批准窄版实现：新增独立 `horizons/`，保留原逐窗口WM/ego/CCR forward与逐窗口shared backward交替顺序，仅0/1、2/3、4/5两未来帧并行render/full-grid CE+Lovasz/occupancy backward。
+batch4/source128、每帧loss归一化、source/existence/R10辅助、clip/Adam/全程余弦/RNG/cursor不变；原top-level训练源码及硬推理保持原样，没有使用慢的prepared/sparse候选。
+只读两路线probe（current_fused/sequential_h2），同source真实八批、AB/BA两遍，复用原概率/梯度/Adam与baseline repeat严预算/≥1.1倍/显存10%门槛；不重跑packed_h1/h2。原始断点仍为gt3_fast_20261011_123726/last.pt实际cursor，未发布新训练更新。
+独立成功receipt与代码/source SHA才允许新目录导入；失败packed receipt不能授权窄版，后续同目录resume不重置权重/Adam/LR/RNG。原GT入口可继续原样恢复。
+7项窄版+60项既有CPU回归共67 passed，包含两真实Adam更新、原逐窗口前后向交替、空物体、只读两路线reset与显式导入/恢复；CLI help/Bash/diff检查通过。不是完整CI/真实CUDA/BF16吞吐或精度结论，窄版L40S验收仍待用户运行。
+入口 `bash tools/joint_occ_experiments/horizons/run.sh probe`，命令及边界见 `docs/JOINT_OCC_GT_HORIZONS_CN.md`。当前只提供测速，不自动启动服务器续训。
 
 ## 当前目标
 

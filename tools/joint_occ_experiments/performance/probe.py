@@ -1,4 +1,4 @@
-"""Read-only checkpoint, same-batch GT training A/B/C execution probe.
+"""Read-only checkpoint, same-batch GT training execution probe.
 
 Transient model/Adam clones do real backward, but NO scientific checkpoint,
 cursor, optimizer or RNG is published to the source training directory.
@@ -247,7 +247,7 @@ def main(argv=None):
             probe_keys=[[r['scene_name'], r['t0_token']] for group in jobs for r in group],
             implementation=legacy.stable_json_fingerprint({p.name: legacy.sha256(p) for p in Path(__file__).parent.glob('*.py')}))
         legacy.write_json(out/'speed.json', report)
-        lines = ['===== READ-ONLY GT TRAINING SPEED A/B/C =====',
+        lines = ['===== READ-ONLY GT TRAINING SPEED =====',
                  f"source_update={saved['updates']}; scientific_updates_published=0; original Adam/RNG unchanged",
                  'Same checkpoint/init/RNG/batches/Adam/cosine; two alternating passes; warmup excluded.',
                  'Target preparation INCLUDED; shared input I/O excluded. Numerical parity, NOT BF16 byte identity.']
