@@ -16,6 +16,13 @@ Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived
 新版mode/backend/实现指纹锁入断点契约，旧paired8保留且不直接移作GT-only恢复；新独立GT目录8步后同目录`RESUME=.../last.pt bash tools/joint_occ_experiments/run_gt.sh`接续TRAIN20%3轮/DEV512，无重建bank或旧缓存写入。
 本轮最终相关回归81 passed/7 CUDA skipped（非全仓CI）。CPU synthetic 18类×640000体素/24编辑的合成+CE/Lovász反传2.884→2.001s（1.442×），不含网络/几何，不能外推L40S整轮或FPS。
 
+最新服务器 GT-only 8 步成功安全停：计算0.933024s/窗，含输入0.947234；render/loss0.416069、占据backward0.297100，约76%仍在全网格。
+用户最新要求更多执行提速，先本地实验后服务器测。新增独立 `performance/` 子目录：prepared CE/Lovász 共用完整梯度buffer，以及零贡献Lovász背景尾部压缩；完整GT前景/漏检梯度与所有非零概率仍参与，密集时回退。
+本地640000体素稀疏概率loss forward/backward 0.944→0.754/0.349s；密集负对照1.739→1.532/1.669s，数值/梯度一致；不外推L40S整轮、精度或FPS。
+只读原GT-only断点的 A/B/C `performance/run_probe.sh`：临时真实forward/backward/Adam、同RNG八批两遍；新目录snapshot/speed/summary，无科学更新/旧缓存写入，无自动推广。
+旧 top-level trainer/依赖源码不改，c57 GT-only恢复契约仍兼容；候选尚未接入正式续训。详见 `docs/JOINT_OCC_GT_SPEED_PROBE_CN.md`。
+此次新loss/probe+原fused/模型专项89项CPU测试通过，CLI/Bash检查通过；本地CUDA环境无法完成导入，未代跑或声称真实服务器加速。
+
 ## 当前目标
 
 Clean Joint Surface CCR 已完整随机联合训练20轮；固定5/6/8/12/14整网等权平均已完成DEV512选择、full4369质量和256×3正式FPS验证。
