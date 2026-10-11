@@ -1,4 +1,15 @@
-# 当前任务摘要（2026-10-10）
+# 当前任务摘要（2026-10-11）
+
+## 最新任务：最终占据监督 + 内部 ego 的独立联合试训
+
+用户批准实现 GT/内部Pred 两种配置，随机同初始化，TRAIN20%×3轮；旧正式模型不修改。
+新增 `tools/joint_occ_experiments/`：原Transport+SurfaceCCR+8710参数历史控制ego头，训练soft投影/合成与全六帧CE+Lovász，source几何/existence和R10ego辅助；硬推理保持owner规则，ADD0.5/REMOVE0.95及REMOVE-off同时报告。
+Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived条件；soft/hard并非同输出，首8评估窗只做gap诊断。
+只读复用原TRAIN/VAL history geometry；Pred丢弃未来GT ego条件字段即时重建，旧冻结feature bank不复用、无新bank/缓存重建。
+历史描述拟合+raw/cache读取CPU有界并行预取，GT/Pred共享一次历史fit；native实时投影/Strong，稀疏概率合成、批量Lovász、逐horizon backward，训练/评估同目录可恢复。
+新增21项CPU真实梯度/几何与CLI恢复测试通过；相关回归103 passed/17 CUDA skipped/16 native deselected，Bash/help/diff检查通过。没有服务器nuScenes/GPU性能结果，不沿用旧54.945FPS或宣称已涨点。
+本地相关回归的native DLL读取受Windows权限限制，旧DLL未修改；CUDA不可用，服务器需测实际backend。
+详见 `docs/JOINT_OCC_EGO_PILOT_CN.md`；服务器入口 `bash tools/joint_occ_experiments/run_paired.sh`，可先`--max-updates 8`保留进度再同目录resume。
 
 ## 当前目标
 
