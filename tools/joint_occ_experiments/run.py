@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent RANDOM-init paired GT/Pred screen; no legacy training promotion."""
+"""Independent RANDOM-init GT, Pred or paired screen; no legacy promotion."""
 import sys
 from pathlib import Path
 if __package__ in (None, ''): sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -44,6 +44,9 @@ def restore_rng(state):
 
 
 def paired_update(models, optimizers, provider, rows, **kwargs):
+    if len(models) == 1:
+        mode = next(iter(models))
+        return {mode: train_arm(models[mode], optimizers[mode], provider, rows, mode, **kwargs)}
     initial = rng_state()
     gt = train_arm(models['gt'], optimizers['gt'], provider, rows, 'gt', **kwargs)
     after = rng_state()
@@ -72,8 +75,10 @@ def restore_checkpoint(saved, models, optimizers, contract):
 
 
 def summarize(result):
-    lines = ['===== PAIRED JOINT OCCUPANCY / INTERNAL EGO =====', f"status={result['status']}",
-        'RANDOM identical init; four histories -> six futures; BOTH complete models jointly optimized.',
+    modes = result.get('contract', {}).get('modes', ['gt', 'pred'])
+    lines = ['===== JOINT OCCUPANCY / INTERNAL EGO =====', f"status={result['status']}",
+        f"active_modes={modes}; RANDOM init; four histories -> six futures; independent complete models.",
+        f"training_backend={result.get('contract', {}).get('training_backend', 'reference')}",
         'GT uses GT future poses; Pred uses INTERNAL predicted poses everywhere (no alignment).',
         'Navigation-conditioned, GT-derived destination commands; NOT navigation-free.',
         'Final full-grid CE+Lovasz + direct source geometry/existence + direct R10 ego geometry.',
@@ -109,6 +114,9 @@ def parser():
                  'train-info', 'dev-info', 'ccr-history-cache', 'ccr-val-history-cache', 'out-dir'):
         p.add_argument('--'+name, required=True)
     p.add_argument('--epochs', type=int, default=3)
+    p.add_argument('--mode', choices=('gt', 'pred', 'paired'), default='paired')
+    p.add_argument('--training-backend', choices=('fused', 'reference'), default='fused',
+                   help='same objective; reference retained for gradient/speed diagnostics')
     p.add_argument('--train-fraction', type=float, default=.2)
     p.add_argument('--seed', type=int, default=20261011)
     p.add_argument('--window-batch-size', type=int, default=4)
@@ -138,7 +146,7 @@ def main(stop_event=None, argv=None):
     a = parser().parse_args(argv)
     root, out = Path(__file__).resolve().parents[2], Path(a.out_dir)
     if out.exists() and not a.resume: raise RuntimeError('NEW experiment directory required')
-    if a.evaluate_only and not a.resume: raise ValueError('evaluate-only requires paired checkpoint')
+    if a.evaluate_only and not a.resume: raise ValueError('evaluate-only requires this experiment checkpoint')
     if (not 0 < a.train_fraction <= 1 or min(a.epochs, a.window_batch_size, a.source_budget, a.checkpoint_every) < 1
             or not 1 <= a.cpu_workers <= 20 or not 1 <= a.prefetch_workers <= 8 or a.max_updates < 0
             or min(a.geometry_ram_mib, a.frame_cache_mib, a.descriptor_ram_mib) < 0
@@ -171,10 +179,12 @@ def main(stop_event=None, argv=None):
     if {r['scene_name'] for r in train} & {r['scene_name'] for r in evaluation}: raise RuntimeError('TRAIN/DEV scene overlap')
     groups = [epoch_groups(train, a.seed, e, a.window_batch_size, a.source_budget) for e in range(a.epochs)]
     total_updates = sum(len(g) for g in groups)
-    models = {'gt': JointOccEgo(config).to(device)}
-    models['pred'] = copy.deepcopy(models['gt'])
+    modes = ['gt', 'pred'] if a.mode == 'paired' else [a.mode]
+    first_model = JointOccEgo(config).to(device)
+    models = {modes[0]: first_model}
+    if len(modes) == 2: models[modes[1]] = copy.deepcopy(first_model)
     # Base checkpoint supplies architecture + cache contract only. NO weights copied.
-    provider = PilotProvider(a.base_checkpoint, CLEAN_SHA256, pcfg, device, a.cpu_workers, models['gt'], None)
+    provider = PilotProvider(a.base_checkpoint, CLEAN_SHA256, pcfg, device, a.cpu_workers, first_model, None)
     provider.raw_io_workers = 1
     from real_motion.canonical_repair_execution import CanonicalCpuExecution
     from real_motion.surface_projection_execution import SurfaceMapExecution
@@ -197,7 +207,8 @@ def main(stop_event=None, argv=None):
         'real_motion/surface_canonical_repair.py', 'real_motion/surface_projection_execution.py',
         'real_motion/surface_ccr_execution.py', 'real_motion/ego_navigation.py',
         'tools/ego_experiments/ego_kinematic.py', 'tools/real_motion/joint_training_recovery.py')
-    contract = dict(protocol=PROTOCOL, model=models['gt'].configs(), epochs=a.epochs, seed=a.seed,
+    contract = dict(protocol=PROTOCOL, modes=modes, training_backend=a.training_backend,
+        model=first_model.configs(), epochs=a.epochs, seed=a.seed,
         train_keys=[list(k) for k in train_keys], eval_keys=[[r['scene_name'], r['t0_token']] for r in evaluation],
         eval_population=a.eval_population, window_batch=a.window_batch_size, source_budget=a.source_budget,
         total_updates=total_updates, lr=[a.motion_lr, a.repair_lr, a.ego_lr],
@@ -217,13 +228,13 @@ def main(stop_event=None, argv=None):
         if (not 0 <= epoch <= a.epochs or epoch == a.epochs and batch != 0
                 or epoch < a.epochs and not 0 <= batch < len(groups[epoch])
                 or updates != sum(len(g) for g in groups[:epoch])+batch):
-            raise RuntimeError('invalid completed paired-update cursor')
-        print(f'PAIRED_RESUME completed_update={updates} epoch={epoch} batch={batch}; Adam/RNG/cosine intact', flush=True)
+            raise RuntimeError('invalid completed optimizer-update cursor')
+        print(f'JOINT_OCC_RESUME modes={modes} completed_update={updates} epoch={epoch} batch={batch}; Adam/RNG/cosine intact', flush=True)
     out.mkdir(parents=True, exist_ok=True)
     write_json(out/'cache_audit.json', cache_report)
     write_json(out/'contract.json', contract)
-    print(f'PAIRED_JOINT_OCC RANDOM train={len(train)} epochs={a.epochs} updates_each={total_updates}; '
-          'GT+internalPred; full6 CE/Lovasz; no new persistent cache/prior', flush=True)
+    print(f'JOINT_OCC RANDOM modes={modes} backend={a.training_backend} train={len(train)} '
+          f'epochs={a.epochs} updates_each={total_updates}; full6 CE/Lovasz; no new persistent cache/prior', flush=True)
     result = dict(status='running', contract=contract, epoch=epoch, updates=updates)
     tick = time.perf_counter()
     def progress(row):
@@ -242,13 +253,15 @@ def main(stop_event=None, argv=None):
                     pair_tick = time.perf_counter()
                     stats = paired_update(models, optimizers, provider, rows, update=updates+1, total_updates=total_updates,
                         object_weight=a.object_weight, ego_weight=a.ego_weight, lovasz_weight=a.lovasz_weight,
+                        optimized=a.training_backend == 'fused',
                         probe=updates == 0)
-                    # Publish cursor ONLY after BOTH arms finish Adam updates.
+                    # Publish cursor ONLY after ALL active arms finish Adam updates.
                     updates += 1; batch += 1
                     if batch == len(groups[epoch]): epoch += 1; batch = 0
                     healthy = True
                     preparing = rows[0][1].get('_joint_prepare_timing', {})
-                    item = dict(event='paired_train', update=updates, completed_epochs=epoch, epoch_batch=batch,
+                    item = dict(event='paired_train' if len(modes) == 2 else 'single_train',
+                        modes=modes, update=updates, completed_epochs=epoch, epoch_batch=batch,
                         paired_compute_seconds=time.perf_counter()-pair_tick,
                         prepare_seconds=preparing, **stats)
                     item['cpu_worker_seconds_sum_overlapping'] = {
@@ -258,9 +271,9 @@ def main(stop_event=None, argv=None):
                     reports['training'].append(item)
                     if updates == 1: reports['gradient_links'] = {k: s['gradient_links'] for k, s in stats.items()}
                     if updates % 16 == 0 or updates == 1:
-                        print(f"PAIRED_OCC {updates}/{total_updates} completed_epochs={epoch} "
-                            f"GT_CE={stats['gt']['CE']:.4f} Pred_CE={stats['pred']['CE']:.4f} "
-                            f"seconds/window_both_including_input="
+                        losses = ' '.join(f"{mode}_CE={stats[mode]['CE']:.4f}" for mode in modes)
+                        print(f"JOINT_OCC {updates}/{total_updates} completed_epochs={epoch} {losses} "
+                            f"seconds/window_all_active_modes_including_input="
                             f"{(item['paired_compute_seconds']+sum(preparing.values()))/len(rows):.4f}", flush=True)
                     if updates % a.checkpoint_every == 0 or batch == 0: save()
                     if batch == 0 or a.max_updates and updates >= a.max_updates: break
@@ -279,8 +292,9 @@ def main(stop_event=None, argv=None):
                 host_stage_seconds_per_window={k: v/max(count, 1) for k, v in stages.items()},
                 stages_are_host_elapsed_not_GPU_utilization=True)
         result['performance'] = performance
-        count = sum(row['gt']['windows'] for row in rows)
+        count = sum(row[modes[0]]['windows'] for row in rows)
         performance['paired_pipeline'] = dict(windows=count,
+            active_modes=modes,
             seconds_per_window_including_input=sum(row['paired_compute_seconds']+
                 sum(row['prepare_seconds'].values()) for row in rows)/max(count, 1),
             input_wait_seconds_per_window=sum(row['prepare_seconds'].get('input_wait', 0.) for row in rows)/max(count, 1),
@@ -317,7 +331,7 @@ def main(stop_event=None, argv=None):
                 provider.paired_eval_sessions = {}
                 for model in models.values(): model.requires_grad_(True)
             result['status'] = 'complete' if epoch == a.epochs else 'interim_read_only_evaluation'
-        else: result['status'] = 'stopped_at_complete_paired_update'
+        else: result['status'] = 'stopped_at_complete_paired_update' if len(modes) == 2 else 'stopped_at_complete_update'
     except InterruptedError as error:
         result.update(status='stopped_at_complete_eval_window', error=str(error))
     except Exception as error:

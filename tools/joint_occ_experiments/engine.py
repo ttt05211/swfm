@@ -12,6 +12,7 @@ from tools.real_motion.eval_p0_f9_v17_local_stwm import window_from_record
 from .model import torch_poses, gradient_scale, ego_geometry_loss, source_auxiliary
 from .data import prepare_projection
 from .soft_geometry import (source_targets, effective_yaw, continuous_context, SoftScene, occupancy_loss)
+from .fast_autograd import RenderGradientBridge
 
 
 def forward_window(model, provider, row, mode, *, ego_gradient=1., soft=True):
@@ -54,7 +55,7 @@ def forward_window(model, provider, row, mode, *, ego_gradient=1., soft=True):
 
 
 def train_arm(model, optimizer, provider, rows, mode, *, update, total_updates,
-              object_weight=1., ego_weight=1., lovasz_weight=1., probe=False):
+              object_weight=1., ego_weight=1., lovasz_weight=1., probe=False, optimized=True):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     # Whole configured cycle; never shorten the schedule for a smoke/stop.
@@ -68,6 +69,9 @@ def train_arm(model, optimizer, provider, rows, mode, *, update, total_updates,
         tick = time.perf_counter()
         fw = forward_window(model, provider, row, mode, ego_gradient=ramp)
         scene = SoftScene(fw['prep'], provider.pcfg.grid, provider.device)
+        bridge = RenderGradientBridge(fw) if optimized else None
+        render_inputs = bridge.leaves if bridge is not None else fw
+        render = scene.render if optimized else scene.render_reference
         stages['motion_ego_projection_head'] += time.perf_counter()-tick
         sources += len(row[0]['features'])
         canonical += len(fw['evidence'])
@@ -75,10 +79,11 @@ def train_arm(model, optimizer, provider, rows, mode, *, update, total_updates,
         labels = torch.as_tensor(np.asarray(row[1]['future_gt_occ']), device=provider.device)
         for h in range(6):
             tick = time.perf_counter()
-            probability = scene.render(h, fw['poses'][h], fw['targets'], fw['yaws'], fw['mapped'],
-                                       fw['evidence'], fw['plan'], fw['actions'])
+            probability = render(h, render_inputs['poses'][h], render_inputs['targets'], render_inputs['yaws'], render_inputs['mapped'],
+                                 fw['evidence'], fw['plan'], render_inputs['actions'])
             classes = [int(c) for c in np.unique(row[1]['future_gt_occ'][h]) if c < 17]
-            loss, ce, lovasz = occupancy_loss(probability, labels[h], lovasz_weight=lovasz_weight, class_ids=classes)
+            loss, ce, lovasz = occupancy_loss(probability, labels[h], lovasz_weight=lovasz_weight, class_ids=classes,
+                                             reference=not optimized)
             if not bool(torch.isfinite(loss)): raise RuntimeError('nonfinite final occupancy loss')
             if probe and h == 1 and loss.requires_grad:
                 tensors = [fw['actions']]
@@ -87,12 +92,13 @@ def train_arm(model, optimizer, provider, rows, mode, *, update, total_updates,
                     tensors += [fw['output']['residual_xy_m'], fw['output']['yaw_delta_rad']]
                     names += ['occupancy_to_xy', 'occupancy_to_yaw']
                 if mode == 'pred': tensors += [fw['ego']]; names += ['occupancy_to_ego']
-                gradients = torch.autograd.grad(loss, tensors, retain_graph=True, allow_unused=True)
+                gradients = (bridge.probe(loss, tensors) if bridge is not None else
+                             torch.autograd.grad(loss, tensors, retain_graph=True, allow_unused=True))
                 for name, gradient in zip(names, gradients):
                     links[name] += 0. if gradient is None else float(gradient.detach().float().norm())
             stages['soft_render_full_ce_lovasz'] += time.perf_counter()-tick
             tick = time.perf_counter()
-            if loss.requires_grad: (loss/(len(rows)*6)).backward(retain_graph=True)
+            if loss.requires_grad: (loss/(len(rows)*6)).backward(retain_graph=not optimized)
             stages['occupancy_backward'] += time.perf_counter()-tick
             terms['CE'].append(ce.detach()); terms['Lovasz'].append(lovasz.detach())
             del probability, loss, ce, lovasz
@@ -101,11 +107,14 @@ def train_arm(model, optimizer, provider, rows, mode, *, update, total_updates,
         ego_loss = ego_geometry_loss(fw['ego'][None], np.asarray(fw['ego_target'])[None])
         auxiliary = object_weight*(geometry+existence)+ego_weight*ego_loss
         if not bool(torch.isfinite(auxiliary)): raise RuntimeError('nonfinite direct pose loss')
-        (auxiliary/len(rows)).backward()
+        if bridge is not None:
+            bridge.backward_shared(auxiliary/len(rows))
+        else:
+            (auxiliary/len(rows)).backward()
         terms['source_geometry'].append(geometry.detach()); terms['existence'].append(existence.detach())
         terms['ego_geometry'].append(ego_loss.detach())
-        stages['direct_geometry_backward'] += time.perf_counter()-tick
-        del fw, scene, labels, geometry, existence, ego_loss, auxiliary
+        stages['shared_network_and_direct_geometry_backward' if optimized else 'direct_geometry_backward'] += time.perf_counter()-tick
+        del fw, scene, labels, geometry, existence, ego_loss, auxiliary, bridge, render_inputs, render
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5., error_if_nonfinite=True)
     tick = time.perf_counter()
     optimizer.step()
@@ -115,6 +124,7 @@ def train_arm(model, optimizer, provider, rows, mode, *, update, total_updates,
     result.update(mode=mode, windows=len(rows), sources=sources, canonical_points=canonical,
         seconds=time.perf_counter()-begun, stages_seconds=dict(stages), grad_norm=float(norm),
         ego_occupancy_gradient_scale=ramp, gradient_links=dict(links),
+        training_backend='fused_sparse_single_shared_vjp' if optimized else 'reference',
         peak_memory_mib=torch.cuda.max_memory_allocated(provider.device)/2**20 if provider.device.type == 'cuda' else 0.)
     optimizer.zero_grad(set_to_none=True)
     return result

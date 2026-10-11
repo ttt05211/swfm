@@ -394,7 +394,8 @@ def test_actual_hard_evaluation_integer_resume_and_soft_hard_gap(monkeypatch):
     assert json.dumps(expected['surrogate_gap'], sort_keys=True) == json.dumps(resumed['surrogate_gap'], sort_keys=True)
 
 
-def test_cli_smoke_then_same_directory_resume_preserves_paired_optimizer_and_rng(tmp_path, monkeypatch):
+@pytest.mark.parametrize('mode', ['paired', 'gt', 'pred'])
+def test_cli_smoke_then_same_directory_resume_preserves_paired_optimizer_and_rng(tmp_path, monkeypatch, mode):
     from tools.joint_occ_experiments import run
     model, _, provider, row = fixture()
     config = tmp_path/'config.yaml'; config.write_text('test')
@@ -447,11 +448,21 @@ def test_cli_smoke_then_same_directory_resume_preserves_paired_optimizer_and_rng
     out = tmp_path/'stopped'
     args = ['--config', str(config), '--base-checkpoint', str(base), '--dataroot', str(tmp_path),
             '--ccr-history-cache', str(tmp_path), '--ccr-val-history-cache', str(tmp_path),
-            '--train-fraction', '.00004', '--out-dir', str(out)]
+            '--train-fraction', '.00004', '--out-dir', str(out), '--mode', mode]
     args += [item for name, path in paths.items() for item in ('--'+name, str(path))]
     assert run.main(threading.Event(), args+['--max-updates', '1']) == 0
     first = torch.load(out/'last.pt', weights_only=False)
     assert first['updates'] == 1 and first['epoch'] == 1 and first['batch'] == 0
+    expected_modes = ['gt', 'pred'] if mode == 'paired' else [mode]
+    assert list(first['models']) == list(first['optimizers']) == expected_modes
+    assert first['contract']['modes'] == expected_modes
+    assert first['contract']['training_backend'] == 'fused'
+    wrong_mode = copy.deepcopy(first['contract']); wrong_mode['modes'] = ['pred'] if mode == 'gt' else ['gt']
+    with pytest.raises(RuntimeError, match='differs'):
+        restore_checkpoint(first, {}, {}, wrong_mode)
+    wrong_backend = copy.deepcopy(first['contract']); wrong_backend['training_backend'] = 'reference'
+    with pytest.raises(RuntimeError, match='differs'):
+        restore_checkpoint(first, {}, {}, wrong_backend)
     assert run.main(threading.Event(), args+['--resume', str(out/'last.pt')]) == 0
     resumed = torch.load(out/'last.pt', weights_only=False)
     assert resumed['updates'] == 3 and resumed['epoch'] == 3

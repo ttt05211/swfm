@@ -10,7 +10,8 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export SWFM_COLUMN_CPU_BACKEND=native
 DATAROOT="${DATAROOT:-/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes}"
-RUN_DIR="${RUN_DIR:-$ROOT/outputs/p0_f9_joint_occ_ego/paired3_$(date +%Y%m%d_%H%M%S)}"
+MODE="${MODE:-paired}"
+RUN_DIR="${RUN_DIR:-$ROOT/outputs/p0_f9_joint_occ_ego/${MODE}3_$(date +%Y%m%d_%H%M%S)}"
 args=(
   --config "$ROOT/configs/real_motion_occfm.yaml"
   --train-cache "${TRAIN_CACHE:-$ROOT/data/p0_f9_v18_se2_train_full.pt}"
@@ -22,10 +23,10 @@ args=(
   --dev-info "$DATAROOT/nuscenes_infos_val_temporal_v3_scene.pkl"
   --ccr-history-cache "${CCR_HISTORY_CACHE:-$ROOT/cache/p0_f9_ccr_history_geometry_v1}"
   --ccr-val-history-cache "${CCR_VAL_CACHE:-$ROOT/cache/p0_f9_ccr_history_geometry_val_v1}"
-  --out-dir "$RUN_DIR" --epochs 3 --train-fraction .2
+  --out-dir "$RUN_DIR" --mode "$MODE" --epochs 3 --train-fraction .2
   --window-batch-size 4 --source-budget 128 --eval-population "${EVAL_POPULATION:-dev512}"
 )
 if [[ -n "${RESUME:-}" ]]; then args+=(--resume "$RESUME"); fi
-echo "Independent RANDOM GT/Pred; reuse history caches READ ONLY; no prior or new bank."
-echo "Output: $RUN_DIR; Ctrl-C saves BOTH arms after a completed paired update."
+echo "Independent RANDOM mode=$MODE; full6 CE/Lovasz; reuse history caches READ ONLY; no new bank."
+echo "Output: $RUN_DIR; Ctrl-C saves all active modes after a completed optimizer update."
 exec "$PY" -u -m tools.joint_occ_experiments.run "${args[@]}" "$@"

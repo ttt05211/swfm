@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from real_motion.canonical_causal_repair import grid_arrays, FEATURE_DIM
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 from real_motion.local_st_world_model_v18_se2 import YAW_ENABLED_CLASS_IDS
+from .fast_autograd import compose_sparse, lovasz_sorted
 
 FREE = 17
 _CENTER_CACHE = {}
@@ -184,6 +185,58 @@ class SoftScene:
         return prob.scatter_add(0, self.backgrounds[h][None], missing[None])
 
     def render(self, h, pose, targets, yaws, mapped, evidence, plan, actions, *, edits=True):
+        background = self.background(pose, h)
+        operations, alphas = [], []
+        actor_np = np.asarray(evidence.actor)
+        legal = np.asarray(plan.legal)
+        # Prepared legality changes with live learned geometry. Cache only
+        # THIS window's row selections, never across forwards/checkpoints.
+        if not hasattr(self, '_edit_groups'):
+            groups = []
+            for cls in (11, 13):
+                groups.append(('static_remove', cls, np.flatnonzero((actor_np < 0) & (evidence.classes == cls))))
+            for i, cls in enumerate(self.classes):
+                groups.append(('dynamic_remove', i, np.flatnonzero(actor_np == i)))
+            for actor in np.unique(actor_np):
+                for cls in np.unique(evidence.classes[actor_np == actor]):
+                    groups.append(('add', int(cls), np.flatnonzero((actor_np == actor) & (evidence.classes == cls))))
+            self._edit_groups = {kind: [] for kind in ('static_remove', 'dynamic_remove', 'add')}
+            for kind, cls, ids in groups:
+                action = 0 if kind == 'add' else 1
+                rows = [torch.as_tensor(ids[legal[ids, slot, action]], device=pose.device) for slot in range(6)]
+                self._edit_groups[kind].append((cls, rows))
+        def append(kind, flat, alpha, cls, destination=None):
+            operations.append((kind, flat, cls, destination)); alphas.append(alpha)
+        if edits:
+            for cls, rows in self._edit_groups['static_remove']:
+                at = rows[h]
+                if not len(at): continue
+                flat, alpha = sparse_splat(mapped[at, h], actions[at, h, 1], self.grid)
+                alpha = alpha*((self.owners[h][flat] < 0) & (self.baselines[h][flat] == cls))
+                append('remove', flat, alpha, cls, torch.full_like(flat, FREE))
+        inverse = torch.linalg.inv(pose)
+        for i, cls in enumerate(self.classes):
+            points = transform(move(self.source_points[i], self.source_centers[i], targets[i, h], yaws[i, h]), inverse)
+            flat, alpha = sparse_splat(points, points.new_ones(len(points)).float(), self.grid, reduction='sum')
+            append('overlay', flat, alpha, cls)
+        if edits:
+            for i, rows in self._edit_groups['dynamic_remove']:
+                at = rows[h]
+                if not len(at): continue
+                cls = self.classes[i]
+                flat, alpha = sparse_splat(mapped[at, h], actions[at, h, 1], self.grid)
+                alpha = alpha*((self.owners[h][flat] == i) & (self.baselines[h][flat] == cls))
+                append('remove', flat, alpha, cls, self.fallbacks[h][flat])
+            for cls, rows in self._edit_groups['add']:
+                at = rows[h]
+                if not len(at): continue
+                flat, alpha = sparse_splat(mapped[at, h], actions[at, h, 0], self.grid)
+                alpha = alpha*(self.baselines[h][flat] == FREE)
+                append('overlay', flat, alpha, cls)
+        return compose_sparse(background, operations, alphas)
+
+    def render_reference(self, h, pose, targets, yaws, mapped, evidence, plan, actions, *, edits=True):
+        """Original autograd chain retained for numerical/gradient audits."""
         prob = self.background(pose, h)
         actor_np = np.asarray(evidence.actor)
         legal = torch.as_tensor(plan.legal[:, h], device=pose.device)
@@ -235,7 +288,7 @@ class SoftScene:
         return prob
 
 
-def lovasz_softmax(prob, target, ignore=255, class_ids=None):
+def lovasz_softmax_reference(prob, target, ignore=255, class_ids=None):
     """Full-grid semantic Lovasz, present classes 0..16. No voxel sampling."""
     target = target.flatten().long()
     valid = (target >= 0) & (target <= FREE) & (target != ignore)
@@ -258,12 +311,24 @@ def lovasz_softmax(prob, target, ignore=255, class_ids=None):
     return (errors*grad).sum(1).mean()
 
 
-def occupancy_loss(prob, target, *, lovasz_weight=1., epsilon=1e-4, class_ids=None):
+def lovasz_softmax(prob, target, ignore=255, class_ids=None):
+    """Identical full-grid stable-sort objective, fused first-order backward."""
+    target = target.flatten().long()
+    positions = torch.nonzero((target >= 0) & (target <= FREE) & (target != ignore), as_tuple=True)[0]
+    labels = target[positions]
+    if class_ids is None:
+        class_ids = [int(c) for c in labels.unique().cpu().tolist() if c < FREE]
+    if not len(class_ids) or not len(labels): return prob.sum()*0
+    classes = torch.as_tensor(class_ids, device=prob.device, dtype=torch.long)
+    return lovasz_sorted(prob, labels, positions, classes)
+
+
+def occupancy_loss(prob, target, *, lovasz_weight=1., epsilon=1e-4, class_ids=None, reference=False):
     labels = target.flatten().long()
     valid = (labels >= 0) & (labels <= FREE)
     # Smooth ALL classes rather than clamp gradients to zero at missed voxels.
     probabilities = (prob.float()+epsilon)/(1+18*epsilon)
     ce = (-probabilities[:, valid].gather(0, labels[valid][None]).log().mean()
           if bool(valid.any()) else prob.sum()*0)
-    lovasz = lovasz_softmax(probabilities, target, class_ids=class_ids)
+    lovasz = (lovasz_softmax_reference if reference else lovasz_softmax)(probabilities, target, class_ids=class_ids)
     return ce+lovasz_weight*lovasz, ce, lovasz

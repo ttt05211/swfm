@@ -11,6 +11,10 @@ Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived
 本地相关回归的native DLL读取受Windows权限限制，旧DLL未修改；CUDA不可用，服务器需测实际backend。
 详见 `docs/JOINT_OCC_EGO_PILOT_CN.md`；服务器入口 `bash tools/joint_occ_experiments/run_paired.sh`，可先`--max-updates 8`保留进度再同目录resume。
 服务器首启在NuScenes初始化失败，未训练/写断点：我把info路径误传为第二位置参数version。TRAIN/DEV均已改显式info_pkl关键字；严格真实adapter签名的CLI fresh/resume测试先复现再修复，21项CPU回归通过。此次不改模型/缓存，原未创建的输出路径可直接重跑8步，不使用RESUME。
+随后服务器旧版paired8成功：GT1.410/Pred1.470/两路含输入2.900 s/窗，dense渲染/loss/backward约88%。用户最新指定先GT-only，并授权优化共享重复反传和概率合成。新增`run_gt.sh`/`--mode gt,pred,paired`，仅实例化活动模型；两路是公平对照，无权重共享/互相学习收益。
+融合稀疏有序合成+Lovász解析一阶backward；六帧renderer VJP在边界累积后一次multi-root回传WM/CCR，仍完整六帧全网格CE+Lovász、所有geometry/action链路不断梯度，硬推理未改。38项CPU数值/梯度/全部参数Adam更新及三模式resume测试通过；BF16汇总顺序不承诺bitwise，服务器速度待实测。
+新版mode/backend/实现指纹锁入断点契约，旧paired8保留且不直接移作GT-only恢复；新独立GT目录8步后同目录`RESUME=.../last.pt bash tools/joint_occ_experiments/run_gt.sh`接续TRAIN20%3轮/DEV512，无重建bank或旧缓存写入。
+本轮最终相关回归81 passed/7 CUDA skipped（非全仓CI）。CPU synthetic 18类×640000体素/24编辑的合成+CE/Lovász反传2.884→2.001s（1.442×），不含网络/几何，不能外推L40S整轮或FPS。
 
 ## 当前目标
 
