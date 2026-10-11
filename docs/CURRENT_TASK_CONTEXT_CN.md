@@ -10,6 +10,7 @@ Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived
 新增21项CPU真实梯度/几何与CLI恢复测试通过；相关回归103 passed/17 CUDA skipped/16 native deselected，Bash/help/diff检查通过。没有服务器nuScenes/GPU性能结果，不沿用旧54.945FPS或宣称已涨点。
 本地相关回归的native DLL读取受Windows权限限制，旧DLL未修改；CUDA不可用，服务器需测实际backend。
 详见 `docs/JOINT_OCC_EGO_PILOT_CN.md`；服务器入口 `bash tools/joint_occ_experiments/run_paired.sh`，可先`--max-updates 8`保留进度再同目录resume。
+服务器首启在NuScenes初始化失败，未训练/写断点：我把info路径误传为第二位置参数version。TRAIN/DEV均已改显式info_pkl关键字；严格真实adapter签名的CLI fresh/resume测试先复现再修复，21项CPU回归通过。此次不改模型/缓存，原未创建的输出路径可直接重跑8步，不使用RESUME。
 
 ## 当前目标
 

@@ -181,8 +181,8 @@ def main(stop_event=None, argv=None):
     from real_motion.strong_majority_execution import ParallelNativeMajority
     provider.ccr_execution = SurfaceMapExecution(CanonicalCpuExecution('native_parallel', min(4, a.cpu_workers)))
     provider.strong_majority = ParallelNativeMajority(min(4, a.cpu_workers))
-    train_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, a.train_info), a.frame_cache_mib, copy_on_insert=False)
-    dev_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, a.dev_info), a.frame_cache_mib, copy_on_insert=False)
+    train_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.train_info), a.frame_cache_mib, copy_on_insert=False)
+    dev_source = CachedColumnSource(NuScenesWindowSource(a.dataroot, info_pkl=a.dev_info), a.frame_cache_mib, copy_on_insert=False)
     provider.ccr_history_cache_source, provider.ccr_val_history_cache_source = train_source, dev_source
     cache_report = attach_caches(provider, a, root)
     descriptors = HistoryInputs(provider, ram_mib=a.descriptor_ram_mib)

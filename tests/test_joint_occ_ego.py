@@ -410,7 +410,16 @@ def test_cli_smoke_then_same_directory_resume_preserves_paired_optimizer_and_rng
     monkeypatch.setattr(run, 'load_runtime_config', lambda *args: None)
     monkeypatch.setattr(run, 'make_prepare_config', lambda cfg: provider.pcfg)
     monkeypatch.setattr(run, 'PilotProvider', lambda *args: provider)
-    monkeypatch.setattr(run, 'NuScenesWindowSource', lambda *args: SimpleNamespace(nusc=None))
+    source_calls = []
+    # Match the real adapter signature: its second positional argument is the
+    # dataset VERSION, not the split info pickle. Check both fresh and resume.
+    def window_source(dataroot, version='v1.0-trainval', info_pkl=None, verbose=False):
+        assert dataroot == str(tmp_path)
+        assert version == 'v1.0-trainval'
+        assert info_pkl in (str(paths['train-info']), str(paths['dev-info']))
+        source_calls.append(info_pkl)
+        return SimpleNamespace(nusc=None)
+    monkeypatch.setattr(run, 'NuScenesWindowSource', window_source)
     class Disposable:
         kernels = pool = None
         def __init__(self, *args): pass
@@ -453,3 +462,4 @@ def test_cli_smoke_then_same_directory_resume_preserves_paired_optimizer_and_rng
     uninterrupted = torch.load(other/'last.pt', weights_only=False)
     assert_nested_equal(uninterrupted['models'], resumed['models'])
     assert_nested_equal(uninterrupted['optimizers'], resumed['optimizers'])
+    assert source_calls == [str(paths['train-info']), str(paths['dev-info'])]*3
