@@ -51,7 +51,14 @@ batch4/source128、每帧loss归一化、source/existence/R10辅助、clip/Adam/
 只读两路线probe（current_fused/sequential_h2），同source真实八批、AB/BA两遍，复用原概率/梯度/Adam与baseline repeat严预算/≥1.1倍/显存10%门槛；不重跑packed_h1/h2。原始断点仍为gt3_fast_20261011_123726/last.pt实际cursor，未发布新训练更新。
 独立成功receipt与代码/source SHA才允许新目录导入；失败packed receipt不能授权窄版，后续同目录resume不重置权重/Adam/LR/RNG。原GT入口可继续原样恢复。
 7项窄版+60项既有CPU回归共67 passed，包含两真实Adam更新、原逐窗口前后向交替、空物体、只读两路线reset与显式导入/恢复；CLI help/Bash/diff检查通过。不是完整CI/真实CUDA/BF16吞吐或精度结论，窄版L40S验收仍待用户运行。
-入口 `bash tools/joint_occ_experiments/horizons/run.sh probe`，命令及边界见 `docs/JOINT_OCC_GT_HORIZONS_CN.md`。当前只提供测速，不自动启动服务器续训。
+入口 `bash tools/joint_occ_experiments/horizons/run.sh probe`，命令及边界见 `docs/JOINT_OCC_GT_HORIZONS_CN.md`。以上为严格验收实施历史；最新决定见下段，不再测速。
+
+服务器窄版已测：原0.741306→sequential_h2 0.504552s/窗，1.469237倍、两遍均快且显存余量通过；首窗renderer概率/loss/梯度及warm单步更新通过。八步候选maxabs0.000817965、原版repeat0.000402516，原严门槛FAIL保留，不称无损。
+用户明确接受此小幅浮点差异，授权直接接续GT三轮，不追加128步A/B。新增仅在 `horizons/continuation/` 的显式accept入口，原horizons顶层实现/内核/测得fingerprint均未改，复用已有speed.json，无重测/新bank。
+初次必须新目录、同source SHA/执行fingerprint、单步/梯度通过、≥1.1倍/两遍快/显存余量；独立接受策略仅容许已测多步与repeat状态maxabs≤0.001，不改原数值预算或pass_gate。float_drift_acceptance.json和训练结果保留原FAIL/未知质量；不承诺最终精度不变。
+原weights/Adam/RNG/cursor/数据/batch4/source128/原三轮余弦不变，完成后原dev512硬输出评估；原GT断点与旧缓存只读。新目录同入口Ctrl-C完成update保存、同目录resume，不是额外三轮。
+本地新增10项+窄版7项共17 passed，含原149游标/Adam/RNG导入、两次续训、源/失败report不改、拒绝未显式接受/过大漂移/单步/梯度/数据/执行不匹配；CLI/Bash检查通过。只测必要CPU恢复，不跑完整CI或新CUDA测速；服务器由用户运行。
+直接入口 `bash tools/joint_occ_experiments/horizons/continuation/run.sh`；命令见 `docs/JOINT_OCC_GT_FLOAT_DRIFT_CONTINUE_CN.md`。
 
 ## 当前目标
 
