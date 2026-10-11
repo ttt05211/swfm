@@ -1,5 +1,11 @@
 # 当前任务摘要（2026-10-11）
 
+## 本线程最新实现：相同规模的内部 Pred 三轮
+
+用户要求不扩大训练，试当前软配置的内部ego版本。新增隔离 `tools/joint_occ_experiments/pred/`：独立RANDOM、相同scene-balanced TRAIN20%4086窗/seed20261011/三轮余弦/batch4/source128；WM+CCR+ego共同更新，不导入GT权重。沿用两未来帧renderer、六未来完整CE+Lovasz及source geometry/existence/R10 ego监督。
+前向所有未来几何使用内部Pred（不混GT pose），占据→ego梯度沿用0.1→1 ramp；仅复用只读纯历史缓存，GT未来背景/投影弃用重建。GT-derived导航条件仍公开，不称navigation-free。最终固定DEV512六读出，主候选预指定fast soft ADD-only；首实际窗三软路线完整六帧byte核验，不额外测速/扩训/调阈值。
+Ctrl-C完整update/评估窗后保存，同一Pred目录恢复Adam/RNG/余弦及整数评估前缀。修复saved errors列表别名导致续跑修改调用者状态；原GT训练指纹不变。本地49项Pred/GT/两帧训练/软快速读出测试通过，CLI/Bash检查通过；无本地nuScenes/L40S，真实训练未代跑。入口 `bash tools/joint_occ_experiments/pred/run.sh`；详见 `docs/JOINT_OCC_INTERNAL_PRED_THREE_CN.md`。
+
 ## 最新任务：最终占据监督 + 内部 ego 的独立联合试训
 
 2026-10-11最新用户授权实现软推理提速，不新训练/不重跑DEV512。新增隔离 `soft_inference/fast.py`：三未来合批、六张byte网格单次CPU回传、单forward合法actor/action索引与常量复用、ADD-only跳过恒零REMOVE、推理scratch原位合成不存反传中间量；18类/全网格/float64几何/原插值/owner/fallback/覆盖顺序不变。
