@@ -2,6 +2,15 @@
 
 ## 最新任务：最终占据监督 + 内部 ego 的独立联合试训
 
+最新用户已完成 GT-only TRAIN20%×3：3088步，DEV512 Transport mIoU38.472382/IoU50.435229；ADD-only37.889726/50.679728；ADD+REMOVE37.908709/50.697061。
+新CCR净mIoU−0.563673，REMOVE相对ADD-only仅+0.018983，Moving−0.127278；FIRST8软硬mIoU差1.697028pp不是全人口或CCR专属差距。原正式模型/指标保持不动。
+用户授权一次集中诊断，非新训练：新增独立 `diagnostics/` TRAIN16原batch/source全六帧梯度 + 固定DEV64软硬三路。
+查实际WM占据/source梯度范数与方向（包括WM→CCR共享feature路径），REMOVE合法/触发/改对损坏及分数分布，分解Transport与CCR软硬gap。
+代码确认REMOVE通道正常；只改原基线owner并恢复固定fallback，不能撤销同次ADD错误。0.95硬阈值与连续训练不一致是待量化因素，不宣称已定位全部原因或证实梯度冲突。
+没有优化器/clip/step/自动重训、阈值选择、新bank或旧缓存写入；旧top-level/horizons源码及训练恢复指纹未改。入口自动定位已完成GT三轮，也允许DIAG_CHECKPOINT显式指定；快照/整数批次窗口状态支持同DIAG_OUT续诊断。
+详见 `docs/JOINT_OCC_LOSS_ACTION_AUDIT_CN.md`；只需服务器一趟 `bash tools/joint_occ_experiments/diagnostics/run.sh` 的summary，不启动15/20轮或新损失对照训练。
+本地新诊断与原fused/两未来分组相关回归29项通过，补充非有限梯度拒绝后新专项8项通过；含分离梯度之和还原原实际WM训练梯度、原硬六帧不变、真实eval session、完整CLI中断/64窗续评不重计及source/Adam/RNG字节不改。CLI help/Bash/diff通过；无完整nuScenes/L40S，尚未得到真实诊断结果，不宣称已找到掉分主因或loss收益。
+
 用户批准实现 GT/内部Pred 两种配置，随机同初始化，TRAIN20%×3轮；旧正式模型不修改。
 新增 `tools/joint_occ_experiments/`：原Transport+SurfaceCCR+8710参数历史控制ego头，训练soft投影/合成与全六帧CE+Lovász，source几何/existence和R10ego辅助；硬推理保持owner规则，ADD0.5/REMOVE0.95及REMOVE-off同时报告。
 Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived条件；soft/hard并非同输出，首8评估窗只做gap诊断。
