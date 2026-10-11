@@ -145,20 +145,25 @@ class _CombinedLoss(torch.autograd.Function):
         if lovasz_upstream is not None and ctx.sparse:
             sparse_saved = ctx.saved_tensors[3:]
             for cls, ids, coefficient in zip(prepared.class_ids, sparse_saved[::2], sparse_saved[1::2]):
-                gradient[cls, ids] = coefficient*lovasz_upstream/ctx.normalizer
+                gradient[cls, ids] = coefficient*lovasz_upstream
         elif lovasz_upstream is not None and len(coefficients):
             local = torch.zeros_like(coefficients).scatter_(
-                1, order, coefficients*lovasz_upstream/ctx.normalizer)
+                1, order, coefficients*lovasz_upstream)
             if positions is None:
                 gradient.index_copy_(0, classes, local)
             else:
                 gradient[classes[:, None], positions[None]] = local
         if ce_upstream is not None and len(labels):
-            local = (-ce_upstream/len(labels))/ce_probability/ctx.normalizer
+            local = (-ce_upstream/len(labels))/ce_probability
             if positions is None:
                 gradient.scatter_add_(0, labels[None], local[None])
             else:
                 gradient[labels, positions] = gradient[labels, positions]+local
+        # Match the reference graph: FIRST accumulate CE + Lovasz derivatives
+        # with respect to normalized probabilities, THEN undo normalization.
+        # Dividing the two terms separately changes FP32 rounding and can
+        # become visible after several BF16 network/Adam updates.
+        gradient.div_(ctx.normalizer)
         return gradient.to(ctx.dtype), None, None, None
 
 
@@ -168,7 +173,7 @@ def occupancy_loss_prepared(probability, prepared, *, lovasz_weight=1., epsilon=
 
 
 @contextmanager
-def prepared_loss_execution(rows, device, *, sparse=False):
+def prepared_loss_execution(rows, device, *, sparse=False, audit=None):
     """Single-thread training/probe opt-in; no changes to the legacy contract.
 
     Preparation is inside the caller's elapsed time. The old engine still
@@ -186,6 +191,29 @@ def prepared_loss_execution(rows, device, *, sparse=False):
         if cursor >= len(prepared): raise RuntimeError('unexpected horizon loss order')
         result = occupancy_loss_prepared(probability, prepared[cursor], lovasz_weight=lovasz_weight,
                                          epsilon=epsilon, sparse=sparse)
+        if audit is not None and cursor == 1:
+            # One REAL horizon from the first batch, OUTSIDE throughput timing.
+            # Detached copies isolate the loss implementation from the network
+            # graph and BF16 parameter-gradient accumulation. No model mutation.
+            p = probability.detach().float().requires_grad_()
+            old = previous(p, target, lovasz_weight=lovasz_weight, epsilon=epsilon,
+                           class_ids=class_ids, reference=False)
+            new = occupancy_loss_prepared(p, prepared[cursor], lovasz_weight=lovasz_weight,
+                                          epsilon=epsilon, sparse=sparse)
+            a = torch.autograd.grad(old[0], p)[0]
+            b = torch.autograd.grad(new[0], p)[0]
+            close = torch.isclose(a, b, rtol=3e-5, atol=2e-7)
+            values_close = all(bool(torch.isclose(x, y, rtol=2e-6, atol=3e-7))
+                               for x, y in zip(old, new))
+            audit.update(loss_values_match=values_close,
+                         gradient_numerical_parity=bool(close.all()),
+                         pass_gate=values_close and bool(close.all()),
+                         max_gradient_abs_difference=float((a-b).abs().max()),
+                         mismatched_gradient_elements=int((~close).sum()),
+                         compared_gradient_elements=a.numel(),
+                         byte_equal_gradients=bool(torch.equal(a, b)),
+                         budgets=dict(loss_rtol=2e-6, loss_atol=3e-7,
+                                      gradient_rtol=3e-5, gradient_atol=2e-7))
         cursor += 1
         return result
     engine.occupancy_loss = loss

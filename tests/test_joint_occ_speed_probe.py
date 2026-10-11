@@ -44,6 +44,40 @@ def test_probe_rejects_empty_and_one_sided_measurements():
             probe.measure(model, optimizer, provider, saved, batches, passes=passes)
 
 
+def test_report_retains_original_budget_and_exact_failure_path():
+    original = dict(model={'bias': torch.zeros(128)})
+    changed = copy.deepcopy(original)
+    changed['model']['bias'][7] = 2.2003543563187122e-5
+    report = probe.state_parity(original, changed)
+    assert report['numerical_parity'] is False and report['mismatched_elements'] == 1
+    assert report['budgets'] == dict(rtol=2e-4, atol=2e-5)
+    assert report['worst_tensors'][0]['path'] == 'state.model.bias'
+    assert report['max_state_abs_difference'] > 2e-5
+    with pytest.raises(RuntimeError, match='structure/dtype'):
+        probe.state_parity(original, dict(model={'bias': torch.zeros(127)}))
+
+
+def test_numeric_failure_finishes_all_timings_but_never_passes_gate(monkeypatch):
+    from tools.joint_occ_experiments import engine
+    model, optimizer, provider, row, saved = saved_fixture()
+    real_step, original_loss = probe.train_arm, engine.occupancy_loss
+    def drift(*args, **kwargs):
+        stats = real_step(*args, **kwargs)
+        if engine.occupancy_loss is not original_loss and not kwargs['probe'] and kwargs['update'] == saved['updates']+2:
+            with torch.no_grad(): next(model.transport.parameters()).flatten()[7] += .01
+        return stats
+    monkeypatch.setattr(probe, 'train_arm', drift)
+    result = probe.measure(model, optimizer, provider, saved, [[row], [row]], progress=lambda *a, **k: None)
+    assert all(len(rows) == 2 for rows in result['timed_passes'].values())
+    for name in probe.BACKENDS[1:]:
+        assert result['warmup'][name]['loss_gradient_audit']['pass_gate']
+        assert not result['candidates'][name]['numerical_parity']
+        assert not result['candidates'][name]['pass_gate']
+        assert result['timed_passes'][name][0]['final_state_parity']['mismatched_elements'] > 0
+    assert probe.assert_close_state(model.state_dict(), saved['models']['gt']) == 0
+    assert probe.assert_close_state(optimizer.state_dict(), saved['optimizers']['gt']) == 0
+
+
 def test_cli_source_snapshot_and_cursor_unmodified(monkeypatch, tmp_path):
     model, optimizer, provider, row, saved = saved_fixture()
     root = Path(probe.__file__).resolve().parents[3]

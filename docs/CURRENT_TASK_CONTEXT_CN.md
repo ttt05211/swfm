@@ -22,6 +22,11 @@ Pred未来GT pose/background/label毒化测试通过，导航仍明确GT-derived
 只读原GT-only断点的 A/B/C `performance/run_probe.sh`：临时真实forward/backward/Adam、同RNG八批两遍；新目录snapshot/speed/summary，无科学更新/旧缓存写入，无自动推广。
 旧 top-level trainer/依赖源码不改，c57 GT-only恢复契约仍兼容；候选尚未接入正式续训。详见 `docs/JOINT_OCC_GT_SPEED_PROBE_CN.md`。
 此次新loss/probe+原fused/模型专项89项CPU测试通过，CLI/Bash检查通过；本地CUDA环境无法完成导入，未代跑或声称真实服务器加速。
+服务器 GT源目录已确定 `outputs/p0_f9_joint_occ_ego/gt3_fast_20261011_123726`；probe_20261011_131016在combined八步累计检查首个报告的128维张量中1元素差2.2003544e-5>2e-5退出，余下未统计；原版0.636530s/窗，原断点未改。
+修复新loss导数归一化顺序：先合CE/Lovász，再统一除，匹配旧计算图；非单位upstream逐体素梯度CPU精确一致。仍不宣称CUDA通过。
+新probe数值超标不再丢剩余速度：报告参数名/count/max、warm真实1s概率loss梯度、两遍原版replay及原预算；任一parity失败候选gate仍False，结构/数据/非有限错误仍停止。
+只改performance子目录与其测试/文档，旧GT resume指纹不变；新progress保留每阶段结果，不自动接入训练。下一步新目录重测同一已知GT source，不重建cache。
+修复后新loss/probe及原fused/模型专项92项CPU通过（非全仓CI）；实际L40S仍待重测，旧失败目录保留。
 
 ## 当前目标
 

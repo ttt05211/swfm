@@ -46,6 +46,41 @@ def assert_close_state(left, right):
     return 0.
 
 
+def state_parity(left, right):
+    """Keep the ORIGINAL tolerance; report numeric failures, never waive them.
+
+    Architecture/structure changes are errors, not rounding differences.
+    """
+    failures, maxima, elements = [], [], 0
+    def visit(a, b, path):
+        nonlocal elements
+        if isinstance(a, torch.Tensor):
+            if not isinstance(b, torch.Tensor) or a.shape != b.shape or a.dtype != b.dtype:
+                raise RuntimeError('state structure/dtype differs: '+path)
+            close = (a == b if not a.is_floating_point() or path.endswith('.step') else
+                     torch.isclose(a, b, rtol=2e-4, atol=2e-5))
+            diff = (a.float()-b.float()).abs()
+            maximum = float(diff.max()) if diff.numel() else 0.
+            maxima.append(maximum); elements += a.numel()
+            if not bool(close.all()):
+                failures.append(dict(path=path, mismatched_elements=int((~close).sum()),
+                                     elements=a.numel(), max_abs_difference=maximum))
+        elif isinstance(a, dict):
+            if not isinstance(b, dict) or a.keys() != b.keys(): raise RuntimeError('different state keys: '+path)
+            for key in a: visit(a[key], b[key], path+'.'+str(key))
+        elif isinstance(a, (list, tuple)):
+            if not isinstance(b, type(a)) or len(a) != len(b): raise RuntimeError('different state lengths: '+path)
+            for i, (x, y) in enumerate(zip(a, b)): visit(x, y, path+'.'+str(i))
+        elif a != b:
+            raise RuntimeError('different scalar state: '+path)
+    visit(left, right, 'state')
+    return dict(numerical_parity=not failures, max_state_abs_difference=max(maxima, default=0.),
+                mismatched_elements=sum(row['mismatched_elements'] for row in failures),
+                compared_elements=elements, mismatched_tensors=len(failures),
+                worst_tensors=sorted(failures, key=lambda row: row['max_abs_difference'], reverse=True)[:8],
+                budgets=dict(rtol=2e-4, atol=2e-5))
+
+
 def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=print):
     """Reset SAME source weights/Adam/RNG before every pass; AB/BA order."""
     if not batches or passes < 2: raise ValueError('nonempty batches and two alternating passes required')
@@ -54,9 +89,9 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
     def reset():
         model.load_state_dict(weights, strict=True); optimizer.load_state_dict(copy.deepcopy(adam))
         legacy.restore_rng(saved['rng']); model.train().requires_grad_(True)
-    def step(name, rows, i, probe=False):
+    def step(name, rows, i, probe=False, audit=None):
         scope = (nullcontext() if name == BACKENDS[0] else
-                 prepared_loss_execution(rows, provider.device, sparse=name == 'prepared_sparse'))
+                 prepared_loss_execution(rows, provider.device, sparse=name == 'prepared_sparse', audit=audit))
         with scope:
             return train_arm(model, optimizer, provider, rows, 'gt',
                 update=min(saved['updates']+i+1, contract['total_updates']), total_updates=contract['total_updates'],
@@ -64,17 +99,22 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
                 lovasz_weight=contract['weights'][2], probe=probe)
     # First-use allocation/probe is deliberately OUTSIDE throughput timing.
     for name in BACKENDS:
-        reset(); stats = step(name, batches[0], 0, probe=True)
+        reset(); loss_audit = {} if name != BACKENDS[0] else dict(pass_gate=True, scope='reference')
+        stats = step(name, batches[0], 0, probe=True, audit=loss_audit)
         state = dict(model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                      adam=copy.deepcopy(optimizer.state_dict()))
         if warm_reference is None: warm_reference = state; reference_stats = stats
-        difference = assert_close_state(warm_reference, state)
-        for key in ('CE', 'Lovasz', 'source_geometry', 'existence', 'ego_geometry', 'grad_norm'):
-            torch.testing.assert_close(torch.tensor(stats[key]), torch.tensor(reference_stats[key]), rtol=2e-4, atol=2e-5)
-        assert_close_state({k: torch.tensor(v) for k, v in reference_stats['gradient_links'].items()},
-                           {k: torch.tensor(v) for k, v in stats['gradient_links'].items()})
-        warm[name] = dict(numerical_parity=True, max_state_abs_difference=difference,
-                          gradient_links=stats['gradient_links'])
+        parity_state = state_parity(warm_reference, state)
+        diagnostic_keys = ('CE', 'Lovasz', 'source_geometry', 'existence', 'ego_geometry', 'grad_norm')
+        diagnostic = lambda s: dict(losses={k: torch.tensor(s[k]) for k in diagnostic_keys},
+                                   gradient_links={k: torch.tensor(v) for k, v in s['gradient_links'].items()})
+        parity_diagnostic = state_parity(diagnostic(reference_stats), diagnostic(stats))
+        warm[name] = dict(numerical_parity=parity_state['numerical_parity'] and parity_diagnostic['numerical_parity']
+                                         and loss_audit.get('pass_gate', False),
+                          max_state_abs_difference=parity_state['max_state_abs_difference'],
+                          state_parity=parity_state, loss_and_links_parity=parity_diagnostic,
+                          loss_gradient_audit=loss_audit, gradient_links=stats['gradient_links'])
+        progress('GT_SPEED_WARM '+json.dumps(dict(backend=name, **warm[name])), flush=True)
     timed = {name: [] for name in BACKENDS}
     parity = {}
     for repeat in range(passes):
@@ -102,15 +142,21 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
             state = dict(model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                          adam=copy.deepcopy(optimizer.state_dict()))
             if final_reference is None: final_reference = state
-            parity[name] = dict(numerical_parity=True, max_state_abs_difference=assert_close_state(final_reference, state))
+            current_parity = state_parity(final_reference, state)
+            row['final_state_parity'] = current_parity
+            if name not in parity: parity[name] = dict(numerical_parity=True, max_state_abs_difference=0.)
+            parity[name]['numerical_parity'] &= current_parity['numerical_parity']
+            parity[name]['max_state_abs_difference'] = max(parity[name]['max_state_abs_difference'], current_parity['max_state_abs_difference'])
             progress('GT_SPEED '+json.dumps(dict(backend=name, **row)), flush=True)
     means = {name: sum(r['seconds'] for r in rows)/sum(r['windows'] for r in rows) for name, rows in timed.items()}
     candidates = {}
     for name in BACKENDS[1:]:
         speedup = means[BACKENDS[0]]/means[name]
-        candidates[name] = dict(speedup=speedup, numerical_parity=parity[name]['numerical_parity'],
-            faster_each_pass=all(a['seconds'] < b['seconds'] for a, b in zip(timed[name], timed[BACKENDS[0]])),
-            pass_gate=speedup >= 1.1 and all(a['seconds'] < b['seconds'] for a, b in zip(timed[name], timed[BACKENDS[0]])))
+        numerical = parity[name]['numerical_parity'] and warm[name]['numerical_parity']
+        replay = parity[BACKENDS[0]]['numerical_parity']
+        faster = all(a['seconds'] < b['seconds'] for a, b in zip(timed[name], timed[BACKENDS[0]]))
+        candidates[name] = dict(speedup=speedup, numerical_parity=numerical, baseline_repeat_parity=replay,
+            faster_each_pass=faster, pass_gate=numerical and replay and speedup >= 1.1 and faster)
     reset()  # Also leave these transient objects at the unmodified source state.
     return dict(seconds_per_window=means, timed_passes=timed, warmup=warm, final_state_parity=parity,
                 candidates=candidates, scope='GT real forward/backward+Adam+target preparation; input I/O excluded',
@@ -190,7 +236,12 @@ def main(argv=None):
                  for j, g in enumerate(sequence) if e > epoch or j >= cursor]+groups[0])[:a.probe_steps]
         descriptors = HistoryInputs(provider, ram_mib=a.descriptor_ram_mib)
         batches = list(prefetched_batches(provider, train_source, jobs, descriptors, workers=a.prefetch_workers))
-        report = measure(model, optimizer, provider, saved, batches)
+        def progress(message, *, flush=True):
+            event, _, payload = message.partition(' ')
+            with (out/'progress.jsonl').open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(dict(event=event, **json.loads(payload)))+'\n')
+            print(message, flush=flush)
+        report = measure(model, optimizer, provider, saved, batches, progress=progress)
         report.update(status='complete', source_checkpoint=str(source_checkpoint), source_snapshot_sha256=digest,
             source_completed_updates=saved['updates'], scientific_updates_published=0, cache_audit=caches,
             probe_keys=[[r['scene_name'], r['t0_token']] for group in jobs for r in group],
@@ -202,7 +253,16 @@ def main(argv=None):
                  'Target preparation INCLUDED; shared input I/O excluded. Numerical parity, NOT BF16 byte identity.']
         for name, seconds in report['seconds_per_window'].items():
             lines.append(f'{name}: {seconds:.6f} seconds/window')
-        lines += ['CANDIDATES '+json.dumps(report['candidates']), 'No automatic continuation/backend promotion; old GT resume remains compatible.']
+        for name in BACKENDS:
+            lines.append('PARITY '+json.dumps(dict(backend=name, warmup=report['warmup'][name]['numerical_parity'],
+                loss_gradient_audit=report['warmup'][name]['loss_gradient_audit'],
+                final=report['final_state_parity'][name])))
+            for trial in report['timed_passes'][name]:
+                if not trial['final_state_parity']['numerical_parity']:
+                    lines.append('MISMATCH '+json.dumps(dict(backend=name, pass_index=trial['pass_index'],
+                                                           **trial['final_state_parity'])))
+        lines += ['CANDIDATES '+json.dumps(report['candidates']),
+                  'Numeric failures remain FAIL; tolerance NOT relaxed. No automatic backend promotion; old GT resume compatible.']
         text = '\n'.join(lines)+'\n'
         (out/'summary.txt').write_text(text, encoding='utf-8'); print(text, flush=True)
     except Exception as error:

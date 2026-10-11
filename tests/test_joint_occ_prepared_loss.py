@@ -53,6 +53,22 @@ def test_prepared_supervision_and_loss_only_patch_restored_on_exception():
     assert engine.occupancy_loss is previous
 
 
+def test_probability_gradients_follow_reference_normalization_order_exactly():
+    torch.set_num_threads(1)
+    torch.manual_seed(42)
+    labels = torch.arange(4007) % 18
+    probability = torch.rand(18, len(labels))
+    probability = (probability/probability.sum(0)).requires_grad_()
+    prepared = prepare_target(labels, 'cpu')
+    # Nonunit upstream catches reassociation of scale, CE and Lovasz division.
+    for weight in (.3, 1.):
+        old = occupancy_loss(probability, labels, lovasz_weight=weight)[0]*.0137
+        new = occupancy_loss_prepared(probability, prepared, lovasz_weight=weight)[0]*.0137
+        a = torch.autograd.grad(old, probability)[0]
+        b = torch.autograd.grad(new, probability)[0]
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize('mode', ['gt', 'pred'])
 @pytest.mark.parametrize('sparse', [False, True])
 def test_actual_six_frame_adam_step_and_all_gradient_links_match_current_fused(mode, sparse):
