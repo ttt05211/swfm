@@ -30,7 +30,7 @@ from tools.joint_occ_experiments.performance.probe import (
 from tools.shared_history_experiments import engine as reference
 from tools.shared_history_experiments.history import SharedHistoryInputs
 from tools.shared_history_experiments.model import SharedJoint, PROTOCOL
-from .engine import train_arm_grouped, train_arm_packed
+from .engine import train_arm_grouped, train_arm_packed, train_arm_scene_packed
 
 
 BACKENDS = (
@@ -40,6 +40,9 @@ BACKENDS = (
     "packed_h2",
     "packed_h3",
     "packed_h6",
+    "scene_packed_h2",
+    "scene_packed_h3",
+    "scene_packed_h6",
 )
 
 
@@ -177,6 +180,16 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
             )
         if name.startswith("packed_h"):
             return train_arm_packed(
+                model,
+                optimizer,
+                provider,
+                rows,
+                "gt",
+                horizon_group=int(name.rsplit("h", 1)[1]),
+                **common,
+            )
+        if name.startswith("scene_packed_h"):
+            return train_arm_scene_packed(
                 model,
                 optimizer,
                 provider,
