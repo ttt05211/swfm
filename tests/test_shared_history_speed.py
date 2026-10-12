@@ -14,6 +14,7 @@ from tools.shared_history_experiments.speed.engine import (
     forward_batch,
     train_arm_grouped,
     train_arm_packed,
+    train_arm_scene_packed,
 )
 from tools.joint_occ_experiments.batching.geometry import GroupedScene, grouped_loss
 from tools.joint_occ_experiments.fast_autograd import RenderGradientBridge
@@ -256,6 +257,37 @@ def test_sequential_h3_h6_one_step_matches_current_h2(horizon_group):
             atol=2e-5,
         )
     _assert_model_close(candidate, baseline)
+
+
+def test_scene_packed_h2_one_step_matches_current_h2_with_same_global_batch():
+    model, _, provider, row = fixture()
+    baseline = copy.deepcopy(model)
+    candidate = copy.deepcopy(model)
+    opt_a, opt_b = _optimizer(baseline), _optimizer(candidate)
+
+    rng = torch.get_rng_state()
+    stats_a = reference.train_arm(
+        baseline, opt_a, provider, [row, row], "gt",
+        update=1, total_updates=4, probe=True,
+    )
+    torch.set_rng_state(rng)
+    stats_b = train_arm_scene_packed(
+        candidate, opt_b, provider, [row, row], "gt",
+        update=1, total_updates=4, probe=True, horizon_group=2,
+    )
+
+    for key in ("CE", "Lovasz", "source_geometry", "existence", "ego_geometry"):
+        np.testing.assert_allclose(
+            stats_b[key], stats_a[key], rtol=3e-4, atol=3e-5
+        )
+    for key in stats_a["gradient_links"]:
+        np.testing.assert_allclose(
+            stats_b["gradient_links"][key],
+            stats_a["gradient_links"][key],
+            rtol=8e-4,
+            atol=8e-5,
+        )
+    _assert_model_close(candidate, baseline, rtol=8e-4, atol=8e-5)
 
 
 def test_packed_h2_one_step_matches_current_h2_with_same_global_batch():
