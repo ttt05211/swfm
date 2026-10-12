@@ -296,6 +296,9 @@ def _encode_fields(model, rows, device):
 
 def _pack_transport(model, fields, reads, times, classes, ktas):
     transport = model.transport
+    if not fields:
+        raise ValueError("packed transport requires at least one field view")
+    template = fields[0]
     dim, hw = transport.config.d_model, transport.config.tube_hw // 2
     local_parts, condition_parts, class_parts, kta_parts, lengths = [], [], [], [], []
 
@@ -347,7 +350,7 @@ def _pack_transport(model, fields, reads, times, classes, ktas):
 
     total = sum(lengths)
     if not total:
-        empty = fields.new_empty
+        empty = template.new_empty
         output = dict(
             residual_xy_m=empty((0, 6, 2)),
             yaw_delta_rad=empty((0, 6)),
@@ -396,6 +399,9 @@ def _split_sources(output, lengths):
 
 
 def _encode_repair_packed(model, fields, reads, times, evidences):
+    if not fields:
+        raise ValueError("packed repair requires at least one field view")
+    template = fields[0]
     columns = model.columns
     values_parts, facts_parts, valid_parts = [], [], []
     actor_parts, class_parts, surface_parts, point_lengths = [], [], [], []
@@ -427,7 +433,7 @@ def _encode_repair_packed(model, fields, reads, times, evidences):
 
     total = sum(point_lengths)
     if not total:
-        return fields.new_empty((0, columns.width)), [], point_lengths
+        return template.new_empty((0, columns.width)), [], point_lengths
 
     values = torch.cat(values_parts, 0)
     facts = torch.cat(facts_parts, 0)
@@ -470,8 +476,13 @@ def forward_batch(model, provider, rows):
         device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
         fields = _encode_fields(model, rows, device)
+        # IMPORTANT: create the per-scene views ONCE and reuse these exact
+        # Tensor objects everywhere.  Re-indexing fields[index] later creates
+        # a different view object; autograd.grad(view_not_consumed, ...) then
+        # reports None even though encoder parameters receive real gradients.
+        field_views = list(fields.unbind(0))
         packed_output, source_lengths = _pack_transport(
-            model, fields, reads, times, classes, ktas
+            model, field_views, reads, times, classes, ktas
         )
         ego_history = cast(np.stack([row[2][0] for row in rows]))
         commands = cast(np.stack([row[2][1] for row in rows]))
@@ -521,7 +532,7 @@ def forward_batch(model, provider, rows):
                 evidence=evidence,
                 plan=plan,
                 mapped=mapped,
-                field=fields[index],
+                field=field_views[index],
             )
         )
 
@@ -529,7 +540,7 @@ def forward_batch(model, provider, rows):
         device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
         encoded, _, point_lengths = _encode_repair_packed(
-            model, fields, reads, times, evidences
+            model, field_views, reads, times, evidences
         )
         if sum(point_lengths):
             global_actor = torch.cat(global_actor_parts, 0)
