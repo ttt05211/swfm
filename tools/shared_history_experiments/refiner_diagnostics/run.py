@@ -40,7 +40,6 @@ def report(out, result, speed_windows, speed_repeats, reference):
         speed['source_epoch2_quality_reproduced'] = metrics_match
         if not metrics_match:
             speed['valid_same_quality_route_timing'] = False
-            speed['window_fps'] = speed['output_frame_fps'] = None
         lines.append('SPEED '+json.dumps(speed))
         legacy.write_json(out/'speed.json', speed)
         legacy.write_json(out/'edit_audit.json', dict(windows=evaluation['windows'],
@@ -49,6 +48,7 @@ def report(out, result, speed_windows, speed_repeats, reference):
     else:
         lines.append('Incomplete evaluation: completed whole windows saved; resume SAME diagnostic directory.')
     lines += ['Same old prepared-history timing boundary; NEW learned Encoder/memory/Refiner included.',
+        'ALL selected windows timed; strict parity FAIL retained independently; NO tolerance waiver.',
         'Initial history staging outside, projection-internal materialization INSIDE.',
         'Fresh Strong/KTA and ALL SIX CPU output frames INSIDE; quality cache never reused for timing.',
         '32x3 is WARM diagnostic latency, NOT old-model 54.945 FPS or raw-camera end-to-end FPS.',

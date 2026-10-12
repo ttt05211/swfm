@@ -65,14 +65,15 @@ def test_real_model_fresh_parity_all6_no_gt_cached_strong_no_ego_readonly(monkey
     for k, v in before.items(): torch.testing.assert_close(v, model.state_dict()[k], atol=0, rtol=0)
     failed = engine.measure(model, p, (row[0], raw, row[2], row[3]),
         {**expected, 'semantic_refine': np.full_like(expected['semantic_refine'], 16)}, repeats=2)
-    assert not failed['six_frame_byte_parity'] and not failed['seconds']
+    assert not failed['six_frame_byte_parity'] and len(failed['seconds']) == 2
+    assert failed['timing_complete'] and len(failed['checks']) == 4
 
 
 def test_full_window_integer_resume_and_distinct_dynamic_moving_populations(monkeypatch):
     model, _, p, row = fixture(); source = SimpleNamespace(nusc=None)
     monkeypatch.setattr(engine, 'gt_moving_support_sequence', lambda *a, **k: [])
     monkeypatch.setattr(engine, 'moving_support_masks', lambda _, shape: np.zeros((6, *shape), bool))
-    monkeypatch.setattr(engine, 'measure', lambda *a: dict(six_frame_byte_parity=True, seconds=[.1]*3, serialized_profile_seconds={}))
+    monkeypatch.setattr(engine, 'measure', lambda *a, **kw: dict(six_frame_byte_parity=True, seconds=[.1]*3, serialized_profile_seconds={}))
     keys = {(row[0]['scene_name'], row[0]['t0_token'])}
     states = []
     engine.evaluate({'gt': model}, p, source, [[row]], speed_keys=keys, save=lambda s: states.append(copy.deepcopy(s)))
@@ -96,7 +97,9 @@ def test_timing_invalid_never_publishes_fps():
     assert report['valid_same_quality_route_timing'] and report['output_frame_fps'] == pytest.approx(60.)
     assert report['window_fps'] == pytest.approx(10.)
     assert not engine.speed_summary({'a': row}, 2, 3, True)['valid_same_quality_route_timing']
-    assert engine.speed_summary({'a': {**row, 'six_frame_byte_parity': False}}, 1, 3, True)['output_frame_fps'] is None
+    failure = engine.speed_summary({'a': {**row, 'six_frame_byte_parity': False}}, 1, 3, True)
+    assert not failure['valid_same_quality_route_timing'] and failure['timing_complete']
+    assert failure['output_frame_fps'] == pytest.approx(60.)
     assert engine.speed_summary({'a': row}, 1, 3, False)['output_frame_fps'] is None
 
 
@@ -143,4 +146,98 @@ def test_report_quality_reproduction_gate(tmp_path):
     reference['evaluation']['variants']['gt']['semantic_refine']['mIoU'] += .1
     run.report(tmp_path, result, 1, 3, reference)
     speed = json.loads((tmp_path/'speed.json').read_text())
-    assert not speed['valid_same_quality_route_timing'] and speed['output_frame_fps'] is None
+    assert not speed['valid_same_quality_route_timing'] and speed['output_frame_fps'] == pytest.approx(60.)
+
+
+def test_logits_flip_margins_nonfinite_and_shape_errors():
+    reference = np.zeros((6, 18, 2), np.float32); reference[:, 0] = 1.
+    actual_logits = torch.tensor(reference); actual_logits[0, 0, 0] = .999
+    actual_logits[0, 1, 0] = 1.001
+    expected = {'semantic_refine': reference.argmax(1)}
+    actual = {'semantic_refine': actual_logits.argmax(1).numpy()}
+    result = engine.comparison_details(actual, expected, actual_logits, reference)
+    assert result['mismatches']['semantic_refine'] == 1
+    assert result['per_horizon']['semantic_refine'] == [1, 0, 0, 0, 0, 0]
+    sample = result['changed_voxel_samples'][0]
+    assert sample['fresh_class'] == 1 and sample['reference_class'] == 0
+    assert sample['fresh_top2_margin'] == pytest.approx(.002, abs=1e-7)
+    actual_logits[0, 0, 0] = float('nan')
+    with pytest.raises(RuntimeError, match='nonfinite'): engine.comparison_details(actual, expected, actual_logits)
+    with pytest.raises(RuntimeError, match='shape'): engine.comparison_details({'semantic_refine': actual['semantic_refine'][:5]}, expected)
+
+
+def test_incomplete_population_not_reported_as_complete_fps():
+    row = dict(six_frame_byte_parity=False, seconds=[.1]*3, serialized_profile_seconds={},
+        mismatches=[{'semantic_refine': 4, 'transport': 0}])
+    report = engine.speed_summary({str(i): row for i in range(28)}, 32, 3, True)
+    assert not report['timing_complete'] and report['output_frame_fps'] is None
+    report = engine.speed_summary({str(i): row for i in range(32)}, 32, 3, True)
+    assert report['timing_complete'] and report['measured_calls'] == report['expected_calls'] == 96
+    assert report['max_changed_voxels_per_six_frame_call']['semantic_refine'] == 4
+    assert not report['six_frame_byte_parity'] and not report['valid_same_quality_route_timing']
+
+
+def test_retime_resume_reuses_quality_counts_and_no_metrics_GT(monkeypatch):
+    from tools.shared_history_experiments.refiner_diagnostics import retime
+    model, _, p, row = fixture(); model.eval()
+    rows = [({**row[0], 't0_token': str(i)}, *row[1:]) for i in range(2)]
+    keys = {(r[0]['scene_name'], r[0]['t0_token']) for r in rows}
+    calls = []
+    def measure(*args, **kw):
+        calls.append(1)
+        return dict(timing_policy=engine.TIMING_POLICY, six_frame_byte_parity=False, seconds=[.1]*3,
+            serialized_profile_seconds={}, mismatches=[{'semantic_refine': 1}])
+    monkeypatch.setattr(engine, 'measure', measure)
+    imported = dict(windows=512, variants={'gt': {}}, edits={'UNCHANGED': 1}, speed={'OLD_BIASED': {}}, trajectory={})
+    original = copy.deepcopy(imported)
+    state = dict(protocol=retime.PROTOCOL, speed={})
+    # First window already completed: no forwarding/scoring or timing again.
+    state['speed']['|'.join((rows[0][0]['scene_name'], rows[0][0]['t0_token']))] = measure()
+    calls.clear(); snapshots = []
+    result = retime.evaluate({'gt': model}, p, SimpleNamespace(nusc='POISON'), [[r] for r in rows],
+        imported=imported, speed_keys=keys, repeats=3, saved=state, save=lambda s: snapshots.append(s))
+    assert len(calls) == 1 and result['quality_reused'] and result['no_DEV512_rescoring']
+    assert result['edits'] == imported['edits'] and imported == original
+    assert len(result['speed']) == 2 and not result['speed_summary']['six_frame_byte_parity']
+
+
+def test_retime_cli_only_prefetches32_and_parent_unchanged(tmp_path, monkeypatch):
+    from tools.shared_history_experiments.refiner_diagnostics import retime
+    parent = tmp_path/'old'; (parent/'frozen').mkdir(parents=True)
+    keys = [['DEV', str(i)] for i in range(512)]
+    contract = dict(modes=['gt'], total_updates=2060, eval_keys=keys)
+    snapshot = parent/'frozen/epoch2.pt'
+    torch.save(dict(protocol=PROTOCOL, epoch=2, batch=0, updates=2060, contract=contract), snapshot)
+    metric = engine.Metrics()
+    for value in vars(metric).values(): value[:] = 1
+    variants = {n: metric.compute() for n in ('transport', 'semantic_refine')}
+    imported = dict(windows=512, edits={'1.0': {'full_grid': {'changed': 1}}}, variants={'gt': variants}, speed={})
+    paths = {n: tmp_path/n for n in ('config', 'train-cache', 'dev-cache', 'population-manifest',
+        'base-checkpoint', 'train-info', 'dev-info')}
+    for path in paths.values(): path.write_text('fixture')
+    retime.legacy.write_json(parent/'results.json', dict(status='complete', contract=contract, updates=2060, evaluation=imported))
+    retime.legacy.write_json(parent/'diagnostic_contract.json', dict(protocol='semantic_refiner_frozen_edits_fresh_fps_v1',
+        checkpoint_sha256=retime.legacy.sha256(snapshot), speed_keys=keys[:32], dependencies={},
+        runtime=dict(torch=str(torch.__version__), cuda=torch.version.cuda, numpy=np.__version__)))
+    retime.legacy.write_json(parent/'eval_state_update2060.json', dict(update=2060,
+        population=retime.legacy.stable_json_fingerprint(keys), state=dict(protocol='semantic_refiner_frozen_edits_fresh_fps_v1',
+        windows=512, edits=imported['edits'], metrics={n: {k: v.tolist() for k, v in vars(metric).items()} for n in variants})))
+    before = {str(p): p.read_bytes() for p in parent.rglob('*') if p.is_file()}
+    root = tmp_path/'retime'
+    args = [v for n, path in paths.items() for v in ('--'+n, str(path))]
+    args += ['--out-dir', str(root), '--resume', str(snapshot), '--reuse-audit', str(parent),
+        '--dataroot', str(tmp_path), '--ccr-history-cache', str(tmp_path), '--ccr-val-history-cache', str(tmp_path)]
+    monkeypatch.setattr(retime.legacy, 'prefetched_batches', lambda p, s, groups, d, **kw: iter(groups))
+    original_eval, original_batches = retime.quality.evaluate, retime.legacy.prefetched_batches
+    def fake(event, argv):
+        assert '--evaluate-only' in argv
+        groups = [[dict(scene_name=s, t0_token=t)] for s, t in keys]
+        loaded = list(retime.legacy.prefetched_batches(None, None, groups, None))
+        assert len(loaded) == 32 and all(int(g[0]['t0_token']) < 32 for g in loaded)
+        (root/'results.json').write_text(json.dumps(dict(status='stopped_at_complete_eval_window')))
+        return 0
+    monkeypatch.setattr(retime.training, 'main', fake)
+    assert retime.main(argv=args) == 0
+    assert retime.main(argv=args+['--retime-resume']) == 0
+    assert retime.quality.evaluate is original_eval and retime.legacy.prefetched_batches is original_batches
+    assert all(Path(p).read_bytes() == value for p, value in before.items())

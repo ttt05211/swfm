@@ -16,7 +16,8 @@ from tools.joint_occ_experiments.soft_geometry import source_targets, effective_
 from ..refine import engine as quality
 from ..refine.geometry import TransportPrior, aligned_memory
 
-PROTOCOL = 'semantic_refiner_frozen_edits_fresh_fps_v1'
+PROTOCOL = 'semantic_refiner_frozen_edits_fresh_fps_v2'
+TIMING_POLICY = 'complete_population_separate_strict_byte_parity_v2'
 REPORT_H = (1, 3, 5)
 
 
@@ -74,7 +75,7 @@ def prepare_speed(model, provider, row):
 
 
 @torch.no_grad()
-def fresh_predictions(model, provider, prepared, profile=None, *, final_only=False):
+def fresh_predictions(model, provider, prepared, profile=None, *, final_only=False, debug=None):
     record, raw, history, causal, staged = prepared
     state = {**history[0]['state']}; device = provider.device
     def stage(name, function):
@@ -109,30 +110,75 @@ def fresh_predictions(model, provider, prepared, profile=None, *, final_only=Fal
     memory = stage('aligned_memory', lambda: aligned_memory(model.columns, lifted, output, history,
         raw, targets, yaws, staged['poses'], provider.pcfg.grid))
     logits = stage('semantic_refiner', lambda: model.columns(memory, prior, range(6), scene.shape))
+    if debug is not None: debug['logits'] = logits  # reference only; inspection AFTER timer
     outputs = (('semantic_refine', logits),) if final_only else (('transport', prior), ('semantic_refine', logits))
     return stage('six_frame_argmax_CPU', lambda: {
         name: values.argmax(1).reshape(6, *scene.shape).byte().cpu().numpy()
         for name, values in outputs})
 
 
+def comparison_details(actual, expected, logits=None, reference_logits=None):
+    mismatches, per_horizon = {}, {}
+    for name, values in actual.items():
+        target = np.asarray(expected[name]); values = np.asarray(values)
+        if values.shape != target.shape or values.shape[0] != 6:
+            raise RuntimeError('comparison must retain SAME complete six-frame shape')
+        if np.any((values < 0) | (values > 17)): raise RuntimeError('invalid semantic output')
+        mask = (values != target).reshape(6, -1)
+        per_horizon[name] = mask.sum(1).astype(int).tolist()
+        mismatches[name] = int(mask.sum())
+    result = dict(mismatches=mismatches, per_horizon=per_horizon)
+    if logits is not None:
+        lo, hi = torch.aminmax(logits.detach().float())
+        if not bool(torch.isfinite(torch.stack((lo, hi))).all()): raise RuntimeError('nonfinite inference logits')
+        result['logit_range'] = [float(lo), float(hi)]
+    if reference_logits is not None and logits is not None:
+        mask = (actual['semantic_refine'] != expected['semantic_refine']).reshape(6, -1)
+        h, at = np.nonzero(mask)
+        # Bounded evidence, not a full-grid probability dump or acceptance tolerance.
+        h, at = h[:16], at[:16]
+        if len(h):
+            device = logits.device
+            fresh = logits[torch.as_tensor(h, device=device), :, torch.as_tensor(at, device=device)].float().cpu().numpy()
+            reference = np.asarray(reference_logits)[h, :, at]
+            if not np.isfinite(reference).all(): raise RuntimeError('nonfinite reference logits')
+            old = expected['semantic_refine'].reshape(6, -1)[h, at].astype(int)
+            new = actual['semantic_refine'].reshape(6, -1)[h, at].astype(int)
+            sorted_ref, sorted_new = np.sort(reference, 1), np.sort(fresh, 1)
+            result['changed_voxel_samples'] = [dict(horizon=.5*(int(h[i])+1), flat=int(at[i]),
+                reference_class=int(old[i]), fresh_class=int(new[i]),
+                reference_top2_margin=float(sorted_ref[i, -1]-sorted_ref[i, -2]),
+                fresh_top2_margin=float(sorted_new[i, -1]-sorted_new[i, -2]),
+                max_abs_logit_difference=float(np.max(np.abs(fresh[i]-reference[i])))) for i in range(len(h))]
+        else: result['changed_voxel_samples'] = []
+    return result
+
+
 @torch.no_grad()
-def measure(model, provider, row, expected, repeats=3):
+def measure(model, provider, row, expected, repeats=3, *, reference_logits=None):
     prepared, preparation = prepare_speed(model, provider, row)
-    parity = lambda actual: {k: int(np.count_nonzero(actual[k] != expected[k])) for k in actual}
-    first = fresh_predictions(model, provider, prepared)  # warmup AND gate outside timing
-    if any(parity(first).values()):
-        return dict(six_frame_byte_parity=False, mismatches=parity(first), seconds=[], history_preparation_seconds=preparation)
+    checks, seconds = [], []
+    def inspect(actual, debug, phase):
+        details = comparison_details(actual, expected, debug.pop('logits'), reference_logits)
+        checks.append(dict(phase=phase, **details))
+    debug = {}
+    first = fresh_predictions(model, provider, prepared, debug=debug)
+    inspect(first, debug, 'warmup')  # output differences NEVER filter timing population
     sync(provider.device)
     if provider.device.type == 'cuda': torch.cuda.reset_peak_memory_stats(provider.device)
-    seconds, mismatches = [], []
-    for _ in range(repeats):
+    for index in range(repeats):
+        debug = {}
         sync(provider.device); tick = time.perf_counter()
-        actual = fresh_predictions(model, provider, prepared, final_only=True); sync(provider.device)
-        seconds.append(time.perf_counter()-tick); mismatches.append(parity(actual))
-    profile = {}; extra = fresh_predictions(model, provider, prepared, profile, final_only=True)
-    mismatches.append(parity(extra))
-    return dict(six_frame_byte_parity=not any(v for item in mismatches for v in item.values()),
-        mismatches=mismatches, seconds=seconds, history_preparation_seconds=preparation,
+        actual = fresh_predictions(model, provider, prepared, final_only=True, debug=debug); sync(provider.device)
+        seconds.append(time.perf_counter()-tick)
+        inspect(actual, debug, f'timed_{index+1}')
+    profile, debug = {}, {}
+    extra = fresh_predictions(model, provider, prepared, profile, final_only=True, debug=debug)
+    inspect(extra, debug, 'serialized_profile')
+    mismatches = [c['mismatches'] for c in checks]
+    return dict(timing_policy=TIMING_POLICY, timing_complete=len(seconds) == repeats,
+        six_frame_byte_parity=not any(v for item in mismatches for v in item.values()),
+        mismatches=mismatches, checks=checks, seconds=seconds, history_preparation_seconds=preparation,
         serialized_profile_seconds=profile, peak_reserved_mib=torch.cuda.max_memory_reserved(provider.device)/2**20
             if provider.device.type == 'cuda' else 0.)
 
@@ -181,9 +227,11 @@ def evaluate(models, provider, source, batches, *, speed_keys, speed_repeats=3,
             predictions = {n: v.argmax(1).reshape(6, *fw['shape']).byte().cpu().numpy()
                 for n, v in (('transport', fw['prior']), ('semantic_refine', fw['logits']))}
             error = fw['ego'].float().cpu().numpy()-np.asarray(fw['ego_target'])
-            del fw
             key = (row[0]['scene_name'], row[0]['t0_token'])
-            timing = measure(model, provider, row, predictions, speed_repeats) if key in speed_keys else None
+            reference_logits = fw['logits'].float().cpu().numpy() if key in speed_keys else None
+            del fw
+            timing = measure(model, provider, row, predictions, speed_repeats,
+                reference_logits=reference_logits) if key in speed_keys else None
             # ALL cached-quality and fresh-timing predictions precede metric GT reads.
             raw = row[1]; window = window_from_record(row[0])
             support = gt_moving_support_sequence(source.nusc, window.t0_token, window.future_tokens,
@@ -221,15 +269,28 @@ def evaluate(models, provider, source, batches, *, speed_keys, speed_repeats=3,
 def speed_summary(speed, expected_windows, repeats, actual_cuda):
     rows = list(speed.values()); samples = [t for row in rows for t in row['seconds']]
     parity = len(rows) == expected_windows and all(r['six_frame_byte_parity'] and len(r['seconds']) == repeats for r in rows)
-    valid = parity and actual_cuda and bool(samples) and all(np.isfinite(samples)) and min(samples) > 0
+    coverage = len(rows) == expected_windows and all(len(r['seconds']) == repeats for r in rows)
+    valid = coverage and actual_cuda and bool(samples) and all(np.isfinite(samples)) and min(samples) > 0
+    maxima = {}
+    for row in rows:
+        items = row.get('mismatches', [])
+        if isinstance(items, dict): items = [items]
+        for item in items:
+            for name, count in item.items(): maxima[name] = max(maxima.get(name, 0), count)
     return dict(windows=len(rows), repeats=repeats, six_frame_byte_parity=parity, actual_cuda=actual_cuda,
-        valid_same_quality_route_timing=valid, six_frame_ms=1000*np.mean(samples) if samples else None,
+        timing_policy=TIMING_POLICY, timing_complete=valid, measured_calls=len(samples),
+        expected_calls=expected_windows*repeats, byte_parity_failed_windows=sum(not r['six_frame_byte_parity'] for r in rows),
+        max_changed_voxels_per_six_frame_call=maxima,
+        valid_same_quality_route_timing=valid and parity,
+        fps_label='WARM actual-execution diagnostic; NOT bit-identical-reference FPS' if not parity else 'WARM byte-verified diagnostic',
+        six_frame_ms=1000*np.mean(samples) if samples else None,
         window_fps=len(samples)/sum(samples) if valid else None,
         output_frame_fps=6*len(samples)/sum(samples) if valid else None,
         p90_six_frame_ms=1000*np.percentile(samples, 90) if samples else None,
         peak_reserved_mib=max((r.get('peak_reserved_mib', 0.) for r in rows), default=0.),
         profile_mean_ms={k: 1000*np.mean([r['serialized_profile_seconds'][k] for r in rows])
-            for k in rows[0].get('serialized_profile_seconds', {})} if parity else {},
+            for k in rows[0].get('serialized_profile_seconds', {})} if coverage else {},
+        allocator_peak_includes_untimed_diagnostics=True,
         scope='prepared deterministic history -> FRESH Strong/KTA + Shared Encoder/STWM + continuous Transport + aligned memory + Refiner + SIX CPU semantics',
         excludes='disk/history CC-association/read-coordinate preparation/initial history H2D/ego auxiliary/labels/metrics/warmup/serialized profile',
         projection_internal_tensor_materialization_is_timed=True, formal_FPS=False)
