@@ -29,5 +29,6 @@ args=(
 )
 if [[ -n "${RESUME:-}" ]]; then args+=(--resume "$RESUME"); fi
 echo "Independent continuous ADD+REMOVE / TRAIN20% / $EPOCHS epochs; no old weights."
+echo "Sequential H6; original strict numerical/replay FAIL retained, user accepted floating execution differences."
 echo "Output: $RUN_DIR; Ctrl-C saves complete update and epoch snapshots."
 exec "$PY" -u -m tools.shared_history_experiments.actions.run "${args[@]}" "$@"

@@ -66,9 +66,11 @@ def main(stop_event=None, argv=None):
             f'This is a fixed {a.epochs}-epoch TRAIN20% pilot, not a converged result or formal FPS.')
         return text + ('Ownership-constrained REMOVE transfers class mass to fallback; not arbitrary relabeling or a second-pass ADD undo.\n'
             'New RANDOM model/protocol; no old Adam/weights imported. Same selection/seed/budget, NOT byte-identical ADD-only initializer.\n'
-            'History geometry reused READ ONLY; no learned bank. Established sequential H2 execution, no unverified speed promotion.\n')
+            'History geometry reused READ ONLY; no learned bank. Sequential H6 by explicit user float-drift acceptance; original numerical/replay FAIL retained.\n'
+            'New REMOVE H6 quality and L40S speed remain unverified; no Packed execution or loss subsampling.\n')
 
     def save(path, payload):
+        payload = dict(payload, execution_policy=engine.execution_policy())
         original['save_resume_checkpoint'](path, payload)
         if Path(path).name == 'last.pt' and payload['epoch'] > 0 and payload['batch'] == 0:
             epoch_path = Path(path).with_name(f"epoch_{payload['epoch']:04d}.pt")
@@ -79,7 +81,8 @@ def main(stop_event=None, argv=None):
         legacy.JointOccEgo, legacy.HistoryInputs = SharedJointBoth, SharedHistoryInputs
         legacy.BothActionsExecution, legacy.PROTOCOL = NoLegacyHeadGraph, PROTOCOL
         legacy.summarize, legacy.stable_json_fingerprint, legacy.save_resume_checkpoint = summary, fingerprint, save
-        print(f'SHARED_ACTIONS: RANDOM GT / TRAIN20% x{a.epochs}; continuous ADD+REMOVE in train/eval; no old resume.', flush=True)
+        print(f'SHARED_ACTIONS: RANDOM GT / TRAIN20% x{a.epochs}; continuous ADD+REMOVE; sequential H6; no old resume.', flush=True)
+        print('H6_EXECUTION: explicit user float-drift acceptance, original probe/replay FAIL retained.', flush=True)
         output = Path(a.out_dir).resolve()
         lock_dir = output.parent/'.shared_pilot_locks'/hashlib.sha256(str(output).encode()).hexdigest()
         lock_dir.mkdir(parents=True, exist_ok=True)

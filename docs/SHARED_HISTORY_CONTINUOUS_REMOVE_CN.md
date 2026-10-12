@@ -16,7 +16,7 @@
 - 训练与推理都连续删除，最终 argmax；不使用硬0.5/0.95动作阈值，不扫描阈值。旧通用 trainer 的 contract 为兼容仍存 thresholds 字段，但本入口软输出不消费它们。
 - 原全六future full-grid CE＋Lovasz、source SE(2)/existence、ego R10 不变；不再新增动作 BCE。
 - 删除把被编辑 source-class 概率质量转移到 fallback。动态回退下层背景；静态 road11/sidewalk13 回 free17。保留 ownership/合法域，不任意删除建筑植被、不任意重标语义，不能撤销同次 ADD。
-- 默认沿用已建立的逐 scene H2 渲染/梯度累积执行，**没有自动采用未在服务器验收的 Packed/H3/H6**。新双动作输出可被修复后的 packed 网络/renderer 消费，但旧只读 speed probe 只接受旧 ADD-only checkpoint，不能把旧测速当新双动作吞吐证据。
+- 2026-10-12 用户明确接受报告中的浮点执行差异，后续新实验默认逐 scene **H6** 渲染/梯度累积，六future全部监督，不采用Packed、不降低Lovasz频率。旧ADD-only测速H2→H6为0.591009→0.353608s/窗，8步严格numerical/replay门槛均FAIL，保留失败记录，**不是无损/逐步数值等价声明**。`last.pt` 与轮次快照保存 `execution_policy` 记录该授权和原报告路径。新双动作的L40S吞吐/质量仍未验证，不能借用旧速度。
 
 DEV512 固定报告同一双动作模型的 Transport、关闭 REMOVE 的 ADD-only 消融、ADD＋REMOVE；预指定主读出为 ADD＋REMOVE，不根据 dev 选择路线。它的 ADD-only 消融与之前独立训练的 ADD-only checkpoint 是不同对照。
 
@@ -54,6 +54,8 @@ RESUME="$TRAIN_DIR/last.pt" RUN_DIR="$TRAIN_DIR/eval_latest_$(date +%Y%m%d_%H%M%
 ```
 
 固定 DEV512 与训练契约一致；不恢复时修改人口/阈值/epoch 总数。历史几何缓存只读复用，不重建 learned bank。
+
+H6默认仅适用于这个新actions入口。旧ADD-only原入口保持H2和原代码指纹；不静默修改已存在断点的执行路径，旧两轮结果保留。新actions源码指纹已变化，如果此前使用H2 actions试跑了断点，必须明确迁移后才能续训（当前未实现该迁移），不能直接套用。
 
 ## 验证边界
 

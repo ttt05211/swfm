@@ -71,6 +71,9 @@ def test_full_occ_updates_delete_head_and_exact_adam_rng_resume():
     model, adam, p, row = fixture()
     before = model.columns.readout[-1].weight[1].detach().clone()
     stats = engine.train_arm(model, adam, p, [row], 'gt', update=1, total_updates=3, probe=True)
+    assert stats['training_backend'] == 'shared_history_sequential_h6'
+    assert engine.execution_policy()['reference_ADDonly_probe_gate'] == 'FAIL'
+    assert engine.execution_policy()['full_future_supervision'] == 6
     assert stats['gradient_links']['occupancy_to_shared_history'] > 0
     assert not torch.equal(model.columns.readout[-1].weight[1], before)
     contract = {'epochs': 2, 'action': 'add_remove'}
@@ -178,6 +181,8 @@ def test_real_cli_population_epoch_snapshots_resume_readonly_eval_and_old_reject
     assert run.main(threading.Event(), args+['--max-updates', '2']) == 0
     saved = torch.load(out/'last.pt', weights_only=False)
     assert saved['protocol'] == PROTOCOL and saved['updates'] == 2
+    assert saved['execution_policy']['backend'] == 'sequential_h6'
+    assert saved['execution_policy']['reference_baseline_repeat_gate'] == 'FAIL'
     assert len(saved['contract']['train_keys']) == 4086
     assert (out/'epoch_0001.pt').is_file()
     assert run.main(threading.Event(), args+['--resume', str(out/'last.pt')]) == 0

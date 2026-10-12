@@ -15,6 +15,16 @@ from real_motion.nuscenes_adapter import gt_moving_support_sequence
 
 EVAL_PROTOCOL = 'shared_history_soft_ADD_REMOVE_eval_v1'
 ROUTES = ('transport', 'add_only', 'add_remove')
+HORIZON_GROUP = 6
+
+
+def execution_policy():
+    """Explicit consent, not a relabeling of the failed numerical gate."""
+    return dict(backend='sequential_h6', horizon_group=HORIZON_GROUP,
+        full_future_supervision=6, acceptance='explicit_user_float_drift_20261012',
+        reference_ADDonly_probe_gate='FAIL', reference_baseline_repeat_gate='FAIL',
+        reference_probe='/root/nas/occ/swfm/outputs/p0_f9_shared_history_speed/read_only_20261012_141945/speed.json',
+        new_REMOVE_L40S_speed_and_quality_verified=False)
 
 
 def forward_window(model, provider, row):
@@ -47,10 +57,10 @@ def forward_window(model, provider, row):
 
 
 def train_arm(model, optimizer, provider, rows, mode, **kwargs):
-    # Start with the established sequential H2 schedule, not an unmeasured
-    # packed backend. Full six horizons are still supervised every update.
+    # User explicitly accepted the measured H6 floating execution differences.
+    # No Packed network batching, horizon subsampling or loss-frequency change.
     return train_arm_grouped(model, optimizer, provider, rows, mode,
-        horizon_group=2, forward_fn=forward_window, **kwargs)
+        horizon_group=HORIZON_GROUP, forward_fn=forward_window, **kwargs)
 
 
 @torch.no_grad()
