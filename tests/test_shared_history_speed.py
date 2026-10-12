@@ -8,6 +8,7 @@ import torch
 from tools.shared_history_experiments import engine as reference
 from tools.shared_history_experiments.speed.engine import (
     WideGroupedScene,
+    PackedSceneRenderer,
     _pack_transport,
     _split_sources,
     forward_batch,
@@ -155,6 +156,76 @@ def test_packed_forward_matches_two_independent_shared_forwards():
             torch.testing.assert_close(
                 a["output"][key], b["output"][key], rtol=2e-5, atol=2e-6
             )
+
+
+def test_scene_horizon_packed_renderer_matches_independent_scenes_with_remove_gradients():
+    model, _, provider, row = fixture()
+    model.eval()
+    forwards = [
+        reference.forward_window(model, provider, row),
+        reference.forward_window(model, provider, row),
+    ]
+    horizons = [0, 1, 2]
+
+    def leaves_for(fw, scene_index):
+        leaves = {}
+        for key in ("poses", "targets", "yaws", "mapped", "actions"):
+            value = fw[key].detach().clone()
+            if key == "actions":
+                # Exercise REMOVE too: the scientific SharedRepair is ADD-only
+                # today, but the speed renderer must remain exact when REMOVE
+                # becomes learnable later.
+                value[..., 1] = (0.15 + 0.1 * scene_index)
+            leaves[key] = value.requires_grad_(fw[key].requires_grad or key == "actions")
+        return leaves
+
+    reference_leaves = [leaves_for(fw, i) for i, fw in enumerate(forwards)]
+    expected_parts = []
+    for fw, leaves in zip(forwards, reference_leaves):
+        scene = WideGroupedScene(fw["prep"], provider.pcfg.grid, provider.device)
+        expected_parts.append(
+            scene.render_group(
+                horizons,
+                **leaves,
+                evidence=fw["evidence"],
+                plan=fw["plan"],
+            )
+        )
+    expected = torch.cat(expected_parts, 0)
+    expected_inputs = [
+        value
+        for leaves in reference_leaves
+        for value in leaves.values()
+        if value.requires_grad
+    ]
+    expected_grads = torch.autograd.grad(
+        expected.square().mean(), expected_inputs, allow_unused=True
+    )
+
+    packed_leaves = [leaves_for(fw, i) for i, fw in enumerate(forwards)]
+    renderer = PackedSceneRenderer(
+        forwards, provider.pcfg.grid, provider.device
+    )
+    actual = renderer.render_group(
+        horizons, packed_leaves, forwards
+    )
+    actual_inputs = [
+        value
+        for leaves in packed_leaves
+        for value in leaves.values()
+        if value.requires_grad
+    ]
+    actual_grads = torch.autograd.grad(
+        actual.square().mean(), actual_inputs, allow_unused=True
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    assert len(actual_grads) == len(expected_grads)
+    for got, want in zip(actual_grads, expected_grads):
+        if got is None or want is None:
+            assert got is want
+        else:
+            torch.testing.assert_close(got, want, rtol=3e-5, atol=3e-6)
 
 
 @pytest.mark.parametrize("horizon_group", [3, 6])
