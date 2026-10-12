@@ -23,8 +23,11 @@
     packed_h2       global B<=4 Shared Encoder/Motion/Repair 合批 + [01][23][45]
     packed_h3       global B<=4 Shared Encoder/Motion/Repair 合批 + [012][345]
     packed_h6       global B<=4 Shared Encoder/Motion/Repair 合批 + [012345]
+    scene_packed_h2 global B<=4 网络 + scene×horizon renderer/loss + [01][23][45]
+    scene_packed_h3 global B<=4 网络 + scene×horizon renderer/loss + [012][345]
+    scene_packed_h6 global B<=4 网络 + scene×horizon renderer/loss + [012345]
 
-Packed 版本只合并 trainable network。每个 scene 的 causal projection / renderer 仍保持独立，用于先隔离网络合批本身的真实收益。跨 scene renderer batching 暂未混入这一轮。
+Packed 版本只合并 trainable network，用于隔离网络合批本身的收益；scene_packed 进一步把同一 global batch 的 scene×horizon 作为不相交 slot，一次执行 background grid_sample、REMOVE/source/ADD sparse composition 与 grouped CE/Lovasz。causal projection 仍逐 scene 保持原 identity/order。
 
 ## Packed B4 的具体执行
 
@@ -72,6 +75,14 @@ WideGroupedScene 是测速目录内的独立实现。它复制当前 GroupedScen
 
 结果写入新的 outputs/p0_f9_shared_history_speed/full6_exec_*/，重点看 summary.txt、speed.json、progress.jsonl。
 
+## 验收修正
+
+- packed 的 shared-field gradient probe 复用网络真实消费的同一个 Tensor view，不再重新索引制造未消费 view。
+- baseline replay 单独比较 current_h2 第1遍与第2..N遍最终 model+Adam；不再把基线与同遍自身比较。
+- parity snapshot 全部搬到 CPU；每个 timing candidate 前 synchronize + empty_cache + reset peak stats，避免前一候选 allocator cache 污染显存余量。
+- 非基线候选 H6/scene-packed 如真实 OOM，会记录失败并继续其他候选；不会让整次 probe 丢失。
+- 新增 ragged B4 source counts（含0 source）、scene×horizon renderer 输出/REMOVE 梯度以及 scene-packed one-step parity 测试。
+
 ## Gate
 
 每个候选都从同一 source snapshot 重新加载 model weights、Adam、RNG、当前 cosine update 和同一批真实训练 windows。
@@ -88,6 +99,6 @@ recommended_backend 只会从 numerical parity 通过、current baseline replay 
 
 ## 下一步
 
-先取得这一轮真实 L40S/H100 timing。如果 packed network 已明显提速，但 soft_render_full_ce_lovasz + occupancy_backward 仍占主要时间，再单独实现 scene×horizon renderer batching，并用同一套 probe gate 比较。
+先取得这一轮真实 L40S/H100 timing。本轮已加入 scene×horizon renderer/loss batching 候选。服务器先比较 network-only packed 与 scene_packed 的真实收益；只有 exact full6 路径仍不足够快时，才进入训练近似。
 
 如果完整六帧 exact execution 仍不足够快，才进入会改变训练轨迹的候选：2/6 horizon、periodic Lovasz 或 sparse CE。
