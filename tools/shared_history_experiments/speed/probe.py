@@ -83,6 +83,31 @@ def execution_fingerprint(root, backend):
     )
 
 
+def _cpu_clone(value):
+    """Detach benchmark snapshots from CUDA so parity bookkeeping cannot inflate VRAM."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_clone(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_clone(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_clone(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _is_oom(error):
+    return isinstance(error, getattr(torch, "OutOfMemoryError", RuntimeError)) or (
+        isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+    )
+
+
+def _clear_cuda(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+
+
 def _diagnostic(stats):
     keys = (
         "CE",
@@ -120,7 +145,10 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
             },
-            adam=copy.deepcopy(optimizer.state_dict()),
+            # optimizer.state_dict() contains CUDA moment tensors after the
+            # first Adam step.  Keeping those snapshots on device would make
+            # later candidates appear to reserve more memory than they need.
+            adam=_cpu_clone(optimizer.state_dict()),
         )
 
     def step(name, rows, index, probe=False):
@@ -160,12 +188,33 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
         raise ValueError("unknown backend " + name)
 
     warm = {}
+    failed = {}
     warm_reference = None
     reference_stats = None
     for name in BACKENDS:
         reset()
-        stats = step(name, batches[0], 0, probe=True)
-        current = state()
+        _clear_cuda(provider.device)
+        try:
+            stats = step(name, batches[0], 0, probe=True)
+            current = state()
+        except RuntimeError as error:
+            if name == "current_h2" or not _is_oom(error):
+                raise
+            failed[name] = dict(stage="warmup", error=str(error))
+            warm[name] = dict(
+                numerical_parity=False,
+                failure=failed[name],
+                gradient_links={},
+                training_backend=name,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            _clear_cuda(provider.device)
+            progress(
+                "SHARED_SPEED_WARM "
+                + json.dumps(dict(backend=name, **warm[name])),
+                flush=True,
+            )
+            continue
         if warm_reference is None:
             warm_reference = current
             reference_stats = stats
@@ -197,34 +246,52 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
 
     for repeat in range(passes):
         order = BACKENDS if repeat % 2 == 0 else BACKENDS[::-1]
-        pass_reference = None
         for name in order:
+            if name in failed:
+                continue
             reset()
+            _clear_cuda(provider.device)
             if provider.device.type == "cuda":
-                torch.cuda.synchronize(provider.device)
                 torch.cuda.reset_peak_memory_stats(provider.device)
-            tick = time.perf_counter()
-            reports = [
-                step(name, rows, index)
-                for index, rows in enumerate(batches)
-            ]
-            if provider.device.type == "cuda":
-                torch.cuda.synchronize(provider.device)
-            elapsed = time.perf_counter() - tick
-            windows = sum(report["windows"] for report in reports)
-            current = state()
-            if pass_reference is None:
-                # The first candidate in each alternating pass is only a
-                # temporary reference; all candidates started from identical
-                # source state/RNG and consumed identical batches.
-                pass_reference = current
+                start_allocated = torch.cuda.memory_allocated(provider.device) / 2**20
+                start_reserved = torch.cuda.memory_reserved(provider.device) / 2**20
+            else:
+                start_allocated = start_reserved = None
+            try:
+                tick = time.perf_counter()
+                reports = [
+                    step(name, rows, index)
+                    for index, rows in enumerate(batches)
+                ]
+                if provider.device.type == "cuda":
+                    torch.cuda.synchronize(provider.device)
+                elapsed = time.perf_counter() - tick
+                windows = sum(report["windows"] for report in reports)
+                current = state()
+            except RuntimeError as error:
+                if name == "current_h2" or not _is_oom(error):
+                    raise
+                failed[name] = dict(
+                    stage="timed_pass",
+                    pass_index=repeat + 1,
+                    error=str(error),
+                )
+                optimizer.zero_grad(set_to_none=True)
+                _clear_cuda(provider.device)
+                progress(
+                    "SHARED_SPEED_OOM "
+                    + json.dumps(dict(backend=name, **failed[name])),
+                    flush=True,
+                )
+                continue
 
-            # Compare final state to current_h2 explicitly below.  Store timing now.
             row = dict(
                 pass_index=repeat + 1,
                 windows=windows,
                 seconds=elapsed,
                 seconds_per_window=elapsed / windows,
+                start_allocated_mib=start_allocated,
+                start_reserved_mib=start_reserved,
                 peak_allocated_mib=(
                     torch.cuda.max_memory_allocated(provider.device) / 2**20
                     if provider.device.type == "cuda"
@@ -258,26 +325,45 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
                 flush=True,
             )
 
-        # Compare all candidates to current_h2 from THIS repeat, independent of
-        # AB/BA timing order.
-        reference_state = timed["current_h2"][-1]["final_state"]
+        if len(timed["current_h2"]) != repeat + 1:
+            raise RuntimeError("baseline current_h2 did not complete every timed pass")
+        reference_state = timed["current_h2"][repeat]["final_state"]
         for name in BACKENDS:
-            check = state_parity(reference_state, timed[name][-1]["final_state"])
+            if len(timed[name]) != repeat + 1:
+                continue
+            check = state_parity(reference_state, timed[name][repeat]["final_state"])
             parity[name]["numerical_parity"] &= check["numerical_parity"]
             parity[name]["max_state_abs_difference"] = max(
                 parity[name]["max_state_abs_difference"],
                 check["max_state_abs_difference"],
             )
-            timed[name][-1]["final_state_parity"] = check
+            timed[name][repeat]["final_state_parity"] = check
 
-    # Do not serialize model/Adam snapshots into speed.json.
-    for rows in timed.values():
-        for row in rows:
-            row.pop("final_state", None)
+    # Baseline replay is a separate gate: compare pass 2..N against pass 1.
+    # Comparing current_h2 to itself within a pass would make this vacuously true.
+    baseline_repeat_checks = [
+        state_parity(
+            timed["current_h2"][0]["final_state"],
+            timed["current_h2"][index]["final_state"],
+        )
+        for index in range(1, len(timed["current_h2"]))
+    ]
+    baseline_repeat = dict(
+        numerical_parity=bool(baseline_repeat_checks)
+        and all(check["numerical_parity"] for check in baseline_repeat_checks),
+        max_state_abs_difference=max(
+            (check["max_state_abs_difference"] for check in baseline_repeat_checks),
+            default=float("inf"),
+        ),
+        checks=baseline_repeat_checks,
+    )
 
     means = {
-        name: sum(row["seconds"] for row in rows)
-        / sum(row["windows"] for row in rows)
+        name: (
+            sum(row["seconds"] for row in rows) / sum(row["windows"] for row in rows)
+            if len(rows) == passes
+            else None
+        )
         for name, rows in timed.items()
     }
     capacity = (
@@ -288,6 +374,20 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
     candidates = {}
     baseline = "current_h2"
     for name in BACKENDS[1:]:
+        if name in failed or means[name] is None:
+            candidates[name] = dict(
+                speedup=None,
+                numerical_parity=False,
+                baseline_repeat_parity=baseline_repeat["numerical_parity"],
+                faster_each_pass=False,
+                memory_headroom_ge_10percent=False,
+                execution_fingerprint=execution_fingerprint(
+                    Path(__file__).resolve().parents[3], name
+                ),
+                failure=failed.get(name, dict(stage="incomplete")),
+                pass_gate=False,
+            )
+            continue
         faster_each_pass = all(
             candidate["seconds"] < reference_row["seconds"]
             for candidate, reference_row in zip(timed[name], timed[baseline])
@@ -296,7 +396,7 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
             warm[name]["numerical_parity"]
             and parity[name]["numerical_parity"]
         )
-        replay = parity[baseline]["numerical_parity"]
+        replay = baseline_repeat["numerical_parity"]
         peak_reserved = max(
             (
                 row["peak_reserved_mib"]
@@ -320,8 +420,6 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
             execution_fingerprint=execution_fingerprint(
                 Path(__file__).resolve().parents[3], name
             ),
-            # No arbitrary speed multiplier is baked into correctness.  The
-            # fastest eligible candidate is selected only after real timing.
             pass_gate=bool(numerical and replay and faster_each_pass and headroom),
         )
 
@@ -329,12 +427,20 @@ def measure(model, optimizer, provider, saved, batches, *, passes=2, progress=pr
         name for name, value in candidates.items() if value["pass_gate"]
     ]
     recommended = min(eligible, key=lambda name: means[name]) if eligible else None
+
+    # CPU parity snapshots must not be serialized into speed.json.
+    for rows in timed.values():
+        for row in rows:
+            row.pop("final_state", None)
+
     reset()
     return dict(
         seconds_per_window=means,
         timed_passes=timed,
         warmup=warm,
         final_state_parity=parity,
+        baseline_repeat_parity=baseline_repeat,
+        failed_candidates=failed,
         candidates=candidates,
         recommended_backend=recommended,
         scope=(
