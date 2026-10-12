@@ -949,3 +949,151 @@ def train_arm_packed(
     )
     optimizer.zero_grad(set_to_none=True)
     return result
+
+
+def train_arm_scene_packed(
+    model,
+    optimizer,
+    provider,
+    rows,
+    mode,
+    *,
+    update,
+    total_updates,
+    object_weight=1.0,
+    ego_weight=1.0,
+    lovasz_weight=1.0,
+    probe=False,
+    optimized=True,
+    horizon_group=2,
+):
+    """Pack B<=4 trainable network AND scene x horizon renderer/loss execution."""
+    if mode != "gt" or not optimized or not rows:
+        raise ValueError("GT-only fused shared-history scene-packed candidate required")
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    factor = 0.01 + 0.99 * 0.5 * (
+        1 + np.cos(np.pi * (update - 1) / max(1, total_updates))
+    )
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * factor
+
+    begun = time.perf_counter()
+    stages, terms, links = defaultdict(float), defaultdict(list), defaultdict(float)
+
+    tick = time.perf_counter()
+    forwards = forward_batch(model, provider, rows)
+    stages["shared_encoder_motion_projection_ccr"] += time.perf_counter() - tick
+
+    bridges = [RenderGradientBridge(fw) for fw in forwards]
+    renderer = PackedSceneRenderer(forwards, provider.pcfg.grid, provider.device)
+    auxiliaries = []
+
+    for hs in _groups(horizon_group):
+        tick = time.perf_counter()
+        probability = renderer.render_group(
+            hs,
+            [bridge.leaves for bridge in bridges],
+            forwards,
+        )
+        labels = np.concatenate(
+            [np.asarray(row[1]["future_gt_occ"])[hs] for row in rows],
+            axis=0,
+        )
+        losses, ce, lovasz = grouped_loss(
+            probability, labels, lovasz_weight=lovasz_weight
+        )
+        if not bool(torch.isfinite(losses).all()):
+            raise RuntimeError("nonfinite packed full-grid occupancy objective")
+
+        if probe and 1 in hs and losses.requires_grad:
+            local = hs.index(1)
+            for scene_index, (bridge, fw) in enumerate(zip(bridges, forwards)):
+                tensors, names = [fw["actions"]], ["occupancy_to_actions"]
+                tensors += [fw["field"]]
+                names += ["occupancy_to_shared_history"]
+                if len(fw["output"]["residual_xy_m"]):
+                    tensors += [
+                        fw["output"]["residual_xy_m"],
+                        fw["output"]["yaw_delta_rad"],
+                    ]
+                    names += ["occupancy_to_xy", "occupancy_to_yaw"]
+                scene_loss = losses[scene_index * len(hs) + local]
+                for name, grad in zip(names, bridge.probe(scene_loss, tensors)):
+                    links[name] += (
+                        0.0
+                        if grad is None
+                        else float(grad.detach().float().norm())
+                    )
+
+        stages["soft_render_full_ce_lovasz"] += time.perf_counter() - tick
+        tick = time.perf_counter()
+        if losses.requires_grad:
+            (losses / (len(rows) * 6)).sum().backward()
+        stages["occupancy_backward"] += time.perf_counter() - tick
+        terms["CE"].extend(ce.detach().unbind())
+        terms["Lovasz"].extend(lovasz.detach().unbind())
+        del probability, losses, ce, lovasz
+
+    tick = time.perf_counter()
+    for row, fw in zip(rows, forwards):
+        geometry, existence = source_auxiliary(
+            fw["output"], row[0], fw["prep"].state
+        )
+        ego_loss = ego_geometry_loss(
+            fw["ego"][None], np.asarray(fw["ego_target"])[None]
+        )
+        auxiliary = (
+            object_weight * (geometry + existence)
+            + ego_weight * ego_loss
+        )
+        if not bool(torch.isfinite(auxiliary)):
+            raise RuntimeError("nonfinite direct geometry objective")
+        auxiliaries.append(auxiliary / len(rows))
+        terms["source_geometry"].append(geometry.detach())
+        terms["existence"].append(existence.detach())
+        terms["ego_geometry"].append(ego_loss.detach())
+
+    roots, gradients = [torch.stack(auxiliaries).sum()], [None]
+    for bridge in bridges:
+        for key, leaf in bridge.leaves.items():
+            if leaf.grad is not None:
+                roots.append(bridge.original[key])
+                gradients.append(leaf.grad)
+    torch.autograd.backward(roots, grad_tensors=gradients)
+    stages["shared_network_and_direct_geometry_backward"] += time.perf_counter() - tick
+
+    norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), 5.0, error_if_nonfinite=True
+    )
+    tick = time.perf_counter()
+    optimizer.step()
+    if provider.device.type == "cuda":
+        torch.cuda.synchronize(provider.device)
+    stages["optimizer_finish"] += time.perf_counter() - tick
+
+    result = {
+        key: float(torch.stack(value).mean()) for key, value in terms.items()
+    }
+    result.update(
+        mode=mode,
+        windows=len(rows),
+        sources=sum(
+            len(fw["output"]["residual_xy_m"]) for fw in forwards
+        ),
+        canonical_points=sum(len(fw["evidence"]) for fw in forwards),
+        seconds=time.perf_counter() - begun,
+        stages_seconds=dict(stages),
+        grad_norm=float(norm),
+        gradient_links=dict(links),
+        training_backend=(
+            f"shared_history_packed_scene_b{len(rows)}_h{horizon_group}"
+        ),
+        peak_memory_mib=(
+            torch.cuda.max_memory_allocated(provider.device) / 2**20
+            if provider.device.type == "cuda"
+            else 0.0
+        ),
+    )
+    optimizer.zero_grad(set_to_none=True)
+    return result
