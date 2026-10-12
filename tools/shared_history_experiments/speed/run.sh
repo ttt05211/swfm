@@ -29,7 +29,8 @@ DATAROOT="${DATAROOT:-/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes}"
 echo "SOURCE=$SOURCE"
 echo "SPEED_OUT=$OUT"
 echo "REMOVE remains enabled in renderer candidates."
-echo "Comparing current_h2, sequential_h3/h6, packed_h2/h3/h6 with full six-horizon supervision."
+echo "Comparing current_h2, sequential_h3/h6, packed_h2/h3/h6 and scene_packed_h2/h3/h6."
+echo "All candidates keep full six-horizon CE+Lovasz, motion/ego supervision and the generic REMOVE path."
 
 exec "$PY" -u -m tools.shared_history_experiments.speed.probe \
   --config "$ROOT/configs/real_motion_occfm.yaml" \
