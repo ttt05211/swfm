@@ -15,7 +15,7 @@
 
 ## 候选
 
-一次只读 probe 比较六种执行：
+一次只读 probe 比较九种执行：
 
     current_h2      当前正式 trainer：逐窗网络 + [01][23][45]
     sequential_h3   逐窗网络不变 + [012][345]
@@ -82,6 +82,9 @@ WideGroupedScene 是测速目录内的独立实现。它复制当前 GroupedScen
 - parity snapshot 全部搬到 CPU；每个 timing candidate 前 synchronize + empty_cache + reset peak stats，避免前一候选 allocator cache 污染显存余量。
 - 非基线候选 H6/scene-packed 如真实 OOM，会记录失败并继续其他候选；不会让整次 probe 丢失。
 - 新增 ragged B4 source counts（含0 source）、scene×horizon renderer 输出/REMOVE 梯度以及 scene-packed one-step parity 测试。
+- 修复 scene-packed 静态 actor=-2 ADD 遗漏：遍历实际 actor/class 排序集合，不假定负 actor 从-1开始。
+- 每forward预建实际合法动作行索引，移除全canonical反复扫描；每scene/horizon group复用pose inverse。数据只在本forward内存活，不持久缓存learned geometry。
+- 本测速仍读取原 ADD-only SharedRepair（REMOVE输出恒零）；保留的是renderer删除支持，并非已训练的删除头。新连续双动作实验另见 `SHARED_HISTORY_CONTINUOUS_REMOVE_CN.md`，不静默导入原模型/Adam。
 
 ## Gate
 

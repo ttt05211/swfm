@@ -229,6 +229,25 @@ def test_scene_horizon_packed_renderer_matches_independent_scenes_with_remove_gr
             torch.testing.assert_close(got, want, rtol=3e-5, atol=3e-6)
 
 
+def test_static_minus_two_add_is_indexed_once_and_pose_inverse_not_per_source(monkeypatch):
+    model, _, provider, row = fixture()
+    fw = reference.forward_window(model, provider, row)
+    renderer = PackedSceneRenderer([fw, fw], provider.pcfg.grid, provider.device)
+    assert (-2, 11) in renderer.add_groups
+    assert any(len(rows[h]) for _, rows in renderer.add_groups[(-2, 11)] for h in range(6))
+    # No CPU canonical-row scan is permitted during the six-horizon readout.
+    monkeypatch.setattr(np, 'flatnonzero', lambda *a: pytest.fail('repeated row scan'))
+    count = []
+    inverse = torch.linalg.inv
+    def measured_inverse(value):
+        count.append(1)
+        return inverse(value)
+    monkeypatch.setattr(torch.linalg, 'inv', measured_inverse)
+    leaves = [RenderGradientBridge(fw).leaves for _ in range(2)]
+    renderer.render_group([0, 1, 2], leaves, [fw, fw])
+    assert len(count) == 3  # current-pose batch + one selected-pose inverse per scene
+
+
 @pytest.mark.parametrize("horizon_group", [3, 6])
 def test_sequential_h3_h6_one_step_matches_current_h2(horizon_group):
     model, _, provider, row = fixture()
@@ -317,3 +336,32 @@ def test_packed_h2_one_step_matches_current_h2_with_same_global_batch():
             atol=5e-5,
         )
     _assert_model_close(candidate, baseline, rtol=5e-4, atol=5e-5)
+
+
+def test_probe_baseline_replay_rejects_real_drift_and_continues_candidate_oom(monkeypatch):
+    from types import SimpleNamespace
+    from tools.shared_history_experiments.speed import probe as speed_probe
+    from tools.joint_occ_experiments import run as legacy
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+    saved = dict(models={'gt': copy.deepcopy(model.state_dict())},
+        optimizers={'gt': copy.deepcopy(optimizer.state_dict())}, rng=legacy.rng_state(), updates=0,
+        contract=dict(total_updates=8, weights=[1., 1., 1.]))
+    monkeypatch.setattr(speed_probe, 'BACKENDS', ('current_h2', 'sequential_h6'))
+    calls = []
+    def baseline(m, o, p, rows, mode, **kwargs):
+        calls.append(1)
+        # warmup, timed pass1, timed pass2: deliberately drift on replay.
+        if len(calls) == 3:
+            with torch.no_grad(): m.weight.add_(.01)
+        return dict(windows=4, stages_seconds={}, gradient_links={}, training_backend='test',
+            CE=1., Lovasz=1., source_geometry=1., existence=1., ego_geometry=1., grad_norm=1.)
+    monkeypatch.setattr(speed_probe.reference, 'train_arm', baseline)
+    monkeypatch.setattr(speed_probe, 'train_arm_grouped', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('CUDA out of memory')))
+    report = speed_probe.measure(model, optimizer, SimpleNamespace(device=torch.device('cpu')),
+                                 saved, [[None]], progress=lambda *a, **k: None)
+    assert report['baseline_repeat_parity']['numerical_parity'] is False
+    assert report['candidates']['sequential_h6']['baseline_repeat_parity'] is False
+    assert report['failed_candidates']['sequential_h6']['stage'] == 'warmup'
+    assert report['recommended_backend'] is None
+    for key, value in saved['models']['gt'].items(): torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)

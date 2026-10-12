@@ -171,6 +171,31 @@ class PackedSceneRenderer:
         self.centers = self.scenes[0].centers
         self.static = torch.cat([scene.static for scene in self.scenes], 0)
         self.current_pose = torch.stack([scene.current_pose for scene in self.scenes])
+        # Only this forward's live plan is indexed. Never persist learned
+        # geometry/legality across windows or optimizer updates.
+        self.add_groups, self.static_remove_groups = {}, {}
+        self.dynamic_remove_groups, self.overlay_groups = {}, {}
+        for index, (scene, fw) in enumerate(zip(self.scenes, forwards)):
+            actors = np.asarray(fw['evidence'].actor)
+            classes = np.asarray(fw['evidence'].classes)
+            legal = np.asarray(fw['plan'].legal)
+            actor_rows = {int(a): np.flatnonzero(actors == a) for a in np.unique(actors)}
+
+            def rows(ids, action):
+                return tuple(torch.as_tensor(ids[legal[ids, h, action]], device=device)
+                             for h in range(6))
+
+            for actor, ids in actor_rows.items():
+                for cls in np.unique(classes[ids]):
+                    at = ids[classes[ids] == cls]
+                    self.add_groups.setdefault((actor, int(cls)), []).append((index, rows(at, 0)))
+            for cls in (11, 13):
+                ids = np.flatnonzero((actors < 0) & (classes == cls))
+                self.static_remove_groups.setdefault(cls, []).append((index, rows(ids, 1)))
+            for rank, cls in enumerate(scene.classes):
+                self.overlay_groups.setdefault((rank, cls), []).append(index)
+                ids = actor_rows.get(rank, np.empty(0, dtype=np.int64))
+                self.dynamic_remove_groups.setdefault((rank, cls), []).append((index, rows(ids, 1)))
 
     def render_group(self, horizons, leaves, forwards, *, edits=True):
         if len(leaves) != len(self.scenes) or len(forwards) != len(self.scenes):
@@ -239,24 +264,17 @@ class PackedSceneRenderer:
             [scene.fallbacks[h] for scene in self.scenes for h in horizons]
         ).flatten()
 
-        actors = [np.asarray(fw["evidence"].actor) for fw in forwards]
-        classes = [np.asarray(fw["evidence"].classes) for fw in forwards]
-        legals = [np.asarray(fw["plan"].legal) for fw in forwards]
         operations, alphas = [], []
 
         def edit_many(items, action):
             points, values, slots = [], [], []
-            for scene_index, ids in items:
-                if not len(ids):
-                    continue
-                legal = legals[scene_index]
+            for scene_index, rows in items:
                 mapped = leaves[scene_index]["mapped"]
                 actions = leaves[scene_index]["actions"]
                 for local_slot, h in enumerate(horizons):
-                    at_np = ids[legal[ids, h, action]]
-                    if not len(at_np):
+                    at = rows[h]
+                    if not len(at):
                         continue
-                    at = torch.as_tensor(at_np, device=device)
                     points.append(mapped[at, h])
                     values.append(actions[at, h, action])
                     slots.append(
@@ -283,19 +301,7 @@ class PackedSceneRenderer:
         # Preserve the full generic REMOVE path.
         if edits:
             for cls in (11, 13):
-                result = edit_many(
-                    [
-                        (
-                            scene_index,
-                            np.flatnonzero(
-                                (actors[scene_index] < 0)
-                                & (classes[scene_index] == cls)
-                            ),
-                        )
-                        for scene_index in range(batch)
-                    ],
-                    1,
-                )
+                result = edit_many(self.static_remove_groups[cls], 1)
                 if result is not None:
                     ids, alpha = result
                     alpha = alpha * ((owners[ids] < 0) & (baseline[ids] == cls))
@@ -303,99 +309,41 @@ class PackedSceneRenderer:
 
         # Source overlays are ordered by local source rank exactly as in every
         # independent scene.  At one rank, different scenes occupy disjoint slots.
-        max_sources = max(len(scene.classes) for scene in self.scenes)
-        for source_index in range(max_sources):
-            for cls in range(18):
-                point_parts, slot_parts = [], []
-                for scene_index, scene in enumerate(self.scenes):
-                    if (
-                        source_index >= len(scene.classes)
-                        or scene.classes[source_index] != cls
-                    ):
-                        continue
-                    leaf = leaves[scene_index]
-                    selected_pose = leaf["poses"][hs]
-                    inverse = torch.linalg.inv(selected_pose)
-                    source = move(
-                        scene.source_points[source_index][None],
-                        scene.source_centers[source_index],
-                        leaf["targets"][source_index, hs, None],
-                        leaf["yaws"][source_index, hs, None],
-                    )
-                    source = (
-                        torch.einsum(
-                            "gij,gnj->gni", inverse[:, :3, :3], source
-                        )
-                        + inverse[:, None, :3, 3]
-                    )
-                    point_parts.append(source.reshape(-1, 3))
-                    slot_parts.append(
-                        (
-                            scene_index * count
-                            + torch.arange(count, device=device)[:, None]
-                        )
-                        .expand(-1, len(scene.source_points[source_index]))
-                        .reshape(-1)
-                    )
-                if point_parts:
-                    points = torch.cat(point_parts)
-                    slots = torch.cat(slot_parts)
-                    ids, alpha = grouped_splat(
-                        points,
-                        points.new_ones(len(points)).float(),
-                        slots,
-                        self.grid,
-                        "sum",
-                    )
-                    append("overlay", ids, alpha, cls)
+        inverses = [torch.linalg.inv(leaf['poses'][hs]) for leaf in leaves]
+        for source_index, cls in sorted(self.overlay_groups):
+            point_parts, slot_parts = [], []
+            for scene_index in self.overlay_groups[(source_index, cls)]:
+                scene = self.scenes[scene_index]
+                leaf = leaves[scene_index]
+                inverse = inverses[scene_index]
+                source = move(scene.source_points[source_index][None],
+                    scene.source_centers[source_index], leaf['targets'][source_index, hs, None],
+                    leaf['yaws'][source_index, hs, None])
+                source = torch.einsum('gij,gnj->gni', inverse[:, :3, :3], source) + inverse[:, None, :3, 3]
+                point_parts.append(source.reshape(-1, 3))
+                slot_parts.append((scene_index * count + torch.arange(count, device=device)[:, None])
+                    .expand(-1, len(scene.source_points[source_index])).reshape(-1))
+            if point_parts:
+                points, slots = torch.cat(point_parts), torch.cat(slot_parts)
+                ids, alpha = grouped_splat(points, points.new_ones(len(points)).float(), slots, self.grid, 'sum')
+                append('overlay', ids, alpha, cls)
 
         if edits:
             # Dynamic REMOVE keeps local actor rank/owner identity.
-            for source_index in range(max_sources):
-                for cls in range(18):
-                    items = []
-                    for scene_index, scene in enumerate(self.scenes):
-                        if (
-                            source_index < len(scene.classes)
-                            and scene.classes[source_index] == cls
-                        ):
-                            items.append(
-                                (
-                                    scene_index,
-                                    np.flatnonzero(
-                                        actors[scene_index] == source_index
-                                    ),
-                                )
-                            )
-                    result = edit_many(items, 1)
-                    if result is not None:
-                        ids, alpha = result
-                        alpha = alpha * (
-                            (owners[ids] == source_index)
-                            & (baseline[ids] == cls)
-                        )
-                        append("remove", ids, alpha, cls, fallback[ids])
+            for source_index, cls in sorted(self.dynamic_remove_groups):
+                result = edit_many(self.dynamic_remove_groups[(source_index, cls)], 1)
+                if result is not None:
+                    ids, alpha = result
+                    alpha = alpha * ((owners[ids] == source_index) & (baseline[ids] == cls))
+                    append('remove', ids, alpha, cls, fallback[ids])
 
             # ADD follows the original sorted actor -> sorted class order.
-            for actor_id in range(-1, max_sources):
-                for cls in range(18):
-                    items = []
-                    for scene_index in range(batch):
-                        ids = np.flatnonzero(
-                            (actors[scene_index] == actor_id)
-                            & (classes[scene_index] == cls)
-                        )
-                        if len(ids):
-                            items.append((scene_index, ids))
-                    result = edit_many(items, 0)
-                    if result is not None:
-                        ids, alpha = result
-                        append(
-                            "overlay",
-                            ids,
-                            alpha * (baseline[ids] == 17),
-                            cls,
-                        )
+            # Includes STATIC=-2 (not an assumed -1 sentinel).
+            for actor_id, cls in sorted(self.add_groups):
+                result = edit_many(self.add_groups[(actor_id, cls)], 0)
+                if result is not None:
+                    ids, alpha = result
+                    append('overlay', ids, alpha * (baseline[ids] == 17), cls)
 
         return compose_sparse(background, operations, alphas).reshape(
             18, batch * count, volume
@@ -426,6 +374,7 @@ def train_arm_grouped(
     probe=False,
     optimized=True,
     horizon_group=3,
+    forward_fn=None,
 ):
     """Reference single-window network execution with H3/H6 renderer grouping."""
     if mode != "gt" or not optimized or not rows:
@@ -442,7 +391,7 @@ def train_arm_grouped(
 
     for row in rows:
         tick = time.perf_counter()
-        fw = reference.forward_window(model, provider, row)
+        fw = (forward_fn or reference.forward_window)(model, provider, row)
         scene = WideGroupedScene(fw["prep"], provider.pcfg.grid, provider.device)
         bridge = RenderGradientBridge(fw)
         stages["shared_encoder_motion_projection_ccr"] += time.perf_counter() - tick
@@ -802,9 +751,12 @@ def forward_batch(model, provider, rows):
             context = torch.cat(contexts, 0)
             base = cast(np.concatenate([fw["plan"].base for fw in forwards], 0))
             legal = cast(np.concatenate([fw["plan"].legal for fw in forwards], 0))
+            fallback = (cast(np.concatenate([fw['plan'].fallback for fw in forwards], 0))
+                        if getattr(model.columns, 'requires_fallback', False) else None)
             actions = []
             for first in range(0, len(encoded), 8192):
                 at = slice(first, first + 8192)
+                extra = {'fallback': fallback[at]} if fallback is not None else {}
                 actions.append(
                     model.columns(
                         encoded[at],
@@ -813,6 +765,7 @@ def forward_batch(model, provider, rows):
                         context[at],
                         base[at],
                         legal[at],
+                        **extra,
                     )
                 )
             actions = torch.cat(actions)
