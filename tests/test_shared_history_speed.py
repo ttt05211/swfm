@@ -8,6 +8,8 @@ import torch
 from tools.shared_history_experiments import engine as reference
 from tools.shared_history_experiments.speed.engine import (
     WideGroupedScene,
+    _pack_transport,
+    _split_sources,
     forward_batch,
     train_arm_grouped,
     train_arm_packed,
@@ -78,6 +80,57 @@ def test_wide_h6_renderer_matches_three_h2_groups_and_boundary_gradients():
             assert a is b
         else:
             torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-6)
+
+
+def test_packed_b4_ragged_different_source_counts_including_empty_match_independent():
+    model, _, _, _ = fixture()
+    model.eval()
+    transport = model.transport
+    width = transport.history_encoder.width
+    hw = transport.config.tube_hw // 2
+    torch.manual_seed(123)
+
+    counts = [2, 0, 1, 3]
+    fields, reads, times, classes, ktas = [], [], [], [], []
+    for window, count in enumerate(counts):
+        # Deliberately different per-window feature content: this catches
+        # accidental scene aliasing in the packed B4 path.
+        field = torch.randn(4, width, 7, 9) + window * 0.25
+        grid = torch.empty(count, 4, hw, hw, 2).uniform_(-0.9, 0.9)
+        valid = (torch.rand(count, 4) > 0.2).float()
+        center = torch.randn(count, 4, 2) + window
+        mask = (torch.rand(count, 4, hw, hw) > 0.65).float()
+        read = dict(
+            source_grid=grid,
+            source_valid=valid,
+            source_center=center,
+            source_mask=mask,
+        )
+        t = torch.tensor([-1.0, -0.66, -0.33, 0.0])
+        cls = torch.arange(count, dtype=torch.long) % 18
+        kta = torch.randn(count, 6, 2)
+        fields.append(field)
+        reads.append(read)
+        times.append(t)
+        classes.append(cls)
+        ktas.append(kta)
+
+    expected = [
+        transport(field, read, time, cls, kta)
+        for field, read, time, cls, kta in zip(fields, reads, times, classes, ktas)
+    ]
+    packed, lengths = _pack_transport(
+        model, fields, reads, times, classes, ktas
+    )
+    actual = _split_sources(packed, lengths)
+
+    assert lengths == counts
+    for got, want, count in zip(actual, expected, counts):
+        for key in want:
+            assert got[key].shape == want[key].shape
+            torch.testing.assert_close(got[key], want[key], rtol=2e-5, atol=2e-6)
+        if count == 0:
+            assert got["residual_xy_m"].shape == (0, 6, 2)
 
 
 def test_packed_forward_matches_two_independent_shared_forwards():
