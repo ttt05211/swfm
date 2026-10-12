@@ -9,6 +9,9 @@ candidates without publishing any training update:
   packed_h2        packed global B<=4 trainable network, H2 renderer
   packed_h3        packed global B<=4 trainable network, H3 renderer
   packed_h6        packed global B<=4 trainable network, H6 renderer
+  scene_packed_h2  packed network + scene x horizon renderer/loss, H2
+  scene_packed_h3  packed network + scene x horizon renderer/loss, H3
+  scene_packed_h6  packed network + scene x horizon renderer/loss, H6
 
 REMOVE remains present in every candidate.  Losses, six future horizons, motion
 and ego supervision are unchanged.  Every candidate is reset to the same source
@@ -100,8 +103,11 @@ def _cpu_clone(value):
 
 
 def _is_oom(error):
-    return isinstance(error, getattr(torch, "OutOfMemoryError", RuntimeError)) or (
-        isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+    oom_type = getattr(torch, "OutOfMemoryError", None)
+    return (
+        (oom_type is not None and isinstance(error, oom_type))
+        or (isinstance(error, RuntimeError)
+            and "out of memory" in str(error).lower())
     )
 
 
