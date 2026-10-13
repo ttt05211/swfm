@@ -24,8 +24,13 @@ TRAIN未来位姿只作R10标签；离散GT派生destination command仍是显式
 ## 入口检查、评估与恢复
 
 正式头训练之前，一窗同GT位姿分别走旧GT缓存背景入口和现场重建入口：比较背景、F/prior/memory/logits。
-背景必须一致；连续张量rtol2e-4/atol2e-5固定，同时记录argmax变化。不以GT诊断分数替代Pred指标，不放宽失败。
-检查结果在same_pose_entrance_audit.json；失败则停，不开始头优化。
+背景必须一致；连续张量rtol2e-4/atol2e-5固定，且六帧argmax零差异。不以GT诊断分数替代Pred指标，不放宽失败。
+检查结果在same_pose_entrance_audit_v2.json；失败则停，不开始头优化。
+
+2026-10-13服务器一窗定位：原GT和重建入口自身重跑各有1体素变化，完全同prior/memory的BF16 Refiner重复则字节一致；跨入口BF16从input层出现差异、2体素改变，memory/coarse prior/point prior分别有4/12/60元素转BF16后改变。FP32跨输入数值通过且argmax0差异，但FP32与原BF16有313体素变化，不能作为无损替换。
+
+v2仅在入口审计的两次完整forward内启用严格确定性算子，关闭cuDNN benchmark、启用cuDNN确定性；BF16及原数值容差不变。不支持确定性的算子直接报错，没有warn-only或自动放行。退出及异常均恢复原执行设置，bank/头训练/DEV推理不改变。用于隔离浮点聚合顺序的影响，**不是证明原普通执行字节等价，也不保证服务器gate通过**。
+原same_pose_entrance_audit.json的FAIL保留。本次未有头断点；代码契约改变须开新EGO_RUN_DIR，勿覆盖/删除旧目录或强改stage_contract恢复。新检查通过才自动继续用户预定的1轮头训练及DEV512。
 
 头训练后仅运行完整DEV512内部ego预测：六帧预测、1/2/3s及平均mIoU/IoU/MovingMicro、ego头与其prior的ADE/FDE/yaw。
 预测ego用于全部Strong背景、Transport和memory投影；不沿用GT未来背景，不事后GT对齐。
@@ -68,3 +73,5 @@ FROZEN_EGO_RESUME=1 bash tools/scene_ego_head/frozen_gt/run.sh
 CLI帮助/Bash语法/diff检查通过，旧full_gt/refine/scene组件源码没有改动。
 模拟人口用于接线验证，不是实际nuScenes精度或L40S速度；服务器训练未代启动。
 增加缓存/头训练分开计时、将源GT训练性能移入source_GT_training_performance后，实际CLI专项再次1passed in24.80s；不把旧主体0.4秒/窗误当成当前头训练速度。
+
+v2确定性审计及原冻结头/一窗诊断回归：14passed in26.58s，含非零Refiner残差CPU/CUDA实测、两次审计一致、权重/精度不变、严格不支持算子异常及设置恢复。仅本地小图验证，不代表真实服务器数据已经通过。

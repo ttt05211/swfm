@@ -1,5 +1,6 @@
 """Frozen-body INTERNAL ego inference and explicit same-pose entrance audit."""
 import copy
+from contextlib import contextmanager
 import time
 import numpy as np
 import torch
@@ -23,8 +24,38 @@ def metadata(source, record, raw):
 gt_history_inputs = gt.history_inputs
 
 
+@contextmanager
+def deterministic_entrance():
+    """Audit ONLY: eliminate atomic reduction drift, never change deployment AMP.
+
+    Unsupported deterministic operations raise; there is no warn-only fallback.
+    All process-wide settings are restored before feature extraction/training.
+    """
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    benchmark, deterministic = torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        torch.backends.cudnn.benchmark = benchmark
+        torch.backends.cudnn.deterministic = deterministic
+
+
 @torch.no_grad()
 def entrance_audit(body, provider, row):
+    with deterministic_entrance():
+        result = _entrance_audit(body, provider, row)
+    result.update(protocol='same_pose_deterministic_BF16_entrance_v2',
+        deterministic_audit_only=True, original_precision_preserved=True,
+        deployment_execution_changed=False, unsupported_operations_fail_closed=True)
+    return result
+
+
+def _entrance_audit(body, provider, row):
     a = gt.forward_window(body, provider, row)
     b = external_forward(body, provider, row, np.stack(row[1]['future_poses']))
     cached = row[1]['_column_causal_preparation']['prepared_state']['column_backgrounds']
@@ -35,9 +66,10 @@ def entrance_audit(body, provider, row):
         x, y = a[k], b[k]
         fields[k] = dict(pass_gate=bool(torch.allclose(x, y, rtol=2e-4, atol=2e-5)),
                         max_abs=float((x.float()-y.float()).abs().max()))
+    semantic_changed = int((a['logits'].argmax(1) != b['logits'].argmax(1)).sum())
     return dict(background_changed_voxels=changed, fields=fields,
-        pass_gate=changed == 0 and all(v['pass_gate'] for v in fields.values()),
-        semantic_argmax_changed_voxels=int((a['logits'].argmax(1) != b['logits'].argmax(1)).sum()),
+        pass_gate=changed == 0 and semantic_changed == 0 and all(v['pass_gate'] for v in fields.values()),
+        semantic_argmax_changed_voxels=semantic_changed,
         diagnostic_GT_poses_only=True, not_a_Pred_score=True)
 
 

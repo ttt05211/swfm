@@ -137,6 +137,31 @@ def test_same_pose_gate_reports_background_difference(monkeypatch):
     assert not engine.entrance_audit(body, p, row)['pass_gate']
 
 
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_deterministic_entrance_preserves_amp_and_restores_settings(monkeypatch, device):
+    if device == 'cuda' and not torch.cuda.is_available(): pytest.skip('CUDA unavailable')
+    torch.set_num_threads(1); body, _, p, row = fixture()
+    body.to(device).eval(); p.device = torch.device(device)
+    with torch.no_grad(): body.columns.readout[-1].weight.normal_(std=.03)
+    cached = row[1]['_column_causal_preparation']['prepared_state']['column_backgrounds']
+    monkeypatch.setattr(integration, 'rebuild_pred_backgrounds', lambda *a: [np.array(x, copy=True) for x in cached])
+    settings = lambda: (torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(), torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic, torch.get_float32_matmul_precision(), torch.autocast)
+    before = settings(); weights = tensor_state_fingerprint(body.state_dict())
+    a, b = engine.entrance_audit(body, p, row), engine.entrance_audit(body, p, row)
+    assert a == b and a['pass_gate'] and a['semantic_argmax_changed_voxels'] == 0
+    assert a['original_precision_preserved'] and not a['deployment_execution_changed']
+    assert settings() == before and tensor_state_fingerprint(body.state_dict()) == weights
+    def failed(*args):
+        assert torch.are_deterministic_algorithms_enabled()
+        assert not torch.is_deterministic_algorithms_warn_only_enabled()
+        raise RuntimeError('unsupported deterministic operation')
+    monkeypatch.setattr(engine, '_entrance_audit', failed)
+    with pytest.raises(RuntimeError, match='unsupported'): engine.entrance_audit(body, p, row)
+    assert settings() == before
+
+
 def test_real_cli_completed_body_train_head_and_internal_only(tmp_path, monkeypatch):
     from test_full_gt_training import test_real_cli_full_population_epoch_snapshots_resume_and_eval_readonly
     test_real_cli_full_population_epoch_snapshots_resume_and_eval_readonly(tmp_path, monkeypatch)

@@ -116,7 +116,7 @@ def main(event=None, argv=None):
             iterator = iter(rows); first = next(iterator, None)
             if first is None: raise RuntimeError('empty DEV population')
             try:
-                audit_path = out/'same_pose_entrance_audit.json'
+                audit_path = out/'same_pose_entrance_audit_v2.json'
                 if audit_path.exists(): audit = json.loads(audit_path.read_text())
                 else:
                     audit = engine.entrance_audit(body, provider, first[0]); legacy.write_json(audit_path, audit)
