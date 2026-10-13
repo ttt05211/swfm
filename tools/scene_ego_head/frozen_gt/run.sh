@@ -24,6 +24,8 @@ args=(--config "$ROOT/configs/real_motion_occfm.yaml"
   --head-epochs "${HEAD_EPOCHS:-3}" --head-batch 64 --head-seed 21 --head-lr 0.0003
   --cpu-workers 4 --prefetch-workers 2 --frame-cache-mib 256 --geometry-ram-mib 128 --descriptor-ram-mib 128)
 if [[ "${FROZEN_EGO_RESUME:-0}" == 1 ]]; then args+=(--resume-stage); fi
+if [[ -n "${EGO_REUSE_DIR:-}" ]]; then args+=(--reuse-stage-dir "$EGO_REUSE_DIR"); fi
+args+=(--final-population "${EGO_FINAL_POPULATION:-dev512}")
 echo 'WAIT UNTIL GT epoch2 finishes. Freeze all body weights; TRAIN20430 head-only -> final INTERNAL DEV512.'
-echo 'New compact HISTORY token bank belongs to this frozen body only; no old bank/cache overwrite.'
+echo "Final population=${EGO_FINAL_POPULATION:-dev512}; reused history=${EGO_REUSE_DIR:-none}; fresh head unless resuming THIS stage."
 exec "$PY" -u -m tools.scene_ego_head.frozen_gt.run "${args[@]}" "$@"

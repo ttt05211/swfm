@@ -14,7 +14,7 @@ from tools.scene_ego_head.model import SceneEgoConfig, SceneEgoHead
 from tools.real_motion.joint_training_recovery import snapshot_checkpoint
 from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
 from tools.real_motion.surface_ego_ablation_common import tensor_state_fingerprint
-from . import bank, training, engine
+from . import bank, training, engine, reuse
 
 
 def validate_completed_source(saved):
@@ -38,7 +38,7 @@ def summarize(result, head_result=None):
             lines.append(f"{n} {r['ADE_m']:.6f} {r['FDE_3s_m']:.6f} {r['yaw_mean_deg'][-1]:.6f}")
     r = result.get('evaluation')
     if r:
-        lines += [f"DEV512 windows={r['windows']}; no planner coverage trimming", 'route mIoU IoU MovingMicro']
+        lines += [f"{result.get('actual_eval_population', 'DEV512')} windows={r['windows']}; no planner coverage trimming", 'route mIoU IoU MovingMicro']
         for name, m in r['variants']['internal'].items():
             lines.append(f"internal_{name} {m['mIoU']:.6f} {m['IoU']:.6f} {m['MovingMicro']:.6f}")
             for h, v in m['per_horizon'].items():
@@ -53,12 +53,14 @@ def summarize(result, head_result=None):
 def main(event=None, argv=None):
     event = event or threading.Event(); p = legacy.parser(); p.description = __doc__
     p.set_defaults(mode='gt', epochs=2, train_fraction=1., eval_population='dev512')
-    p.add_argument('--head-epochs', type=int, choices=(1, 2, 3), default=3)
+    p.add_argument('--head-epochs', type=int, choices=range(1, 11), default=3)
     p.add_argument('--head-batch', type=int, default=64)
     p.add_argument('--head-seed', type=int, default=21)
     p.add_argument('--head-lr', type=float, default=3e-4)
     p.add_argument('--head-pool-side', type=int, default=8)
     p.add_argument('--resume-stage', action='store_true')
+    p.add_argument('--reuse-stage-dir', help='completed legacy stage; import only history tokens READ ONLY')
+    p.add_argument('--final-population', choices=('dev512', 'all'), default='dev512')
     a = p.parse_args(argv)
     if (not a.resume or a.max_updates or a.evaluate_only or a.mode != 'gt' or a.epochs != 2 or a.train_fraction != 1.
             or a.eval_population != 'dev512' or a.window_batch_size != 4 or a.source_budget != 128
@@ -67,6 +69,9 @@ def main(event=None, argv=None):
         raise ValueError('completed full-GT source / bounded head-only settings required')
     origin, out = Path(a.resume).resolve(), Path(a.out_dir).resolve()
     if out == origin.parent or origin.parent in out.parents: raise ValueError('NEW stage directory OUTSIDE GT train')
+    if a.reuse_stage_dir:
+        reused = Path(a.reuse_stage_dir).resolve()
+        if out == reused or reused in out.parents: raise ValueError('NEW stage OUTSIDE reused history stage')
     if not a.resume_stage:
         validate_completed_source(torch.load(origin, map_location='cpu', weights_only=False))
     lock = out.parent/'.frozen_scene_ego_locks'/legacy.stable_json_fingerprint(str(out))
@@ -91,14 +96,28 @@ def main(event=None, argv=None):
             raise RuntimeError('frozen head stage source/settings/implementation changed')
         legacy.write_json(contract_path, identity)
         print(f'FROZEN_BODY {origin}; GT epoch2 update={saved["updates"]}; body will NEVER be optimized', flush=True)
-        names = ('load_cache', 'summarize', 'save_resume_checkpoint')
+        names = ('load_cache', 'prefetched_batches', 'summarize', 'save_resume_checkpoint')
         original = {n: getattr(legacy, n) for n in names}
         original_eval, original_train, original_inputs = gt_engine.evaluate, gt_engine.train_arm, gt_engine.history_inputs
-        captured = []; holder = {}
+        captured = []; val_records = []; holder = {}
         def load(path):
             value = original['load_cache'](path)
             if Path(path).resolve() == Path(a.train_cache).resolve(): captured[:] = [value[1]]
+            if Path(path).resolve() == Path(a.dev_cache).resolve(): val_records[:] = [value[1]]
             return value
+        def batches(provider, source, groups, descriptors, **kwargs):
+            if a.final_population == 'all':
+                if not val_records: raise RuntimeError('full VAL cache missing')
+                keys = legacy.record_keys(val_records[0])
+                if len(keys) != 4369: raise RuntimeError('complete VAL4369 required; no planner trimming')
+                if set(k[0] for k in keys) & set(k[0] for k in source_contract['train_keys']):
+                    raise RuntimeError('TRAIN/VAL scenes overlap')
+                groups = [[r] for r in val_records[0]]
+                holder['val_keys'] = [list(k) for k in keys]
+                legacy.write_json(out/'population.json', dict(population='all_val', keys=holder['val_keys'],
+                    windows=len(keys), scenes=len(set(k[0] for k in keys)), planner_trimmed=False))
+                print(f'INTERNAL_ALL_VAL windows={len(keys)}; no planner trimming', flush=True)
+            return original['prefetched_batches'](provider, source, groups, descriptors, **kwargs)
         def forbidden(*args, **kwargs): raise RuntimeError('frozen body cannot train/save body checkpoints')
         def evaluate(models, provider, dev_source, rows, **kwargs):
             body = models['gt']; body.eval().requires_grad_(False)
@@ -124,8 +143,14 @@ def main(event=None, argv=None):
                 if not captured: raise RuntimeError('TRAIN metadata missing')
                 records = legacy.align_records(captured[0], [tuple(k) for k in source_contract['train_keys']])
                 tick = time.perf_counter()
-                features, inventory = bank.build(body, records, provider.ccr_history_cache_source, provider.pcfg.grid,
-                    out/'history_tokens', contract, pool_side=a.head_pool_side, workers=a.prefetch_workers, stop_event=event)
+                if a.reuse_stage_dir:
+                    if Path(a.reuse_stage_dir).resolve() == out: raise ValueError('reused stage must be separate')
+                    features, inventory = reuse.load_readonly(a.reuse_stage_dir, contract, stop_event=event)
+                    legacy.write_json(out/'history_reuse_receipt.json', inventory)
+                    print(f'REUSED_HISTORY windows={inventory["windows"]}; fresh=0; old head/Adam NOT imported', flush=True)
+                else:
+                    features, inventory = bank.build(body, records, provider.ccr_history_cache_source, provider.pcfg.grid,
+                        out/'history_tokens', contract, pool_side=a.head_pool_side, workers=a.prefetch_workers, stop_event=event)
                 holder['stage_seconds'] = dict(history_tokens_build_or_reuse=time.perf_counter()-tick)
                 print(f'COMPACT_HISTORY_BANK {inventory["tensor_mib"]:.1f}MiB; source-bound frozen features', flush=True)
                 tick = time.perf_counter()
@@ -134,7 +159,10 @@ def main(event=None, argv=None):
                 holder['stage_seconds']['head_training_and_TRAIN_report'] = time.perf_counter()-tick
                 holder['training'] = head_result; del features, records
                 report = engine.evaluate(body, head, provider, dev_source, itertools.chain([first], iterator), **kwargs)
-                if report['windows'] != 512: raise RuntimeError('exact complete DEV512 required')
+                expected = 4369 if a.final_population == 'all' else 512
+                if report['windows'] != expected: raise RuntimeError('exact complete evaluation population required')
+                if a.final_population == 'all' and report['population_keys'] != holder['val_keys']:
+                    raise RuntimeError('full VAL keys/order differ')
                 return report
             finally:
                 if tensor_state_fingerprint(body.state_dict()) != before:
@@ -144,7 +172,7 @@ def main(event=None, argv=None):
                     trainable_body_parameters=sum(p.requires_grad for p in body.parameters())))
         inner = vars(a).copy()
         for k in tuple(inner):
-            if k.startswith('head_') or k == 'resume_stage': inner.pop(k)
+            if k.startswith('head_') or k in ('resume_stage', 'reuse_stage_dir', 'final_population'): inner.pop(k)
         inner.update(resume=str(frozen), evaluate_only=True)
         args = []
         for k, v in inner.items():
@@ -154,20 +182,21 @@ def main(event=None, argv=None):
             else: args += ['--'+k.replace('_', '-'), str(v)]
         for v in a.override or []: args += ['--override', v]
         try:
-            legacy.load_cache, legacy.save_resume_checkpoint = load, forbidden
+            legacy.load_cache, legacy.prefetched_batches, legacy.save_resume_checkpoint = load, batches, forbidden
             legacy.summarize = lambda r: summarize(r, holder.get('training'))
             gt_engine.evaluate, gt_engine.train_arm, gt_engine.history_inputs = evaluate, forbidden, engine.metadata
             status = gt_run.main(event, args)
         finally:
             for k, v in original.items(): setattr(legacy, k, v)
             gt_engine.evaluate, gt_engine.train_arm, gt_engine.history_inputs = original_eval, original_train, original_inputs
-            captured.clear()
+            captured.clear(); val_records.clear()
         if legacy.sha256(frozen) != identity['source_sha256']: raise RuntimeError('source snapshot changed')
         result_path = out/'results.json'; result = json.loads(result_path.read_text())
         if 'performance' in result: result['source_GT_training_performance'] = result.pop('performance')
         result.update(training_protocol=training.PROTOCOL, head_training=holder.get('training'),
                       frozen_body_source=str(origin), two_stage_not_joint_RANDOM=True,
                       stage_seconds=holder.get('stage_seconds', {}))
+        result['actual_eval_population'] = 'ALL_VAL4369' if a.final_population == 'all' else 'DEV512'
         if result.get('evaluation'): result['status'] = 'complete'
         legacy.write_json(result_path, result)
         text = summarize(result, holder.get('training')); (out/'summary.txt').write_text(text, encoding='utf-8')

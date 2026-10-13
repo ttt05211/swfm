@@ -107,11 +107,13 @@ def test_internal_forward_future_poison_and_eval_resume(monkeypatch, device):
     body.eval().requires_grad_(False); head = SceneEgoHead(SceneEgoConfig(16, 32, 4, 2)).to(device).eval()
     monkeypatch.setattr(integration, 'rebuild_pred_backgrounds', causal_background)
     with torch.no_grad(): head.readout[-1].bias[0] = .05
-    fw = engine.predict(body, head, p, row)
+    # A causal poison comparison must isolate input changes from CUDA splat
+    # reduction order. Ordinary deployment nondeterminism is audited separately.
+    with engine.deterministic_entrance(): fw = engine.predict(body, head, p, row)
     raw = copy.deepcopy(row[1]); raw['future_poses'] = object(); raw['future_gt_occ'] = object()
     raw['_column_causal_preparation'] = object()
     poisoned = (row[0], raw, (row[2][0], row[2][1], object()), row[3])
-    other = engine.predict(body, head, p, poisoned)
+    with engine.deterministic_entrance(): other = engine.predict(body, head, p, poisoned)
     for k in ('poses', 'prior', 'memory', 'logits'): torch.testing.assert_close(fw[k], other[k], rtol=0, atol=0)
     monkeypatch.setattr(engine.gt, 'gt_moving_support_sequence', lambda *a, **k: [])
     monkeypatch.setattr(engine.gt, 'moving_support_masks', lambda _, shape: np.ones((6, *shape), bool))

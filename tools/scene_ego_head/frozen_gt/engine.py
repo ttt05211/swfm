@@ -164,6 +164,7 @@ def evaluate(body, head, provider, source, batches, *, saved=None, save=None,
                     if progress: progress(dict(event='frozen_internal_eval', windows=offset))
     finally: persist()
     if offset < len(state['keys']): raise RuntimeError('cursor exceeds evaluation population')
-    return dict(windows=len(state['keys']), variants={'internal': {n: m.compute() for n, m in meters.items()}},
+    return dict(windows=len(state['keys']), population_keys=state['keys'], scenes=len({k[0] for k in state['keys']}),
+        variants={'internal': {n: m.compute() for n, m in meters.items()}},
         trajectory=trajectory_report(state['errors']), seconds=time.perf_counter()-tick,
         planner_used=False, GT_reference_run=False, scoring='full grid, internal predicted ego; no alignment')

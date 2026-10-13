@@ -2,6 +2,8 @@
 
 ## 做什么
 
+后续用户授权的随机头10轮＋旧bank只读复用＋完整VAL入口见 `FROZEN_EGO_RANDOM10_REUSE_ALL_VAL_20261013_CN.md`。旧默认仍3轮/DEV512；新脚本run10_all.sh明确选10轮/all，新目录独立，不直接续接旧1轮周期。
+
 读取当前完整TRAIN20430×2的**最终epoch_0002.pt**，冻结Shared Encoder、STWM和SemanticRefiner。
 复用现有SceneEgoHead（默认143094参数），读取四帧历史ego运动和同一Encoder的历史场景F，按已声明的6时刻right/left/straight导航分支输出XY/yaw。
 不是重训主体，也不是从随机初始化进行Pred全网联合训练。
