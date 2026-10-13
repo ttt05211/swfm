@@ -14,7 +14,7 @@ from tools.scene_ego_head.model import SceneEgoConfig, SceneEgoHead
 from tools.real_motion.joint_training_recovery import snapshot_checkpoint
 from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
 from tools.real_motion.surface_ego_ablation_common import tensor_state_fingerprint
-from . import bank, training, engine, reuse
+from . import bank, training, engine, reuse, comparison
 
 
 def validate_completed_source(saved):
@@ -45,6 +45,13 @@ def summarize(result, head_result=None):
                 lines.append(f"  {h}s mIoU={v['mIoU']:.6f} IoU={v['IoU']:.6f} MovingMicro={v['MovingMicro']:.6f}")
         lines.append('DEV trajectory head/prior='+json.dumps(r['trajectory']))
     if result.get('error'): lines.append('error='+result['error'])
+    if r and r.get('head_comparison'):
+        lines += ['===== SAME FIXED DEV512 / FOUR HEADS =====', 'head_epoch mIoU IoU MovingMicro ADE_m FDE3s_m yaw3s_deg']
+        for epoch, report in r['head_comparison'].items():
+            m = report['variants']['internal']['semantic_refine']; t = report['trajectory']['head']
+            lines.append(f"{epoch:>10s} {m['mIoU']:.6f} {m['IoU']:.6f} {m['MovingMicro']:.6f} "
+                f"{t['ADE_m']:.6f} {t['FDE_3s_m']:.6f} {t['yaw_mean_deg'][-1]:.6f}")
+        lines.append('50/80 are snapshots of ONE 100-epoch cosine, not separate 50/80-epoch schedules. No selection.')
     if result.get('stage_seconds'): lines.append('stage_seconds='+json.dumps(result['stage_seconds']))
     lines.append('Original GT checkpoints/trainer/caches unchanged. Fixed final head epoch; no automatic promotion or retry.')
     return '\n'.join(lines)+'\n'
@@ -53,7 +60,7 @@ def summarize(result, head_result=None):
 def main(event=None, argv=None):
     event = event or threading.Event(); p = legacy.parser(); p.description = __doc__
     p.set_defaults(mode='gt', epochs=2, train_fraction=1., eval_population='dev512')
-    p.add_argument('--head-epochs', type=int, choices=range(1, 11), default=3)
+    p.add_argument('--head-epochs', type=int, choices=range(1, 101), default=3)
     p.add_argument('--head-batch', type=int, default=64)
     p.add_argument('--head-seed', type=int, default=21)
     p.add_argument('--head-lr', type=float, default=3e-4)
@@ -61,7 +68,12 @@ def main(event=None, argv=None):
     p.add_argument('--resume-stage', action='store_true')
     p.add_argument('--reuse-stage-dir', help='completed legacy stage; import only history tokens READ ONLY')
     p.add_argument('--final-population', choices=('dev512', 'all'), default='dev512')
+    p.add_argument('--save-head-epochs', type=int, nargs='+')
+    p.add_argument('--comparison-head10')
     a = p.parse_args(argv)
+    if a.comparison_head10 and (a.head_epochs != 100 or a.final_population != 'dev512'
+            or a.save_head_epochs != [50, 80, 100] or not a.reuse_stage_dir):
+        raise ValueError('comparison requires fresh 100-epoch cycle / fixed50,80,100 / DEV512 / reused history')
     if (not a.resume or a.max_updates or a.evaluate_only or a.mode != 'gt' or a.epochs != 2 or a.train_fraction != 1.
             or a.eval_population != 'dev512' or a.window_batch_size != 4 or a.source_budget != 128
             or not 1 <= a.head_batch <= 128 or not 0 < a.head_lr <= .01
@@ -81,6 +93,11 @@ def main(event=None, argv=None):
             out.mkdir(parents=True, exist_ok=False); (out/'frozen').mkdir()
             snapshot_checkpoint(origin, out/'frozen/body.pt')
         frozen = out/'frozen/body.pt'; saved = torch.load(frozen, map_location='cpu', weights_only=False)
+        baseline = out/'frozen/head10.pt'
+        if a.comparison_head10:
+            if not a.resume_stage: snapshot_checkpoint(a.comparison_head10, baseline)
+            if legacy.sha256(baseline) != legacy.sha256(Path(a.comparison_head10)):
+                raise RuntimeError('ten-epoch baseline snapshot changed')
         source_contract = validate_completed_source(saved)
         fields = vars(a).copy()
         for n in ('resume_stage', 'evaluate_only'): fields.pop(n)
@@ -91,6 +108,7 @@ def main(event=None, argv=None):
             'tools/ego_experiments/train_surface_ego_full.py')]
         identity = dict(protocol=training.PROTOCOL, args=fields, source_sha256=legacy.sha256(frozen),
             implementation={str(f.relative_to(root)): legacy.sha256(f) for f in dependencies})
+        if a.comparison_head10: identity['head10_sha256'] = legacy.sha256(baseline)
         contract_path = out/'stage_contract.json'
         if a.resume_stage and json.loads(contract_path.read_text()) != identity:
             raise RuntimeError('frozen head stage source/settings/implementation changed')
@@ -106,6 +124,7 @@ def main(event=None, argv=None):
             if Path(path).resolve() == Path(a.dev_cache).resolve(): val_records[:] = [value[1]]
             return value
         def batches(provider, source, groups, descriptors, **kwargs):
+            holder['descriptors'] = descriptors
             if a.final_population == 'all':
                 if not val_records: raise RuntimeError('full VAL cache missing')
                 keys = legacy.record_keys(val_records[0])
@@ -132,6 +151,8 @@ def main(event=None, argv=None):
                 body_state_sha256=before, encoder_precision='BF16' if provider.device.type == 'cuda' else 'FP32',
                 head_precision='FP32', features='pooled pure history F; no future-conditioned memory',
                 bank_chunk=64, final_epoch_only=True)
+            if a.save_head_epochs: contract['save_epochs'] = a.save_head_epochs
+            if a.comparison_head10: comparison.checked_head(baseline, contract, 10)
             iterator = iter(rows); first = next(iterator, None)
             if first is None: raise RuntimeError('empty DEV population')
             try:
@@ -140,6 +161,7 @@ def main(event=None, argv=None):
                 else:
                     audit = engine.entrance_audit(body, provider, first[0]); legacy.write_json(audit_path, audit)
                 if not audit['pass_gate']: raise RuntimeError('same-pose entrance mismatch; do not train ego head yet')
+                if a.comparison_head10 and hasattr(iterator, 'close'): iterator.close()
                 if not captured: raise RuntimeError('TRAIN metadata missing')
                 records = legacy.align_records(captured[0], [tuple(k) for k in source_contract['train_keys']])
                 tick = time.perf_counter()
@@ -158,7 +180,14 @@ def main(event=None, argv=None):
                     head_result = training.train(head, features, out, contract, stop_event=event, resume=a.resume_stage)
                 holder['stage_seconds']['head_training_and_TRAIN_report'] = time.perf_counter()-tick
                 holder['training'] = head_result; del features, records
-                report = engine.evaluate(body, head, provider, dev_source, itertools.chain([first], iterator), **kwargs)
+                if a.comparison_head10:
+                    records = legacy.align_records(val_records[0], [tuple(k) for k in source_contract['eval_keys']])
+                    report = comparison.evaluate(body, head, provider, dev_source, records,
+                        holder['descriptors'], contract, out, baseline,
+                        batches=original['prefetched_batches'], workers=a.prefetch_workers,
+                        stop_event=event, progress=kwargs.get('progress'))
+                else:
+                    report = engine.evaluate(body, head, provider, dev_source, itertools.chain([first], iterator), **kwargs)
                 expected = 4369 if a.final_population == 'all' else 512
                 if report['windows'] != expected: raise RuntimeError('exact complete evaluation population required')
                 if a.final_population == 'all' and report['population_keys'] != holder['val_keys']:
@@ -172,7 +201,8 @@ def main(event=None, argv=None):
                     trainable_body_parameters=sum(p.requires_grad for p in body.parameters())))
         inner = vars(a).copy()
         for k in tuple(inner):
-            if k.startswith('head_') or k in ('resume_stage', 'reuse_stage_dir', 'final_population'): inner.pop(k)
+            if k.startswith('head_') or k in ('resume_stage', 'reuse_stage_dir', 'final_population',
+                                             'save_head_epochs', 'comparison_head10'): inner.pop(k)
         inner.update(resume=str(frozen), evaluate_only=True)
         args = []
         for k, v in inner.items():

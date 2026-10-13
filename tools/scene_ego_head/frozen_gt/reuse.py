@@ -14,6 +14,7 @@ def feature_identity(contract):
     extraction = ('tools/scene_ego_head/frozen_gt/bank.py', 'tools/scene_ego_head/model.py',
         'real_motion/ego_navigation.py', 'tools/ego_experiments/ego_kinematic.py',
         'tools/ego_experiments/train_surface_ego_full.py')
+    implementation = {k.replace('\\', '/'): v for k, v in stage['implementation'].items()}
     return dict(protocol='frozen_scene_history_feature_identity_v1',
         source_sha256=stage['source_sha256'], body_state_sha256=contract['body_state_sha256'],
         train_keys=contract['source_train_keys'], runtime=contract['source_runtime'],
@@ -21,7 +22,7 @@ def feature_identity(contract):
         pool_side=contract['head']['pool_side'], feature_width=contract['head']['feature_width'],
         chunk_size=contract['bank_chunk'],
         data={k: args.get(k) for k in ('config', 'override', 'dataroot', 'train_info', 'train_cache', 'ccr_history_cache')},
-        implementation={k: stage['implementation'][k] for k in extraction})
+        implementation={k: implementation[k] for k in extraction})
 
 
 def load_readonly(stage_dir, contract, *, stop_event=None):

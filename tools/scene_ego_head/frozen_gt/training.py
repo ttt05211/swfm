@@ -30,6 +30,10 @@ def train(head, bank, directory, contract, *, stop_event=None, resume=False):
     epochs, batch_size, seed, lr = (schedule[k] for k in ('epochs', 'batch_size', 'seed', 'lr'))
     device = next(head.parameters()).device; count = len(bank['target'])
     per_epoch = math.ceil(count/batch_size); total = epochs*per_epoch
+    save_epochs = contract.get('save_epochs', [epochs])
+    if (not save_epochs or len(set(save_epochs)) != len(save_epochs)
+            or any(type(n) is not int or not 1 <= n <= epochs for n in save_epochs)):
+        raise ValueError('fixed checkpoint epochs must lie inside configured cycle')
     adam = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=.01)
     initial = tensor_state_fingerprint(head.state_dict())
     epoch = cursor = updates = 0; history = []; epoch_loss = 0.; epoch_windows = 0
@@ -51,6 +55,19 @@ def train(head, bank, directory, contract, *, stop_event=None, resume=False):
             head={k: v.detach().cpu().clone() for k, v in head.state_dict().items()}, adam=adam.state_dict(),
             epoch=epoch, cursor=cursor, updates=updates, rng=legacy.rng_state(), history=history,
             epoch_loss=epoch_loss, epoch_windows=epoch_windows, status=status))
+    def export_epoch():
+        if not epoch or epoch not in save_epochs and epoch != epochs: return
+        export = directory/f'head_epoch{epoch}.pt'
+        payload = dict(protocol=PROTOCOL, contract=contract, head=head.state_dict(), epochs=epoch,
+            updates=updates, final_epoch_only=epoch == epochs, state_sha256=tensor_state_fingerprint(head.state_dict()))
+        if export.exists():
+            old = torch.load(export, map_location='cpu', weights_only=False)
+            if (old['contract'] != contract or old['state_sha256'] != payload['state_sha256'] or
+                    tensor_state_fingerprint(old['head']) != old['state_sha256']):
+                raise RuntimeError('head epoch export changed; no overwrite')
+        else: save_resume_checkpoint(export, payload)
+    # Recover a boundary snapshot if interruption happened after head_last publication.
+    if cursor == 0: export_epoch()
     while epoch < epochs:
         order = np.random.default_rng(seed+epoch).permutation(count)
         while cursor < per_epoch:
@@ -76,16 +93,9 @@ def train(head, bank, directory, contract, *, stop_event=None, resume=False):
         epoch += 1; history.append(dict(epoch=epoch, update=updates, train_mean_R10=epoch_loss/epoch_windows))
         cursor = 0; epoch_loss = 0.; epoch_windows = 0
         persist('complete' if epoch == epochs else 'running')
+        export_epoch()
         print(f'FROZEN_EGO_EPOCH {epoch}/{epochs} train_R10={history[-1]["train_mean_R10"]:.6f}', flush=True)
     export = directory/f'head_epoch{epochs}.pt'
-    payload = dict(protocol=PROTOCOL, contract=contract, head=head.state_dict(), epochs=epochs,
-        updates=updates, final_epoch_only=True, state_sha256=tensor_state_fingerprint(head.state_dict()))
-    if export.exists():
-        old = torch.load(export, map_location='cpu', weights_only=False)
-        if (old['contract'] != contract or old['state_sha256'] != payload['state_sha256'] or
-                tensor_state_fingerprint(old['head']) != old['state_sha256']):
-            raise RuntimeError('final head export changed; no overwrite')
-    else: save_resume_checkpoint(export, payload)
     result = dict(status='complete', complete_epochs=epochs, updates=updates, train_windows=count,
                   report=report(head, bank, batch_size), history=history, head_checkpoint=str(export),
                   train_report_in_sample=True, WM_STWM_Refiner_updated=False)
