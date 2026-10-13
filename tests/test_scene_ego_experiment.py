@@ -111,7 +111,10 @@ def test_evaluation_all_three_atomic_resume_and_same_windows(tmp_path, monkeypat
     with pytest.raises(ValueError): engine.restore_metrics(broken, planner.metadata)
 
 
-def test_actual_cli_safe_partial_resume_own_protocol_and_hook_restore(tmp_path, monkeypatch):
+@pytest.mark.parametrize('runner_mode', ['planner', 'internal_only'])
+def test_actual_cli_safe_partial_resume_own_protocol_and_hook_restore(tmp_path, monkeypatch, runner_mode):
+    from tools.scene_ego_head.experiment.internal_only import run as internal_run
+    runner = run if runner_mode == 'planner' else internal_run
     model, p, row = refiner_fixture()
     paths = {name: tmp_path/name for name in ('config', 'train-cache', 'dev-cache', 'train-info', 'dev-info', 'population-manifest')}
     for path in paths.values(): path.write_text('fixture')
@@ -147,34 +150,67 @@ def test_actual_cli_safe_partial_resume_own_protocol_and_hook_restore(tmp_path, 
     class Tiny(original_class):
         def __init__(self, cfg):
             super().__init__(cfg, feature_width=16, z_bins=4, memory_width=4, width=8, chunk_size=32, ego_width=32, pool_side=2)
-    monkeypatch.setattr(run, 'SceneEgoRefiner', Tiny)
+    monkeypatch.setattr(runner, 'SceneEgoRefiner', Tiny)
     class FakePlanner:
         def __init__(self, root): self.metadata = {'covered': 512, 'missing_keys': []}
         def prepare(self, requested): self.metadata['requested'] = len(requested)
-    monkeypatch.setattr(run, 'PlannerCache', FakePlanner)
+    if runner_mode == 'planner': monkeypatch.setattr(run, 'PlannerCache', FakePlanner)
     monkeypatch.setattr(integration, 'rebuild_pred_backgrounds', causal_background)
     out = tmp_path/'joint'
-    args = ['--base-checkpoint', str(base), '--dataroot', str(tmp_path), '--plan-cache', str(tmp_path),
+    args = ['--base-checkpoint', str(base), '--dataroot', str(tmp_path),
         '--ccr-history-cache', str(tmp_path), '--ccr-val-history-cache', str(tmp_path), '--out-dir', str(out)]
+    if runner_mode == 'planner': args += ['--plan-cache', str(tmp_path)]
     args += [value for name, path in paths.items() for value in ('--'+name, str(path))]
     original_train = legacy.train_arm
-    assert run.main(threading.Event(), args+['--max-updates', '2']) == 0
+    assert runner.main(threading.Event(), args+['--max-updates', '2']) == 0
     state = torch.load(out/'last.pt', weights_only=False)
     assert state['updates'] == 2 and state['contract']['total_updates'] == 500
-    assert state['contract']['modes'] == ['pred'] and state['protocol'] == run.PROTOCOL
+    assert state['contract']['modes'] == ['pred'] and state['protocol'] == runner.PROTOCOL
+    if runner_mode == 'internal_only': assert state['contract']['model']['experiment']['planner_used'] is False
     assert legacy.train_arm is original_train
-    assert run.main(threading.Event(), args+['--resume', str(out/'last.pt'), '--max-updates', '3']) == 0
+    assert runner.main(threading.Event(), args+['--resume', str(out/'last.pt'), '--max-updates', '3']) == 0
     assert torch.load(out/'last.pt', weights_only=False)['updates'] == 3
     # Read-only interim evaluation must neither train nor write source state.
     source_bytes = (out/'last.pt').read_bytes(); source_summary = (out/'summary.txt').read_bytes()
-    monkeypatch.setattr(engine, 'evaluate', lambda *a, **k: dict(windows=512,
-        population=dict(requested=512, missing_keys=[]), variants={}, trajectory={}, same_model_internal_minus_external={}))
+    fake_eval = lambda *a, **k: dict(windows=512, population=dict(requested=512, missing_keys=[]),
+        variants={'internal': {}}, trajectory={}, same_model_internal_minus_external={})
+    if runner_mode == 'planner': monkeypatch.setattr(engine, 'evaluate', fake_eval)
+    else: monkeypatch.setattr(runner, 'evaluate', fake_eval)
     eval_args = args.copy(); eval_args[eval_args.index(str(out))] = str(tmp_path/'evaluation')
-    assert run.main(threading.Event(), eval_args+['--resume', str(out/'last.pt'), '--evaluate-only']) == 0
+    assert runner.main(threading.Event(), eval_args+['--resume', str(out/'last.pt'), '--evaluate-only']) == 0
     assert (out/'last.pt').read_bytes() == source_bytes and (out/'summary.txt').read_bytes() == source_summary
     bad = copy.deepcopy(state); bad['protocol'] = 'old_gt'
     wrong = out/'wrong.pt'; torch.save(bad, wrong)
     preserved = (out/'last.pt').read_bytes()
-    with pytest.raises(RuntimeError, match='differs'): run.main(threading.Event(), args+['--resume', str(wrong)])
+    with pytest.raises(RuntimeError, match='differs'): runner.main(threading.Event(), args+['--resume', str(wrong)])
     assert (out/'last.pt').read_bytes() == preserved
     assert legacy.train_arm is original_train
+
+
+def test_internal_only_no_planner_or_gt_pose_forward_and_eval_resume(monkeypatch):
+    from tools.scene_ego_head.experiment.internal_only import run as internal
+    from tools.shared_history_experiments.refine import engine as quality
+    model, p, row = refiner_fixture()
+    monkeypatch.setattr(integration, 'rebuild_pred_backgrounds', causal_background)
+    monkeypatch.setattr(integration, 'forecast_conditioned', lambda *a, **k: pytest.fail('pose intervention must NOT run'))
+    monkeypatch.setattr(quality, 'gt_moving_support_sequence', lambda *a, **k: [])
+    monkeypatch.setattr(quality, 'moving_support_masks', lambda _, shape: np.ones((6, *shape), bool))
+    raw = copy.deepcopy(row[1]); raw['future_poses'] = 'POISON GT FUTURE POSES'
+    raw['_column_causal_preparation'] = 'POISON GT BACKGROUNDS'
+    row = (row[0], raw, row[2], row[3])
+    before = quality.forward_window, quality.EVAL_PROTOCOL
+    states = []
+    result = internal.evaluate({'pred': model}, p, SimpleNamespace(nusc=None), [[row]],
+        save=lambda value: states.append(copy.deepcopy(value)))
+    assert result['evaluation_routes'] == ['internal'] and not result['planner_used']
+    assert set(result['variants']) == {'internal'} and result['windows'] == 1
+    assert (quality.forward_window, quality.EVAL_PROTOCOL) == before
+    resumed = []; full = []
+    internal.evaluate({'pred': model}, p, SimpleNamespace(nusc=None), [[row], [row]], saved=states[-1],
+        save=lambda value: resumed.append(copy.deepcopy(value)))
+    internal.evaluate({'pred': model}, p, SimpleNamespace(nusc=None), [[row], [row]],
+        save=lambda value: full.append(copy.deepcopy(value)))
+    assert resumed[-1]['metrics'] == full[-1]['metrics']
+    with pytest.raises(RuntimeError, match='differs'):
+        internal.evaluate({'pred': model}, p, None, [], saved={**states[-1], 'protocol': 'old_gt'})
+    assert (quality.forward_window, quality.EVAL_PROTOCOL) == before
