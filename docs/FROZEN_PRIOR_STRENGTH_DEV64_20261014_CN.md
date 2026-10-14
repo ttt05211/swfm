@@ -25,3 +25,18 @@ bash tools/prior_strength/run.sh && cat "$PRIOR_DIAG_DIR/summary.txt"
 只需回传summary。详细1/2/3s与每窗整数统计在evaluation.json/state.json。若中断，保留原PRIOR_DIAG_DIR，设置 `export PRIOR_DIAG_RESUME=1` 再运行同脚本；新窗口完整后存盘，不重复旧窗口，不覆盖源权重/缓存。缺失STC历史拒绝，不替换人口。可选STC_ZIP显式核原ZIP，否则仍核compact extraction receipt/所选历史语义bytes。
 
 入口保留原GT同位姿检查与数值容差，不切FP32或免除FAIL。原权重文件/Adam/RNG历史缓存只读，代码不改旧模型/trainer/正式评估或指纹。计时仅质量诊断wall time，非FPS。本地测试只能验证真实小网格前向、对照公式/因果输入与断点行为，nuScenes实际涨点需服务器结果。
+
+## 已有结果一次性提取（不重跑模型）
+
+```bash
+cd /root/nas/occ/swfm
+conda activate OccFM
+git pull --ff-only
+python tools/prior_strength_report.py
+```
+
+优先读取原PRIOR_DIAG_DIR；变量不存在时只按时间找到最近的完整同协议结果，不按分数选择。可显式 `--result /actual/run/evaluation.json`。同时读取同目录state.json核整数计数/固定64键prefix/contract/分数与编辑计数重现，只打印、不写文件、不导入Torch、不运行GPU或读取原数据。
+
+报告原版及半强度的FP/FN、相对Transport/原Refiner的修正率、正确free/occupied损坏精确分解、新增漏占据、1/2/3s降幅、最差5语义类、单窗及场景下降分布。`损坏正确free = FP_after - FP_before + 修正假占据`；`新增漏占据 = FN_after - FN_before + wrong_free改变数量`，后者可包含此前语义错的占据变free，不能冒充全部原本正确占据损坏。窗口/场景mIoU不能简单平均替代主表；类变化也非因果贡献分解。
+
+已有state没有体素位置或logits，不可据此拟合距离/空间形态/时序STC噪声或断言可学习gate会成功。主程序及旧结果resume fingerprint未改（提取器放tools根，不放prior_strength模块目录）。
