@@ -1,5 +1,13 @@
 # 当前任务摘要（2026-10-11）
 
+## 独立工作副本：Unified source track / Multi-frame KTA DEV64（2026-10-15）
+
+用户授权独立实现，不混其他开发分支。本工作副本swfm-unified-source-tracks/experiment/unified-source-track-kta-dev64基于88d8dac；仅新增tools/unified_source_tracks五文件、专项test与操作文档，旧model/trainer/final evaluation/cache源码不改。原swfm-surface-ccr及其当前STC适配开发、混合文档/tmp不动。新实验完整GTepoch2冻结、同DEV64 OCC+GT/STC+GT，baseline/unified_two/unified_fit三路，固定baseline Strong/CLEAR以隔离track/KTA；不是整个Strong的新正式统一版本。
+
+保原associate_backwards的25m/s/歧义保护/缺帧接续与ICP，不加shape代价或门限；一张原始world-centroid身份表供KTA/注册及source patch/memory读取。ICP失败仍不供空间证据；速度原始质心actual-history-time slope，p0不改、future名义2Hz，单点零/两点fit=差分。旧磁盘cache含旧source配准/KTA，不能当新版，首版现场RAM重建不写旧/新geometry bank。后续采用需新派生cache版本，原语义/known/poses及规则不变组件可复用。
+
+38passed in11.56s，含真实CPU/CUDA小网格、运动抖动正例和加速负例、源权重不变、GT未来标签/annotation全部候选预测后只评分、displacement-preserving KTA误差与有效点分组、整窗整数resume/实际CLI快照契约保护。初次测试临时父目录缺失、测试输出嵌入source训练目录被正确保护，修测试未放宽保护。入口TRACK_DIR新目录+bash tools/unified_source_tracks/run.sh，TRACK_RESUME=1同目录恢复；实际nuScenes指标未运行，未训练/自动扩训/推广。只在独立分支实现，远端推送和服务器评估尚未执行。
+
 ## 本线程最新实现：相同规模的内部 Pred 三轮
 
 用户要求不扩大训练，试当前软配置的内部ego版本。新增隔离 `tools/joint_occ_experiments/pred/`：独立RANDOM、相同scene-balanced TRAIN20%4086窗/seed20261011/三轮余弦/batch4/source128；WM+CCR+ego共同更新，不导入GT权重。沿用两未来帧renderer、六未来完整CE+Lovasz及source geometry/existence/R10 ego监督。
