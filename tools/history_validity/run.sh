@@ -12,7 +12,7 @@ export SWFM_COLUMN_CPU_BACKEND=native
 DATAROOT="${DATAROOT:-/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes}"
 if [[ -n "${RESUME:-}" ]]; then echo 'Use KNOWN_RESUME=1 and original RUN_DIR'; exit 1; fi
 if [[ "${KNOWN_RESUME:-0}" == 1 && -z "${RUN_DIR:-}" ]]; then echo 'Set original RUN_DIR before resume'; exit 1; fi
-RUN_DIR="${RUN_DIR:-$ROOT/outputs/p0_f9_shared_history/known_20pct_2ep_$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="${RUN_DIR:-$ROOT/outputs/p0_f9_shared_history/known_20pct_1ep_$(date +%Y%m%d_%H%M%S)}"
 args=(--config "$ROOT/configs/real_motion_occfm.yaml"
   --train-cache "${TRAIN_CACHE:-$ROOT/data/p0_f9_v18_se2_train_full.pt}"
   --dev-cache "${DEV_CACHE:-$ROOT/data/p0_f9_v18_se2_val_all_4369.pt}"
@@ -24,11 +24,11 @@ args=(--config "$ROOT/configs/real_motion_occfm.yaml"
   --ccr-history-cache "${CCR_HISTORY_CACHE:-$ROOT/cache/p0_f9_ccr_history_geometry_v1}"
   --ccr-val-history-cache "${CCR_VAL_CACHE:-$ROOT/cache/p0_f9_ccr_history_geometry_val_v1}"
   --stc-root "${STC_ROOT:-$ROOT/data/stc_camera/compact}"
-  --out-dir "$RUN_DIR" --epochs 2 --train-fraction .2 --mode gt --eval-population dev64
+  --out-dir "$RUN_DIR" --epochs 1 --train-fraction .2 --mode gt --eval-population dev64
   --cpu-workers "${CPU_WORKERS:-4}" --prefetch-workers 4
   --frame-cache-mib 1024 --geometry-ram-mib 512 --descriptor-ram-mib 256)
 if [[ "${KNOWN_RESUME:-0}" == 1 ]]; then args+=(--resume-workflow); fi
-echo 'Matched RANDOM original-known/dense-valid, TRAIN20% x2 EACH. H6 CE+Lovasz ONLY; no ego head.'
+echo 'Matched RANDOM original-known/dense-valid, TRAIN20% x1 EACH. H6 CE+Lovasz ONLY; no ego head.'
 echo 'No augmentation or learned prior gate; geometry caches read-only; final same DEV64 OCC+GT/STC+GT.'
 echo "RUN_DIR=$RUN_DIR; Ctrl-C saves complete update/window."
 exec "$PY" -u -m tools.history_validity.workflow "${args[@]}" "$@"

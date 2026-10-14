@@ -15,7 +15,7 @@ from .run import PROTOCOL, stc_inventory, validate, dependency_files
 
 def parser():
     p = legacy.parser(); p.description = __doc__
-    p.set_defaults(mode='gt', epochs=2, train_fraction=.2, eval_population='dev64')
+    p.set_defaults(mode='gt', epochs=1, train_fraction=.2, eval_population='dev64')
     p.add_argument('--stc-root', required=True)
     p.add_argument('--resume-workflow', action='store_true')
     return p
@@ -27,12 +27,12 @@ def completed(directory):
     result = json.loads(path.read_text(encoding='utf-8'))
     if result.get('status') != 'complete': return None
     c = result['contract']; report = result['evaluation']
-    if (c['protocol'] != PROTOCOL or result['epoch'] != 2 or report['windows'] != 64
+    if (c['protocol'] != PROTOCOL or result['epoch'] != 1 or c['epochs'] != 1 or report['windows'] != 64
             or result['updates'] != c['total_updates'] or report['history_known_policy'] != directory.name
             or set(report['variants']['gt']) != set(ROUTES)):
         raise RuntimeError('wrong completed known-policy arm')
     saved = torch.load(directory/'last.pt', map_location='cpu', weights_only=False)
-    if (saved['contract'] != c or saved['updates'] != result['updates'] or saved['epoch'] != 2
+    if (saved['contract'] != c or saved['updates'] != result['updates'] or saved['epoch'] != 1
             or saved['batch'] != 0 or saved['history_known_policy'] != directory.name):
         raise RuntimeError('completed report/checkpoint mismatch')
     return dict(contract=c, metrics=report['variants']['gt'], updates=result['updates'],
@@ -49,7 +49,7 @@ def comparison(root):
         for field in left['contract']:
             if field != 'implementation' and left['contract'][field] != right['contract'][field]:
                 raise RuntimeError('unmatched known A/B contract: '+field)
-    lines = ['===== MATCHED HISTORY KNOWN / TRAIN20% x2 / DEV64 =====',
+    lines = ['===== MATCHED HISTORY KNOWN / TRAIN20% x1 / DEV64 =====',
         'Same RANDOM body/initializer/order/H6/full6 CE+Lovasz/cosine; no ego head or noise.',
         'Original GT lidar-known vs dense-valid TRAIN AND OCC eval. STC dense-valid in BOTH arms.',
         'Geometry/source/Strong construction unchanged; learned history coverage rebuilt.',
@@ -68,7 +68,7 @@ def comparison(root):
             delta[name] = {k: rows['dense_valid']['metrics'][name][k]-rows['lidar_known']['metrics'][name][k]
                            for k in ('mIoU', 'IoU', 'MovingMicro')}
         lines.append('dense_valid_minus_lidar_known='+json.dumps(delta))
-    lines.append('Both fixed final epoch2 reported; NO automatic selection, expansion or promotion. NOT FPS.')
+    lines.append('Both fixed final epoch1 reported; NO automatic selection, expansion or promotion. NOT FPS.')
     legacy.write_json(root/'comparison.json', dict(status='complete' if len(rows) == 2 else 'partial',
         arms=rows, dense_valid_minus_lidar_known=delta, no_automatic_promotion=True))
     (root/'summary.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
@@ -82,7 +82,7 @@ def main(event=None, argv=None, launch=None):
     root = Path(a.out_dir).resolve(); fields = vars(a).copy()
     for name in ('out_dir', 'resume_workflow', 'max_updates'): fields.pop(name)
     code = Path(__file__).resolve().parents[2]
-    identity = dict(protocol='history_known_matched_workflow_v1', args=fields,
+    identity = dict(protocol='history_known_matched_one_epoch_workflow_v1', args=fields,
         STC_inventory=stc_inventory(a),
         data={k: legacy.sha256(getattr(a, k)) for k in ('config', 'train_cache', 'dev_cache',
             'population_manifest', 'base_checkpoint', 'train_info', 'dev_info')},

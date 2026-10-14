@@ -133,12 +133,12 @@ def test_workflow_smoke_resume_complete_and_initializer_guard(tmp_path, monkeypa
             (directory/'last.pt').write_bytes(b'safe smoke cursor')
             result = dict(status='stopped_at_complete_update')
         else:
-            assert '--resume' in command
-            c = dict(protocol=run.PROTOCOL, total_updates=2060, implementation=policy, model='same')
-            torch.save(dict(contract=c, updates=2060, epoch=2, batch=0, history_known_policy=policy,
+            if (directory/'last.pt').exists(): assert '--resume' in command
+            c = dict(protocol=run.PROTOCOL, epochs=1, total_updates=1030, implementation=policy, model='same')
+            torch.save(dict(contract=c, updates=1030, epoch=1, batch=0, history_known_policy=policy,
                             random_initializer='same_init'), directory/'last.pt')
             m = dict(mIoU=20., IoU=30., MovingMicro=10.)
-            result = dict(status='complete', epoch=2, updates=2060, contract=c,
+            result = dict(status='complete', epoch=1, updates=1030, contract=c,
                 evaluation=dict(windows=64, history_known_policy=policy, variants={'gt': {n: m for n in evaluation.ROUTES}}))
         (directory/'results.json').write_text(json.dumps(result))
         return SimpleNamespace(returncode=0)
@@ -150,6 +150,10 @@ def test_workflow_smoke_resume_complete_and_initializer_guard(tmp_path, monkeypa
     saved['random_initializer'] = 'wrong'; torch.save(saved, root/'dense_valid'/'last.pt')
     with pytest.raises(RuntimeError, match='initializers differ'): workflow.comparison(root)
     with pytest.raises(ValueError): workflow.main(argv=args+['--epochs', '3'], launch=launch)
+    direct = list(args); direct[direct.index('--out-dir')+1] = str(tmp_path/'direct')
+    assert workflow.main(argv=direct, launch=launch) == 0
+    assert all('--max-updates' not in c and '--resume' not in c and c[c.index('--epochs')+1] == '1'
+               for c in calls[-2:])
 
 
 @pytest.mark.parametrize('policy', data.POLICIES)
@@ -200,12 +204,19 @@ def test_actual_cli_safe_resume_policy_and_original_binding_guards(tmp_path, mon
     assert initial['history_known_policy'] == policy
     assert run.main(threading.Event(), args+['--resume', str(out/'last.pt')]) == 0
     saved = torch.load(out/'last.pt', weights_only=False)
-    assert saved['updates'] == 4 and saved['epoch'] == 2 and saved['batch'] == 0
+    assert saved['updates'] == 2 and saved['epoch'] == 1 and saved['batch'] == 0
+    assert saved['contract']['epochs'] == 1 and saved['contract']['total_updates'] == 2
     assert saved['random_initializer'] == initial['random_initializer']
-    assert (out/'epoch_0001.pt').is_file() and (out/'epoch_0002.pt').is_file()
+    assert (out/'epoch_0001.pt').is_file() and not (out/'epoch_0002.pt').exists()
     fraction = saved['reports']['training'][0]['gt']['history_known']['fractions'][0]
     assert fraction == (1. if policy == 'dense_valid' else float(row[1]['history_observed'].mean()))
     assert legacy.parser is original_parser and run.data.ego_inputs is original_ego
+    old = copy.deepcopy(saved)
+    old['protocol'] = 'shared_gt_history_known_train20pct_2epochs_v1'
+    old['contract']['epochs'] = 2
+    torch.save(old, out/'old_two_epoch.pt')
+    with pytest.raises(RuntimeError, match='differs'):
+        run.main(argv=args+['--resume', str(out/'old_two_epoch.pt')])
     other = 'lidar_known' if policy == 'dense_valid' else 'dense_valid'
     wrong = [other if v == policy else v for v in args]
     with pytest.raises(RuntimeError, match='differs'):

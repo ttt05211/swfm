@@ -1,4 +1,4 @@
-"""Matched RANDOM GT-body TRAIN20% x2: original known vs dense-valid."""
+"""Matched RANDOM GT-body TRAIN20% x1: original known vs dense-valid."""
 import hashlib
 from pathlib import Path
 import signal
@@ -15,7 +15,7 @@ from tools.perception_robustness.run import stc_inventory
 from .data import POLICIES, history_inputs, prefetch_adapter
 from .evaluation import evaluator
 
-PROTOCOL = 'shared_gt_history_known_train20pct_2epochs_v1'
+PROTOCOL = 'shared_gt_history_known_train20pct_1epoch_v1'
 
 
 def dependency_files():
@@ -36,17 +36,17 @@ def dependency_files():
 
 def parser():
     p = legacy.parser(); p.description = __doc__
-    p.set_defaults(mode='gt', epochs=2, train_fraction=.2, eval_population='dev64')
+    p.set_defaults(mode='gt', epochs=1, train_fraction=.2, eval_population='dev64')
     p.add_argument('--known-policy', choices=POLICIES, required=True)
     p.add_argument('--stc-root', required=True)
     return p
 
 
 def validate(a):
-    if (a.mode != 'gt' or a.epochs != 2 or a.train_fraction != .2 or a.eval_population != 'dev64'
+    if (a.mode != 'gt' or a.epochs != 1 or a.train_fraction != .2 or a.eval_population != 'dev64'
             or a.window_batch_size != 4 or a.source_budget != 128 or a.seed != 20261011
             or a.training_backend != 'fused' or (a.object_weight, a.ego_weight, a.lovasz_weight) != (1., 1., 1.)):
-        raise ValueError('fixed RANDOM GT-body TRAIN20% x2 / B4-source128 / full6 CE+Lovasz / DEV64')
+        raise ValueError('fixed RANDOM GT-body TRAIN20% x1 / B4-source128 / full6 CE+Lovasz / DEV64')
 
 
 def main(event=None, argv=None):
@@ -74,7 +74,7 @@ def main(event=None, argv=None):
     def summary(result):
         text = ['===== HISTORY KNOWN / MATCHED GT BODY =====',
             f'status={result["status"]}; policy={a.known_policy}; epochs={result.get("epoch", 0)}; updates={result.get("updates", 0)}',
-            'RANDOM; same TRAIN4086 x2 / order / B4-source128 / H6 / two-epoch cosine.',
+            'RANDOM; same TRAIN4086 x1 / order / B4-source128 / H6 / one-epoch cosine.',
             'GT future ego conditioned; ONLY full6 CE+Lovasz; no ego/motion/existence auxiliary loss.',
             'Only learned history known/coverage changes. Geometry/KTA/Strong/Transport math unchanged.',
             'STC full semantics/dense validity; scoring full grid, NO visibility mask or alignment.',

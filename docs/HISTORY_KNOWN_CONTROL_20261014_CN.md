@@ -6,7 +6,7 @@
 ## 实际变化与保持不变
 
 两路均相同 GTBody（SharedEncoder/STWM/18 类 SemanticRefiner）、相同 RANDOM 初始化、
-seed20261011、TRAIN4086×2、B4/source128、H6 全六帧 CE+Lovasz、两轮完整余弦。
+seed20261011、TRAIN4086×1、B4/source128、H6 全六帧 CE+Lovasz、单轮完整余弦。
 初始化 tensor digest 实测一致才发布成对结果。基础 E14 checkpoint 仅供结构和历史缓存身份，
 不导入它的权重；不存在 ego/motion/existence 辅助 loss、旧 Surface 或 ADD/REMOVE。
 
@@ -31,13 +31,15 @@ known 相关 memory coverage，使用独立有界 RAM 缓存。没有学习特�
 cd /root/nas/occ/swfm
 conda activate OccFM
 git pull --ff-only
-export RUN_DIR="$PWD/outputs/p0_f9_shared_history/known_20pct_2ep_$(date +%Y%m%d_%H%M%S)"
+export RUN_DIR="$PWD/outputs/p0_f9_shared_history/known_20pct_1ep_$(date +%Y%m%d_%H%M%S)"
 unset RESUME KNOWN_RESUME
-bash tools/history_validity/run.sh --max-updates 8
+bash tools/history_validity/run.sh && cat "$RUN_DIR/summary.txt"
 ```
 
-先各8步，只检查训练接口；不评8步模型、不丢弃已完成步、不更改两轮 LR 周期。
-正常后继续同一个目录：
+用户最新要求：两路各1轮，直接完整运行，不做首检。不是只修改日志里的轮数：
+总更新数、学习率周期、完成判定、最终checkpoint和对照表都改为单轮。
+两轮版本的旧输出/8步断点保留，但不能接入单轮周期；必须使用上述新目录。
+如果新的单轮实验中断，设置原单轮 RUN_DIR 后恢复：
 
 ```bash
 export KNOWN_RESUME=1
@@ -45,14 +47,13 @@ bash tools/history_validity/run.sh
 cat "$RUN_DIR/summary.txt"
 ```
 
-也可新目录首次直接不加 `--max-updates 8` 跑完整对照。
 中断后仍设原 RUN_DIR 和 KNOWN_RESUME=1；完整完成的路不会重训或重评。
 失败不自动重试，旧断点、缓存、已完成 formal/long6/Waymo 实验不改。
 
 最终只评同固定 DEV64 OCC+GT / STC+GT，各报告 Transport/Refiner 和 1/2/3s 指标，
 根目录 summary/comparison 给 dense-valid 相对原策略差值，不自动选优、扩512/full或推广。
 这轮刻意重训同预算控制：不把旧正式全量 epoch2 或旧500步结果冒充成对基线。
-两路训练预算共16344窗口，时间以真实训练日志为准，质量评估耗时不是 FPS。
+两路训练预算共8172窗口，时间以真实训练日志为准，质量评估耗时不是 FPS。
 
 ## 解释边界
 
@@ -66,3 +67,5 @@ STC 头2.4061。是输入分布影响的证据，不证明统一后一定恢复�
 真实 runner 的 Adam/RNG/轮快照/跨策略恢复拒绝）及既有噪声/GT/正式评估40项共48通过。
 测试不是服务器真实数据训练，也不证明 STC 涨点。首次发现 Windows 路径分隔符导致策略
 fingerprint 未绑定；已在新 runner 规范路径识别，跨策略恢复确实拒绝，旧代码没有更改。
+最新单轮改动的8项专项回归10.67s通过：直接完整工作流、单轮步数/LR周期/快照、
+两路同预算、旧两轮协议拒绝以及CPU/CUDA前反传；Bash语法检查通过。未代跑服务器。
