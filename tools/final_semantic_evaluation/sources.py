@@ -4,7 +4,6 @@ import numpy as np
 from real_motion.nuscenes_adapter import NuScenesWindowSource, WindowTokens, gt_moving_support_sequence
 from real_motion.stc_camera_protocol import semantics
 from real_motion.ego_navigation import navigation_commands
-from tools.real_motion.shared_evidence_pilot_common import moving_support_masks
 from tools.real_motion import geniedrive_eval_alignment as genie, joint_long_rollout_common as rollout
 
 
@@ -72,9 +71,25 @@ class NuscInputs:
         return result
 
     def moving(self, w, indices, horizons, grid, workers):
+        indices, horizons = tuple(indices), tuple(horizons)
+        if (indices not in ((1, 3, 5), (1, 3, 5, 7, 9, 11))
+                or horizons != tuple(float(i+1) for i in range(len(indices)))):
+            raise ValueError('Moving requires paired fixed 1--3s or 1--6s report keys')
         support = gt_moving_support_sequence(self.source.nusc, w.t0_token,
-            tuple(w.future_tokens[i] for i in indices), tuple(horizons), grid=grid, workers=workers)
-        return moving_support_masks(support, grid.shape_hwd)
+            tuple(w.future_tokens[i] for i in indices), horizons, grid=grid, workers=workers)
+        # The legacy unmarshaller requires SIX rows. This evaluator requests
+        # only the reporting horizons (3 or 6), not six half-second forecasts.
+        # Preserve the same row/shape/dtype checks, without padding or casting.
+        if len(support) != len(indices): raise ValueError('Moving support/report count differs')
+        masks = []
+        for h, row in enumerate(support):
+            if not isinstance(row, (tuple, list)) or len(row) != 3:
+                raise ValueError(f'Moving support row must be (mask, records, exclusions), horizon={h}')
+            mask = np.asarray(row[0])
+            if mask.dtype != np.dtype(bool) or mask.shape != tuple(grid.shape_hwd):
+                raise ValueError(f'Moving mask must be boolean with shape {tuple(grid.shape_hwd)}, horizon={h}')
+            masks.append(mask)
+        return masks
 
 
 def nusc_jobs(inputs, records, parent, population, task, *, genie_info=None, long_alignment='geniedrive'):

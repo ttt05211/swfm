@@ -199,3 +199,72 @@ def test_long_compatibility_same_integer_counts():
         occ_inter=v[:, :17, :17].sum((1, 2)), occ_union=v.sum((1, 2))-v[:, 17, 17]))
     assert metrics.report(counts, range(1, 7), moving=False)['average']['mIoU'] == pytest.approx(100/3)
     assert legacy['per_horizon']['1.0']['mIoU'] == 100.
+
+
+def moving_source_fixture():
+    """Real nuScenes Moving adapter with synthetic metadata, no mask stubbing."""
+    from real_motion.geometry import OccupancyGrid
+    tables = {}
+    for i, token in enumerate(['a0', *('f'+str(j) for j in range(12))]):
+        tables['sample', token] = dict(anns=[token], data=dict(LIDAR_TOP=token), timestamp=i*500000)
+        tables['sample_data', token] = dict(ego_pose_token=token)
+        tables['ego_pose', token] = dict(translation=[0., 0., 0.], rotation=[1., 0., 0., 0.])
+        tables['sample_annotation', token] = dict(instance_token='car', category_name='vehicle.car',
+            translation=[2.+i*.5, 2., 1.], rotation=[1., 0., 0., 0.], size=[1., 1., 1.])
+    source = sources.NuscInputs.__new__(sources.NuscInputs)
+    source.source = SimpleNamespace(nusc=SimpleNamespace(get=lambda table, token: tables[table, token]))
+    return source, OccupancyGrid(x_min=0, y_min=0, z_min=0, voxel_size=(1., 1., 1.), shape_hwd=(12, 8, 4))
+
+
+@pytest.mark.parametrize('count', [3, 6])
+def test_real_moving_reporting_adapter_matches_all_horizons(count):
+    source, grid = moving_source_fixture(); job = jobs()[0]
+    indices = tuple(range(1, 2*count, 2)); horizons = tuple(float(i+1) for i in range(count))
+    actual = source.moving(job, indices, horizons, grid, 2)
+    from real_motion.nuscenes_adapter import gt_moving_support_for_horizon
+    assert len(actual) == count
+    for mask, at, h in zip(actual, indices, horizons):
+        reference, records, _ = gt_moving_support_for_horizon(source.source.nusc, job.t0_token,
+            job.future_tokens[at], h, grid=grid)
+        assert records and mask.any()
+        np.testing.assert_array_equal(mask, reference)
+
+
+@pytest.mark.parametrize('task', ['gt', 'stc', 'long6'])
+def test_evaluator_calls_real_moving_adapter_after_predictions(task, monkeypatch):
+    adapter, grid = moving_source_fixture(); source = FakeSource(2 if task != 'gt' else 1)
+    # Retain synthetic occupancy/model, but use the actual failing production interface.
+    source.source = adapter.source
+    def moving(*args):
+        assert source.forecast_count >= source.required
+        return adapter.moving(*args)
+    source.moving = moving
+    pred = FakePredictor(source); pred.provider.pcfg.grid = grid
+    shape = grid.shape_hwd
+    base_dense = pred.dense
+    pred.dense = lambda fw: {k: np.broadcast_to(v[:, :1, :1, :1], (6, *shape)).copy()
+                              for k, v in base_dense(fw).items()}
+    source.targets = lambda job, ids: [np.full(shape, 4, np.uint8)]*len(ids)
+    monkeypatch.setattr(engine, 'inherited_observation_masks', lambda *a: np.ones((4, *shape), bool))
+    result = engine.evaluate(pred, source, jobs(), task, [['VAL', 'a0']], dict(population={}))
+    assert result['windows'] == 1 and result['status'] == 'complete'
+    assert len(next(iter(result['reports'].values()))['per_horizon']) == (6 if task == 'long6' else 3)
+
+
+@pytest.mark.parametrize('bad', ['row_count', 'row_schema', 'dtype', 'shape'])
+def test_moving_reporting_adapter_rejects_malformed_support(bad, monkeypatch):
+    source, grid = moving_source_fixture(); mask = np.zeros(grid.shape_hwd, bool)
+    rows = [(mask, [], {}) for _ in range(3)]
+    if bad == 'row_count': rows = rows[:2]
+    if bad == 'row_schema': rows[0] = (mask, [])
+    if bad == 'dtype': rows[0] = (mask.astype(np.uint8), [], {})
+    if bad == 'shape': rows[0] = (np.zeros((1,), bool), [], {})
+    monkeypatch.setattr(sources, 'gt_moving_support_sequence', lambda *a, **k: rows)
+    with pytest.raises(ValueError): source.moving(jobs()[0], (1, 3, 5), (1., 2., 3.), grid, 1)
+
+
+def test_moving_reporting_adapter_rejects_horizon_mismatch_before_annotations():
+    source, grid = moving_source_fixture()
+    source.source = SimpleNamespace(nusc=object())
+    with pytest.raises(ValueError, match='paired fixed'):
+        source.moving(jobs()[0], (1, 3, 5), (.5, 1., 1.5), grid, 1)
