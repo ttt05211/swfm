@@ -1,5 +1,13 @@
 # 当前任务摘要（2026-10-11）
 
+## 独立分支：统一track多帧KTA，同预算随机重训一轮（2026-10-15）
+
+冻结64结果已complete：多帧KTA 3s均值OCC2.212→2.080m/STC3.740→2.961m，但旧GTepoch2直接换初值Refiner OCC mIoU−.188808/Moving−1.831655，STC+.197338/+.039153；统一两点OCC+.041881/+.148153、STC+.026406/+.000513。不推广Frozen fit，不断言尾部/旧残差分布哪个解释全部。用户明确授权做同规模预算重训。
+
+仅在本独立worktree/experiment分支新增tools/unified_source_training六文件+专项test+说明；不改原冻结screen（其resume指纹不变）、正式model/train/cache或另一分支STC适配。baseline/unified_fit两路相同RANDOM init，TRAIN20%4086各一轮、seed20261011/同序B4-source128/H6完整6 CE+Lovasz/完整一轮余弦，无ego或运动/existence损失，无旧权重导入。新track同时TRAIN与OCC/STC最终评估使用；原Strong/CLEAR保持两帧控制。旧cached t0 source/原始历史可复用，新previous/older components、关联/注册/reads/KTA在原有CPU预取和有界RAM构建，KTA与anchors同步更新；不写旧cache、不建新bank。
+
+最终同DEV64 OCCGT/STCGT Transport+Refiner，fullgrid/STC all-known、无aligned；源码/数据/STCinventory/相同初始化hash与科学契约核验。两个child顺序执行，完整update/window resume/Adam-RNG-cosine/epoch_0001与完成路跳过；可max-updates8两路首检后同一轮恢复，默认直接各一轮。输出TRACK_TRAIN_DIR新目录（默认原swfm outputs），TRACK_TRAIN_RESUME=1恢复。原E14仅架构+cache契约，不导其权重；原GTepoch2不读。45passed21.99s含CPU/CUDA反传、实际trainer恢复及64窗评估，CLI/Bash通过。尚未代启动服务器；用户代理只ghfast.top。只推此独立分支，不混其他开发代码。
+
 ## 独立工作副本：Unified source track / Multi-frame KTA DEV64（2026-10-15）
 
 用户授权独立实现，不混其他开发分支。本工作副本swfm-unified-source-tracks/experiment/unified-source-track-kta-dev64基于88d8dac；仅新增tools/unified_source_tracks五文件、专项test与操作文档，旧model/trainer/final evaluation/cache源码不改。原swfm-surface-ccr及其当前STC适配开发、混合文档/tmp不动。新实验完整GTepoch2冻结、同DEV64 OCC+GT/STC+GT，baseline/unified_two/unified_fit三路，固定baseline Strong/CLEAR以隔离track/KTA；不是整个Strong的新正式统一版本。
