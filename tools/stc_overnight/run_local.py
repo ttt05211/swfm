@@ -52,7 +52,7 @@ def main(argv=None):
     a.add_argument('--temporal-support',action='store_true')
     a.add_argument('--memory-static-current',action='store_true')
     a.add_argument('--memory-range',action='store_true')
-    a.add_argument('--velocity-model',choices=['half','full','wiener'],default='half')
+    a.add_argument('--velocity-model',choices=['half','full','wiener','registered_half'],default='half')
     a.add_argument('--role',choices=['reference64','clean_train'],default='reference64')
     a.add_argument('--posterior-stats',action='store_true')
     a.add_argument('--spatial-stats',action='store_true')
@@ -173,7 +173,11 @@ def main(argv=None):
                 from .replay import semantic_memory_consistency
                 row,_=semantic_memory_consistency(row,b.pcfg.grid,args.device)
             kta_audit=None
-            if args.kta_multiframe or args.center_filter:row,kta_audit=multiframe_velocity(row,predictor.provider,times,args.center_filter,args.velocity_model)
+            if args.kta_multiframe or args.center_filter:
+                if args.velocity_model=='registered_half':
+                    from .registered_velocity import registered_velocity
+                    row,kta_audit=registered_velocity(row,predictor.provider,times,args.center_filter)
+                else:row,kta_audit=multiframe_velocity(row,predictor.provider,times,args.center_filter,args.velocity_model)
             if args.memory_recency or args.memory_current_only or args.memory_last2:
                 # Geometry and network features remain original; only normalized
                 # history evidence pooling receives a fixed age preference.

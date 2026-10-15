@@ -186,3 +186,37 @@ def test_observer_em_recovers_independent_synthetic_rates_and_prior_mass():
         mask=prior.argmax(1)!=17
         assert (after.permute(0,2,3,4,1)[mask].max(-1).values>=.5).all()
     finally:p.close()
+
+
+def test_registration_velocity_uses_common_anchor_and_keeps_original_last_pair():
+    from dataclasses import replace
+    from real_motion.shared_source_track import from_raw
+    from tools.stc_overnight.registered_velocity import registered_velocity
+    p,rec,raw=fixture()
+    try:
+        times=np.arange(4)*.5;row=p.prepare(rec,raw,times=times)
+        _,track=from_raw(raw,p.provider,times,current=row[3][0]['state']['current'])
+        assert len(track.centers)>0
+        valid=track.track_valid.copy();valid[0]=True
+        points=track.centers.copy();current=points[0,3].copy();true_velocity=np.array([2.,1.,0.])
+        points[0]=current+track.times[:,None]*true_velocity
+        points[0,:,0]+=np.array([.4,-.2,.3,0.]) # changing visibility biases centroids
+        registrations=[list(r) for r in track.registrations]
+        registrations[0]=[]
+        for t in track.times:
+            m=np.eye(4);m[:3,3]=-t*true_velocity
+            registrations[0].append((m,np.empty((0,3),np.int64)))
+        velocity=dict(track.pair_velocity);velocity[0]=np.array([4.,0.,0.])
+        track=replace(track,centers=points,track_valid=valid,pair_velocity=velocity,registrations=registrations)
+        source=(row[0],dict(row[1],_shared_source_track=track),row[2],row[3])
+        result,audit=registered_velocity(source,p.provider,times)
+        np.testing.assert_allclose(result[1]['_shared_source_track'].pair_velocity[0],[3.,.5,0.],atol=1e-12)
+        np.testing.assert_array_equal(track.pair_velocity[0],[4.,0.,0.])
+        assert audit['registered_velocity_sources']>=1
+        np.testing.assert_array_equal(result[1]['_shared_source_track'].centers,track.centers)
+        np.testing.assert_array_equal(result[1]['_shared_source_track'].track_valid,track.track_valid)
+        # No original pair means no velocity, even with four accepted registrations.
+        source=(source[0],dict(source[1],_shared_source_track=replace(track,pair_velocity={})),source[2],source[3])
+        result,_=registered_velocity(source,p.provider,times)
+        assert result[1]['_shared_source_track'].pair_velocity=={}
+    finally:p.close()
