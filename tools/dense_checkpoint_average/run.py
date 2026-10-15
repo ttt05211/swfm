@@ -1,4 +1,4 @@
-"""Fixed mean(10000,10292,12000,14000); one GPU, no training or coefficient search."""
+"""Two explicitly requested fixed four-checkpoint recipes; single-card evaluation only."""
 import argparse
 import csv
 import json
@@ -15,7 +15,7 @@ from tools.shared_source_track.adapter import SharedTrackPredictor
 from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
 from tools.real_motion.joint_training_recovery import save_resume_checkpoint
 from tools.real_motion.surface_ego_ablation_common import tensor_state_fingerprint
-from .weights import (PROTOCOL, STEPS, ROUTES, METRICS, model_from_spec, select_directories,
+from .weights import (PROTOCOL, RECIPES, METRICS, model_from_spec, select_directories,
                       load_sources, historical_report, averaged_payload)
 
 
@@ -33,8 +33,10 @@ def fmt(value): return 'NA' if value is None else f'{value:.6f}'
 
 
 def comparison_text(result):
+    steps = result['contract']['source_steps']
     lines = ['===== FIXED FOUR-CHECKPOINT PARAMETER MEAN / SAME REMAINING64 =====',
-        'status='+result['status'], 'Equal weights 1/4 each:10000,10292(epoch2),12000,14000; single-model inference.',
+        'status='+result['status'], 'Equal weights 1/4 each:'+','.join(str(s)+('(epoch2)' if s == 10292 else '')
+            for s in steps)+'; single-model inference.',
         'No training/Adam averaging/threshold search/automatic selection; not guaranteed to improve.',
         'MATCHED: OCC AND STC dense-valid; GT future ego; full-grid; 1/2/3s average.',
         'Existing complete compatible metrics reused; missing/wrong-known routes evaluated with fresh shared-track inference.']
@@ -69,11 +71,13 @@ def publish(out, result):
 def main(event=None, argv=None):
     event = event or threading.Event(); p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--epoch3-dir'); p.add_argument('--source-dir'); p.add_argument('--out-dir', required=True)
+    p.add_argument('--recipe', choices=tuple(RECIPES), default='recent')
     p.add_argument('--resume', action='store_true'); p.add_argument('--config', required=True)
     p.add_argument('--dataroot', required=True); p.add_argument('--dev-info', required=True)
     p.add_argument('--dev-cache', required=True); p.add_argument('--stc-root', required=True)
     p.add_argument('--cpu-workers', type=int, default=4); p.add_argument('--device', default='cuda')
     a = p.parse_args(argv); repo = Path(__file__).resolve().parents[2]; out = Path(a.out_dir).resolve()
+    steps = RECIPES[a.recipe]
     if not 1 <= a.cpu_workers <= 8: raise ValueError('bounded CPU workers required')
     if a.device.startswith('cuda') and torch.cuda.device_count() != 1: raise RuntimeError('expose exactly ONE GPU')
     torch.set_num_threads(1); torch.manual_seed(21)
@@ -82,7 +86,7 @@ def main(event=None, argv=None):
     stage, parent, stage_c = select_directories(a.epoch3_dir, a.source_dir, repo/'outputs/p0_f9_shared_history')
     if any(out == old or old in out.parents for old in (stage, parent)):
         raise ValueError('independent output outside BOTH training runs required')
-    sources = load_sources(stage, parent, stage_c)
+    sources = load_sources(stage, parent, stage_c, steps=steps)
     original = stage_c['source_contract']; keys = stage_c['eval_keys']
     for name in ('config', 'dev_cache', 'dev_info'):
         if base.sha256(getattr(a, name)) != original['data'][name]: raise RuntimeError('original metadata differs: '+name)
@@ -105,7 +109,7 @@ def main(event=None, argv=None):
     body = model_from_spec(stage_c['model'])
     args = vars(a).copy(); args.pop('resume'); args.update(epoch3_dir=str(stage), source_dir=str(parent), out_dir=str(out))
     files = sorted(Path(__file__).parent.glob('*.py'))
-    contract = dict(protocol=PROTOCOL, args=args, epoch3_dir=str(stage), source_steps=list(STEPS), keys=keys,
+    contract = dict(protocol=PROTOCOL, args=args, epoch3_dir=str(stage), source_steps=list(steps), keys=keys,
         sources=[{k: s[k] for k in ('step', 'path', 'sha256')} for s in sources], coefficients=[.25]*4,
         source_contract=original, continuation_contract=stage_c,
         known=dict(occ='dense_valid', stc='dense_valid'), historical=historical, inventory=inventory,
@@ -126,7 +130,7 @@ def main(event=None, argv=None):
             raise RuntimeError('averaged evaluation-only artifact differs')
         result = dict(status='running', scientific_updates=0, contract=contract,
             historical={str(s): historical[str(s)] if historical[str(s)] else
-                        dict(known=dict(occ='missing', stc='missing'), metrics={}) for s in STEPS}, matched={})
+                        dict(known=dict(occ='missing', stc='missing'), metrics={}) for s in steps}, matched={})
         if a.resume: result = json.loads((out/'results.json').read_text(encoding='utf-8'))
         result['status'] = 'running'; publish(out, result)
         pcfg = base.make_prepare_config(base.load_runtime_config(a.config, original.get('overrides')))

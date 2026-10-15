@@ -18,6 +18,6 @@ args=(--out-dir "$DENSE_MEAN_DIR" --config "$ROOT/configs/real_motion_occfm.yaml
 if [[ -n "${DENSE_EPOCH3_DIR:-}" ]]; then args+=(--epoch3-dir "$DENSE_EPOCH3_DIR"); fi
 if [[ -n "${DENSE_DDP_DIR:-}" ]]; then args+=(--source-dir "$DENSE_DDP_DIR"); fi
 if [[ "${DENSE_MEAN_RESUME:-0}" == 1 ]]; then args+=(--resume); fi
-echo "Fixed equal mean10000/10292/12000/14000; single GPU; SAME64 dense OCC/STC; originals read only."
+echo "Fixed equal mean (recent by default; explicit wide recipe via run_wide.sh); ONE GPU; SAME64 dense OCC/STC."
 echo "DENSE_MEAN_DIR=$DENSE_MEAN_DIR"
 exec "$PY" -u -m tools.dense_checkpoint_average.run "${args[@]}" "$@"

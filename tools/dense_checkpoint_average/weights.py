@@ -9,6 +9,7 @@ from tools.shared_history_experiments.full_gt.model import GTBody
 from tools.real_motion.joint_surface_checkpoint_selection import average_named_parameters
 
 STEPS = (10000, 10292, 12000, 14000)
+RECIPES = dict(recent=STEPS, wide=(4000, 6000, 8000, 10292))
 PROTOCOL = 'dense_shared_semantic_refiner_fixed_mean4_evaluation_only_v1'
 ROUTES = ('occ_gt_transport', 'occ_gt_semantic_refine', 'stc_gt_transport', 'stc_gt_semantic_refine')
 METRICS = ('mIoU', 'IoU', 'MovingMicro')
@@ -37,11 +38,12 @@ def select_directories(epoch3, original, search):
     return stage, parent, c
 
 
-def load_sources(stage, parent, stage_contract):
-    paths = [parent/'update_010000.pt', parent/'epoch_0002.pt',
-             stage/'update_012000.pt', stage/'update_014000.pt']
+def load_sources(stage, parent, stage_contract, *, steps=STEPS):
+    if tuple(steps) not in RECIPES.values(): raise ValueError('only the two explicitly fixed recipes supported')
+    paths = [(parent/'epoch_0002.pt' if step == 10292 else
+              (parent if step < 10292 else stage)/f'update_{step:06d}.pt') for step in steps]
     sources = []
-    for step, path in zip(STEPS, paths):
+    for step, path in zip(steps, paths):
         sha = base.sha256(path); saved = torch.load(path, map_location='cpu', weights_only=False)
         c = saved['contract']; expected = ORIGINAL if step <= 10292 else CONTINUATION
         if (saved.get('protocol') != expected or c.get('protocol') != expected or saved['updates'] != step
@@ -93,6 +95,6 @@ def averaged_payload(sources, body, contract):
     # The old helper only supplies arithmetic; NO old Surface model/renderer is executed.
     state = average_named_parameters([s['state'] for s in sources], body)
     return dict(protocol=PROTOCOL, checkpoint_role='evaluation_only', resume_allowed=False,
-        source_updates=list(STEPS), coefficients=[.25]*4, buffers='identical_copy',
+        source_updates=[s['step'] for s in sources], coefficients=[.25]*4, buffers='identical_copy',
         arithmetic='equal_named_parameter_mean_float64_then_original_dtype', contract=contract,
         model_configs=body.configs(), models={'gt': state})

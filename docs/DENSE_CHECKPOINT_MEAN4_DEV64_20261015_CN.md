@@ -29,3 +29,18 @@ bash tools/dense_checkpoint_average/run.sh && cat "$DENSE_MEAN_DIR/summary.txt"
 输出 `mean4.pt`、`summary.txt`、`comparison.md`、`comparison.csv`、详细 `results.json` 与每个补评模态的整数 state。Ctrl-C 保存完整窗口；在相同 `DENSE_MEAN_DIR` 下设 `DENSE_MEAN_RESUME=1` 再执行同命令，已完成部分不重预测。无旧 track cache writer lease，因此不需要开放原训练缓存写权限。
 
 本地三个小数据测试覆盖等权算术/原文件只读、错误来源和人口拒绝、旧known标记、复用dense baseline、真实小网格网络及旧full-grid引擎中断/恢复与完成后零重预测；不是实际 nuScenes 质量结论。
+
+## 用户指定的第二组：4000/6000/8000/10292
+
+上一组已实测无收益：mean4 OCC m50.703359、STC m18.215072；epoch2分别50.706282/18.220671。用户要求只再试这一组更早快照，不搜索其他组合。新增 `run_wide.sh`，复用同平均/评估引擎；仅支持 recent/wide 两个明确配方，默认旧入口仍 recent。
+
+```bash
+export AVERAGE_GPU=0
+export DENSE_MEAN_DIR="$PWD/outputs/p0_f9_shared_history/dense_mean4_wide_$(date +%Y%m%d_%H%M%S)"
+unset DENSE_MEAN_RESUME
+bash tools/dense_checkpoint_average/run_wide.sh && cat "$DENSE_MEAN_DIR/summary.txt"
+```
+
+读取原两轮的 `update_004000.pt` / `update_006000.pt` / `update_008000.pt` / `epoch_0002.pt`，各1/4，不混上次mean或第三轮权重；10292正确dense baseline仍从已绑定的第三轮报告复用。4000/6000/8000旧OCC若为lidar-known则各补64窗dense OCC；STC正确旧结果直接读，最后新mean两模态各64。输出新目录同样包含mean4.pt、历史/统一口径两张表、CSV和可恢复整数状态。
+
+不会自动根据64窗挑模型或自动启动全集。若仍无清晰收益，停止融合组合尝试，按已讨论的epoch2候选做完整评估。旧训练依赖和原文件不变；本次通用化改变融合工具自身指纹，已完成旧mean结果保留，不对旧目录恢复新代码。

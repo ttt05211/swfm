@@ -80,6 +80,31 @@ def test_reports_label_old_known_and_exact_population(tmp_path):
     finally: p.close()
 
 
+def test_wide_recipe_exact_steps_equal_mean_and_no_late_weights(tmp_path):
+    p, _, _ = fixture()
+    try:
+        parent, stage, c, _, _ = make_bundle(tmp_path, p.body)
+        template = torch.load(parent/'update_010000.pt', weights_only=False)
+        for step, delta in ((4000, .01), (6000, .02), (8000, .03)):
+            value = copy.deepcopy(template); value['updates'] = step
+            for key in dict(p.body.named_parameters()): value['models']['gt'][key] += delta
+            torch.save(value, parent/f'update_{step:06d}.pt')
+        sources = weights.load_sources(stage, parent, c, steps=weights.RECIPES['wide'])
+        assert [s['step'] for s in sources] == [4000, 6000, 8000, 10292]
+        assert all(Path(s['path']).parent == parent for s in sources)
+        payload = weights.averaged_payload(sources, p.body, dict(test=True))
+        assert payload['source_updates'] == [4000, 6000, 8000, 10292]
+        for key in dict(p.body.named_parameters()):
+            expected = (sum(s['state'][key].double() for s in sources)/4).float()
+            torch.testing.assert_close(payload['models']['gt'][key], expected, atol=0, rtol=0)
+        text = run.comparison_text(dict(status='complete', contract=dict(source_steps=payload['source_updates']),
+                                       historical={}, matched={}))
+        assert '4000,6000,8000,10292(epoch2)' in text and '12000' not in text
+        with pytest.raises(ValueError, match='explicitly fixed'):
+            weights.load_sources(stage, parent, c, steps=(4000, 6000, 8000, 10000))
+    finally: p.close()
+
+
 def test_single_card_cli_reuses_dense_reports_only_and_resumes_real_engine(tmp_path, monkeypatch):
     torch.set_num_threads(1); p, rec, raw = fixture(); event = Event()
     try:
