@@ -1,5 +1,15 @@
 # 当前任务摘要（2026-10-11）
 
+## 独立最后对照：Pinned original pair / 原KTA不变（2026-10-15）
+
+用户matched20%各1轮结果：unified_fit OCC Refiner mIoU+.717503/IoU+.026781/Moving−1.167401（Transport+.713404）；STC−.119398/−.205448/+.171161。不能只归旧checkpoint不适应；多帧平均稀释瞬时运动仍是假说，不是已单独定位。用户允许最后试统一接口、原两帧KTA不变，不再跑fit或新tracking设计分支。
+
+仅新增tools/pinned_source_track四文件+test/doc，仍本独立experiment分支，不改旧c58训练、609冻结screen或其他分支。原t-1/t0同类别XYZ mutual-nearest/25m/s/.5匹配一次同时产出索引+原速度；固定末段，只延伸t-2/t-3，已有older歧义/缺帧/ICP保护不变。无multi-fit/最近两有效点回退；未配对KTA零。TRAIN直接保旧record/KTA/anchors bytes，仅换历史registrations/patch/memory；EVAL新PinnedPredictor四帧提取一次、不先跑旧four-frame prepare，Strong复用同一pair速度避免再匹配，仍原Strong背景算法。
+
+只新训unified_pair RANDOM TRAIN4086×1/原H6 CE+Lovasz，无ego/aux；复用之前matched root/baseline完成权重metadata及指标，不导weights/Adam/RNG，不重训baseline。源workflow/data/code/last SHA核验，相同初始化在optimizer前验证，TRAIN keys/order/update数训练前验证，最终科学合同只protocol/implementation可不同。首次可按时间找最近完成同协议baseline（非按分数），打印冻结reference；resume固定source，PAIR_DIR新root/unified_pair，PAIR_RESUME=1只续新路，完成不多训。最终同DEV64 OCCGT/STCGT/no masks/alignment，与旧baseline并列，不自动采用/扩训。
+
+51passed21.62s，真实CPU/CUDA小图、pair原速度/Strong六帧bytes一致、KTA对象不改、最后一对不重配/未匹配不拿older速度、真实trainer和外层入口新路部分/完整resume、baseline只读/初始化拒绝/模块绑定恢复；CLI/Bash通过。旧c58/609源码fingerprint不变，无服务器训练代跑。入口bash tools/pinned_source_track/run.sh，PINNED_REFERENCE_DIR可原TRACK_TRAIN_DIR；只同步本独立分支，ghfast.top代理，等用户真实summary后判断。
+
 ## 独立分支：统一track多帧KTA，同预算随机重训一轮（2026-10-15）
 
 冻结64结果已complete：多帧KTA 3s均值OCC2.212→2.080m/STC3.740→2.961m，但旧GTepoch2直接换初值Refiner OCC mIoU−.188808/Moving−1.831655，STC+.197338/+.039153；统一两点OCC+.041881/+.148153、STC+.026406/+.000513。不推广Frozen fit，不断言尾部/旧残差分布哪个解释全部。用户明确授权做同规模预算重训。
