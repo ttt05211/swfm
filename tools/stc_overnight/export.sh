@@ -15,5 +15,5 @@ args=(--out-dir "$STC_BUNDLE_DIR" --config "$ROOT/configs/real_motion_occfm.yaml
   --stc-root "${STC_ROOT:-$ROOT/data/stc_camera/compact}")
 if [[ -n "${DENSE_DDP_DIR:-}" ]]; then args+=(--dense-dir "$DENSE_DDP_DIR"); fi
 if [[ -n "${CLEAN1000_CKPT:-}" ]]; then args+=(--clean-checkpoint "$CLEAN1000_CKPT"); fi
-echo "CPU-only, NEW portable data bundle; FULL4369 real VAL +64 clean TRAIN; no raw sensors; three model roles if available."
+echo "SMALL CPU-only bundle: SAME64 VAL +32 clean TRAIN; compact lossless labels; dense+clean1000 only; no raw sensors."
 exec "$PY" -u -m tools.stc_overnight.export "${args[@]}" "$@"

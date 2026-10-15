@@ -13,7 +13,7 @@ def test_selected_roles_are_scene_disjoint():
     dev = [dict(scene_name=f'v{i%150}', t0_token=str(i)) for i in range(4369)]
     train = [dict(scene_name=f't{i%100}', t0_token=str(i)) for i in range(20430)]
     keys = [[r['scene_name'], r['t0_token']] for r in dev[:64]]
-    rows = export.choose_records(dev, train, keys)
+    rows = export.choose_records(dev, train, keys, 256, 64)
     assert len(rows) == 320
     scenes = {role: {r['scene_name'] for r, what, _ in rows if what == role}
               for role in ('reference64', 'stc_fit', 'stc_selection', 'clean_train')}
@@ -21,11 +21,14 @@ def test_selected_roles_are_scene_disjoint():
         for other in scenes:
             if role != other: assert not scenes[role] & scenes[other]
     assert len({(r['scene_name'], r['t0_token']) for r, _, _ in rows}) == 320
-    full = export.choose_records(dev, train, keys, val_count=len(dev))
+    full = export.choose_records(dev, train, keys, val_count=len(dev), train_count=64)
     assert len(full) == 4369+64
     assert {r['scene_name'] for r, role, _ in full if role in ('reference64', 'reference_scene')} == scenes['reference64']
     assert not {r['scene_name'] for r, role, _ in full if role.startswith('stc_')} & scenes['reference64']
     assert len({(r['scene_name'], r['t0_token']) for r, _, split in full if split == 'val'}) == 4369
+    small = export.choose_records(dev, train, keys)
+    assert len(small) == 96 and sum(role == 'reference64' for _, role, _ in small) == 64
+    assert sum(role == 'clean_train' for _, role, _ in small) == 32
 
 
 def test_real_export_weights_frames_zip_no_optimizer_or_source_mutation(tmp_path, monkeypatch):
@@ -67,6 +70,12 @@ def test_real_export_weights_frames_zip_no_optimizer_or_source_mutation(tmp_path
             manifest = json.loads(z.read('manifest.json'))
             assert len(manifest['records']) == 66 and len(manifest['inventory']) > 0
             assert not any('sample_data.json' in name or name.endswith('.jpg') for name in z.namelist())
+            import io
+            frame = next(r for r in manifest['inventory'] if r['file'].startswith('frames/gt/'))
+            with np.load(io.BytesIO(z.read(frame['file'])), allow_pickle=False) as labels:
+                assert labels['semantics'].dtype == np.uint8 and 'mask_lidar' not in labels
+                restored = np.unpackbits(labels['mask_lidar_packed'])[:8].reshape(2, 2, 2)
+                assert restored.all()
         packed = torch.load(out/'models/dense_epoch2.pt', weights_only=False)
         assert 'optimizers' not in packed and packed['optimizer_included'] is False
         assert dense.read_bytes() == original

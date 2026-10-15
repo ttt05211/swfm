@@ -2,9 +2,11 @@
 import argparse
 from dataclasses import asdict
 import hashlib
+import io
 import json
 from pathlib import Path
 import zipfile
+import numpy as np
 import torch
 from tools.joint_occ_experiments import run as base
 from tools.dense_valid_epoch3.run import select_source, validate_source
@@ -13,7 +15,7 @@ from real_motion.nuscenes_adapter import NuScenesWindowSource
 PROTOCOL = 'stc_overnight_portable_real_replay_v1'
 
 
-def choose_records(dev, train, reference_keys, val_count=256, train_count=64):
+def choose_records(dev, train, reference_keys, val_count=64, train_count=32):
     if len(reference_keys) != 64 or len(set(map(tuple, reference_keys))) != 64: raise ValueError('exact reference64 required')
     reference = base.align_records(dev, reference_keys); held_scenes = {str(r['scene_name']) for r in reference}
     # Full-VAL export includes additional windows from reference scenes, but
@@ -23,8 +25,8 @@ def choose_records(dev, train, reference_keys, val_count=256, train_count=64):
         remaining = [r for r in dev if (str(r['scene_name']), str(r['t0_token'])) not in ref]
     else: remaining = [r for r in dev if str(r['scene_name']) not in held_scenes]
     needed = val_count-64
-    if needed < 1 or len(remaining) < needed or len(train) < train_count: raise ValueError('insufficient distinct export windows')
-    extras = base.align_records(remaining, base.select_scene_balanced_round_robin(base.record_keys(remaining), needed))
+    if needed < 0 or train_count < 1 or len(remaining) < needed or len(train) < train_count: raise ValueError('insufficient distinct export windows')
+    extras = base.align_records(remaining, base.select_scene_balanced_round_robin(base.record_keys(remaining), needed)) if needed else []
     clean = base.align_records(train, base.select_scene_balanced_round_robin(base.record_keys(train), train_count))
     if {str(r['scene_name']) for r in clean} & {str(r['scene_name']) for r in dev}: raise ValueError('TRAIN/VAL overlap')
     rows = [(r, 'reference64', 'val') for r in reference]
@@ -56,12 +58,26 @@ def export_weight(path, name, out, *, required=False):
     return dict(role=name, file=str(target.relative_to(out)).replace('\\', '/'), sha256=base.sha256(target), source_sha256=sha)
 
 
+def compact_label(path):
+    with np.load(path, allow_pickle=False) as z:
+        sem = z['semantics']
+        if sem.dtype.kind not in 'ui' or sem.ndim != 3 or np.any(sem < 0) or np.any(sem > 255):
+            raise ValueError('lossless uint8 semantic export required: '+str(path))
+        values = dict(semantics=sem.astype(np.uint8, copy=False))
+        if 'mask_lidar' in z:
+            mask = np.asarray(z['mask_lidar'], bool)
+            if mask.shape != sem.shape: raise ValueError('mask/semantic shape differs')
+            values.update(mask_lidar_packed=np.packbits(mask.reshape(-1)), mask_lidar_shape=np.asarray(mask.shape, np.int32))
+    buffer = io.BytesIO(); np.savez_compressed(buffer, **values)
+    return buffer.getvalue()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dense-dir'); p.add_argument('--clean-checkpoint'); p.add_argument('--old-checkpoint')
     for name in ('out-dir', 'config', 'dataroot', 'dev-info', 'dev-cache', 'train-cache', 'stc-root'):
         p.add_argument('--'+name, required=True)
-    p.add_argument('--val-windows', type=int, default=4369); p.add_argument('--train-windows', type=int, default=64)
+    p.add_argument('--val-windows', type=int, default=64); p.add_argument('--train-windows', type=int, default=32)
     a = p.parse_args(argv); root = Path(__file__).resolve().parents[2]; out = Path(a.out_dir).resolve()
     torch.set_num_threads(1)
     dense = select_source(a.dense_dir, root/'outputs/p0_f9_shared_history')
@@ -90,16 +106,16 @@ def main(argv=None):
     for target, path in sorted(frame_paths.items()):
         st = path.stat()
         if not path.is_file() or not st.st_size: raise RuntimeError('missing/empty frame: '+str(path))
-        inventory.append(dict(file=target, size=st.st_size, sha256=base.sha256(path), source_mtime_ns=st.st_mtime_ns))
-    total = sum(r['size'] for r in inventory)
-    print(f'BUNDLE_INPUT windows={len(records)} unique_frames={len(inventory)} frame_bytes={total} ({total/2**20:.1f}MiB); CPU ONLY', flush=True)
+        inventory.append(dict(file=target, source_size=st.st_size, source_sha256=base.sha256(path), source_mtime_ns=st.st_mtime_ns))
+    total = sum(r['source_size'] for r in inventory)
+    print(f'BUNDLE_INPUT windows={len(records)} unique_frames={len(inventory)} original_frame_bytes={total} ({total/2**20:.1f}MiB); compact export; CPU ONLY', flush=True)
     out.mkdir(parents=True, exist_ok=False)
     weights = [export_weight(dense, 'dense_epoch2', out, required=True)]
     clean = a.clean_checkpoint
     if not clean:
         options = list((root/'outputs/p0_f9_shared_history').glob('stc_clean_continue1000_*/train/last.pt'))
         if options: clean = max(options, key=lambda x: x.stat().st_mtime_ns)
-    old = a.old_checkpoint or root/'outputs/p0_f9_shared_history/full_gt_ce_lovasz_2ep_20261013_123513/train/epoch_0002.pt'
+    old = a.old_checkpoint  # Small default: only dense epoch2 + clean1000; no third model.
     for path, name in ((clean, 'clean1000'), (old, 'original_gt_epoch2')):
         weight = export_weight(path, name, out)
         if weight: weights.append(weight)
@@ -113,17 +129,20 @@ def main(argv=None):
         policy='VAL supervised adaptation possible; fit/selection/reference scenes disjoint; NOT zero-shot or pristine independent test',
         no_raw_sensors=True, no_optimizer=True, future_labels_are_supervision_only=True,
         export_implementation={str(f.relative_to(root)): base.sha256(f) for f in sorted(Path(__file__).parent.glob('*.py'))})
-    base.write_json(out/'manifest.json', manifest)
+    manifest['label_encoding'] = 'lossless_uint8_semantics_plus_packbits_lidar_no_camera_mask'
     archive = out/'stc_overnight_bundle.zip'
     with zipfile.ZipFile(archive, 'w', allowZip64=True) as z:
-        z.write(out/'manifest.json', 'manifest.json', compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
         for weight in weights:
             z.write(out/weight['file'], weight['file'], compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
         for i, entry in enumerate(inventory, 1):
             path = frame_paths[entry['file']]; st = path.stat()
-            if (st.st_size, st.st_mtime_ns) != (entry['size'], entry['source_mtime_ns']): raise RuntimeError('source frame changed')
-            z.write(path, entry['file'], compress_type=zipfile.ZIP_STORED)  # NPZ already compressed; no duplicate staging copy.
+            if (st.st_size, st.st_mtime_ns) != (entry['source_size'], entry['source_mtime_ns']): raise RuntimeError('source frame changed')
+            payload = compact_label(path)
+            entry.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+            z.writestr(entry['file'], payload, compress_type=zipfile.ZIP_STORED)
             if i % 128 == 0 or i == len(inventory): print(f'BUNDLE_ZIP {i}/{len(inventory)}', flush=True)
+        z.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False), compress_type=zipfile.ZIP_DEFLATED, compresslevel=1)
+    base.write_json(out/'manifest.json', manifest)
     digest = base.sha256(archive)
     report = dict(archive=str(archive), bytes=archive.stat().st_size, sha256=digest, windows=counts, models=[w['role'] for w in weights])
     base.write_json(out/'bundle_receipt.json', report)
