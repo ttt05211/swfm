@@ -87,6 +87,58 @@ class GridShift:
 VIEWS.update({s.name:s for s in (GridShift(1,0),GridShift(0,1),GridShift(1,1))})
 
 
+def blur_semantic_embedding(module,inputs,value):
+    """Fixed binomial XY anti-aliasing of EMBEDDINGS, never geometry/labels.
+
+    Each height and embedding channel stays separate. Existing known channels
+    are untouched. This is a declared representation variant, not byte parity.
+    """
+    n,sx,sy,z,e=value.shape
+    x=value.permute(0,3,4,1,2).reshape(n,z*e,sx,sy)
+    with torch.autocast(device_type=x.device.type,enabled=False):
+        k=x.new_tensor([1.,2.,1.],dtype=torch.float32)
+        kernel=(k[:,None]*k[None,:]/16)[None,None].expand(z*e,1,3,3)
+        result=F.conv2d(F.pad(x.float(),(1,1,1,1),mode='replicate'),kernel,groups=z*e)
+    return result.to(value.dtype).reshape(n,z,e,sx,sy).permute(0,3,4,1,2)
+
+
+@torch.no_grad()
+def semantic_memory_consistency(row,grid,device):
+    """Soft, history-only agreement weights; never edits the transport prior.
+
+    Register coarse semantic distributions to each frame's native coordinates.
+    One self-vote is the Laplace pseudocount, so disagreement cannot completely
+    remove a frame. Dynamic memory and all source identities remain unchanged.
+    This is an experimental pooling variant, not a production default.
+    """
+    rec,raw,ego,history=row
+    poses=torch.as_tensor(np.asarray(raw['history_poses']),device=device,dtype=torch.float64)
+    sem=torch.as_tensor(raw['history_occ'],device=device).long()
+    known=torch.as_tensor(raw['history_observed'],device=device).bool() & (sem<18)
+    probabilities=[]
+    for f in range(4):
+        p=F.one_hot(sem[f].clamp(0,17),18).permute(3,0,1,2).float()*known[f][None]
+        probabilities.append(F.avg_pool3d(p[None],(2,2,1))[0])
+    probabilities=torch.stack(probabilities)
+    query=centers(grid,device,coarse=True)
+    reliability=[]
+    for f in range(4):
+        matrices=torch.linalg.inv(poses) @ poses[f][None]
+        sampling=inverse_grid(query[None].expand(4,-1,-1,-1,-1),matrices,grid,coarse=True)
+        aligned=F.grid_sample(probabilities,sampling,align_corners=False,padding_mode='zeros')
+        observed=aligned.sum(1)
+        self_probability=probabilities[f]/probabilities[f].sum(0,keepdim=True).clamp_min(1e-8)
+        agreements=(aligned*self_probability[None]).sum(1)
+        keep=torch.arange(4,device=device)!=f
+        reliability.append(((1+agreements[keep].sum(0))/(1+observed[keep].sum(0))).cpu().numpy())
+    weights=np.stack(reliability).astype(np.float32)
+    causal=dict(history[0]);reads=dict(causal['memory_reads'])
+    reads['static_valid']=reads['static_valid']*weights
+    causal['memory_reads']=reads
+    return (rec,raw,ego,(causal,history[1])),dict(static_only=True,minimum=float(weights.min()),
+        mean=float(weights.mean()),maximum=float(weights.max()),GT_or_future_inputs=False)
+
+
 def multiframe_velocity(row,provider=None,times=None,filter_center=False,velocity_model='half'):
     """Separate diagnostic KTA variant; does NOT change production pair policy.
 
@@ -213,7 +265,7 @@ def prepare_forecast(predictor, row, future_poses):
     targets = source_targets(output, rec, state['current_pose'], state['source_z_t0'])
     yaws = effective_yaw(output, [int(s['class_id']) for s in state['current']])
     renderer = TransportPrior(raw, state, provider.pcfg.grid, device)
-    return dict(body=body, provider=provider, raw=raw, history=history, output=output, lifted=lifted,
+    return dict(body=body, provider=provider, raw=raw, history=history, output=output, lifted=lifted,field=field,
         poses=poses, state=state, targets=targets, yaws=yaws, renderer=renderer, shape=renderer.shape)
 
 

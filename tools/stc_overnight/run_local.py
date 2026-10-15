@@ -35,6 +35,7 @@ def main(argv=None):
     a.add_argument('--save-logits', action='store_true')
     a.add_argument('--group-size', type=int, default=1)
     a.add_argument('--temporal-static', action='store_true')
+    a.add_argument('--temporal-em',action='store_true')
     a.add_argument('--occupied-prior-half', action='store_true')
     a.add_argument('--feature-affine')
     a.add_argument('--oracle-refiner-history', action='store_true')
@@ -42,6 +43,7 @@ def main(argv=None):
     a.add_argument('--history-adapter')
     a.add_argument('--held-split',help='adapter contract, to evaluate ONLY its held scenes even for original baseline')
     a.add_argument('--memory-recency',action='store_true')
+    a.add_argument('--memory-consistency',action='store_true')
     a.add_argument('--kta-multiframe',action='store_true')
     a.add_argument('--memory-current-only',action='store_true')
     a.add_argument('--importance-uniform',action='store_true')
@@ -58,6 +60,10 @@ def main(argv=None):
     a.add_argument('--posterior-bias')
     a.add_argument('--temporal-strict-fill',action='store_true')
     a.add_argument('--occupancy-head')
+    a.add_argument('--embedding-blur',action='store_true')
+    a.add_argument('--refiner-embedding-blur',action='store_true')
+    a.add_argument('--feature-support')
+    a.add_argument('--support-mode',choices=['coordinate_clip','manifold_clip','quantize'],default='manifold_clip')
     args = a.parse_args(argv)
     torch.set_num_threads(1)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -67,6 +73,13 @@ def main(argv=None):
         split=json.loads(Path(args.held_split).read_text(encoding='utf-8'))
         held=set(map(tuple,split['held_keys']));rows=[r for r in rows if (r['scene_name'],r['t0_token']) in held]
     model, saved, policy = b.load_model(args.model, args.device)
+    support=None
+    if args.feature_support:
+        support=torch.load(args.feature_support,map_location='cpu',weights_only=False)
+        if support['contract']['source_sha256']!=saved['source_sha256']:raise ValueError('support fitted to different model')
+    if args.embedding_blur:
+        from .replay import blur_semantic_embedding
+        model.transport.history_encoder.semantic.register_forward_hook(blur_semantic_embedding)
     occupancy_head=None;occupancy_saved=None
     if args.occupancy_head:
         from .occupancy_head import OccupancyCalibration
@@ -106,11 +119,13 @@ def main(argv=None):
         full_grid=True, future_GT_ego_conditioned=True, moving_not_evaluated=True,
         scope='repeatedly inspected reference64 development subset; NOT full VAL target verification')
     if args.temporal_static: contract['temporal_static'] = 'strict_three_history_votes_static_only_v1'
+    if args.temporal_em:contract['temporal_em']='binary_observer_EM50_static_only_equal_prior_blend_no_GT_fit'
     if args.occupied_prior_half: contract['occupied_prior_half'] = 'final_c05_on_prior_occupied_only_free_unchanged_v1'
     if affine is not None:contract['feature_affine'] = affine
     if adapted is not None:contract['adapted_encoder'] = adapted['contract']
     if adapter_saved is not None:contract['supervised_HISTORY_adapter'] = adapter_saved['contract']
     if args.memory_recency:contract['memory_recency'] = 'fixed_half_second_decay_0.125_0.25_0.5_1'
+    if args.memory_consistency:contract['memory_consistency']='native_semantic_distribution_other_history_agreement_with_self_pseudocount'
     if args.kta_multiframe:contract['kta_multiframe'] = 'EXPERIMENT_half_original_pair_plus_multiframe_LS_no_new_match'
     if args.memory_current_only:contract['memory_current_only'] = 'DIAGNOSTIC_only_t0_memory_STWM_still_four_frames'
     if args.importance_uniform:contract['importance_uniform'] = 'DIAGNOSTIC_disable_learned_evidence_scores_static_and_dynamic'
@@ -125,6 +140,9 @@ def main(argv=None):
     if args.spatial_stats:contract['spatial_stats']='binary_by_t0_range_and_future_z'
     if occupancy_saved is not None:contract['occupancy_head']={k:v for k,v in occupancy_saved.items() if k!='model'}
     if args.memory_last2:contract['memory_last2']='memory_latest_two_frames_STWM_four_frames'
+    if args.embedding_blur:contract['embedding_blur']='fixed_binomial3_XY_height_separate_geometry_unchanged'
+    if args.refiner_embedding_blur:contract['refiner_embedding_blur']='same_binomial3_only_lifted_field_motion_original'
+    if support is not None:contract['source_feature_support']=dict(mode=args.support_mode,fit=support['contract'])
     if args.temporal_strict_fill:contract['temporal_strict_fill']='past3_same_static_class_fills_current_free_only'
     posterior_bias=None
     if args.posterior_bias:
@@ -151,6 +169,9 @@ def main(argv=None):
             rec, raw, times = b.history(r, args.modality, args.known)
             rec, raw, poses = view.apply(rec, raw, r['future_poses'], b.pcfg.grid)
             row = predictor.prepare(rec, raw, times=times)
+            if args.memory_consistency:
+                from .replay import semantic_memory_consistency
+                row,_=semantic_memory_consistency(row,b.pcfg.grid,args.device)
             kta_audit=None
             if args.kta_multiframe or args.center_filter:row,kta_audit=multiframe_velocity(row,predictor.provider,times,args.center_filter,args.velocity_model)
             if args.memory_recency or args.memory_current_only or args.memory_last2:
@@ -172,6 +193,25 @@ def main(argv=None):
                 reads=row[3][0]['memory_reads'];reads['static_valid']=reads['static_valid']*reliability[None,:,:,None]
                 cells=reads['cell'];reads['coverage']=reads['coverage']*reliability[cells//((ny//2)*nz),(cells//nz)%(ny//2)]
             context = prepare_forecast(predictor, row, poses)
+            if args.temporal_em:
+                from .temporal_em import apply
+                apply(context)
+            if support is not None:
+                from .feature_support import project
+                with torch.no_grad(),torch.autocast(device_type='cuda',dtype=torch.bfloat16):
+                    cleaned=project(context['field'],support,args.support_mode)
+                    context['lifted']=model.columns.lift_history(cleaned)
+                del cleaned
+            if args.refiner_embedding_blur:
+                from .replay import blur_semantic_embedding
+                handle=model.transport.history_encoder.semantic.register_forward_hook(blur_semantic_embedding)
+                try:
+                    with torch.no_grad(),torch.autocast(device_type='cuda',dtype=torch.bfloat16):
+                        f=model.transport.history_encoder(torch.as_tensor(row[1]['history_occ'],device=args.device),
+                            torch.as_tensor(row[1]['history_observed'],device=args.device))
+                        context['lifted']=model.columns.lift_history(f)
+                finally:handle.remove()
+                del f
             if history_adapter is not None:
                 from tools.shared_history_experiments.model import encode_window
                 with torch.no_grad(),torch.autocast(device_type='cuda',dtype=torch.bfloat16):

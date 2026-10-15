@@ -16,16 +16,23 @@ from tools.shared_source_track.adapter import SharedTrackPredictor
 from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
 from tools.real_motion.surface_ego_ablation_common import tensor_state_fingerprint
 from .bundle import Bundle
-from .replay import prepare_forecast, iter_forecasts, multiframe_velocity
+from .replay import prepare_forecast, iter_forecasts, multiframe_velocity,temporal_static_prior
 
 
-def forecast(predictor,row,poses):
+def forecast(predictor,row,poses,posterior_bias=None,include_support=False):
     context=prepare_forecast(predictor,row,poses)
     result={name:[] for name in ('transport','semantic_refine')}
-    for hs,fw in iter_forecasts(context):
-        for name,key in [('transport','prior'),('semantic_refine','logits')]:
-            result[name].append(fw[key].argmax(1).reshape(len(hs),*fw['shape']).byte().cpu().numpy())
-        del fw
+    for prefix in ('','supported_') if include_support else ('',):
+        if prefix:temporal_static_prior(context,support_only=True)
+        for name in ('transport','semantic_refine'):result.setdefault(prefix+name,[])
+        if posterior_bias is not None:result[prefix+'calibrated_semantic_refine']=[]
+        for hs,fw in iter_forecasts(context):
+            for name,key in [('transport','prior'),('semantic_refine','logits')]:
+                result[prefix+name].append(fw[key].argmax(1).reshape(len(hs),*fw['shape']).byte().cpu().numpy())
+            if posterior_bias is not None:
+                adjusted=fw['logits']+fw['logits'].new_tensor(posterior_bias)[None,:,None]
+                result[prefix+'calibrated_semantic_refine'].append(adjusted.argmax(1).reshape(len(hs),*fw['shape']).byte().cpu().numpy())
+            del fw
     return {name:np.concatenate(value) for name,value in result.items()}
 
 
@@ -47,6 +54,8 @@ def summary(result):
         'Candidate: half original-pair + multiframe LS velocity; pooled history weights [1/8,1/4,1/2,1].',
         'GT future ego conditioned. All SIX readouts before GT label reads. FULL GRID, no mask/alignment.',
         'NO training, threshold/coefficient sweep, GT history feature oracle, supervised VAL adapter, or automatic promotion.',
+        'Optional calibration uses fixed TRAIN32 source / unlabeled reference64 target posterior; transductive, no target labels.',
+        'Optional supported_ routes: past semantic agreement supplies soft evidence ONLY to t0-free static prior; original routes retained.',
         'route                       mIoU        IoU']
     for name,value in result.get('metrics',{}).items():
         r=value['average'];fmt=lambda v:'NA' if v is None else f'{v:.6f}'
@@ -63,6 +72,8 @@ def main(argv=None,event=None):
     ap.add_argument('--population',choices=['all','dev64'],default='all');ap.add_argument('--portable-subset',action='store_true')
     ap.add_argument('--dev-cache');ap.add_argument('--dev-info');ap.add_argument('--dataroot');ap.add_argument('--stc-root')
     ap.add_argument('--device',default='cuda');ap.add_argument('--resume',action='store_true')
+    ap.add_argument('--posterior-align',action='store_true',help='also report fixed unlabeled relative posterior calibration, separately from core candidate')
+    ap.add_argument('--history-support',action='store_true',help='also report causal static-history soft support, without replacing original routes')
     a=ap.parse_args(argv);event=event or threading.Event();torch.set_num_threads(1);torch.manual_seed(21)
     b=Bundle(a.bundle);body,saved,policy=b.load_model(a.model,a.device)
     if a.portable_subset:
@@ -87,19 +98,31 @@ def main(argv=None,event=None):
         runtime=dict(torch=str(torch.__version__),cuda=torch.version.cuda,device=a.device),
         known='STC dense-valid; NO GT visibility',metric_mask='none',future_GT_ego_conditioned=True,
         implementation={name:base.sha256(Path(__file__).parent/name) for name in ('verify_all.py','replay.py','bundle.py')})
+    if a.posterior_align:
+        contract['posterior_alignment']='source_TRAIN32_target_unlabeled_reference64; transductive; no labels/coefficient tuning'
+        contract['implementation']['calibration.py']=base.sha256(Path(__file__).parent/'calibration.py')
+    if a.history_support:contract['history_support']='half_current_half_history_probability_on_t0_free_with_two_past_static_agreements'
     lock=out.parent/'.stc_verify_locks'/base.stable_json_fingerprint(str(out));lock.mkdir(parents=True,exist_ok=True)
     with evaluation_lock(lock):
         if not a.resume:out.mkdir(parents=True,exist_ok=False)
         elif json.loads((out/'contract.json').read_text(encoding='utf-8'))!=contract:raise RuntimeError('resume contract differs')
         base.write_json(out/'contract.json',contract)
         counts={n:metrics.empty(3) for n in ['baseline/transport','baseline/semantic_refine','candidate/transport','candidate/semantic_refine']}
+        if a.posterior_align:counts['candidate/calibrated_semantic_refine']=metrics.empty(3)
+        if a.history_support:
+            for name in ['transport','semantic_refine']+(['calibrated_semantic_refine'] if a.posterior_align else []):
+                counts['candidate/supported_'+name]=metrics.empty(3)
         state=dict(keys=[],counts={n:{k:v.tolist() for k,v in c.items()} for n,c in counts.items()},contract=contract)
+        fit_path=out/'unlabeled_posterior_fit.json'
         if a.resume:
             state=json.loads((out/'state.json').read_text(encoding='utf-8'))
             if state['contract']!=contract or state['keys']!=keys[:len(state['keys'])]:raise RuntimeError('saved prefix differs')
             counts={n:{k:np.asarray(v,np.int64) for k,v in c.items()} for n,c in state['counts'].items()}
             expected=len(state['keys'])*int(np.prod(b.pcfg.grid.shape_hwd))
             if any(np.any(c['confusion'].sum((1,2))!=expected) for c in counts.values()):raise ValueError('incomplete saved windows')
+            if a.posterior_align and state['keys']:
+                if not fit_path.exists() or state.get('calibration_sha256')!=base.sha256(fit_path):
+                    raise ValueError('saved calibration missing/changed; do not mix posterior policies in resumed counts')
         p=(SharedTrackPredictor if policy=='shared_pinned' else Predictor)(body,b.pcfg,a.device,workers=2)
         before=tensor_state_fingerprint(body.state_dict());tic=time.monotonic()
         result=dict(status='running',windows=len(state['keys']),contract=contract,scientific_updates=0)
@@ -108,8 +131,19 @@ def main(argv=None,event=None):
             left=result['metrics']['baseline/semantic_refine']['average'];right=result['metrics']['candidate/semantic_refine']['average']
             if left['mIoU'] is not None:result['delta']={k:right[k]-left[k] for k in ('mIoU','IoU')}
             base.write_json(out/'results.json',result);(out/'summary.txt').write_text(summary(result),encoding='utf-8')
-            base.write_json(out/'state.json',dict(contract=contract,keys=state['keys'],counts={n:{k:v.tolist() for k,v in c.items()} for n,c in counts.items()}))
+            base.write_json(out/'state.json',dict(contract=contract,keys=state['keys'],
+                calibration_sha256=base.sha256(fit_path) if a.posterior_align and fit_path.exists() else None,
+                counts={n:{k:v.tolist() for k,v in c.items()} for n,c in counts.items()}))
         try:
+            calibration=None
+            if a.posterior_align:
+                from .calibration import fit
+                if a.resume and fit_path.exists():calibration=json.loads(fit_path.read_text(encoding='utf-8'))
+                else:
+                    calibration=fit(b,p,saved['source_sha256'],event)
+                    base.write_json(fit_path,calibration)
+                if calibration['source_sha256']!=saved['source_sha256']:raise ValueError('calibration source mismatch')
+                result['posterior_alignment_fit']=calibration
             for i,r in enumerate(records):
                 if i<len(state['keys']):continue
                 if event.is_set():raise InterruptedError('stopped at complete paired window')
@@ -119,7 +153,7 @@ def main(argv=None,event=None):
                 row=p.prepare(rec,raw,times=times)
                 original=forecast(p,row,poses)
                 modified,audit=candidate(row,p.provider,times)
-                changed=forecast(p,modified,poses)
+                changed=forecast(p,modified,poses,calibration['bias'] if calibration is not None else None,a.history_support)
                 # Both full six-frame forecasts precede label access.
                 targets=b.targets(r) if inputs is None else inputs.targets(job,(1,3,5))
                 for prefix,predictions in [('baseline',original),('candidate',changed)]:
@@ -131,6 +165,13 @@ def main(argv=None,event=None):
             result['status']='complete'
             average=metrics.report(counts['candidate/semantic_refine'],(1.,2.,3.),moving=False)['average']
             result['full_target_verified']=a.population=='all' and average['IoU']>28.77 and average['mIoU']>18.97
+            if a.posterior_align:
+                average=metrics.report(counts['candidate/calibrated_semantic_refine'],(1.,2.,3.),moving=False)['average']
+                result['full_calibrated_target_verified']=a.population=='all' and average['IoU']>28.77 and average['mIoU']>18.97
+            if a.history_support:
+                route='candidate/supported_'+('calibrated_semantic_refine' if a.posterior_align else 'semantic_refine')
+                average=metrics.report(counts[route],(1.,2.,3.),moving=False)['average']
+                result['full_supported_target_verified']=a.population=='all' and average['IoU']>28.77 and average['mIoU']>18.97
         except InterruptedError:result['status']='stopped_at_complete_paired_window'
         except Exception:
             result['status']='failed_original_unchanged';raise

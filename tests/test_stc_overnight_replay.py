@@ -95,3 +95,94 @@ def test_tiny_confidence_head_initial_identity_bound_and_final_loss_gradient():
     assert head.net[-1].bias.grad.abs().sum()>0
     assert sum(p.numel() for p in head.parameters())==1025
     assert beta.abs().max()<=2
+
+
+def test_soft_memory_consistency_keeps_geometry_and_dynamic_evidence():
+    from tools.stc_overnight.replay import semantic_memory_consistency
+    p,rec,raw=fixture()
+    try:
+        row=p.prepare(rec,raw,times=np.arange(4)*.5)
+        old=row[3][0]['memory_reads'];before=old['static_valid'].copy()
+        value,audit=semantic_memory_consistency(row,p.provider.pcfg.grid,'cpu')
+        new=value[3][0]['memory_reads']
+        assert value[:3]==row[:3]
+        assert value[3][0]['state'] is row[3][0]['state']
+        np.testing.assert_array_equal(old['static_valid'],before)
+        np.testing.assert_array_equal(new['coverage'],old['coverage'])
+        assert audit['minimum']>=.25-1e-6 and audit['maximum']<=1+1e-6
+        assert (new['static_valid']<=before+1e-6).all()
+    finally:p.close()
+
+
+def test_relative_binary_alignment_identity_sign_and_invalid_marginals():
+    import pytest
+    from tools.stc_overnight.calibration import binary_bias
+    p=np.ones(18);p[17]=17
+    np.testing.assert_array_equal(binary_bias(p,p),np.zeros(18))
+    q=p.copy();q[17]=34
+    bias=binary_bias(p,q)
+    assert bias[0]>bias[17]
+    np.testing.assert_array_equal(bias[:17],np.full(17,bias[0]))
+    with pytest.raises(ValueError):binary_bias(np.zeros(18),p)
+
+
+def test_calibration_fit_only_requests_historical_inputs(monkeypatch):
+    from tools.stc_overnight import calibration
+    from types import SimpleNamespace
+    class HistoryOnly:
+        records=[dict(role=role,scene_name=f'{role}_{i}',t0_token=str(i),future_poses=np.tile(np.eye(4),(6,1,1)))
+            for role,n in [('clean_train',32),('reference64',64)] for i in range(n)]
+        def history(self,row,modality,known):
+            assert known=='dense_valid'
+            assert modality==('gt' if row['role']=='clean_train' else 'stc')
+            return {},dict(modality=modality),np.arange(4)*.5
+        def targets(self,*args,**kwargs):raise AssertionError('calibration must not read future labels')
+    monkeypatch.setattr(calibration,'prepare_forecast',lambda p,row,poses:row)
+    def forecasts(context):
+        for h in range(6):
+            x=torch.zeros(1,18,8);x[:,17]=2 if context['raw']['modality']=='gt' else 3
+            yield [h],dict(logits=x)
+    monkeypatch.setattr(calibration,'iter_forecasts',forecasts)
+    predictor=SimpleNamespace(prepare=lambda rec,raw,times:dict(raw=raw))
+    fit=calibration.fit(HistoryOnly(),predictor,'frozen_source_hash')
+    assert len(fit['keys']['source'])==32 and len(fit['keys']['target'])==64
+    assert fit['target_GT_labels_used_for_fitting'] is False
+    assert fit['bias'][0]>fit['bias'][17]
+
+
+def test_supported_server_routes_preserve_original_predictions():
+    from tools.stc_overnight.verify_all import forecast
+    p,rec,raw=fixture()
+    try:
+        row=p.prepare(rec,raw,times=np.arange(4)*.5);poses=np.tile(np.eye(4),(6,1,1))
+        bias=np.zeros(18);bias[:17]=.2
+        original=forecast(p,row,poses,bias)
+        extended=forecast(p,row,poses,bias,include_support=True)
+        for name,value in original.items():np.testing.assert_array_equal(value,extended[name])
+        assert set(extended)==set(original)|{'supported_'+name for name in original}
+        assert all(v.shape==(6,*p.provider.pcfg.grid.shape_hwd) for v in extended.values())
+    finally:p.close()
+
+
+def test_observer_em_recovers_independent_synthetic_rates_and_prior_mass():
+    from tools.stc_overnight.temporal_em import binary_observer_posterior,apply
+    rng=np.random.default_rng(21);latent=rng.random(100000)<.08
+    sensitivity=np.asarray([.65,.75,.8,.7]);false_positive=np.asarray([.015,.02,.01,.025])
+    occupied=rng.random((len(latent),4))<np.where(latent[:,None],sensitivity,false_positive)
+    known=rng.random(occupied.shape)>.1
+    code=(np.where(known,occupied.astype(int)+1,0)*(3**np.arange(4))).sum(1)
+    posterior,audit=binary_observer_posterior(np.bincount(code,minlength=81))
+    assert posterior[0]==0 and posterior[80]>posterior[40]
+    assert abs(audit['occupied_prior']-.08)<.01
+    np.testing.assert_allclose(audit['sensitivity'],sensitivity,atol=.03,rtol=0)
+    np.testing.assert_allclose(audit['false_positive'],false_positive,atol=.005,rtol=0)
+    p,rec,raw=fixture()
+    try:
+        row=p.prepare(rec,raw,times=np.arange(4)*.5)
+        context=prepare_forecast(p,row,np.tile(np.eye(4),(6,1,1)))
+        prior=context['renderer'].static.clone();apply(context);after=context['renderer'].static
+        torch.testing.assert_close(after.sum(1),torch.ones_like(after[:,0]))
+        assert torch.isfinite(after).all() and (after>=0).all()
+        mask=prior.argmax(1)!=17
+        assert (after.permute(0,2,3,4,1)[mask].max(-1).values>=.5).all()
+    finally:p.close()
