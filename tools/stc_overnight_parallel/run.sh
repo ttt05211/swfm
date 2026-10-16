@@ -2,9 +2,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-export CUDA_VISIBLE_DEVICES="${STC_VERIFY_GPU:-0}"
+export CUDA_VISIBLE_DEVICES="${STC_VERIFY_GPUS:-${STC_VERIFY_GPU:-0}}"
 PY="$(command -v python)"
-"$PY" -c 'import sys,torch; assert "OccFM" in sys.executable; assert torch.cuda.device_count()==1'
+"$PY" -c 'import sys,torch,os; assert "OccFM" in sys.executable; assert torch.cuda.device_count()==(2 if os.environ.get("STC_VERIFY_GPUS") else 1)'
 export PYTHONPATH="$ROOT:$ROOT/upstream_occfm${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:8 SWFM_COLUMN_CPU_BACKEND=native
@@ -25,6 +25,7 @@ args=(--source-dir "$SOURCE" --out-dir "$OUT" --bundle "$STC_REPLAY_BUNDLE"
   --dev-cache "${DEV_CACHE:-$ROOT/data/p0_f9_v18_se2_val_all_4369.pt}"
   --stc-root "${STC_ROOT:-$ROOT/data/stc_camera/compact}")
 if [[ "${STC_PARALLEL_RESUME:-0}" == 1 ]]; then args+=(--resume); fi
-echo "ONE GPU / TWO processes; import existing complete windows; H6; SOURCE=$SOURCE; OUT=$OUT"
+if [[ -n "${STC_VERIFY_GPUS:-}" ]]; then args+=(--worker-gpus "$STC_VERIFY_GPUS"); fi
+echo "TWO processes; GPUs=$CUDA_VISIBLE_DEVICES; import complete windows; H${STC_VERIFY_HORIZON_GROUP:-6}; SOURCE=$SOURCE; OUT=$OUT"
 echo 'With --stop-source, SIGINT is sent ONLY to the original module with this exact output directory.'
 exec "$PY" -u -m tools.stc_overnight_parallel.run "${args[@]}" "$@"

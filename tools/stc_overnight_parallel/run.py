@@ -1,4 +1,4 @@
-"""Two same-GPU shards, H6 readout, no recomputation of imported serial prefix."""
+"""Two disjoint GPU shards, H6 readout, immutable imported serial prefix."""
 import argparse
 from contextlib import contextmanager,ExitStack
 import hashlib
@@ -121,7 +121,13 @@ def worker(a,event):
 def parent(a,event):
     torch.set_num_threads(1);source=Path(a.source_dir).resolve();out=Path(a.out_dir).resolve()
     if out==source or source in out.parents or out in source.parents:raise ValueError('NEW independent sibling output required')
-    if a.device.startswith('cuda') and torch.cuda.device_count()!=1:raise ValueError('both processes must see SAME one GPU')
+    gpu_ids=a.worker_gpus.split(',') if a.worker_gpus else None
+    if gpu_ids and (len(gpu_ids)!=2 or len(set(gpu_ids))!=2 or any(not s.strip() for s in gpu_ids)):
+        raise ValueError('--worker-gpus requires TWO distinct GPU IDs, e.g. 0,1')
+    if gpu_ids and os.environ.get('CUDA_VISIBLE_DEVICES')!=a.worker_gpus:
+        raise ValueError('parent CUDA_VISIBLE_DEVICES must equal --worker-gpus')
+    if a.device.startswith('cuda') and torch.cuda.device_count()!=(2 if gpu_ids else 1):
+        raise ValueError('expected TWO visible GPUs for separate cards, otherwise ONE shared GPU')
     c=inspect_source(source);paths={n:str(Path(getattr(a,n)).resolve()) for n in ['bundle','dev_cache','dev_info','dataroot','stc_root']}
     b=Bundle(paths['bundle'],cache_mib=0);body,saved,policy=b.load_model(c['model'],'cpu')
     if (saved['source_sha256']!=c['source_sha256'] or policy!=c['source_policy']
@@ -135,7 +141,8 @@ def parent(a,event):
         if a.resume:
             job=read(out/'contract.json')
             if (job['legacy_contract']!=c or job['source_dir']!=str(source) or job['data_paths']!=paths or job['horizon_group']!=a.horizon_group
-                    or job['device']!=a.device or job['cpu_workers']!=a.cpu_workers):raise ValueError('same parallel execution required for resume')
+                    or job['device']!=a.device or job['cpu_workers']!=a.cpu_workers
+                    or job.get('worker_GPUs')!=gpu_ids):raise ValueError('same parallel execution required for resume')
             for name,digest in job['implementation'].items():
                 if base.sha256(Path(__file__).parent/name)!=digest:raise ValueError('parallel implementation changed')
             check_snapshot(job,out)
@@ -145,7 +152,8 @@ def parent(a,event):
             imported,hashes=snapshot(source,out,c,volume)
             job=dict(protocol=PROTOCOL,source_dir=str(source),legacy_contract=c,data_paths=paths,voxel_count=volume,
                 source_snapshot_sha256=hashes,imported_windows=len(imported['keys']),horizon_group=a.horizon_group,
-                device=a.device,cpu_workers=a.cpu_workers,processes=2,physical_GPUs=1 if a.device.startswith('cuda') else 0,
+                device=a.device,cpu_workers=a.cpu_workers,processes=2,
+                physical_GPUs=(2 if gpu_ids else 1) if a.device.startswith('cuda') else 0,worker_GPUs=gpu_ids,
                 visible_GPU=os.environ.get('CUDA_VISIBLE_DEVICES'),partition='REMAINING ordered_keys rank::2, NO padding',
                 scientific_updates=0,execution=f'imported H1 prefix + H{a.horizon_group} tail; not bitwise identity',
                 implementation={p.name:base.sha256(p) for p in sorted(Path(__file__).parent.glob('*.py'))})
@@ -169,11 +177,13 @@ def parent(a,event):
             if job['imported_windows']<len(c['keys']):
                 for rank in range(2):
                     handle=stack.enter_context((out/f'shard_{rank:02d}.log').open('a',encoding='utf-8'))
-                    env=os.environ.copy() # SAME CUDA_VISIBLE_DEVICES, not one GPU per process.
+                    env=os.environ.copy()
+                    if gpu_ids:env['CUDA_VISIBLE_DEVICES']=gpu_ids[rank] # cuda:0 inside EACH child.
                     child=subprocess.Popen([sys.executable,'-u','-m','tools.stc_overnight_parallel.run',
                         '--source-dir',str(source),'--out-dir',str(out),'--worker-rank',str(rank)],
                         cwd=Path(__file__).resolve().parents[2],env=env,stdout=handle,stderr=subprocess.STDOUT,start_new_session=True)
-                    children.append(child);print('SAME_GPU_WORKER',rank,'pid=',child.pid,flush=True)
+                    children.append(child);print('GPU_WORKER',rank,'pid=',child.pid,
+                        'CUDA_VISIBLE_DEVICES=',env.get('CUDA_VISIBLE_DEVICES'),flush=True)
                 signaled=False
                 while any(p.poll() is None for p in children):
                     if (event.is_set() or any(p.poll() not in (None,0) for p in children)) and not signaled:
@@ -201,6 +211,7 @@ def main(argv=None,event=None):
     ap.add_argument('--dev-info');ap.add_argument('--stc-root',default=str(root/'data/stc_camera/compact'))
     ap.add_argument('--horizon-group',type=int,choices=[1,2,3,6],default=6);ap.add_argument('--cpu-workers',type=int,choices=[1,2,3,4],default=2)
     ap.add_argument('--device',default='cuda');ap.add_argument('--resume',action='store_true');ap.add_argument('--stop-source',action='store_true')
+    ap.add_argument('--worker-gpus',help='optional TWO physical GPU IDs, one process per GPU; otherwise share one visible GPU')
     ap.add_argument('--worker-rank',type=int,choices=[0,1]);a=ap.parse_args(argv);event=event or threading.Event()
     if a.worker_rank is not None:return worker(a,event)
     if not a.bundle:ap.error('--bundle is required')

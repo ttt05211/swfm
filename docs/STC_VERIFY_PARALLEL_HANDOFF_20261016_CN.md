@@ -1,5 +1,21 @@
 # STC 全集评估：单卡双进程接手
 
+## 双卡继续（用户停在1456附近后新增）
+
+同一个入口设置 `STC_VERIFY_GPUS=0,1`，父进程可见两卡，两个子进程分别只见0和1，每卡一进程；不是DDP，不重复窗口。仍导入旧state实际保存进度（可能比最后打印的1456略多，强制结束也可能略少），不根据终端数字猜计数。6项专项测试通过，覆盖单卡和双卡进程环境分配、原始计数合并和恢复；本地只有一块GPU，未声称完成双卡硬件测速。
+
+```bash
+export STC_VERIFY_SOURCE="$STC_VERIFY_DIR" # 原串行目录，不要指向新目录
+export STC_VERIFY_GPUS=0,1
+export STC_VERIFY_HORIZON_GROUP=6
+export STC_PARALLEL_DIR="$PWD/outputs/p0_f9_shared_history/stc_verify_dual_$(date +%Y%m%d_%H%M%S)"
+unset STC_PARALLEL_RESUME
+nohup bash tools/stc_overnight_parallel/run.sh >"${STC_PARALLEL_DIR}.log" 2>&1 &
+tail -n 15 -f "${STC_PARALLEL_DIR}.log"
+```
+
+已停止旧进程时不需要 `--stop-source`。H6数值边界同下文，保留所有8路及固定原校准。当前1456前缀的分数不是全集分数。
+
 用户当前 `STC_VERIFY 432/4369 seconds411.6`。旧入口是窗口串行，并沿用了本地4GiB显存的H1读出；provider的workers并不等于两个GPU推理进程。本次仅新增独立执行入口，不修改旧verify_all/replay/bundle/calibration、训练器、权重或校准。
 
 ## 接手方式

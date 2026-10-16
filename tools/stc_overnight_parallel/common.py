@@ -9,7 +9,7 @@ from tools.joint_occ_experiments import run as base
 from tools.final_semantic_evaluation import metrics
 from tools.stc_overnight import verify_all as old
 
-PROTOCOL='frozen_STC_sameGPU_two_process_H6_imported_complete_prefix_v1'
+PROTOCOL='frozen_STC_two_process_H6_imported_complete_prefix_v2'
 
 
 def read(path):return json.loads(Path(path).read_text(encoding='utf-8'))
@@ -159,7 +159,8 @@ def result(job,counts,keys,status):
 
 def summary(r):
     group=r['contract']['horizon_group']
-    lines=[f'===== FROZEN STC / SINGLE GPU TWO PROCESSES / H{group} CONTINUATION =====',
+    gpus=r['contract']['physical_GPUs']
+    lines=[f'===== FROZEN STC / {gpus} GPU / TWO PROCESSES / H{group} CONTINUATION =====',
         f"status={r['status']}; windows={r['windows']}/{len(r['contract']['legacy_contract']['keys'])}",
         f"imported complete H1 windows={r['imported_complete_windows']}; new H{group} windows={r['new_complete_windows']}",
         'SAME source weights/calibration/keys/full-grid metrics. NO training or method/threshold changes.',

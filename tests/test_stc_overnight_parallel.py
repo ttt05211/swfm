@@ -81,7 +81,8 @@ def fixture_source(tmp_path):
     return source,contract
 
 
-def test_parent_two_same_gpu_processes_import_resume_and_no_source_writes(tmp_path,monkeypatch):
+@pytest.mark.parametrize('gpu_ids',[None,'0,1'])
+def test_parent_two_gpu_processes_import_resume_and_no_source_writes(tmp_path,monkeypatch,gpu_ids):
     source,contract=fixture_source(tmp_path);before=(source/'state.json').read_bytes();out=tmp_path/'parallel';children=[]
     class FakeBundle:
         def __init__(self,*args,**kwargs):
@@ -102,12 +103,14 @@ def test_parent_two_same_gpu_processes_import_resume_and_no_source_writes(tmp_pa
         def wait(self):return self.poll()
         def terminate(self):self.returncode=130
     monkeypatch.setattr(run,'Bundle',FakeBundle);monkeypatch.setattr(run.subprocess,'Popen',Child)
-    monkeypatch.setenv('CUDA_VISIBLE_DEVICES','0')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES',gpu_ids or '0')
     argv=['--source-dir',str(source),'--out-dir',str(out),'--bundle',str(tmp_path/'bundle.zip'),'--device','cpu']
+    if gpu_ids:argv+=['--worker-gpus',gpu_ids]
     assert run.main(argv)==0
     r=c.read(out/'results.json');assert r['windows']==64 and r['imported_complete_windows']==16
     assert r['new_complete_windows']==48 and len(children)==2
-    assert all(kwargs['env']['CUDA_VISIBLE_DEVICES']=='0' for _,kwargs in children)
+    assert [kwargs['env']['CUDA_VISIBLE_DEVICES'] for _,kwargs in children]==(['0','1'] if gpu_ids else ['0','0'])
+    assert r['contract']['worker_GPUs']==(['0','1'] if gpu_ids else None)
     assert all(v is False for v in r['full_target_verified_by_route'].values())
     assert (source/'state.json').read_bytes()==before
     expected=counts(contract['keys'],c.routes(contract));state=c.read(out/'state.json')
