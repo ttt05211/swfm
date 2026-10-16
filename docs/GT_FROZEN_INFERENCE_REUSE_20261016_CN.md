@@ -15,6 +15,7 @@
 | geometry_reuse | 复用已上传历史语义/known；同次前向复用历史位姿、逆矩阵、full-grid坐标；source点合并上传后按原顺序切回；coverage/8邻域常量不重复上传；Strong直接用原CPU GT pose输入，避免GPU→CPU绕行 |
 | combined | 同时启用上面两类 |
 | combined_cpu4 | combined加已有Strong native majority调度线程2→4；单独标记CPU预算变化，不修改其native实现 |
+| packed_splat_cpu4 | 在combined_cpu4上，将逐source的stencil/unique/sum合批，source键隔离后按原顺序恢复，原FP64运动与原composition不改 |
 
 静态软支持仍每次新算四帧投票与相同mixture，移除的只是未使用的 `int(use.sum())` 统计及其隐式GPU同步，并利用初始one-hot的原语义替代重复argmax。source逐层叠加顺序、原splat与source_query操作不变，不用新的多source归约或FP64融合。
 
@@ -37,6 +38,31 @@ RTX3050 Laptop / 4GiB，真实原始ZIP中固定8个GT窗口，完整H6，每pas
 新增7项＋原冻结/复用/majority回归共 **65 passed / 13.20s**；Git Bash脚本语法通过。无新依赖，无原模型/训练缓存/正式推理路径改动。
 
 这不是L40S或128窗FPS，没有达到“服务器回到40FPS”的实测结论；需要服务器同窗口A/B。原模型和正式推理默认路径未替换。
+
+## 第二轮：只合批source去重（2026-10-16）
+
+服务器第一轮32窗实测：reference175.274ms/34.232FPS，combined164.367ms/36.504FPS，CPU4为158.202ms/37.926FPS；Strong完全一致，原repeat24/候选28个最大语义差异保留FAIL。此处不能与128窗35.759直接算paired增益。
+
+新增 `next_ops.PackedTransport`：每个source的FP64 SE(2)与ego投影保持原调用/shape/dtype，仅把输出点拼起来做一次stencil与unique/sum。地址编码含独立source slot，不跨物体合并；保留全部零权/outside stencil项，sum后仍clamp到[0,1]，恢复原source次序调用原 `compose_sparse`。一次读取ragged counts替代逐source的动态unique开销。没有新CUDA/Triton、自定义kernel、FP64融合、owner规则、删点或降分辨率；整个新计算仍在每次六帧timer内，不存forecast缓存。
+
+真实local8窗、双pass交替各repeat2：同次reference659.953ms，上一版CPU4 **616.605ms**，packed **575.050ms**，相对上一版 **1.07226×**；两pass均更快。前4窗Transport163.250→125.462ms，其他网络保持原执行。Strong byte全8通过；原repeat与packed语义最大均差4体素，严格gate仍FAIL，所有timings保留。原冻结权重不变，不据本地比例宣称服务器已40FPS。
+
+同轮还试过省训练反向备份/clone的inference composition：574.551ms，相对packed仅省0.499ms（不足0.1%），无足够额外收益，**未保留为可运行后端**，避免再堆一条实现。原实验输出只读保留，不用新版resume旧代码指纹。
+
+本地CPU张量测试覆盖多source同址不合并、空source、out-of-grid项、原排序/权重、完整六帧与原CPU pool恢复；FP32 sum在GPU上的原子归约仍可能有微小漂移，不把CPU exact当GPU byte证明。
+
+保留候选后最终新旧回归 **67 passed / 14.97s**，Bash语法/diff通过。旧冻结模型/训练/源缓存和正式推理默认仍未改。新输出目录绑定当前代码指纹，不能拿新版恢复本轮旧prototype测次。
+
+服务器第二轮只跑同32窗三路：原reference、上一版CPU4、新packed。新目录执行，不覆盖第一轮：
+
+```bash
+export GT_REUSE_WINDOWS=32
+export GT_REUSE_DIR="$PWD/outputs/p0_f9_shared_history/gt_packed_splat_ab_$(date +%Y%m%d_%H%M%S)"
+nohup bash tools/gt_inference_reuse/run.sh --backends reference combined_cpu4 packed_splat_cpu4 > "${GT_REUSE_DIR}.log" 2>&1 &
+tail -F "${GT_REUSE_DIR}.log"
+```
+
+仍用原GT/STC128冻结目录作GT_FPS_SOURCE；丢失变量时脚本按前述前缀找。只测速、不训练或改正式默认；summary新增vs previous combined_cpu4 speedup/faster_each_pass。
 
 ## 服务器
 

@@ -41,7 +41,11 @@ def aggregate(rows,backends,repeats,actual_cuda):
         r=result[name];ref=result['reference'];r['speedup']=ref['mean_six_frame_ms']/r['mean_six_frame_ms']
         r['faster_each_pass']=all(x<y for x,y in zip(r['pass_mean_ms'],ref['pass_mean_ms']))
         r['strict_pass_gate']=r['faster_each_pass'] and r['strict_byte_parity'] and ref['strict_byte_parity']
-        if name=='combined_cpu4':
+        if name=='packed_splat_cpu4' and 'combined_cpu4' in result:
+            previous=result['combined_cpu4']
+            r['speedup_over_combined_cpu4']=previous['mean_six_frame_ms']/r['mean_six_frame_ms']
+            r['faster_each_pass_than_combined_cpu4']=all(x<y for x,y in zip(r['pass_mean_ms'],previous['pass_mean_ms']))
+        if engine.cpu4(name):
             r['Strong_six_frame_byte_parity']=bool(rows) and all(row['strong_audit']['strict_byte_parity'] for row in rows)
             r['Strong_max_changed_voxels']=max((max(row['strong_audit']['changed_voxels_by_horizon']) for row in rows),default=0)
             r['strict_pass_gate']=r['strict_pass_gate'] and r['Strong_six_frame_byte_parity']
@@ -58,7 +62,8 @@ def summary(r):
     for name,v in r['speed'].items():
         lines.append(f"{name:22s} {v['mean_six_frame_ms']} {v['output_frame_fps']} {v.get('speedup',1.)} {v['max_changed_voxels']} {v['strict_byte_parity']}")
         lines.append(name+' serialized_profile_mean_ms='+str(v['profile_mean_ms']))
-        if name=='combined_cpu4':lines.append('EXISTING native majority CPU4 (different CPU thread budget): Strong six-frame byte parity='+str(v.get('Strong_six_frame_byte_parity'))+' max_changed_voxels='+str(v.get('Strong_max_changed_voxels')))
+        if 'speedup_over_combined_cpu4' in v:lines.append('vs previous combined_cpu4 speedup='+str(v['speedup_over_combined_cpu4'])+' faster_each_pass='+str(v['faster_each_pass_than_combined_cpu4']))
+        if engine.cpu4(name):lines.append('EXISTING native majority CPU4 (different CPU thread budget): Strong six-frame byte parity='+str(v.get('Strong_six_frame_byte_parity'))+' max_changed_voxels='+str(v.get('Strong_max_changed_voxels')))
     lines += ['Original reference-repeat drift remains FAIL if present. No tolerance relaxation or automatic backend promotion.',
         'SCOPE: '+SCOPE,'EXCLUDES: '+EXCLUDES,
         'Not camera end-to-end FPS; new GT quality is not evaluated. No forecast/learned-field caching across calls.']
@@ -101,13 +106,13 @@ def main(argv=None):
         frozen_checkpoint_sha256=receipt['frozen_checkpoint_sha256'],merged_state_sha256=fingerprint,
         backends=a.backends,repeats=a.repeats,cpu_workers=a.cpu_workers,passes=2,horizon_group=6,
         reference_native_majority_workers=min(a.cpu_workers,4),
-        candidate_native_majority_workers=4 if 'combined_cpu4' in a.backends else None,
+        candidate_native_majority_workers=4 if any(map(engine.cpu4,a.backends)) else None,
         scientific_updates=0,history='GT dense-valid',GT_future_ego_conditioned=True,target_future_occupancy_read=False,
         fps_scope=SCOPE,fps_excludes=EXCLUDES,
         implementation={p.name:base.sha256(p) for p in Path(__file__).parent.glob('*.py')})
     out=Path(a.out).resolve();out.mkdir(parents=True,exist_ok=False);write(out/'contract.json',job)
     p=(SharedTrackPredictor if policy=='shared_pinned' else Predictor)(body,bundle.pcfg,a.device,workers=a.cpu_workers)
-    majority=ParallelNativeMajority(4) if 'combined_cpu4' in a.backends else None
+    majority=ParallelNativeMajority(4) if any(map(engine.cpu4,a.backends)) else None
     p.gt_reuse_majority=majority
     event=threading.Event()
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:event.set())

@@ -17,7 +17,10 @@ from tools.joint_occ_experiments.batching.geometry import grouped_splat
 from tools.joint_occ_experiments.fast_autograd import compose_sparse
 from real_motion.metrics.moving_miou_v2 import DYNAMIC_CLASS_IDS
 
-BACKENDS=('reference','readout_reuse','geometry_reuse','combined','combined_cpu4')
+BACKENDS=('reference','readout_reuse','geometry_reuse','combined','combined_cpu4','packed_splat_cpu4')
+
+
+def cpu4(backend):return backend.endswith('_cpu4')
 
 
 def prepared(p,row,poses,times):
@@ -158,8 +161,8 @@ def memory(columns,lifted,output,history,raw,targets,yaws,poses,grid,renderer,ho
 def fresh(p,ready,bias,backend='combined',profile=None):
     if backend not in BACKENDS:raise ValueError('unknown execution backend')
     if backend=='reference':return reference.fresh(p,ready[0],bias,6,profile)
-    use_geometry=backend in ('geometry_reuse','combined','combined_cpu4')
-    use_readout=backend in ('readout_reuse','combined','combined_cpu4')
+    use_geometry=backend!='readout_reuse'
+    use_readout=backend!='geometry_reuse'
     (row,staged,times),cpu_poses=ready;device=p.provider.device;body=p.body
     def stage(name,fn):
         if profile is None:return fn()
@@ -175,7 +178,7 @@ def fresh(p,ready,bias,backend='combined',profile=None):
     output,lifted=stage('shared_encoder_STWM_lift',network)
     def strong():
         original=getattr(p.provider,'strong_majority',None)
-        if backend=='combined_cpu4':p.provider.strong_majority=p.gt_reuse_majority
+        if cpu4(backend):p.provider.strong_majority=p.gt_reuse_majority
         try:return backgrounds(raw,state,cpu_poses if use_geometry else poses,p.provider,raw['_shared_source_track'])
         finally:p.provider.strong_majority=original
     bg=stage('fresh_Strong_CLEAR',strong)
@@ -183,7 +186,11 @@ def fresh(p,ready,bias,backend='combined',profile=None):
     targets=source_targets(output,rec,state['current_pose'],state['source_z_t0'])
     yaws=effective_yaw(output,[int(s['class_id']) for s in state['current']])
     def renderer():
-        value=ReusedTransport(raw,state,p.provider.pcfg.grid,device,poses,staged) if use_geometry else TransportPrior(raw,state,p.provider.pcfg.grid,device)
+        renderer_class=ReusedTransport
+        if backend=='packed_splat_cpu4':
+            from .next_ops import PackedTransport
+            renderer_class=PackedTransport
+        value=renderer_class(raw,state,p.provider.pcfg.grid,device,poses,staged) if use_geometry else TransportPrior(raw,state,p.provider.pcfg.grid,device)
         if use_geometry:value.static_support(staged['observed'])
         else:old.temporal_static_prior(dict(renderer=value,raw=raw,poses=poses),support_only=True)
         return value
