@@ -1,4 +1,18 @@
-# 冻结 STC norm192 版本＋单进程128窗推理测速
+# 一个冻结 norm192 模型＋GT/STC 同128窗单进程测速
+
+## GT 入口更新（2026-10-16）
+
+按用户最终决定，**只保留一个最终模型**。同一个 `frozen/final_model.pt` 同时接受 GT 历史和 STC 历史；不按输入来源切换192参数、posterior bias、KTA、年龄权重或静态支持开关。旧STC完整分数仍只证明STC质量，不能直接沿用适配前的GT成绩。此次仅补输入与测速，不训练、不读取未来占据标签、不发布新GT质量分。
+
+`run.sh` 默认 `STC_FPS_MODALITY=both`：固定同128个窗口，各测GT与STC；一个GPU、一个模型进程，逐窗交替 `GT→STC` / `STC→GT`，不是同时开两个模型或多进程测吞吐。也可设 `STC_FPS_MODALITY=gt` 或 `stc` 单独测。直接Python入口新增 `--modality gt|stc|both`，为兼容旧单STC调用，其缺省仍为 `stc`。
+
+两种历史都在几何准备**之前**重建 `dense_valid=(0<=semantics<18)`，供encoder和历史feature memory共同使用。不能拿通用GT读取器的默认 `mask_lidar` 原样喂入，再仅修改encoder mask。源读取器、缓存和原评估脚本不改；STC不使用GT可见性。运行时核对同窗口、历史时间/ego和未来GT ego一致，所有预测均完整六帧。
+
+结果 `results.json/by_modality/gt` 与 `stc` 分别报速度，`summary.txt` 同时列出两组。每窗原始记录在 `gt/window_*.json`、`stc/window_*.json`，绑定同一个合并state SHA；报告source数、历史/t0占据点数、source点数、dynamic memory点数及前8窗分段profile。固定网格并不意味着Strong/搬运/汇聚处理的点数相同，不能仅凭总体FPS判断实现出错。
+
+以下FPS计时边界完全保留。原双路/GC对照只存在于**计时外的独立A/B诊断**，其临时原norm会立即恢复；主FPS始终只执行冻结最终模型。旧结果与冻结文件保留，新测必须使用新目录，不把旧单STC计时拼到这次GT/STC配对测次。
+
+本地新增回归覆盖单GT/单STC/配对入口、common dense-valid重建、相同state SHA、交替顺序与无未来标签读取。真实RTX3050单窗H6配对联调complete：GT/STC主FPS与参考六帧均byte pass、共用同一冻结件；仅证明入口能执行，不把单窗延迟当服务器128窗结果。旧A/B独立诊断该GT窗有1体素差异，原样保留，不抹掉strict FAIL。
 
 ## 冻结内容
 
@@ -70,8 +84,9 @@ git fetch https://ghfast.top/https://github.com/ttt05211/swfm.git feature/shared
 git merge --ff-only FETCH_HEAD
 
 export STC_FPS_GPU=0
+export STC_FPS_MODALITY=both
 export NORM_VALIDATED_DIR="$PWD/outputs/p0_f9_shared_history/stc_norm192_final_20261016_125218/all"
-export STC_FPS_DIR="$PWD/outputs/p0_f9_shared_history/stc_norm192_frozen_fps128_$(date +%Y%m%d_%H%M%S)"
+export STC_FPS_DIR="$PWD/outputs/p0_f9_shared_history/shared_norm192_gt_stc_fps128_$(date +%Y%m%d_%H%M%S)"
 nohup bash tools/stc_frozen_speed/run.sh > "${STC_FPS_DIR}.log" 2>&1 &
 tail -F "${STC_FPS_DIR}.log"
 ```
@@ -85,7 +100,7 @@ cat "$STC_FPS_DIR/summary.txt"
 ls -lh "$STC_FPS_DIR/frozen/"
 ```
 
-每8窗打印 `FROZEN_STC_FPS n /128`，不是4369。原始每窗timings/parity/profile保存window_*.json；results/summary增量写入。该轻量128窗入口不自动拼接失败测次/恢复不同计时状态；若中断，已有结果和冻结文件保留，用新目录重新测，不覆盖。后台nohup可关终端。
+每8对窗口打印 `FROZEN_HISTORY_FPS n /128 modalities gt,stc`，不是4369。原始每窗timings/parity/profile分别保存gt/stc子目录；results/summary增量写入。该轻量128窗入口不自动拼接失败测次/恢复不同计时状态；若中断，已有结果和冻结文件保留，用新目录重新测，不覆盖。后台nohup可关终端。
 
 ## 本地实测与测试边界
 

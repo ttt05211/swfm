@@ -19,8 +19,9 @@ fi
 [[ -f "$VALIDATED/results.json" ]] || { echo 'Set NORM_VALIDATED_DIR to completed norm192 ALL evaluation directory'; exit 1; }
 OUT="${STC_FPS_DIR:-$ROOT/outputs/p0_f9_shared_history/stc_norm192_frozen_fps128_$(date +%Y%m%d_%H%M%S)}"
 DATA="${DATAROOT:-/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes}"
-echo "Freeze verified norm192, SINGLE GPU/process,128 fixed windows; no full VAL rerun. OUT=$OUT"
+echo "ONE frozen norm192 model, GT/STC histories, SINGLE GPU/process,128 matched windows EACH; no quality/full VAL rerun. OUT=$OUT"
 args=(--out "$OUT" --bundle "$STC_REPLAY_BUNDLE" --validated-run "$VALIDATED"
+  --modality "${STC_FPS_MODALITY:-both}"
   --windows 128 --repeats "${STC_FPS_REPEATS:-2}" --horizon-group 6 --cpu-workers "${STC_FPS_CPU_WORKERS:-2}"
   --dev-cache "${DEV_CACHE:-$ROOT/data/p0_f9_v18_se2_val_all_4369.pt}" --dev-info "${DEV_INFO:-$DATA/nuscenes_infos_val_temporal_v3_scene.pkl}"
   --dataroot "$DATA" --stc-root "${STC_ROOT:-$ROOT/data/stc_camera/compact}")

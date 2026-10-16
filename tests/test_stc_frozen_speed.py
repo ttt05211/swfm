@@ -82,22 +82,57 @@ def test_timing_keeps_byte_failures_and_uses_total_time_not_mean_of_reciprocals(
     assert engine.aggregate([],2,False)['window_fps'] is None
 
 
-def test_actual_small_workflow_does_not_read_future_labels_or_modify_source(tmp_path,monkeypatch):
+@pytest.mark.parametrize('modality',['stc','gt','both'])
+def test_actual_small_workflow_does_not_read_future_labels_or_modify_source(tmp_path,monkeypatch,modality):
     from test_shared_source_track import fixture
     old,rec,raw=fixture();old.close();body=old.body
     body.columns=SemanticRefiner(source_dim=body.transport.config.d_model,feature_width=16,z_bins=4,memory_width=4,width=32,chunk_size=32)
     body.requires_grad_(False);source=tmp_path/'bundle.zip';source.write_bytes(b'fixture source');before=source.read_bytes()
     records=[dict(rec,scene_name='scene',t0_token=f'token{i}',role='reference64',future_poses=np.tile(np.eye(4),(6,1,1))) for i in range(2)]
     for r in records:r['history_tokens']=[*rec['history_tokens'][:-1],r['t0_token']]
+    calls=[]
     class B:
         def __init__(self,*args,**kwargs):self.pcfg=old.provider.pcfg;self.records=records
         def load_model(self,*args):return body,dict(source_sha256=BODY_SHA,model_configs=body.configs(),source_contract={}), 'baseline'
-        def history(self,r):return r,copy.deepcopy(raw),np.arange(4)*.5
+        def history(self,r,kind,policy):
+            calls.append((kind,policy));value=copy.deepcopy(raw)
+            if kind=='gt':value['history_occ'][:,1,1,0]=11
+            value['history_observed'][:]=False  # must be rebuilt before ALL preparation
+            return r,value,np.arange(4)*.5
         def targets(self,*args):raise AssertionError('future GT occupancy accessed by inference benchmark')
         def close(self):pass
     monkeypatch.setattr(run,'Bundle',B)
     out=tmp_path/'speed'
-    assert run.main(['--out',str(out),'--bundle',str(source),'--portable-subset','--device','cpu','--windows','2','--repeats','1'])==0
+    assert run.main(['--out',str(out),'--bundle',str(source),'--portable-subset','--device','cpu','--windows','2','--repeats','1','--modality',modality])==0
     r=read(out/'results.json');assert r['status']=='complete' and r['windows']==2
-    assert r['contract']['processes']==1 and r['speed']['window_fps'] is None
+    modes=['gt','stc'] if modality=='both' else [modality]
+    assert r['contract']['processes']==1 and r['contract']['modalities']==modes
+    assert r['contract']['same_model_and_pipeline']
+    for m in modes:
+        assert r['by_modality'][m]['windows']==2 and r['by_modality'][m]['speed']['window_fps'] is None
+        w=read(out/m/'window_000.json')
+        assert w['modality']==m and w['merged_state_sha256']==r['contract']['merged_state_sha256']
+        assert w['workload']['history_occupied_voxels']>0
+    if modality=='both':
+        gt=read(out/'gt/window_000.json');stc=read(out/'stc/window_000.json')
+        assert gt['key']==stc['key'] and gt['merged_state_sha256']==stc['merged_state_sha256']
+        assert gt['workload']['history_occupied_voxels']>stc['workload']['history_occupied_voxels']
+        # Per-row order alternates rather than always giving one input a cold start.
+        assert [k for k,_ in calls]==['gt']*3+['stc']*3+['stc']*3+['gt']*3
     assert (out/'frozen/final_model.pt').is_file() and source.read_bytes()==before
+
+
+@pytest.mark.parametrize('modality,kind',[('gt','occ'),('stc','stc')])
+def test_server_history_dense_valid_before_preparation_without_mutating_loader(modality,kind):
+    occ=np.array([0,17,255,18],np.int16).reshape(4,1,1,1)
+    raw=dict(history_occ=occ,history_observed=np.zeros_like(occ,bool),history_poses=np.tile(np.eye(4),(4,1,1)))
+    row=dict(scene_name='s',t0_token='t0',history_tokens=['h0','h1','h2','t0'],future_tokens=[f'f{i}' for i in range(6)])
+    called=[]
+    class Inputs:
+        def history(self,w,k):called.append(k);return row,raw,np.arange(4)*.5
+        def poses(self,w):return np.tile(np.eye(4),(6,1,1))
+        def targets(self,*args):raise AssertionError('future label read')
+    _,value,_,poses=run.read_history(None,Inputs(),row,modality)
+    assert called==[kind] and poses.shape==(6,4,4)
+    assert value['history_observed'].reshape(-1).tolist()==[True,True,False,False]
+    assert not raw['history_observed'].any() and value['history_occ'] is occ

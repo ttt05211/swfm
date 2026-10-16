@@ -127,8 +127,10 @@ def aggregate(rows,repeats,actual_cuda):
             mean_forced_gc_seconds=float(np.mean([v['forced_gc_seconds'] for v in values])) if values else None)
     if rows:out['evaluation_speedup']=out['evaluation_ab']['legacy_paired_forced_gc']['seconds_per_window']/out['evaluation_ab']['frozen_single_auto_gc']['seconds_per_window']
     out['evaluation_changed_voxels_max']=max((row['evaluation_ab']['changed_voxels'] for row in rows),default=0)
-    out['profile_mean_ms']={k:1000*np.mean([row['profile'][k] for row in rows if row['profile']])
+    out['profile_mean_ms']={k:float(1000*np.mean([row['profile'][k] for row in rows if row['profile']]))
         for k in next((row['profile'] for row in rows if row['profile']),{})}
+    out['workload_mean']={k:float(np.mean([row['workload'][k] for row in rows]))
+        for k in next((row['workload'] for row in rows if 'workload' in row),{})}
     out['peak_allocated_mib']=max((row['peak_allocated_mib'] for row in rows if row.get('peak_allocated_mib') is not None),default=None)
     out['peak_reserved_mib']=max((row['peak_reserved_mib'] for row in rows if row.get('peak_reserved_mib') is not None),default=None)
     out['memory_scope']='allocator peak includes serialized profile; reserved memory may retain earlier untimed diagnostics'
