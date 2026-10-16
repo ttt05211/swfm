@@ -1,0 +1,16 @@
+{
+  "version": "stc_gt_norm192_r1_20261016",
+  "source_role": "clean1000",
+  "source_sha256": "17d649046fe7eafdbd1ce08fb8350bb90c93a757faeccdd544266113070aea44",
+  "source_policy": "baseline",
+  "norm_patch_semantic_sha256": "3a25ccbeb24c34aaeff62bd43b753213d409ffdae2b5b4f0c411346bf01fe066",
+  "posterior_semantic_sha256": "9a154104f2ec3943e57c4aa1d796b8413e6a2a162262f24a56d2230997dca8c3",
+  "method": "half original-pair + multiframe LS KTA; history weights [1/8,1/4,1/2,1]; historical static soft support; fixed posterior bias; target final200 Refiner norm192",
+  "condition": "STC four historical semantics, dense-valid; GT future ego; complete six future CPU semantics",
+  "scope": "unlabeled target-history adaptation; NOT target-domain-information-free or an independent test",
+  "parameters_changed": 192,
+  "new_training_allowed": false,
+  "server_result_evidence": "User-returned complete ALL4369/150, single GPU, 4 processes, H6; no Moving evaluation",
+  "verified_average": {"mIoU": 19.190065, "IoU": 29.016647},
+  "previous_average": {"mIoU": 19.163079, "IoU": 28.731681}
+}
