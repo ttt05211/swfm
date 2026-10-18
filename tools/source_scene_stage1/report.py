@@ -1,4 +1,4 @@
-"""Fixed BOTH-epoch paired report, never select or promote an arm."""
+"""Fixed-budget paired report, never select or promote an arm."""
 import argparse
 import json
 from pathlib import Path
@@ -19,11 +19,12 @@ def compare(folder):
                   'precision', 'world_size', 'STC_inventory', 'implementation'):
         if left[field] != right[field]: raise RuntimeError('unmatched scientific contract: '+field)
     rows = []; lines = ['===== MATCHED RANDOM BASELINE / SCENE READER =====',
-        'TRAIN20% x2; same latest shared_pinned / dense-valid / globalB4-source128 / H6 CE+Lovasz.',
+        f'TRAIN20% x{left["epochs"]}; same latest shared_pinned / dense-valid / globalB4-source128 / H6 CE+Lovasz.',
         'Same fresh common modules, NOT old checkpoints. Different motion architecture/parameter count.',
-        'SAME fixed remaining64; both epochs reported. NO best-head/epoch selection.',
+        'SAME fixed remaining64; all configured epochs reported. NO best-head/epoch selection.',
         'epoch arm      route                         mIoU       IoU MovingMicro']
-    for epoch in ('1', '2'):
+    if left['epochs'] not in (1, 2): raise RuntimeError('invalid fixed epoch budget')
+    for epoch in map(str, range(1, left['epochs']+1)):
         for arm in ('baseline', 'reader'):
             value = results[arm]['evaluations'][epoch]
             if value['windows'] != 64 or value['keys'] != left['eval_keys']: raise RuntimeError('evaluation keys differ')

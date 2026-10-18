@@ -164,17 +164,29 @@ def test_fixed_training_plan_and_comparison_reject_mismatched_population(tmp_pat
     fields = ('train_keys', 'eval_keys', 'epochs', 'total_updates', 'epochs_updates', 'seed', 'learning_rates',
               'schedule', 'objective', 'known', 'source_policy', 'source_implementation', 'data', 'overrides',
               'precision', 'world_size', 'STC_inventory', 'implementation')
-    common = dict.fromkeys(fields, 'same'); common.update(protocol=PROTOCOL, eval_keys=keys)
+    common = dict.fromkeys(fields, 'same'); common.update(protocol=PROTOCOL, eval_keys=keys, epochs=1)
     values = {name: dict(mIoU=20., IoU=30., MovingMicro=10.) for name in ROUTES}
     for arm in ('baseline', 'reader'):
         folder = tmp_path/arm; folder.mkdir()
         result = dict(status='complete', contract=dict(common, arm=arm),
-                      evaluations={str(e): dict(windows=64, keys=keys, variants=values) for e in (1, 2)})
+                      evaluations={'1': dict(windows=64, keys=keys, variants=values)})
         (folder/'results.json').write_text(json.dumps(result))
-    assert 'epoch2 stc_gt_semantic_refine' in compare(tmp_path)
+    assert len(groups) == 1
+    report = compare(tmp_path)
+    assert 'epoch1 stc_gt_semantic_refine' in report and 'epoch2' not in report
     result['contract']['known'] = 'lidar_known'
     (tmp_path/'reader/results.json').write_text(json.dumps(result))
     with pytest.raises(RuntimeError, match='known'): compare(tmp_path)
+
+
+def test_one_epoch_complete_cursor_and_old_schedule_rejected():
+    groups = [[1, 2, 3]]; contract = dict(epochs=1, world_size=1)
+    saved = dict(protocol=PROTOCOL, contract=contract, epoch=1, batch=0, updates=3, rank_rng=[{}])
+    assert validate_resume(saved, contract, groups) == (1, 0, 3)
+    with pytest.raises(RuntimeError): validate_resume(dict(saved, epoch=2), contract, groups)
+    with pytest.raises(RuntimeError): validate_resume(dict(saved, batch=1), contract, groups)
+    with pytest.raises(RuntimeError):
+        validate_resume(dict(saved, protocol='source_scene_reader_stage1_matched_TRAIN20x2_H6_v1'), contract, groups)
 
 
 @pytest.mark.parametrize('arm', ['baseline', 'reader'])

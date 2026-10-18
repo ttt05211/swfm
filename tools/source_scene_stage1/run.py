@@ -1,4 +1,4 @@
-"""Isolated RANDOM TRAIN20% x2, one/two training GPUs; single-GPU DEV64."""
+"""Isolated RANDOM TRAIN20% x1 by default; single-GPU DEV64."""
 from contextlib import ExitStack
 from dataclasses import replace
 import json
@@ -22,12 +22,12 @@ from .model import make_model
 from .history import StageHistory, batches
 from .evaluation import evaluate
 
-PROTOCOL = 'source_scene_reader_stage1_matched_TRAIN20x2_H6_v1'
+PROTOCOL = 'source_scene_reader_stage1_matched_TRAIN20_fixed_epochs_H6_v2'
 
 
 def parser():
     p = base.parser(); p.description = __doc__
-    p.set_defaults(mode='gt', epochs=2, train_fraction=.2, seed=20261011, cpu_workers=4,
+    p.set_defaults(mode='gt', epochs=1, train_fraction=.2, seed=20261011, cpu_workers=4,
                    prefetch_workers=2, frame_cache_mib=512, geometry_ram_mib=128,
                    descriptor_ram_mib=128, eval_population='dev64')
     p.add_argument('--arm', choices=('baseline', 'reader'), required=True)
@@ -36,14 +36,15 @@ def parser():
     return p
 
 
-def plan(all_train, all_dev, reference, seed):
+def plan(all_train, all_dev, reference, seed, epochs=1):
+    if epochs not in (1, 2): raise ValueError('fixed one or two epoch budget required')
     if len(all_train) != 20430 or len(all_dev) != 4369: raise ValueError('TRAIN20430 / VAL4369 required')
     keys = base.select_scene_balanced_round_robin(base.record_keys(all_train), 4086)
     train = base.align_records(all_train, keys)
     evaluation = base.align_records(all_dev, eval_keys(reference))
     if {r['scene_name'] for r in train} & {r['scene_name'] for r in evaluation}:
         raise ValueError('TRAIN/DEV scene overlap')
-    groups = [base.epoch_groups(train, seed, e, 4, 128) for e in range(2)]
+    groups = [base.epoch_groups(train, seed, e, 4, 128) for e in range(epochs)]
     return keys, evaluation, groups
 
 
@@ -51,8 +52,9 @@ def validate_resume(saved, contract, groups):
     if saved.get('protocol') != PROTOCOL or saved.get('contract') != contract:
         raise RuntimeError('resume contract changed; old checkpoints are never resumed here')
     epoch, batch, updates = (int(saved[k]) for k in ('epoch', 'batch', 'updates'))
-    if (not 0 <= epoch <= 2 or epoch == 2 and batch != 0 or
-            epoch < 2 and not 0 <= batch < len(groups[epoch]) or
+    limit = len(groups)
+    if (not 0 <= epoch <= limit or epoch == limit and batch != 0 or
+            epoch < limit and not 0 <= batch < len(groups[epoch]) or
             updates != sum(map(len, groups[:epoch]))+batch):
         raise RuntimeError('invalid completed-update cursor')
     if len(saved['rank_rng']) != contract['world_size']: raise RuntimeError('rank count changed')
@@ -63,13 +65,13 @@ def summary(result):
     c = result['contract']
     lines = ['===== MATCHED SOURCE SCENE READER / STAGE1 =====', 'status='+result['status'],
         f'arm={c["arm"]}; updates={result["updates"]}/{c["total_updates"]}; completed_epochs={result["epoch"]}',
-        'RANDOM TRAIN4086 x2; latest shared_pinned identities; no old body/norm/calibration weights.',
+        f'RANDOM TRAIN4086 x{c["epochs"]}; latest shared_pinned identities; no old body/norm/calibration weights.',
         'SAME train keys/order/global B4-source128/AdamW/LR/cosine; common fresh Encoder/Refiner initialization.',
         'Only full6 CE+Lovasz. No ego/motion/existence loss or navigation. GT future ego conditioned.',
         'TRAIN, OCC and STC use dense-valid. Registration/KTA/background/memory/Refiner unchanged.',
         'Reader: sparse multi-scale local + explicit coarse global + XY/time position encoding; masked temporal tokens.',
         'KTA Query conditioning retained. No class/velocity/mask numeric feature in reader arm.',
-        'Each epoch SAME remaining64 OCC/STC on ONE GPU; both epochs reported, no best selection.',
+        'Final fixed epoch(s): SAME remaining64 OCC/STC on ONE GPU; no best selection.',
         f'parameters={c["parameters"]}; training_world_size={c["world_size"]}; NOT an equal-parameter ablation.']
     for epoch, evaluation in sorted(result['evaluations'].items(), key=lambda p: int(p[0])):
         lines += [f'===== epoch={epoch}; windows={evaluation["windows"]} =====',
@@ -82,13 +84,13 @@ def summary(result):
 
 
 def launch(a, event, context):
-    if (a.mode != 'gt' or a.epochs != 2 or a.train_fraction != .2 or a.seed != 20261011 or
+    if (a.mode != 'gt' or a.epochs not in (1, 2) or a.train_fraction != .2 or a.seed != 20261011 or
             a.window_batch_size != 4 or a.source_budget != 128 or a.training_backend != 'fused' or
             a.evaluate_only or a.max_updates < 0 or a.checkpoint_every < 1 or a.lovasz_weight != 1. or
             a.eval_population != 'dev64' or
             not 1 <= a.cpu_workers <= 20 or not 1 <= a.prefetch_workers <= 8 or
             min(a.motion_lr, a.repair_lr) <= 0):
-        raise ValueError('fixed TRAIN20% x2 / B4-source128 / H6 CE+Lovasz protocol')
+        raise ValueError('fixed TRAIN20% x1(default) or x2 / B4-source128 / H6 CE+Lovasz protocol')
     for name in ('frame_cache_mib', 'geometry_ram_mib', 'descriptor_ram_mib'):
         if not 0 <= getattr(a, name) <= 4096: raise ValueError('bounded RAM required')
     root = Path(__file__).resolve().parents[2]; out = Path(a.out_dir).resolve()
@@ -101,7 +103,7 @@ def launch(a, event, context):
     architecture = torch.load(a.base_checkpoint, map_location='cpu', weights_only=False)['model_config']
     cfg = replace(base.config_from_mapping_v17(architecture), history_frames=4)
     _, all_train = base.load_cache(a.train_cache); _, all_dev = base.load_cache(a.dev_cache)
-    train_keys, evaluation, groups = plan(all_train, all_dev, a.eval_reference, a.seed)
+    train_keys, evaluation, groups = plan(all_train, all_dev, a.eval_reference, a.seed, a.epochs)
     total = sum(map(len, groups))
     model = make_model(a.arm, cfg).to(device)
     if context.active:
@@ -145,10 +147,10 @@ def launch(a, event, context):
     contract = dict(protocol=PROTOCOL, arm=a.arm, model=model.configs(), world_size=context.world_size,
         parameters=sum(p.numel() for p in model.parameters()), source_policy='shared_pinned',
         source_implementation=source_implementation, train_keys=[list(k) for k in train_keys],
-        eval_keys=base.record_keys(evaluation), epochs=2, total_updates=total, epochs_updates=list(map(len, groups)),
+        eval_keys=base.record_keys(evaluation), epochs=a.epochs, total_updates=total, epochs_updates=list(map(len, groups)),
         grouping='original_train20_round_robin_globalB4_source128_no_truncation',
         objective=dict(CE=1., Lovasz=1., motion=0., existence=0., ego=0.), seed=a.seed,
-        learning_rates=[a.motion_lr, a.repair_lr], schedule='whole_two_epoch_cosine_floor0.01',
+        learning_rates=[a.motion_lr, a.repair_lr], schedule=f'whole_{a.epochs}_epoch_cosine_floor0.01',
         known='TRAIN_OCC_STC_dense_valid', precision='original_BF16_geometry_FP64_H6',
         execution=dict(torch=str(torch.__version__), cuda=torch.version.cuda,
                        cpu_workers=a.cpu_workers, prefetch_workers=a.prefetch_workers),
@@ -207,9 +209,9 @@ def launch(a, event, context):
     try:
         if context.primary:
             base.write_json(out/'contract.json', contract); base.write_json(out/'cache_audit.json', cache_report)
-            print(f'SCENE_STAGE1 {a.arm} RANDOM TRAIN4086 x2; updates={total}; world={context.world_size}; NEW={out}', flush=True)
+            print(f'SCENE_STAGE1 {a.arm} RANDOM TRAIN4086 x{a.epochs}; updates={total}; world={context.world_size}; NEW={out}', flush=True)
         if not evaluate_epoch(): event.set()
-        while epoch < 2 and not context.stop(event.is_set()) and not (a.max_updates and updates >= a.max_updates):
+        while epoch < a.epochs and not context.stop(event.is_set()) and not (a.max_updates and updates >= a.max_updates):
             global_groups = groups[epoch][batch:]
             iterator = batches(provider, train_source, [g[context.rank::context.world_size] for g in global_groups],
                                history, workers=a.prefetch_workers)
@@ -238,7 +240,7 @@ def launch(a, event, context):
                     if context.stop(event.is_set()) or a.max_updates and updates >= a.max_updates or batch == 0: break
             finally: iterator.close()
         save()
-        result['status'] = 'complete' if epoch == 2 and '2' in evaluations else 'stopped_at_complete_update_or_eval_window'
+        result['status'] = 'complete' if epoch == a.epochs and str(a.epochs) in evaluations else 'stopped_at_complete_update_or_eval_window'
         publish()
         if context.primary: print(summary(result), flush=True)
         return 0

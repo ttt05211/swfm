@@ -1,5 +1,9 @@
 # 第一阶段：Source Scene Reader，同预算随机初始化对照
 
+## 最新预算：TRAIN20% × 1轮（2026-10-18）
+
+按用户最新要求，两组都默认只训一轮，完整一轮余弦，结束各评同remaining64。协议升级为v2，拒绝将旧两轮计划checkpoint当一轮断点；使用新目录。可显式SCENE_EPOCHS=2创建新的两轮计划，但不自动扩训。网络、数据人口、损失、匹配审计与旧结果不变。
+
 ## 边界与回退
 
 独立新增 `tools/source_scene_stage1/`，不修改旧网络、trainer、评估、source匹配、缓存协议或默认入口。旧模型与 clean1000/norm192/41.78FPS 结果继续保留，但不作为本次初始化，也不继承其分数或速度。
@@ -32,13 +36,13 @@ Reader不消费独立的class embedding、source mask通道、人工速度/位�
 - `baseline`：当前 SharedTransport＋最新 shared-pinned＋dense-valid。
 - `reader`：新 SceneTransport，其余相同。
 
-固定 TRAIN20430 中原 round-robin 选出的4086窗（20%），seed20261011，两轮完整余弦；原 global B4/source128分组，不截source、不drop窗口。每个窗口仍监督全部六未来帧。只使用 CE＋Lovász；motion/existence/ego损失均不计算，没有ego头或导航。GT future ego明确作为几何条件。
+固定 TRAIN20430 中原 round-robin 选出的4086窗（20%），seed20261011，一轮完整余弦；原 global B4/source128分组，不截source、不drop窗口。每个窗口仍监督全部六未来帧。只使用 CE＋Lovász；motion/existence/ego损失均不计算，没有ego头或导航。GT future ego明确作为几何条件。
 
-两模型从随机初始化开始。构造同一seed的原模型后，将**新鲜随机**且名称/形状一致的 Encoder、Refiner、KTA投影、未来decoder/head参数赋给Reader；不导入任何旧训练权重。共同模块初始化逐元素相同，架构/参数量不同，因此不是等参数或单输入通道消融。两组使用相同AdamW、LR（motion5e-4/refiner3e-4）、weight decay、global clip5、样本与日程。
+两模型从随机初始化开始。构造同一seed的原模型后，将**新鲜随机**且名称/形状一致的 Encoder、Refiner、KTA投影、未来decoder/head参数赋给Reader；不导入任何旧训练权重。共同模块初始化逐元素相同，架构/参数量不同，因此不是等参数或单输入通道消融。两组使用相同AdamW、LR（motion5e-4/refiner3e-4）、weight decay、global clip5、样本与一轮日程。
 
-每轮完成后保存 `epoch_0001.pt` / `epoch_0002.pt`，在**相同 remaining64**评OCC+GT和STC+GT，分别报告Transport和Refiner、1/2/3s及平均mIoU/IoU/Moving。**训练、OCC评估、STC评估全为dense-valid**，不重演先前OCC评估known错配。每次评估仅rank0的一张GPU运行，另一训练rank等待；没有双卡评估。
+一轮完成后保存 `epoch_0001.pt`，在**相同 remaining64**评OCC+GT和STC+GT，分别报告Transport和Refiner、1/2/3s及平均mIoU/IoU/Moving。**训练、OCC评估、STC评估全为dense-valid**，不重演先前OCC评估known错配。每次评估仅rank0的一张GPU运行，另一训练rank等待；没有双卡评估。
 
-两轮都报告，不按DEV选best。DEV64反复看过，不是独立测试。小预算结果只筛研究方向，不保证全集或收敛结论；不自动加轮数或换主线。最终比较器核对两组人口/known/日程/源策略/数据和实现指纹，拒绝混旧结果。
+固定第1轮，不按DEV选best。DEV64反复看过，不是独立测试。小预算结果只筛研究方向，不保证全集或收敛结论；不自动加轮数或换主线。最终比较器核对两组人口/known/日程/源策略/数据和实现指纹，拒绝混旧结果。
 
 ## 缓存、恢复与旧结果保护
 
@@ -62,16 +66,17 @@ git merge --ff-only FETCH_HEAD
 
 # 一卡可设0，双卡训练设0,1。评估始终只在rank0一张卡进行。
 export SCENE_TRAIN_GPUS=0,1
-export SCENE_PILOT_DIR="$PWD/outputs/p0_f9_shared_history/scene_reader_stage1_$(date +%Y%m%d_%H%M%S)"
+export SCENE_EPOCHS=1
+export SCENE_PILOT_DIR="$PWD/outputs/p0_f9_shared_history/scene_reader_stage1_1ep_$(date +%Y%m%d_%H%M%S)"
 nohup bash tools/source_scene_stage1/workflow.sh > "${SCENE_PILOT_DIR}.log" 2>&1 &
 tail -F "${SCENE_PILOT_DIR}.log"
 ```
 
 `REFERENCE_DIR`默认原 `stc_empirical_refiner500_20261014_194954`，仅取其中 `clean/results.json` 的remaining64 keys，不导入其权重或分数。数据/E14/旧cache路径沿用此前脚本，可用环境变量指定。
 
-结束后：`cat "$SCENE_PILOT_DIR/summary.txt"`。分组细节在两arm的 `results.json`，逐轮完整评估在 `eval_epoch_0001.json` / `eval_epoch_0002.json`。续跑重新设置相同 `SCENE_PILOT_DIR` 和 `SCENE_TRAIN_GPUS`，重跑相同workflow命令，自动加载各arm自己的last。
+结束后：`cat "$SCENE_PILOT_DIR/summary.txt"`。分组细节在两arm的 `results.json`，完整评估在 `eval_epoch_0001.json`。续跑重新设置相同 `SCENE_PILOT_DIR`、`SCENE_EPOCHS` 和 `SCENE_TRAIN_GPUS`，重跑相同workflow命令，自动加载各arm自己的last。
 
-不自动加入服务器首检或全量训练。若只想手动做数步管线检查，明确设置新 `SCENE_ARM_DIR` 后可单独 `bash tools/source_scene_stage1/run.sh reader --max-updates 8`，总两轮余弦不变；它不是8步收敛试验。
+不自动加入服务器首检或全量训练。若只想手动做数步管线检查，明确设置新 `SCENE_ARM_DIR` 后可单独 `bash tools/source_scene_stage1/run.sh reader --max-updates 8`，总一轮余弦不变；它不是8步收敛试验。
 
 ## 独立只读：最近两帧匹配正确率审计
 

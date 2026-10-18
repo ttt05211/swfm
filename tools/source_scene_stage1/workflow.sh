@@ -2,10 +2,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-export SCENE_PILOT_DIR="${SCENE_PILOT_DIR:-$ROOT/outputs/p0_f9_shared_history/scene_reader_stage1_$(date +%Y%m%d_%H%M%S)}"
+export SCENE_PILOT_DIR="${SCENE_PILOT_DIR:-$ROOT/outputs/p0_f9_shared_history/scene_reader_stage1_${SCENE_EPOCHS:-1}ep_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$SCENE_PILOT_DIR"
-echo "Fixed TWO random runs, baseline THEN reader; TRAIN20% x2 each. OUT=$SCENE_PILOT_DIR"
-echo 'Only history geometry caches reused. Epoch1/2 BOTH eval64 on ONE GPU, no best selection.'
+echo "Fixed TWO random runs, baseline THEN reader; TRAIN20% x${SCENE_EPOCHS:-1} each. OUT=$SCENE_PILOT_DIR"
+echo 'Only history geometry caches reused. Configured final epoch(s) eval64 on ONE GPU, no best selection.'
 for arm in baseline reader; do
   export SCENE_ARM_DIR="$SCENE_PILOT_DIR/$arm"
   if [[ -f "$SCENE_ARM_DIR/last.pt" ]]; then export SCENE_RESUME=1; else export SCENE_RESUME=0; fi
