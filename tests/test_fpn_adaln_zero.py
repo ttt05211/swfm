@@ -165,6 +165,51 @@ def test_control_rejection_and_original_runner_untouched(tmp_path):
         run.check_settings(a,SimpleNamespace(world_size=2),dict(contract={}))
 
 
+def test_scientific_launch_checks_real_plan_against_JSON_control(tmp_path,monkeypatch):
+    # Exercise the production launch wrapper AND unmodified planner/record_keys.
+    # No CUDA/model/optimizer needed: only the training loop is replaced here.
+    train = [dict(scene_name='TRAIN',t0_token=str(i),features=[None]) for i in range(20430)]
+    dev = [dict(scene_name='VAL',t0_token=str(i),history_tokens=['past']) for i in range(4369)]
+    control = fake_control(); path = tmp_path/'results.json'
+    eval_reference = tmp_path/'eval_reference.json'
+    eval_reference.write_text(json.dumps(control),encoding='utf-8')
+    args = (train,dev,eval_reference,20261011,1)
+    keys,evaluation,groups = run._plan(*args)
+    assert isinstance(original.base.record_keys(evaluation),tuple)
+    c = control['contract']
+    c.update(train_keys=keys,eval_keys=original.base.record_keys(evaluation),total_updates=len(groups[0]))
+    stc = tmp_path/'VAL'/'past'/'labels.npz'
+    stc.parent.mkdir(parents=True); stc.write_bytes(b'only inventory metadata is read')
+    stat = stc.stat()
+    c['STC_inventory'] = [(str(stc.resolve()),stat.st_size,stat.st_mtime_ns)]
+    control['updates'] = c['total_updates']
+    # Reproduce exactly the JSON round trip used by the original control.
+    control = json.loads(json.dumps(control)); path.write_text(json.dumps(control),encoding='utf-8')
+    monkeypatch.setattr(run,'check_settings',lambda *a:None)
+    monkeypatch.setattr(run,'_launch',lambda *a:run.runner.plan(*args))
+    a = SimpleNamespace(control_dir=tmp_path,stc_root=tmp_path)
+    factory_before,plan_before = run.runner.make_model,run.runner.plan
+    actual = run.launch(a,None,None)
+    assert actual[0] == keys and actual[1] == evaluation and actual[2] == groups
+    assert run.runner.make_model is factory_before and run.runner.plan is plan_before
+    # Container normalization must NOT conceal a real order, identity, budget,
+    # or STC inventory change. All failures still restore the private bindings.
+    for name in ('train_keys','eval_keys','total_updates','STC_inventory'):
+        changed = copy.deepcopy(control)
+        if name.endswith('_keys'):
+            changed['contract'][name][:2] = changed['contract'][name][1::-1]
+            if name == 'eval_keys':
+                changed['evaluations']['1']['keys'] = copy.deepcopy(changed['contract'][name])
+        elif name == 'total_updates':
+            changed['contract'][name] += 1; changed['updates'] += 1
+        else:
+            changed['contract'][name][0][1] += 1
+        path.write_text(json.dumps(changed),encoding='utf-8')
+        message = 'STC inventory' if name == 'STC_inventory' else name
+        with pytest.raises(RuntimeError,match=message): run.launch(a,None,None)
+        assert run.runner.make_model is factory_before and run.runner.plan is plan_before
+
+
 def test_reused_cuda_training_resume_and_final_evaluation(tmp_path,monkeypatch):
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(): pytest.skip('BF16 CUDA')
     import test_fpn_unet as baseline_test

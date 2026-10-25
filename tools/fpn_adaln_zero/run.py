@@ -109,9 +109,20 @@ def launch(a, event, ctx):
         candidate_implementation={p.relative_to(root).as_posix():original.base.sha256(p) for p in files})
     def checked_plan(*args):
         keys, evaluation, groups = _plan(*args); c = control['contract']
-        if ([list(k) for k in keys] != c['train_keys'] or original.base.record_keys(evaluation) != c['eval_keys'] or
-                len(groups[0]) != c['total_updates']):
-            raise RuntimeError('ordered TRAIN/eval keys or update budget differ from additive control')
+        # record_keys returns tuple[tuple], while the saved JSON contract uses
+        # list[list]. Normalize containers ONLY; never sort or change identities.
+        ordered = dict(train_keys=[list(k) for k in keys],
+            eval_keys=[list(k) for k in original.base.record_keys(evaluation)])
+        for name, actual in ordered.items():
+            expected = c[name]
+            if actual != expected:
+                first = next((i for i, pair in enumerate(zip(actual, expected))
+                              if pair[0] != pair[1]), min(len(actual), len(expected)))
+                raise RuntimeError(f'{name} differ from additive control: '
+                    f'actual_count={len(actual)}, expected_count={len(expected)}, first_difference={first}')
+        if len(groups[0]) != c['total_updates']:
+            raise RuntimeError(f'total_updates differ from additive control: '
+                f'actual={len(groups[0])}, expected={c["total_updates"]}')
         inventory = set()
         for record in evaluation:
             for token in record['history_tokens'][-4:]:
