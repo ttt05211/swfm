@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 from tools.causal_forward_train import control,data,model,run,report
+from tools.causal_forward_train.calibration import CALIBRATION
 from tools.fpn_adaln_zero import model as old_model
 
 
@@ -126,7 +127,8 @@ def test_actual_candidate_launch_JSON_plan_and_strict_rejection(tmp_path,monkeyp
     path = tmp_path/'results.json';path.write_text(json.dumps(value))
     a = SimpleNamespace(control_dir=tmp_path,stc_root=tmp_path,seed=20261011,motion_lr=5e-4,repair_lr=3e-4,
         override=[],cpu_workers=4,prefetch_workers=2)
-    ctx = SimpleNamespace(world_size=2)
+    ctx = SimpleNamespace(world_size=1)
+    with pytest.raises(RuntimeError,match='ONE GPU'):run.check_settings(a,SimpleNamespace(world_size=2),value)
     monkeypatch.setattr(run,'_launch',lambda *a:run.runner.plan(*args))
     before = run.runner.plan
     assert run.launch(a,None,ctx) == (keys,evaluation,groups)
@@ -137,7 +139,8 @@ def test_actual_candidate_launch_JSON_plan_and_strict_rejection(tmp_path,monkeyp
     with pytest.raises(RuntimeError,match='eval_keys'):run.launch(a,None,ctx)
     assert run.runner.plan is before
     assert run.original.DirectProvider is not data.ForwardProvider
-    assert run.original_evaluation.DirectPredictor is not data.ForwardPredictor
+    from tools.fpn_unet import evaluation as original_evaluation
+    assert original_evaluation.DirectPredictor is not data.ForwardPredictor
     assert run.runner.evaluate is not run.original.evaluate
 
 
@@ -149,15 +152,21 @@ def test_three_arm_report_checks_provenance_and_keeps_negative_results(tmp_path)
     cp = control_dir/'results.json';cp.write_text(json.dumps(a))
     ckpt = control_dir/'epoch_0001.pt';ckpt.write_bytes(b'report does not load model weights')
     keys = a['contract']['eval_keys']
-    b = dict(status='complete',keys=keys,contract=dict(protocol=FROZEN_PROTOCOL,keys=keys,stc_age=False,
+    b = dict(status='complete',keys=keys,contract=dict(protocol=FROZEN_PROTOCOL,keys=keys,stc_age=False,output_calibration=CALIBRATION,
         horizon_chunk=6,source_contract=a['contract'],source=dict(checkpoint_sha256=control.sha(ckpt))),reports={})
     for name in control.NAMES:
         kind,route = name.split('_gt_',1)
         for arm,score in (('baseline',1.1),('forward',1.2)):
             b['reports'][kind+'/'+arm+'/'+route] = dict(average=dict(mIoU=score,IoU=2.,MovingMicro=3.))
+            if route=='semantic_refine':
+                b['reports'][kind+'/'+arm+'/'+route+'_free_minus1'] = dict(average=dict(mIoU=score+.1,IoU=2.2,MovingMicro=2.8))
     c = copy.deepcopy(a);c['contract'].update(protocol=run.PROTOCOL,source_policy=model.SOURCE_POLICY,
+        world_size=1,
         model=dict(source_policy=model.SOURCE_POLICY,experiment=dict(control_results_sha256=control.sha(cp))))
     for m in c['evaluations']['1']['variants'].values():m.update(mIoU=1.5,MovingMicro=2.5)
+    c['evaluations']['1']['calibration'] = CALIBRATION
+    for kind in ('occ_gt','stc_gt'):
+        c['evaluations']['1']['variants'][kind+'_semantic_refine_free_minus1'] = dict(mIoU=1.6,IoU=2.1,MovingMicro=2.4)
     audit = dict(status='complete',rows=[dict(key=k) for k in keys],reports={},
         contract=dict(protocol=AUDIT_PROTOCOL,keys=keys,control_results_sha256=control.sha(cp)))
     for folder,value in (('frozen_B',b),('C_train',c),('pair_audit',audit)):
@@ -168,6 +177,10 @@ def test_three_arm_report_checks_provenance_and_keeps_negative_results(tmp_path)
     assert delta['C_minus_B_training_policy']['mIoU'] == pytest.approx(.3)
     assert delta['C_minus_recorded_A_total']['MovingMicro'] == -.5
     assert delta['fresh_A_minus_recorded']['mIoU'] == pytest.approx(.1)
+    assert result['execution_comparison']['control_training_GPUs']==2
+    assert result['execution_comparison']['candidate_training_GPUs']==1
+    assert result['fixed_free_minus1']['stc']['C_forward_trained']['delta']['mIoU']==pytest.approx(.1)
+    assert result['fixed_free_minus1']['occ']['A_fresh']['delta']['MovingMicro']==pytest.approx(-.2)
     assert 'A_fresh' in text and 'NOT FPS' in text
     b['contract']['stc_age'] = True
     (tmp_path/'frozen_B/results.json').write_text(json.dumps(b))
@@ -196,6 +209,7 @@ def test_forward_evaluator_both_modalities_and_integer_resume(tmp_path,monkeypat
             save=lambda x:states.append(copy.deepcopy(x)))
         again = run.evaluation.evaluate(body,base.provider,SimpleNamespace(nusc=None),[[new]],stc_root=tmp_path,saved=states[-1])
         assert first['keys']==again['keys'] and len(calls)==2
+        assert len(first['variants'])==6 and first['calibration']==CALIBRATION
         restored,_ = run.evaluation.restore(states[-1])
         for name,fields in states[-1]['metrics'].items():
             for field,counts in fields.items():np.testing.assert_array_equal(getattr(restored[name],field),counts)

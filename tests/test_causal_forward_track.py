@@ -185,7 +185,8 @@ def test_resume_integer_counts_population_and_unknown_Moving_not_reported():
     with pytest.raises(ValueError): run.restore(wrong,contract,8,False)
 
 
-def test_actual_cli_loop_full6_before_labels_stop_resume_no_optimizer(tmp_path,monkeypatch):
+@pytest.mark.parametrize('free_minus1',[False,True])
+def test_actual_cli_loop_full6_before_labels_stop_resume_no_optimizer(tmp_path,monkeypatch,free_minus1):
     import threading
     from real_motion.geometry import OccupancyGrid
     grid = OccupancyGrid(x_min=0,y_min=0,z_min=0,voxel_size=(.4,.4,.4),shape_hwd=(2,2,2))
@@ -225,11 +226,13 @@ def test_actual_cli_loop_full6_before_labels_stop_resume_no_optimizer(tmp_path,m
     monkeypatch.setattr(torch.optim,'Adam',lambda *a,**kw:pytest.fail('optimizer created'))
     args = ['--checkpoint',str(ckpt),'--bundle',str(bundle),'--out-dir',str(tmp_path/'out'),
             '--device','cpu','--limit','16','--horizon-chunk','1']
+    if free_minus1:args+=['--free-minus1']
     assert run.main(args,event=stop) == 130 and calls == dict(infer=4,labels=1)
     stop.clear()
     assert run.main(args+['--resume'],event=stop) == 0 and calls == dict(infer=64,labels=16)
     import json
     result = json.loads((tmp_path/'out'/'results.json').read_text())
     assert result['status'] == 'complete' and len(result['keys']) == 16
+    assert len(result['reports'])==(12 if free_minus1 else 8)
     assert all(r['average']['mIoU'] == 100. for r in result['reports'].values())
     for k,v in model.state_dict().items(): torch.testing.assert_close(v,before[k],rtol=0,atol=0)

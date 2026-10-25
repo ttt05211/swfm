@@ -19,10 +19,19 @@ from tools.real_motion.surface_ego_ablation_common import tensor_state_fingerpri
 from tools.stc_overnight.bundle import Bundle
 from .adapter import TrackPredictor
 from .track import PROTOCOL as TRACK_PROTOCOL
+from tools.causal_forward_train.calibration import CALIBRATION,predict as calibrated_readout,delta as calibration_delta
 
 PROTOCOL = 'frozen_FPN_or_AdaLN_forward_association_same64_dense_GTego_v1'
 NAMES = tuple(f'{kind}/{arm}/{route}' for kind in ('occ', 'stc') for arm in ('baseline', 'forward')
               for route in ('transport', 'semantic_refine'))
+
+
+def route_names(contract):
+    calibration = contract.get('output_calibration')
+    if calibration is not None and calibration != CALIBRATION:raise ValueError('unknown fixed calibration')
+    extra = tuple(f'{kind}/{arm}/semantic_refine_free_minus1' for kind in ('occ','stc')
+        for arm in ('baseline','forward')) if calibration else ()
+    return NAMES+extra
 
 
 def config_identity(path, expected=None):
@@ -102,7 +111,7 @@ def summarize(result):
         'STC age0.5 in BOTH arms='+str(result['contract']['stc_age']),
         'route mIoU IoU MovingMicro']
     reports = {}
-    for name in NAMES:
+    for name in route_names(result['contract']):
         reports[name] = metrics.report({k:np.asarray(v, np.int64) for k,v in result['counts'][name].items()},
                                       (1., 2., 3.), moving=result['moving_available'])
         row = reports[name]['average']
@@ -115,6 +124,18 @@ def summarize(result):
             a, b = (reports[f'{kind}/{arm}/{route}']['average'] for arm in ('baseline', 'forward'))
             delta[kind+'/'+route] = {k:b[k]-a[k] for k in a if a[k] is not None and b[k] is not None}
     result['forward_minus_baseline'] = delta
+    if result['contract'].get('output_calibration'):
+        calibration = {}
+        for kind in ('occ','stc'):
+            for arm in ('baseline','forward'):
+                a,b = (reports[f'{kind}/{arm}/{route}'] for route in
+                    ('semantic_refine','semantic_refine_free_minus1'))
+                calibration[kind+'/'+arm] = dict(average=calibration_delta(b['average'],a['average']),
+                    per_horizon={h:calibration_delta(b['per_horizon'][h],a['per_horizon'][h]) for h in a['per_horizon']})
+        result['free_minus1_minus_raw'] = calibration
+        lines += ['FIXED inherited FREE-1 from previous GT-labeled FPN development; NOT refitted on AdaLN.',
+            'OCC/STC share the SAME coefficient; raw and calibrated readouts share ONE forward; training unchanged.',
+            'free_minus1_minus_raw='+json.dumps(calibration)]
     lines += ['forward_minus_baseline='+json.dumps(delta),
         'History links/KTA changed intentionally; this is a frozen-input-policy study, NOT numerical parity.',
         'Portable replay has NO true Moving annotations; no dynamic-class surrogate is reported.',
@@ -125,7 +146,7 @@ def summarize(result):
 
 def restore(result, contract, voxels, moving_available):
     if (result['contract'] != contract or result['keys'] != contract['keys'][:len(result['keys'])] or
-            len(result['keys']) > len(contract['keys']) or set(result['counts']) != set(NAMES) or
+            len(result['keys']) > len(contract['keys']) or set(result['counts']) != set(route_names(contract)) or
             result['moving_available'] != moving_available or len(result['audits']) != len(result['keys'])):
         raise ValueError('resume same source/data/ordered population and complete windows only')
     for fields in result['counts'].values():
@@ -151,6 +172,7 @@ def main(argv=None, event=None):
     ap.add_argument('--horizon-chunk', type=int, choices=(1,2,3,6), default=6)
     ap.add_argument('--cpu-workers', type=int, choices=(1,2,3,4), default=2)
     ap.add_argument('--stc-age', action='store_true', help='same existing age0.5 memory weighting in BOTH STC arms')
+    ap.add_argument('--free-minus1',action='store_true',help='extra fixed labeled-calibration readout, no fitting or extra forward')
     ap.add_argument('--resume', action='store_true')
     a = ap.parse_args(argv); event = event or threading.Event()
     torch.set_num_threads(1); torch.manual_seed(21)
@@ -182,15 +204,19 @@ def main(argv=None, event=None):
             inventory={k:data.preflight(jobs,k) for k in ('occ','stc')})
         moving_available = True
     implementation = {p.relative_to(repo).as_posix():base.sha256(p) for p in Path(__file__).parent.glob('*.py')}
+    if a.free_minus1:
+        for name in ('tools/causal_forward_train/calibration.py','tools/fpn_stc_bias448/run.py'):
+            implementation[name] = base.sha256(repo/name)
     contract = json.loads(json.dumps(dict(protocol=PROTOCOL, track_protocol=TRACK_PROTOCOL, source=receipt,
         keys=keys, source_contract=c, data=data_contract, implementation=implementation,config=config_receipt,
         stc_age=a.stc_age, known='dense_valid_both', GT_future_ego=True, horizon_chunk=a.horizon_chunk,
         runtime=dict(torch=str(torch.__version__),cuda=torch.version.cuda,device=a.device,workers=a.cpu_workers))))
+    if a.free_minus1:contract['output_calibration'] = json.loads(json.dumps(CALIBRATION))
     cp = out/'contract.json'
     if a.resume and json.loads(cp.read_text(encoding='utf-8')) != contract: raise ValueError('resume contract differs')
     base.write_json(cp,contract)
     result = dict(status='running',contract=contract,keys=[],audits=[],moving_available=moving_available,
-        counts={n:{k:v.tolist() for k,v in metrics.empty(3).items()} for n in NAMES},scientific_updates=0)
+        counts={n:{k:v.tolist() for k,v in metrics.empty(3).items()} for n in route_names(contract)},scientific_updates=0)
     if a.resume:
         result = restore(json.loads((out/'results.json').read_text(encoding='utf-8')), contract,
                          int(np.prod(pcfg.grid.shape_hwd)), moving_available)
@@ -221,8 +247,13 @@ def main(argv=None, event=None):
                     begin = time.perf_counter()
                     with torch.no_grad():
                         fw = predictor.infer(rows[arm],poses,stc_age=(kind == 'stc' and a.stc_age))
-                        for route,tensor in (('transport',fw['prior']),('semantic_refine',fw['logits'])):
-                            predictions[f'{kind}/{arm}/{route}'] = tensor.argmax(1).reshape(6,*fw['shape']).byte().cpu().numpy()
+                        if a.free_minus1:
+                            predictions[f'{kind}/{arm}/transport'] = fw['prior'].argmax(1).reshape(6,*fw['shape']).byte().cpu().numpy()
+                            for route,value in calibrated_readout(fw['logits'],fw['shape']).items():
+                                predictions[f'{kind}/{arm}/{route}'] = value
+                        else:
+                            for route,tensor in (('transport',fw['prior']),('semantic_refine',fw['logits'])):
+                                predictions[f'{kind}/{arm}/{route}'] = tensor.argmax(1).reshape(6,*fw['shape']).byte().cpu().numpy()
                     audit['inference_seconds_not_FPS'][arm] = time.perf_counter()-begin
                     del fw
                 audits[kind] = audit
@@ -231,7 +262,7 @@ def main(argv=None, event=None):
             target = data.targets(job) if a.bundle else data.targets(job,(1,3,5))
             moving = None if a.bundle else data.moving(job,(1,3,5),(1.,2.,3.),pcfg.grid,a.cpu_workers)
             pending_counts = {}
-            for name in NAMES:
+            for name in route_names(contract):
                 counts = {k:np.asarray(v,np.int64) for k,v in result['counts'][name].items()}
                 for h,index in enumerate((1,3,5)):
                     metrics.add(counts,h,predictions[name][index],target[h],None if moving is None else moving[h])

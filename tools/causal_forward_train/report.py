@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 from .control import reference,sha,NAMES
+from .calibration import CALIBRATION,delta as metric_delta
 
 
 def combine(control_dir,root):
@@ -17,16 +18,19 @@ def combine(control_dir,root):
     from tools.causal_forward_track.run import PROTOCOL as FROZEN_PROTOCOL
     if (b['status'] != 'complete' or b['keys'] != keys or b['contract']['keys'] != keys
             or b['contract']['protocol'] != FROZEN_PROTOCOL
+            or b['contract'].get('output_calibration') != CALIBRATION
             or b['contract']['stc_age'] or b['contract']['horizon_chunk'] != 6
             or b['contract']['source_contract'] != a['contract']
             or b['contract']['source']['checkpoint_sha256'] != sha(cp.parent/'epoch_0001.pt')):
         raise RuntimeError('B must use the exact A checkpoint/same64/H6/no age')
     fields = ('train_keys','eval_keys','epochs','total_updates','seed','objective','learning_rates',
-        'schedule','known','precision','world_size','data','overrides','STC_inventory','execution','parameters')
+        'schedule','known','precision','data','overrides','STC_inventory','execution','parameters')
     if (c['status'] != 'complete' or c['epoch'] != 1 or c['contract']['protocol'] != PROTOCOL
             or c['contract']['source_policy'] != SOURCE_POLICY or c['evaluations']['1']['keys'] != keys
+            or c['contract']['world_size'] != 1 or a['contract']['world_size'] not in (1,2)
+            or c['evaluations']['1'].get('calibration') != CALIBRATION
             or c['contract']['model']['experiment']['control_results_sha256'] != sha(cp)):
-        raise RuntimeError('C must be completed matched forward TRAIN4086x1')
+        raise RuntimeError('C must be completed SINGLE-GPU forward TRAIN4086x1 with both fixed readouts')
     for field in fields:
         if c['contract'][field] != a['contract'][field]:raise RuntimeError('C differs from A: '+field)
     if (audit['status'] != 'complete' or len(audit['rows']) != 64 or audit['contract']['keys'] != keys
@@ -46,19 +50,45 @@ def combine(control_dir,root):
                 ('B_minus_fresh_A_input_policy','B_old_weights_forward','A_fresh'),
                 ('C_minus_B_training_policy','C_forward_trained','B_old_weights_forward'),
                 ('C_minus_recorded_A_total','C_forward_trained','A_recorded'))}
+    free = {}
+    for kind in ('occ','stc'):
+        free[kind] = {}
+        for label,arm in (('A_fresh','baseline'),('B_old_weights_forward','forward')):
+            raw,cal = (b['reports'][f'{kind}/{arm}/{name}'] for name in
+                ('semantic_refine','semantic_refine_free_minus1'))
+            free[kind][label] = dict(raw=raw['average'],free_minus1=cal['average'],delta=metric_delta(cal['average'],raw['average']),
+                per_horizon={h:metric_delta(cal['per_horizon'][h],raw['per_horizon'][h]) for h in raw.get('per_horizon',{})})
+        raw,cal = (c['evaluations']['1']['variants'][kind+'_gt_'+name] for name in
+            ('semantic_refine','semantic_refine_free_minus1'))
+        free[kind]['C_forward_trained'] = dict(raw=raw,free_minus1=cal,delta=metric_delta(cal,raw),
+            per_horizon={h:metric_delta(cal['per_horizon'][h],raw['per_horizon'][h]) for h in raw.get('per_horizon',{})})
+    execution = dict(control_training_GPUs=a['contract']['world_size'],candidate_training_GPUs=1,
+        effective_global_batch=4,exact_world_size_match=a['contract']['world_size']==1,
+        caveat='Single-GPU execution requested; same objective/budget, not bit-identical gradient reduction.')
     result = dict(status='complete',keys=keys,rows=rows,deltas=deltas,pair_audit=audit['reports'],
+        fixed_free_minus1=free,calibration=CALIBRATION,execution_comparison=execution,
         provenance=dict(control_results_sha256=sha(cp),B_results_sha256=sha(root/'frozen_B/results.json'),
             C_results_sha256=sha(root/'C_train/results.json'),audit_results_sha256=sha(root/'pair_audit/results.json')))
     lines = ['===== MATCHED AdaLN-Zero / HISTORY ASSOCIATION / A-B-C =====',
         'status=complete; SAME TRAIN4086x1/order/seed/budget/initial weights/architecture/same64.',
         'A recorded=old train/old eval. A fresh+B=ONE frozen old checkpoint, old vs new eval.',
         'C=new RANDOM training with forward association in BOTH TRAIN and EVAL; no trained weight import.',
-        'GT future ego/dense-valid/H6/full-grid/CE+Lovasz only; no age/bias/calibration/head/noise.',
+        'GT future ego/dense-valid/H6/full-grid/CE+Lovasz only; no age/head/noise; FREE-1 is EVAL ONLY.',
+        'training_execution='+json.dumps(execution),
         'route model mIoU IoU MovingMicro']
     for name,values in rows.items():
         for label,m in values.items():
             lines.append(f'{name:28s} {label:24s} {m["mIoU"]:.6f} {m["IoU"]:.6f} {m["MovingMicro"]:.6f}')
         for label,delta in deltas[name].items():lines.append(name+' '+label+'='+json.dumps(delta))
+    lines += ['===== FIXED INHERITED FREE-1 / SAME FORWARD / NO FITTING =====',
+        'Previous coefficient used first32 FPN/STC GT labels; current evaluation is calibration transfer, NOT label-free proof.',
+        'input model raw_mIoU minus1_mIoU d_mIoU raw_IoU minus1_IoU d_IoU raw_Moving minus1_Moving d_Moving']
+    for kind,stages in free.items():
+        for stage,value in stages.items():
+            raw,cal,d = value['raw'],value['free_minus1'],value['delta']
+            numbers = [v for k in ('mIoU','IoU','MovingMicro') for v in (raw[k],cal[k],d[k])]
+            lines.append(f'{kind:4s} {stage:24s} '+' '.join(f'{v:.6f}' for v in numbers))
+            lines.append(kind+'/'+stage+' free_minus1_minus_raw_by_horizon='+json.dumps(value['per_horizon']))
     lines += ['Pair audit: pair_audit/summary.txt (all AND changed-only precision/coverage/recall/GT-speed strata).',
         'Repeated development64; conditional GT-box attribution is not perfect instance truth.',
         'All fixed final results retained; no best selection/threshold tuning/full training/promotion. NOT FPS.']
