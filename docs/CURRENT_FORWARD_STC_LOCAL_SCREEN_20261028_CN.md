@@ -1,5 +1,31 @@
 # 最新 forward AdaLN epoch2：本地 STC 筛查与冻结候选
 
+用户于2026-10-28回传服务器固定候选全集摘要，输出 `Fixed target STC mIoU>=19 and IoU>=29: met=True`；同一入口仅在complete且4369窗时输出此标记。本地保存的是用户贴出的数值，没有直接下载服务器evaluation.json或逐窗confusion。以下覆盖原先“全集待验证”，不改变冻结系数或原默认。
+
+| 路线 | 时距/s | IoU | mIoU | MovingMicro |
+|---|---:|---:|---:|---:|
+| occ_gt/transport | 1 | 59.870161 | 51.705078 | 43.422698 |
+| occ_gt/transport | 2 | 53.975771 | 42.047486 | 25.134746 |
+| occ_gt/transport | 3 | 49.991130 | 36.400623 | 15.415586 |
+| occ_gt/transport | Avg | 54.612354 | 43.384396 | 27.991010 |
+| occ_gt/semantic_refine | 1 | 65.475386 | 55.023828 | 44.582186 |
+| occ_gt/semantic_refine | 2 | 60.253220 | 45.996796 | 27.820764 |
+| occ_gt/semantic_refine | 3 | 56.382252 | 40.360227 | 18.051345 |
+| occ_gt/semantic_refine | Avg | 60.703620 | 47.126950 | 30.151432 |
+| stc_gt/transport | 1 | 29.118172 | 20.808048 | 26.499608 |
+| stc_gt/transport | 2 | 26.676371 | 17.642094 | 17.210538 |
+| stc_gt/transport | 3 | 24.675135 | 15.431648 | 11.207660 |
+| stc_gt/transport | Avg | 26.823226 | 17.960597 | 18.305935 |
+| stc_gt/semantic_refine | 1 | 31.059236 | 21.728093 | 27.683212 |
+| stc_gt/semantic_refine | 2 | 29.115673 | 18.847181 | 19.264376 |
+| stc_gt/semantic_refine | 3 | 27.264147 | 16.644298 | 13.324443 |
+| stc_gt/semantic_refine | Avg | 29.146352 | 19.073191 | 20.090677 |
+
+与同一最新epoch2原ALL4369最终Refiner相比，STC mIoU18.721545→19.073191（+0.351646）、IoU28.446166→29.146352（+0.700186）、Moving18.725074→20.090677（+1.365603）；OCC mIoU48.711339→47.126950（−1.584389）、IoU62.809965→60.703620（−2.106345）、Moving30.593620→30.151432（−0.442188）。候选达成用户19/29目标，代价为OCC质量下降。三个STC时距的最终Refiner mIoU/IoU/Moving均高于原版。此结果不能分解两个改动的独立贡献。
+
+该配置继续固定为独立的有监督目标域校准候选；32个校准VAL场景包含在4369全集中，且既往完整VAL已查看，不能当作未接触目标域标签的zero-shot或独立测试结果。仍使用原2816122参数网络权重和同一GT future ego条件；未重新训练、未按新全集分数调参、未替换默认入口。新候选FPS尚未测量，不沿用其他模型FPS。源SHA、两个系数和历史估计规则见下文。
+
+
 本轮全部使用用户刚提供的 `forward_adaln_epoch2_local.zip`，2816122参数的 forward关联 / FPN / AdaLN-Zero Decoder2 / U-Net epoch2。原始服务器checkpoint为 `outputs/p0_f9_shared_history/adaln_forward_full_2ep_20261026_215351/epoch_0002.pt`，原文件SHA256为 `7760c6f4f92277aa248161cd3e90f87ac2354329babceb6e5ed3b872adde33a0`。ZIP为11,132,055字节。只复用旧本地包的真实数据；没有加载旧clean1000、norm192或旧FPN权重。
 
 数据是与本次训练记录逐key一致的原remaining64，每窗来自不同VAL场景，另有干净原TRAIN32。当前拟合固定前32，检查后32，并将后32拆为screen16/confirmation16查看。64窗过去已反复查看，均属于开发数据，不是独立测试。本地无Moving标注，所有表格仅标准全网格1/2/3s平均mIoU/IoU。
@@ -16,7 +42,7 @@
 
 冻结候选相对原版：STC约+0.298mIoU/+0.638IoU；GT约−1.776mIoU/−2.046IoU。后32窗原版18.063933/28.623019，候选18.621489/29.189383。原版新鲜复算与服务器同64的18.229030/28.514311、51.260686/64.055743接近；不同GPU/Torch以及原执行的细小数值漂移仍存在，不声称逐字节一致或改变原数值门槛。
 
-**当前没有新的ALL4369结果。** 原ALL4369为STC18.721545/28.446166、GT48.711339/62.809965。开发64与全集的类频率和窗口人口不同，不能将本地增益直接加到原全集分数后宣称19/29达标。
+首次完成本地筛查时尚无新的ALL4369结果；现已收到上述服务器实测摘要。原ALL4369为STC18.721545/28.446166、GT48.711339/62.809965。开发64与全集的类频率和窗口人口不同，达标判断使用服务器实测，不将本地增益加到原全集分数。
 
 候选只保留两个改动：
 
@@ -57,6 +83,6 @@ nohup bash tools/causal_forward_stc_candidate/run.sh >"${STC_CANDIDATE_DIR}.log"
 tail -n 25 -f "${STC_CANDIDATE_DIR}.log"
 ```
 
-结果为 `$STC_CANDIDATE_DIR/summary.txt`，每30秒日志给OCC/STC进度。恢复需设置原目录及 `STC_CANDIDATE_RESUME=1`。不需要上传适配权重，服务器不重新训练或重新拟合。完成全集后汇总会明确显示固定STC19/29目标是否达到；在此之前不声称达标。
+结果为 `$STC_CANDIDATE_DIR/summary.txt`，每30秒日志给OCC/STC进度。恢复需设置原目录及 `STC_CANDIDATE_RESUME=1`。不需要上传适配权重，服务器不重新训练或重新拟合。首次服务器全集已经完成并回传met=True；保留命令用于复现，不自动重复运行。
 
-检查：29项新旧回归通过，包括真实原模型加载/源SHA、无损缓存/拟合场景分离、source和直接Memory位移只计一次、GPU正式入口GT/STC各64窗新鲜复算、六时距读出/未来占据poison、单卡双worker与整数合并、不同recipe拒绝、完整窗中断续评/源只读。两个CLI、Bash语法及原模型/训练文件零diff通过。未测试服务器新全集分数或新FPS。
+检查：29项新旧回归通过，包括真实原模型加载/源SHA、无损缓存/拟合场景分离、source和直接Memory位移只计一次、GPU正式入口GT/STC各64窗新鲜复算、六时距读出/未来占据poison、单卡双worker与整数合并、不同recipe拒绝、完整窗中断续评/源只读。两个CLI、Bash语法及原模型/训练文件零diff通过。服务器新全集分数以上述用户回传为据，新FPS未测试。
