@@ -6,7 +6,7 @@ import torch
 from tools.joint_occ_experiments import run as base
 from .model import ARMS
 
-PROTOCOL = 'CarryWorld_five_ablations_train_only_v1'
+PROTOCOL = 'CarryWorld_five_ablations_train_only_dualGPU_v2'
 FULL = 'forward_AdaLN_RANDOM_fullTRAIN20430x2_raw_every2000_v1'
 SMALL = 'AdaLN_forward_RANDOM_TRAIN4086x1_singleGPU_raw_FREEreadout_v2'
 TRAIN_FILES = ('config','train_cache','base_checkpoint','train_info')
@@ -39,7 +39,10 @@ def reference(path,arm):
 
 
 def check_inputs(a,ctx,c,root):
-    expected=dict(seed=a.seed,world_size=ctx.world_size,learning_rates=[a.motion_lr,a.repair_lr],
+    if ctx.world_size!=2: raise RuntimeError('all five ablations now require TWO training GPUs')
+    # User explicitly requested 1->2 GPUs for the small arms. Keep the old E
+    # world-size as provenance, not an equality assertion or a hidden relabel.
+    expected=dict(seed=a.seed,learning_rates=[a.motion_lr,a.repair_lr],
         overrides=a.override,precision='BF16_network_FP64_geometry_full6',
         execution=dict(torch=str(torch.__version__),cuda=torch.version.cuda,
             cpu_workers=a.cpu_workers,prefetch_workers=a.prefetch_workers))

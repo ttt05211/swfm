@@ -2,6 +2,8 @@
 
 2026-11-07执行更新：五组训练代码已在 `tools/paper_ablation_train` 独立实现，运行/恢复说明见 `PAPER_ABLATION_TRAIN_ONLY_20261107_CN.md`。本次只实现并测试训练入口，未启动数据集实验；所有评估保持关闭。下面的表格仍是后续完整实验计划，不表示已实现或运行评估。
 
+用户随后要求一个总脚本、五组全部双卡：`tools/paper_ablation_train/workflow.sh`顺序运行，globalB4/数据/步数/日程不变。小E历史为单卡，新M0/M1/S0双卡，合同明确执行变化及负载平衡策略，不声称单卡字节复现；不为此增加控制训练。
+
 本文件覆盖PAPER_ABLATION_PLAN_CURRENT_FORWARD_20261029_CN.md中此前“C/D完整两轮”的建议。用户明确要求：消融只报告mIoU和IoU，主组件C/D也只训练完整TRAIN一轮，其余短组仍为TRAIN20%一轮。本轮逐行记录配置与复用安排，不运行训练/推理或改动已冻结实现。
 
 用户随后指出FPN＋Query加法早已训练，核验后调整复用策略：该版本既有TRAIN20%×1，也有FULL×2（旧full目录fpn_unet_full_2ep_20261021_112202）。第三表的ego条件比较直接复用旧pinned关联下已经匹配的Additive/AdaLN两组，不把旧Additive与最新forward的E直接相减。这样新增训练由6组降为5组：2个全量一轮＋3个20%一轮。第三表多一行旧关联AdaLN参照，不新增训练。以下为更新后的预算。
@@ -43,7 +45,7 @@ E的复用来源为原 `adaln_forward_full_2ep_20261026_215351/epoch_0001.pt`，
 | M1 | 四帧历史Memory，仅自车对齐 | 完整E其他部分 | TRAIN20%=4086窗×1轮，约1031更新 | 新训练1组 |
 | M2 | 四帧历史Memory，自车＋source运动对齐 | 完整E | 同TRAIN20%×1轮 | 复用已有小预算E，不新增训练 |
 
-M1只改变动态Memory的source位移/旋转对齐；静态Memory、importance/coverage、Transport Prior、Strong和STWM学习预测均按完整配置。训练和推理都使用同一种Memory策略。M0/M1与M2必须使用同一个4086窗口列表、样本顺序、一轮余弦日程及同单卡设置。
+M1只改变动态Memory的source位移/旋转对齐；静态Memory、importance/coverage、Transport Prior、Strong和STWM学习预测均按完整配置。训练和推理都使用同一种Memory策略。M0/M1与M2使用同一个4086窗口列表、全局组顺序和一轮余弦；按最新用户要求，新组双卡，旧M2为单卡，明确记录该执行差异。
 
 小预算E来源为 `adaln_forward_single_free20_20261025_161644/C_train/epoch_0001.pt` 的raw读出，关联必须是当前forward，FREE/age关闭。最终用原contract核验，而不是仅依靠目录名。不能混入旧pinned关联的AdaLN或FPN/U-Net对照。无法核验时，增加一组匹配的小预算E（而非重新训练完整两轮）。
 

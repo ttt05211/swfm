@@ -8,6 +8,7 @@ from tools.shared_history_experiments.full_gt.engine import semantic_loss
 from tools.real_motion.joint_training_recovery import save_resume_checkpoint
 from .control import PROTOCOL,validate_resume
 from .geometry import forward_window
+from .partition import partition,source_count
 
 
 def train_step(model,optimizer,provider,rows,ctx,*,global_windows,update,schedule_updates):
@@ -25,6 +26,7 @@ def train_step(model,optimizer,provider,rows,ctx,*,global_windows,update,schedul
         if objective.requires_grad: objective.backward()
         totals+=torch.stack((ce.detach().mean(),lovasz.detach().mean(),loss.detach().mean())).double()/global_windows
         del value,loss,ce,lovasz,objective
+    local_forward_backward_seconds=time.perf_counter()-begun
     if ctx.stop(not bool(torch.isfinite(totals).all())): raise RuntimeError('nonfinite full6 objective')
     used=ctx.synchronize_gradients(model)
     norm=torch.nn.utils.clip_grad_norm_(model.parameters(),5.,error_if_nonfinite=True)
@@ -33,7 +35,8 @@ def train_step(model,optimizer,provider,rows,ctx,*,global_windows,update,schedul
     totals=ctx.sum(totals).cpu().tolist()
     if provider.device.type=='cuda': torch.cuda.synchronize(provider.device)
     return dict(CE=totals[0],Lovasz=totals[1],loss=totals[2],grad_norm=float(norm),
-        local_windows=len(rows),optimizer_updated=used,seconds=time.perf_counter()-begun)
+        local_windows=len(rows),local_forward_backward_seconds=local_forward_backward_seconds,
+        optimizer_updated=used,seconds=time.perf_counter()-begun)
 
 
 def summary(result):
@@ -78,27 +81,34 @@ def execute(model,optimizer,provider,groups,contract,ctx,rng,event,out,make_batc
 
     if epoch==1:
         result['status']='complete';save(final=True);return result
-    iterator=make_batches([group[ctx.rank::ctx.world_size] for group in groups[batch:]])
-    last_saved=None;begun=time.perf_counter();session_windows=0
+    if resume is None: save()  # recover even before the first 64-update interval.
+    iterator=make_batches([partition(group,ctx.world_size,i)[ctx.rank] for i,group in enumerate(groups[batch:],batch)])
+    last_saved=None;begun=time.perf_counter();session_windows=0;fetch_started=begun
     try:
         for rows in iterator:
+            input_wait_seconds=time.perf_counter()-fetch_started
             if ctx.stop(event.is_set() or max_updates>0 and updates>=max_updates): break
-            global_windows=len(groups[batch]);tick=time.perf_counter()
+            shards=partition(groups[batch],ctx.world_size,batch);global_windows=len(groups[batch]);tick=time.perf_counter()
             stats=step(model,optimizer,provider,rows,ctx,global_windows=global_windows,
                 update=updates+1,schedule_updates=contract['budget']['schedule_reference_updates'])
             updates+=1;batch+=1;session_windows+=global_windows
             if batch==len(groups): epoch,batch=1,0
             result.update(epoch=epoch,updates=updates)
+            report_step=updates==1 or updates%16==0 or epoch==1
+            rank_timing=ctx.gather(dict(input_wait_seconds=input_wait_seconds,
+                forward_backward_seconds=stats.get('local_forward_backward_seconds'))) if report_step else None
             if ctx.primary:
                 record=dict(update=updates,epoch=epoch,batch=batch,global_windows=global_windows,
-                    rank_windows=[len(g) for g in [groups[updates-1][r::ctx.world_size] for r in range(ctx.world_size)]],
-                    seconds_per_window=(time.perf_counter()-tick)/global_windows,**stats)
+                    rank_windows=list(map(len,shards)),rank_sources=[sum(map(source_count,g)) for g in shards],
+                    rank_timing=rank_timing,seconds_per_window=(time.perf_counter()-tick)/global_windows,**stats)
                 with (out/'progress.jsonl').open('a',encoding='utf-8') as handle: handle.write(json.dumps(record)+'\n')
-                if updates==1 or updates%16==0 or epoch==1:
+                if report_step:
                     print(f'ABLATION_TRAIN {contract["arm"]} {updates}/{len(groups)} CE={stats["CE"]:.4f} '
-                        f'Lovasz={stats["Lovasz"]:.4f} seconds/window={(time.perf_counter()-begun)/session_windows:.4f}',flush=True)
+                        f'Lovasz={stats["Lovasz"]:.4f} seconds/window={(time.perf_counter()-begun)/session_windows:.4f} '
+                        f'rank_windows={record["rank_windows"]} rank_sources={record["rank_sources"]}',flush=True)
             if epoch==1: break
             if updates%checkpoint_every==0: save();last_saved=updates
+            fetch_started=time.perf_counter()
     finally:
         if hasattr(iterator,'close'): iterator.close()
     result['status']='complete' if epoch==1 else 'interrupted'

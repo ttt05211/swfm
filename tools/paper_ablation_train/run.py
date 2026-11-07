@@ -20,6 +20,7 @@ from .model import ARMS,make_model
 from .control import PROTOCOL,reference,check_inputs,plan,sha,canonical
 from .data import TrainProvider,attach_train_cache,batches
 from .engine import execute
+from .partition import PARTITION
 
 
 def parser():
@@ -87,6 +88,10 @@ def launch(a,event,ctx):
     contract=canonical(dict(protocol=PROTOCOL,training_only=True,arm=a.arm,recipe=ARMS[a.arm],
         model=model.configs(),parameters=sum(p.numel() for p in model.parameters()),
         reference_contract_sha256=sha(a.reference_contract),world_size=ctx.world_size,
+        training_execution=dict(reference_world_size=c.get('world_size'),actual_world_size=ctx.world_size,
+            world_size_change_explicitly_requested=c.get('world_size')!=ctx.world_size,
+            global_window_batch=4,source_budget=128,partition=PARTITION,
+            no_padding_no_drop=True,byte_identity_to_single_GPU_not_claimed=True),
         train_keys=keys,eval_keys_metadata_only=c.get('eval_keys',[]),budget=budget,
         seed=a.seed,objective=c['objective'],known='TRAIN_dense_valid',registration='none',
         precision=c['precision'],data=data,overrides=a.override,learning_rates=c['learning_rates'],
@@ -101,7 +106,15 @@ def launch(a,event,ctx):
                 raise RuntimeError('resume only original output last.pt or last.previous.pt')
             if not (out/'contract.json').is_file() or json.loads((out/'contract.json').read_text())!=contract:
                 raise RuntimeError('output contract differs')
-        elif out.exists() and any(out.iterdir()): raise RuntimeError('NEW empty output directory required')
+        elif out.exists() and any(out.iterdir()):
+            # Setup may fail before execute() publishes its update0 checkpoint.
+            # Only identical metadata with NO training log/checkpoint is safe
+            # to initialize again; never overwrite an old scientific run.
+            names={p.name for p in out.iterdir()}
+            initial={'contract.json','evaluation.lock','cache_policy.json'}
+            if (not names<=initial or not (out/'contract.json').is_file()
+                    or json.loads((out/'contract.json').read_text(encoding='utf-8'))!=contract):
+                raise RuntimeError('NEW empty output directory or SAME unstarted metadata required')
         out.mkdir(parents=True,exist_ok=True)
     ctx.barrier()
     with ExitStack() as stack:
@@ -136,10 +149,9 @@ def launch(a,event,ctx):
 
 def main(argv=None,event=None):
     a=parser().parse_args(argv);ctx=DistributedTraining(True)
-    if not ctx.active:
-        ctx.device=torch.device(a.device)
-        if ctx.device.type=='cuda': torch.cuda.set_device(ctx.device)
-    try: return launch(a,event or threading.Event(),ctx)
+    try:
+        if not ctx.active: raise RuntimeError('launch with run.sh or torchrun --nproc_per_node=2; TWO GPUs required')
+        return launch(a,event or threading.Event(),ctx)
     finally: ctx.close()
 
 

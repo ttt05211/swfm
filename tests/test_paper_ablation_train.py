@@ -155,8 +155,9 @@ def test_train_inputs_hashes_never_read_val_or_stc(tmp_path,monkeypatch):
     for name in control.TRAIN_FILES:
         p=tmp_path/name;p.write_text('train fixture');setattr(a,name,p);c['data'][name]=control.sha(p)
     for name in ('dev_cache','dev_info','eval_reference'): c['data'][name]='MISSING_VAL_MUST_NOT_OPEN'
-    assert set(control.check_inputs(a,SimpleNamespace(world_size=1),c,tmp_path))==set(control.TRAIN_FILES)
-    with pytest.raises(RuntimeError,match='world_size'): control.check_inputs(a,SimpleNamespace(world_size=2),c,tmp_path)
+    # Explicitly authorized old single-GPU E -> new two-GPU execution.
+    assert set(control.check_inputs(a,SimpleNamespace(world_size=2),c,tmp_path))==set(control.TRAIN_FILES)
+    with pytest.raises(RuntimeError,match='TWO'): control.check_inputs(a,SimpleNamespace(world_size=1),c,tmp_path)
 
 
 def test_RAM_tracks_bounded_no_disk_and_input_sensitive():
@@ -318,5 +319,5 @@ def test_training_launcher_single_TRAIN_source_and_no_eval_after_final(tmp_path,
         assert saved['updates']==2 and saved['epoch']==1 and saved['training_only']
         assert saved['contract']['evaluation']=='DISABLED' and 'evaluations' not in saved
         assert not list((tmp_path/'new').glob('*eval*state*'))
-        assert len(list((tmp_path/'new').glob('*.pt')))==2
+        assert len(list((tmp_path/'new').glob('*.pt')))==3
     finally: predictor.close();old.close()
