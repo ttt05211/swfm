@@ -1,5 +1,6 @@
 """Continue the fixed epoch2 Waymo 10Hz evaluation with same-GPU workers."""
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,9 @@ from tools.real_motion.static_evidence_selector_common import write_json
 
 
 ROUTES = ('gt/transport', 'gt/semantic_refine')
+VOLUME = int(np.prod(SHAPE))
+MAX_SHARDS = 8
+PARALLEL_PROTOCOL = 'forward_waymo10_parallel_v2'
 DEFAULT_CHECKPOINT = ROOT / 'outputs/p0_f9_shared_history/adaln_forward_full_2ep_20261026_215351/epoch_0002.pt'
 DEFAULT_CONFIG = ROOT / 'configs/real_motion_occfm.yaml'
 
@@ -32,7 +36,7 @@ def read(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def read_counts(state, contract, keys, *, complete=False, volume=int(np.prod(SHAPE))):
+def read_counts(state, contract, keys, *, complete=False):
     done = len(state['keys'])
     if (state['contract'] != contract or done > len(keys) or state['keys'] != keys[:done]
             or (complete and done != len(keys)) or state['ego_errors'] or set(state['counts']) != set(ROUTES)):
@@ -43,28 +47,99 @@ def read_counts(state, contract, keys, *, complete=False, volume=int(np.prod(SHA
         counts[name] = value = np.asarray(fields['confusion'])
         moving = np.asarray(fields['moving'])
         if (value.shape != (3, 18, 18) or value.dtype.kind not in 'iu' or np.any(value < 0)
-                or np.any(value.sum((1, 2)) != done * volume)
+                or np.any(value.sum((1, 2)) != done * VOLUME)
                 or moving.shape != value.shape or np.any(moving != 0)):
             raise ValueError(f'invalid Waymo integer counts for {name}')
     return counts
 
 
-def partition(start, end):
-    count = min(4, end - start)
-    return [(start + i * (end - start) // count, start + (i + 1) * (end - start) // count)
-            for i in range(count)]
+def gaps(intervals, windows):
+    missing, cursor = [], 0
+    for start, end in sorted(intervals):
+        if not cursor <= start < end <= windows:
+            raise ValueError('invalid or overlapping completed Waymo intervals')
+        if cursor < start:
+            missing.append((cursor, start))
+        cursor = end
+    if cursor < windows:
+        missing.append((cursor, windows))
+    return missing
 
 
-def merge_counts(prefix_state, serial, shard_states, ranges, job_sha, *, volume=int(np.prod(SHAPE))):
-    keys = serial['keys']
-    total = read_counts(prefix_state, serial, keys, volume=volume)
-    if list(map(tuple, ranges)) != partition(len(prefix_state['keys']), len(keys)) or len(shard_states) != len(ranges):
-        raise ValueError('shards must partition the unevaluated suffix exactly once')
+def split_ranges(missing, processes):
+    ranges = list(missing)
+    while ranges and len(ranges) < processes:
+        largest = max(range(len(ranges)), key=lambda i: ranges[i][1] - ranges[i][0])
+        start, end = ranges[largest]
+        if end - start <= 1:
+            break
+        middle = (start + end) // 2
+        ranges[largest:largest+1] = [(start, middle), (middle, end)]
+    return ranges
+
+
+def read_seed(out, job):
+    serial = job['serial']
+    if job.get('protocol') != PARALLEL_PROTOCOL:
+        state = read(out / 'serial_prefix.json')
+        counts = read_counts(state, serial, serial['keys'])
+        done = len(state['keys'])
+        return ([(0, done)] if done else []), counts
+    path = out / 'imported.json'
+    if file_sha256(path) != job['imported_sha256']:
+        raise ValueError('imported snapshot changed')
+    state = read(path)
+    intervals = [tuple(pair) for pair in state['intervals']]
+    gaps(intervals, len(serial['keys']))
+    done = sum(end - start for start, end in intervals)
+    counts = {name: np.asarray(state['counts'][name]) for name in ROUTES}
+    for value in counts.values():
+        if (value.shape != (3, 18, 18) or value.dtype.kind not in 'iu' or np.any(value < 0)
+                or np.any(value.sum((1, 2)) != done * VOLUME)):
+            raise ValueError('invalid imported Waymo counts')
+    return intervals, counts
+
+
+def collect_shards(job, seed, shard_states, *, complete=False):
+    intervals, counts = seed
+    intervals = list(intervals)
+    counts = {name: value.astype(np.int64, copy=True) for name, value in counts.items()}
+    keys = job['serial']['keys']
+    ranges = [(start, end) for start, end, _ in job['shards']]
+    if gaps(intervals + ranges, len(keys)) or len(shard_states) != len(ranges):
+        raise ValueError('Waymo shards and imported windows must cover the population exactly once')
+    job_sha = fingerprint(job)
     for rank, (state, (start, end)) in enumerate(zip(shard_states, ranges)):
-        counts = read_counts(state, dict(job_sha256=job_sha, rank=rank), keys[start:end], complete=True, volume=volume)
+        if state is None and not complete:
+            continue
+        if state is None:
+            raise ValueError(f'missing state for shard {rank}')
+        shard_counts = read_counts(state, dict(job_sha256=job_sha, rank=rank), keys[start:end], complete=complete)
+        done = len(state['keys'])
+        if done:
+            intervals.append((start, start + done))
         for name in ROUTES:
-            total[name] += counts[name]
-    return total
+            counts[name] += shard_counts[name]
+    return intervals, counts
+
+
+def import_source(original):
+    contract = read(original / 'contract.json')
+    if 'serial' not in contract:
+        state = read(original / 'state.json')
+        counts = read_counts(state, contract, contract['keys'])
+        done = len(state['keys'])
+        return contract, (([(0, done)] if done else []), counts)
+    with ExitStack() as stack:
+        states = []
+        for rank, _ in enumerate(contract['shards']):
+            shard = original / f'shard_{rank}'
+            if shard.is_dir():
+                stack.enter_context(evaluation_lock(shard))
+            path = shard / 'state.json'
+            states.append(read(path) if path.exists() else None)
+        seed = collect_shards(contract, read_seed(original, contract), states)
+    return contract['serial'], seed
 
 
 def make_inputs(serial, waymo_root):
@@ -124,31 +199,33 @@ def worker(out, rank, stop):
 
 
 def prepare_job(args, out, original):
-    serial, state = read(original / 'contract.json'), read(original / 'state.json')
+    if args.resume:
+        job = read(out / 'contract.json')
+        if job.get('source_dir', str(original)) != str(original):
+            raise ValueError('resume with the same continuation source')
+        check_original(job['serial'], Path(job['config']), Path(job['checkpoint']))
+        return job, read_seed(out, job)
+    serial, seed = import_source(original)
     checkpoint, config = args.checkpoint.resolve(), args.config.resolve()
     check_original(serial, config, checkpoint)
-    read_counts(state, serial, serial['keys'])
     waymo_root = args.waymo_root.resolve()
     source = make_inputs(serial, waymo_root)
     if source.preflight(source.windows) != serial['population']['inventory']:
         raise ValueError('Waymo files changed since the serial run')
-    ranges = partition(len(state['keys']), len(serial['keys']))
+    intervals, counts = seed
+    ranges = split_ranges(gaps(intervals, len(serial['keys'])), args.processes)
     shards = [[start, end, source.preflight(source.windows[start:end])] for start, end in ranges]
-    job = dict(serial=serial, checkpoint=str(checkpoint), config=str(config), waymo_root=str(waymo_root),
-               cpu_workers=args.cpu_workers,
-               prefix_sha256=file_sha256(original / 'state.json'), shards=shards,
+    snapshot = out / 'imported.json'
+    write_json(snapshot, dict(intervals=sorted(intervals), counts={name: v.tolist() for name, v in counts.items()}))
+    job = dict(protocol=PARALLEL_PROTOCOL, serial=serial, source_dir=str(original), checkpoint=str(checkpoint),
+               config=str(config), waymo_root=str(waymo_root), cpu_workers=args.cpu_workers,
+               imported_sha256=file_sha256(snapshot), shards=shards,
                coordinator_sha256=file_sha256(Path(__file__)))
-    if args.resume:
-        if (read(out / 'contract.json') != job
-                or read(out / 'serial_prefix.json') != state):
-            raise ValueError('parallel resume inputs, original prefix, or shard configuration changed')
-    else:
-        write_json(out / 'serial_prefix.json', state)
-        write_json(out / 'contract.json', job)
-    return job, state, ranges
+    write_json(out / 'contract.json', job)
+    return job, seed
 
 
-def run_shards(out, job, prefix_windows, processes, stop):
+def run_shards(out, job, imported_windows, processes, stop):
     active = {}
     files = [out / f'shard_{rank}' / 'state.json' for rank in range(len(job['shards']))]
     keys, job_sha = job['serial']['keys'], fingerprint(job)
@@ -180,8 +257,8 @@ def run_shards(out, job, prefix_windows, processes, stop):
                 print(f'WAYMO10_WORKER {rank} pid={active[rank].pid}', flush=True)
             now = time.monotonic()
             if now - last >= 30:
-                done = prefix_windows + sum(len(read(path)['keys']) for path in files if path.exists())
-                print(f'WAYMO10_PARALLEL {done}/{len(keys)} saved; imported={prefix_windows}', flush=True)
+                done = imported_windows + sum(len(read(path)['keys']) for path in files if path.exists())
+                print(f'WAYMO10_PARALLEL {done}/{len(keys)} saved; imported={imported_windows}', flush=True)
                 last = now
             if active:
                 stop.wait(1)
@@ -201,10 +278,10 @@ def main(argv=None, stop=None):
     parser.add_argument('--checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
     parser.add_argument('--waymo-root', type=Path, default=ROOT / 'data/waymo')
-    parser.add_argument('--processes', type=int, choices=range(1, 5), default=4)
+    parser.add_argument('--processes', type=int, choices=range(1, MAX_SHARDS+1), default=4)
     parser.add_argument('--cpu-workers', type=int, choices=range(1, 5), default=1)
     parser.add_argument('--resume', action='store_true')
-    parser.add_argument('--worker', type=int, choices=range(4), help=argparse.SUPPRESS)
+    parser.add_argument('--worker', type=int, choices=range(MAX_SHARDS), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.worker is None and args.continue_from is None:
         parser.error('--continue-from is required')
@@ -223,16 +300,17 @@ def main(argv=None, stop=None):
     with evaluation_lock(original):
         out.mkdir(parents=True, exist_ok=args.resume)
         with evaluation_lock(out):
-            job, state, ranges = prepare_job(args, out, original)
-            shards = run_shards(out, job, len(state['keys']), args.processes, stop)
+            job, seed = prepare_job(args, out, original)
+            imported = sum(end - start for start, end in seed[0])
+            shards = run_shards(out, job, imported, args.processes, stop)
             if shards is None:
                 return 130
             serial = job['serial']
-            counts = merge_counts(state, serial, shards, ranges, fingerprint(job))
+            _, counts = collect_shards(job, seed, shards, complete=True)
             windows = len(serial['keys'])
             result = dict(status='complete', task='waymo10', windows=windows, source_sha256=SOURCE_SHA256,
-                          population=serial['population'], imported_windows=len(state['keys']),
-                          new_windows=windows-len(state['keys']), source_update=10292, scientific_updates=0,
+                          population=serial['population'], imported_windows=imported,
+                          new_windows=windows-imported, source_update=10292, scientific_updates=0,
                           reports=format_10hz_reports({n: WaymoMetrics(v, windows).report() for n, v in counts.items()}))
             write_json(out / 'evaluation.json', result)
             write_json(out / 'counts.json', {n: v.tolist() for n, v in counts.items()})
