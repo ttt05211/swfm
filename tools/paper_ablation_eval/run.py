@@ -1,4 +1,4 @@
-"""Score one frozen row on OCC and STC using complete-window integer counts."""
+"""Score one frozen row on OCC using complete-window integer counts."""
 import argparse
 from dataclasses import replace
 import json
@@ -24,7 +24,12 @@ from tools.shared_history_experiments.refine.geometry import TransportPrior
 from tools.shared_source_track.adapter import backgrounds
 from .population import PreparedInputs, select_jobs
 
-PROTOCOL = 'paper_ablation_VAL4369_eval_v1'
+PROTOCOL = 'paper_ablation_OCC_VAL4369_eval_v2'
+# The original worker used the same OCC predictions and integer counts.
+LEGACY_OCC_CODE = {
+    'tools/paper_ablation_eval/run.py': '738d683db63cfefa542e304a51e81698153566ab0d0ab990efa8b78532d32bab',
+    'tools/paper_ablation_eval/population.py': 'c86015f5f7dc4f4b414e240ba48e0aa16d564c36d6a37acf65153db8614a2798',
+}
 GEOMETRY = ('a_static', 'b_kta')
 HORIZONS = (1., 2., 3.)
 INDICES = (1, 3, 5)
@@ -95,7 +100,12 @@ def read_counts(path, contract, windows, voxels):
     saved = json.loads(path.read_text(encoding='utf-8'))
     count = saved['completed_windows']
     confusion = np.asarray(saved['confusion'])
-    if (saved['contract'] != contract or type(count) is not int or not 0 <= count <= windows
+    accepted = saved['contract'] == contract
+    if not accepted and contract.get('protocol') == PROTOCOL and contract.get('input') == 'occ':
+        legacy = dict(contract, protocol='paper_ablation_VAL4369_eval_v1',
+                      implementation={**contract['implementation'], **LEGACY_OCC_CODE})
+        accepted = saved['contract'] == legacy
+    if (not accepted or type(count) is not int or not 0 <= count <= windows
             or confusion.shape != (3, 18, 18) or confusion.dtype.kind not in 'iu'
             or np.any(confusion < 0) or np.any(confusion.sum((1, 2)) != count * voxels)):
         raise ValueError(f'Invalid or incompatible evaluation state: {path}')
@@ -103,9 +113,11 @@ def read_counts(path, contract, windows, voxels):
 
 
 @torch.no_grad()
-def evaluate(arm, predictor, inputs, jobs, kind, path, contract, stop):
+def evaluate(arm, predictor, inputs, jobs, path, contract, stop):
     voxels = int(np.prod(predictor.provider.pcfg.grid.shape_hwd))
     count, confusion = read_counts(path, contract, len(jobs), voxels)
+    if count:
+        print(f'ABLATION_EVAL {arm} occ {count}/{len(jobs)}', flush=True)
 
     def save():
         base.write_json(path, dict(contract=contract, completed_windows=count, confusion=confusion.tolist()))
@@ -114,7 +126,7 @@ def evaluate(arm, predictor, inputs, jobs, kind, path, contract, stop):
         for job in jobs[count:]:
             if stop.is_set():
                 raise InterruptedError('Stopping at a complete evaluation window')
-            record, raw, times = inputs.history(job, kind)
+            record, raw, times = inputs.history(job)
             poses = inputs.future_poses(job, predicted=arm == 'pred_ego')
             prediction = predict(arm, predictor, record, raw, times, poses)
             targets = inputs.targets(job, INDICES)
@@ -127,7 +139,7 @@ def evaluate(arm, predictor, inputs, jobs, kind, path, contract, stop):
             count += 1
             if count % 32 == 0 or count == len(jobs):
                 save()
-                print(f'ABLATION_EVAL {arm} {kind} {count}/{len(jobs)}', flush=True)
+                print(f'ABLATION_EVAL {arm} occ {count}/{len(jobs)}', flush=True)
     finally:
         save()
     return metrics.report(dict(confusion=confusion), HORIZONS, moving=False)
@@ -184,9 +196,8 @@ def main(argv=None):
         result = dict(contract=contract, status='running', reports={})
         try:
             print(f'ABLATION_EVAL_START {args.arm} GPU={contract["gpu"]} windows={len(jobs)}/4369', flush=True)
-            for kind in ('occ', 'stc'):
-                result['reports'][kind] = evaluate(args.arm, predictor, inputs, jobs, kind,
-                                                  out/f'{kind}_state.json', dict(contract, input=kind), stop)
+            result['reports']['occ'] = evaluate(args.arm, predictor, inputs, jobs, out/'occ_state.json',
+                                               dict(contract, input='occ'), stop)
             if args.checkpoint and base.sha256(args.checkpoint) != checkpoint_sha:
                 raise RuntimeError('Evaluation checkpoint changed during the run')
             result['status'] = 'complete'

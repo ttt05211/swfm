@@ -18,5 +18,4 @@ exec "$PY" -u -m tools.paper_ablation_eval.workflow \
   --config "$ROOT/configs/real_motion_occfm.yaml" --dataroot "$DATA" \
   --dev-info "$DATA/nuscenes_infos_val_temporal_v3_scene.pkl" \
   --dev-cache "${DEV_CACHE:-$ROOT/data/p0_f9_v18_se2_val_all_4369.pt}" \
-  --stc-root "${STC_ROOT:-$ROOT/data/stc_camera/compact}" \
   --plan-cache "${PLAN_CACHE:-/root/nas/occ/new_code/cache/come_main_table/camera_pred}" "$@"

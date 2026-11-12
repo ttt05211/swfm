@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from tools.paper_ablation_eval import run, workflow
-from tools.paper_ablation_eval.population import select_jobs
+from tools.paper_ablation_eval import report, run, workflow
+from tools.paper_ablation_eval.population import select_jobs, validate_resume
 from tools.paper_ablation_train import control, model
 from tools.paper_ablation_train.geometry import forward_window
 from test_paper_ablation_train import tiny
@@ -100,8 +100,8 @@ def test_integer_counts_resume_and_pred_pose_routing(tmp_path, monkeypatch):
     poses = np.arange(6*4*4).reshape(6, 4, 4)
 
     class Inputs:
-        def history(self, job, kind):
-            order.append(('history', job, kind))
+        def history(self, job):
+            order.append(('history', job))
             return job, {}, np.arange(4)
 
         def future_poses(self, job, predicted):
@@ -124,15 +124,63 @@ def test_integer_counts_resume_and_pred_pose_routing(tmp_path, monkeypatch):
     predictor = SimpleNamespace(provider=SimpleNamespace(pcfg=SimpleNamespace(
         grid=SimpleNamespace(shape_hwd=labels.shape))))
     path = tmp_path/'occ_state.json'
-    contract = dict(arm='pred_ego', input='occ')
+    contract = dict(arm='pred_ego', input='occ', protocol=run.PROTOCOL,
+                    implementation={**dict.fromkeys(run.LEGACY_OCC_CODE, 'new'), 'metrics.py': 'same'})
     jobs = ['first', 'second']
     with pytest.raises(InterruptedError):
-        run.evaluate('pred_ego', predictor, Inputs(), jobs, 'occ', path, contract, stop)
-    assert json.loads(path.read_text())['completed_windows'] == 1
-    stop.clear()
-    result = run.evaluate('pred_ego', predictor, Inputs(), jobs, 'occ', path, contract, stop)
-    assert result['average'] == dict(mIoU=100., IoU=100.)
-    assert order == [('history', 'first', 'occ'), ('prediction', 'first'),
-                     ('history', 'second', 'occ'), ('prediction', 'second')]
+        run.evaluate('pred_ego', predictor, Inputs(), jobs, path, contract, stop)
+    state = json.loads(path.read_text())
+    assert state['completed_windows'] == 1
+    state['contract'] = dict(contract, protocol='paper_ablation_VAL4369_eval_v1',
+                             implementation={**contract['implementation'], **run.LEGACY_OCC_CODE})
+    path.write_text(json.dumps(state))
     with pytest.raises(ValueError, match='incompatible'):
         run.read_counts(path, dict(contract, input='stc'), 2, 2)
+    stop.clear()
+    result = run.evaluate('pred_ego', predictor, Inputs(), jobs, path, contract, stop)
+    assert result['average'] == dict(mIoU=100., IoU=100.)
+    assert order == [('history', 'first'), ('prediction', 'first'),
+                     ('history', 'second'), ('prediction', 'second')]
+    assert json.loads(path.read_text())['contract'] == contract
+
+
+def test_resume_ignores_old_stc_inventory(tmp_path):
+    args = SimpleNamespace(dataroot=tmp_path, plan_cache=tmp_path, config=tmp_path/'config',
+                           dev_info=tmp_path/'info', dev_cache=tmp_path/'cache')
+    files = {}
+    for name in ('config', 'dev_info', 'dev_cache'):
+        path = getattr(args, name)
+        path.write_bytes(b'metadata')
+        files[name] = run.base.sha256(path)
+    manifest = args.plan_cache/'manifest.json'
+    manifest.write_text('{}')
+    history = ['a', 'b', 'c', 't0']
+    future = list('123456')
+    inventory = {str(tmp_path/'missing_stc'/'labels.npz'): [1, 1]}
+    for token in history + future:
+        path = tmp_path/'gts'/'scene'/token/'labels.npz'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'x')
+        stat = path.stat()
+        inventory[str(path)] = [stat.st_size, stat.st_mtime_ns]
+    population = dict(dataroot=str(tmp_path), files=files, poses={}, times={}, predicted={},
+                      jobs=[['scene', history, 't0', future]], inventory=inventory,
+                      planner=dict(root=str(tmp_path), manifest_sha256=run.base.sha256(manifest)))
+    validate_resume(args, population)
+    path.write_bytes(b'changed OCC file')
+    with pytest.raises(RuntimeError, match='label file changed'):
+        validate_resume(args, population)
+
+
+def test_report_reads_finished_occ_counts_without_worker_summary(tmp_path):
+    path = tmp_path/'occ_state.json'
+    confusion = np.zeros((3, 18, 18), dtype=np.int64)
+    confusion[:, 0, 0] = 2 * int(np.prod(report.SHAPE))
+    contract = dict(arm='pred_ego', input='occ', population_sha256='population', windows=2)
+    state = dict(contract=contract, completed_windows=2, confusion=confusion.tolist())
+    path.write_text(json.dumps(state))
+    assert report.read_row(path, 'pred_ego', 'population', 2) == (2, 100., 100.)
+    state['completed_windows'] = 1
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match='only 1/2 OCC windows'):
+        report.read_row(path, 'pred_ego', 'population', 2)

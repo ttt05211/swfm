@@ -63,7 +63,7 @@ def launch_all(args, gpus, out, checkpoints, stop):
 
 
 def summarize(out, codes):
-    rows = ['arm                 windows  OCC mIoU / IoU    STC mIoU / IoU']
+    rows = ['arm                 windows  OCC mIoU / IoU']
     for arm in TABLE_ORDER:
         if codes.get(arm) != 0:
             rows.append(f'{arm:19s} pending or failed; see {arm}.log')
@@ -72,9 +72,8 @@ def summarize(out, codes):
         if value['status'] != 'complete' or value['contract']['arm'] != arm:
             raise RuntimeError(f'{arm}: worker exited without a complete result')
         occ = value['reports']['occ']['average']
-        stc = value['reports']['stc']['average']
         rows.append(f'{arm:19s} {value["contract"]["windows"]:7d}  '
-                    f'{occ["mIoU"]:7.3f} / {occ["IoU"]:6.3f}  {stc["mIoU"]:7.3f} / {stc["IoU"]:6.3f}')
+                    f'{occ["mIoU"]:7.3f} / {occ["IoU"]:6.3f}')
     summary = '\n'.join(rows)+'\n'
     (out/'summary.txt').write_text(summary, encoding='utf-8')
     print(summary, end='', flush=True)
@@ -83,7 +82,7 @@ def summarize(out, codes):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('out-dir', 'train-dir', 'epoch2', 'config', 'dataroot', 'dev-info',
-                 'dev-cache', 'stc-root', 'plan-cache'):
+                 'dev-cache', 'plan-cache'):
         parser.add_argument('--'+name, required=True, type=Path)
     parser.add_argument('--gpus', default='0,1')
     parser.add_argument('--cpu-workers', type=int, default=2)
@@ -109,7 +108,7 @@ def main(argv=None):
     from real_motion.native_column_cpu import prepare_native
     from tools.joint_occ_experiments.run import write_json
     from tools.real_motion.eval_p0_f9_joint_checkpoints import evaluation_lock
-    from .population import prepare
+    from .population import prepare, validate_resume
 
     if torch.cuda.device_count() != 2:
         raise RuntimeError('The coordinator requires exactly the two selected GPUs to be visible')
@@ -121,12 +120,12 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     with evaluation_lock(out):
         print(f'ABLATION_PREPARE shared VAL4369 metadata, output={out}', flush=True)
-        population = prepare(args, epoch2)
         path = out/'population.json'
         if path.exists():
-            if json.loads(path.read_text(encoding='utf-8')) != population:
-                raise RuntimeError('Evaluation population, poses or inputs changed; use a separate output directory')
+            population = json.loads(path.read_text(encoding='utf-8'))
+            validate_resume(args, population)
         else:
+            population = prepare(args, epoch2)
             write_json(path, population)
         print(f'ABLATION_POPULATION GT=4369 Pred={len(population["predicted"])}/4369', flush=True)
         if stop.is_set():

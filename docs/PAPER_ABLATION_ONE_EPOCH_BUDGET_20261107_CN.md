@@ -1,6 +1,6 @@
 # 用户确定的消融预算：全量一轮＋20%一轮，只报mIoU/IoU
 
-2026-11-12评估安排。E、M2和表三的FPN＋AdaLN-Zero＋GT共用正式两轮模型的原版VAL4369结果，OCC mIoU/IoU为48.711339/62.809965，STC为18.721545/28.446166。表三FPN＋Query加法＋GT复用已有全集结果。待评共八行，表一A/B/C/D，表二M0/M1，表三池化金字塔和完整模型Pred轨迹。
+2026-11-12评估安排。三张消融表只评OCC。E、M2和表三的FPN＋AdaLN-Zero＋GT共用正式两轮模型的原版VAL4369结果，mIoU/IoU为48.711339/62.809965。表三FPN＋Query加法＋GT复用已有OCC全集结果。待评共八行，表一A/B/C/D，表二M0/M1，表三池化金字塔和完整模型Pred轨迹。
 
 2026-11-07执行更新：五组训练代码已在 `tools/paper_ablation_train` 独立实现，运行/恢复说明见 `PAPER_ABLATION_TRAIN_ONLY_20261107_CN.md`。本次只实现并测试训练入口，未启动数据集实验；所有评估保持关闭。下面的表格仍是后续完整实验计划，不表示已实现或运行评估。
 
@@ -12,9 +12,8 @@
 
 - 输入四帧历史，预测六帧，完整六帧CE＋Lovasz；同global B4/source128、ordered keys/seed/初始化和原AdamW/LR设置。
 - 当前forward关联/FPN/2+2 AdaLN-Zero/pure-history Memory/U-Net/no ICP为完整E；除指定消融项外保持当前版本。
-- 训练用原GT TRAIN；STC用于评估，不进行STC监督训练或新的标签校准。
-- 新评估和E使用原版读出，全部使用dense-valid。复用的FPN＋Query全集结果沿用原报告设置，STC使用0.5秒Memory半衰期。
-- 本轮GT轨迹配置统一评VAL4369，分别报告OCC历史和STC历史的mIoU、IoU，主数字为1/2/3s平均。S3使用同一条Pred future ego贯穿Decoder和全部未来几何，在预测覆盖窗口上和GT轨迹配对评分。
+- 训练用原GT TRAIN。评估使用OCC历史和dense-valid原版读出。
+- 本轮GT轨迹配置统一评VAL4369，报告1/2/3s平均mIoU、IoU。Pred使用同一条预测轨迹贯穿Decoder和全部未来几何，评估预测覆盖窗口。
 - 消融不报告或计算MovingMicro/MovingMacro，不读Moving支持标注；不附加参数/FPS实验。
 - 所有新训练组从随机初始化开始，公共新鲜模块/RNG匹配；不从原完整E训练权重微调成删模块模型。
 - 新完整训练只跑一轮，不再默认加到两轮；只保存恢复last和固定末轮权重/必要合同及整数confusion，不保存稠密中间张量缓存。
@@ -56,7 +55,7 @@ M1只改变动态Memory的source位移/旋转对齐；静态Memory、importance/
 | FPN | AdaLN-Zero | GT | TRAIN100%×2 | 共用E、M2的原版全集结果 |
 | FPN | AdaLN-Zero | Pred | 同E权重 | 用已有预测轨迹推理，评估完整VAL的预测覆盖窗口 |
 
-FPN＋Query来源为 `fpn_unet_full_2ep_20261021_112202/epoch_0002.pt`，沿用原评估报告，OCC为48.513241/62.593428，STC为18.738317/28.512420（mIoU/IoU，STC含0.5秒Memory衰减）。评估设置见 `FPN_UNET_ALL4369_20261023_CN.md`。第三表逐行保留训练预算和报告来源。
+FPN＋Query来源为 `fpn_unet_full_2ep_20261021_112202/epoch_0002.pt`，沿用原评估报告，OCC mIoU/IoU为48.513241/62.593428。评估设置见 `FPN_UNET_ALL4369_20261023_CN.md`。第三表逐行保留训练预算和报告来源。
 
 第四行使用E的 `epoch_0002.pt`，Decoder和全部未来几何使用同一条外部planner预测轨迹。以VAL4369为输入清单，按实际预测覆盖报告分数。既有planner缓存曾覆盖4219窗，比较GT与Pred时取同一批窗口。
 
@@ -78,10 +77,11 @@ FPN＋Query来源为 `fpn_unet_full_2ep_20261021_112202/epoch_0002.pt`，沿用�
 ## 论文与运行记录边界
 
 - 每行标训练数据量和轮数。C/D为全量一轮，M0/M1和池化为TRAIN20%一轮，完整E为全量两轮。涉及不同训练预算的分差同时反映配置与训练预算差异。
-- 三表只显示OCC和STC各自的mIoU/IoU，不报告Moving。需要1/2/3s明细时放JSON，主表固定平均。
+- 三表只显示OCC的mIoU/IoU。1/2/3s明细在JSON，主表固定平均。
+
 ## 两卡并行评估
 
-`tools/paper_ablation_eval/run.sh` 先准备一次VAL窗口和位姿清单，然后并发启动八个独立进程。第一张卡负责A、C、M1和池化，第二张卡负责B、D、M0和Pred。每个进程评自己的OCC和STC输入，保存各自的整数计数。
+`tools/paper_ablation_eval/run.sh` 先准备一次VAL窗口和位姿清单，然后并发启动八个独立进程。第一张卡负责A、C、M1和池化，第二张卡负责B、D、M0和Pred。每个进程评自己的OCC输入，保存各自的整数计数。此前已启动的任务可以在协调进程退出后用原目录恢复已有OCC计数。
 
 ```bash
 cd /root/nas/occ/swfm
@@ -94,3 +94,9 @@ tail -f "${ABLATION_EVAL_DIR}.log"
 ```
 
 看到 `ABLATION_WAVE_STARTED 8 processes / 4 per GPU` 后，进度见总目录内的各组 `.log`，分数汇总在 `summary.txt`。恢复时保留原 `ABLATION_EVAL_DIR` 和同一设置，重跑入口会从各组计数恢复。默认训练来源为 `ablation_five_dual_20261107_203511`，E和planner路径分别可用 `FORWARD_FULL_DIR`、`PLAN_CACHE` 指定。
+
+如果八组OCC已经累计到最后一窗，可直接从计数汇总三张表。
+
+```bash
+python -m tools.paper_ablation_eval.report "$ABLATION_EVAL_DIR" | tee "$ABLATION_EVAL_DIR/summary_occ.txt"
+```

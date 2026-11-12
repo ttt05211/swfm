@@ -39,9 +39,8 @@ def prepare(args, epoch2):
     if {key[0] for key in keys} & {key[0] for key in reference['train_keys']}:
         raise RuntimeError('TRAIN and VAL scenes overlap')
 
-    source = DenseInputs(args.dataroot, args.dev_info, stc_root=args.stc_root, cache_mib=0)
-    for kind in ('occ', 'stc'):
-        source.preflight(jobs, kind)
+    source = DenseInputs(args.dataroot, args.dev_info, cache_mib=0)
+    source.preflight(jobs, 'occ')
     tokens = sorted({token for job in jobs for token in job.history_tokens + job.future_tokens})
     poses = {token: np.asarray(source.source.pose(token)).tolist() for token in tokens}
     times = {token: source.source.nusc.get('sample', token)['timestamp'] / 1e6 for token in tokens}
@@ -54,11 +53,20 @@ def prepare(args, epoch2):
                           history_tokens=job.history_tokens, future_tokens=job.future_tokens)
             predicted[job.t0_token] = planner.poses(record, np.asarray(poses[job.t0_token])).tolist()
 
-    return dict(dataroot=str(Path(args.dataroot).resolve()), stc_root=str(Path(args.stc_root).resolve()),
-                files=files, overrides=reference.get('overrides'),
+    return dict(dataroot=str(Path(args.dataroot).resolve()), files=files, overrides=reference.get('overrides'),
                 jobs=[[job.scene_name, list(job.history_tokens), job.t0_token, list(job.future_tokens)] for job in jobs],
                 poses=poses, times=times, predicted=predicted, planner=planner.metadata,
                 inventory={path: list(stamp) for path, stamp in source.inventory.items()})
+
+
+def validate_resume(args, population):
+    files = {name: base.sha256(getattr(args, name)) for name in ('config', 'dev_info', 'dev_cache')}
+    if (population['files'] != files or population['dataroot'] != str(args.dataroot.resolve())
+            or population['planner']['root'] != str(args.plan_cache.resolve())
+            or population['planner']['manifest_sha256'] != base.sha256(args.plan_cache/'manifest.json')):
+        raise RuntimeError('Resume with the original VAL inputs and planner manifest')
+    # Revalidate the OCC inventory before adding any new windows to old counts.
+    PreparedInputs(population, cache_mib=0).preflight(select_jobs(population, False), 'occ')
 
 
 def select_jobs(population, predicted):
@@ -74,7 +82,6 @@ class PreparedInputs(DenseInputs):
 
     def __init__(self, population, cache_mib=128):
         self.source = SimpleNamespace(dataroot=population['dataroot'])
-        self.stc = Path(population['stc_root'])
         self.cache = OrderedDict()
         self.bytes = 0
         self.limit = cache_mib * 2**20
@@ -83,10 +90,10 @@ class PreparedInputs(DenseInputs):
         self.predicted = population['predicted']
         self.times = population['times']
 
-    def history(self, job, kind='occ'):
+    def history(self, job):
         record = dict(scene_name=job.scene_name, t0_token=job.t0_token,
                       history_tokens=job.history_tokens, future_tokens=job.future_tokens)
-        frames = [self.frame(kind, job.scene_name, token) for token in job.history_tokens]
+        frames = [self.frame('occ', job.scene_name, token) for token in job.history_tokens]
         raw = dict(history_occ=np.stack([frame[0] for frame in frames]),
                    history_observed=np.stack([frame[1] for frame in frames]),
                    history_poses=np.asarray([self.gt_poses[token] for token in job.history_tokens], dtype=np.float64))
