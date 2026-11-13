@@ -50,6 +50,67 @@ def compact_label(path):
     return compact(path)
 
 
+def iter_json_array(path, chunk=1 << 22):
+    """Stream objects of a top-level JSON array without loading the file (low RAM)."""
+    dec = json.JSONDecoder(); buf = ''; started = False
+    with open(path, 'r', encoding='utf-8') as f:
+        while True:
+            data = f.read(chunk); buf += data; pos = 0
+            while True:
+                while pos < len(buf) and buf[pos] in ' \t\r\n,': pos += 1
+                if not started and pos < len(buf):
+                    if buf[pos] != '[': raise ValueError('top-level JSON array expected: '+str(path))
+                    started = True; pos += 1; continue
+                if pos < len(buf) and buf[pos] == ']': return
+                try: obj, end = dec.raw_decode(buf, pos)
+                except json.JSONDecodeError:
+                    if not data: raise
+                    break
+                yield obj; pos = end
+            buf = buf[pos:]
+            if not data: return
+
+
+class LiteNusc:
+    """Minimal read-only nuScenes tables (scene, sample, LIDAR_TOP keyframe ego poses): ~100 MB RAM
+    instead of the multi-GB full devkit.  Same records/fields as NuScenes.get for these tables."""
+    def __init__(self, dataroot, version='v1.0-trainval'):
+        meta = Path(dataroot)/version; t = time.time()
+        self.scene = json.loads((meta/'scene.json').read_text())
+        self._scene = {r['token']: r for r in self.scene}
+        self._sample = {r['token']: r for r in json.loads((meta/'sample.json').read_text())}
+        lidar = {}
+        for r in iter_json_array(meta/'sample_data.json'):
+            if r.get('is_key_frame') and '/LIDAR_TOP/' in r['filename'] and r['sample_token'] in self._sample:
+                lidar[r['sample_token']] = dict(token=r['token'], ego_pose_token=r['ego_pose_token'])
+        need = {v['ego_pose_token'] for v in lidar.values()}
+        self._ego = {r['token']: r for r in iter_json_array(meta/'ego_pose.json') if r['token'] in need}
+        self._sd = {v['token']: v for v in lidar.values()}
+        for token, rec in self._sample.items():
+            if token in lidar: rec['data'] = dict(LIDAR_TOP=lidar[token]['token'])
+        if len(lidar) != len(self._sample) or len(self._ego) != len(need):
+            raise RuntimeError(f'incomplete LIDAR_TOP keyframes: samples={len(self._sample)} lidar={len(lidar)} ego={len(self._ego)}')
+        print(f'LITE_NUSCENES samples={len(self._sample)} scenes={len(self.scene)} {time.time()-t:.0f}s', flush=True)
+
+    def get(self, table, token):
+        return {'scene': self._scene, 'sample': self._sample, 'sample_data': self._sd, 'ego_pose': self._ego}[table][token]
+
+
+class LiteSource:
+    """NuScenesWindowSource subset used here: nusc, dataroot, pose(), allowed_scenes, info_by_token."""
+    def __init__(self, dataroot, info_pkl):
+        import pickle
+        self.dataroot = str(Path(dataroot).resolve()); self.nusc = LiteNusc(dataroot)
+        with open(info_pkl, 'rb') as f: infos = pickle.load(f)['infos']
+        self.allowed_scenes = set(infos.keys())
+        self.info_by_token = {rec['token']: dict(token=rec['token']) for frames in infos.values() for rec in frames}
+        del infos
+
+    def pose(self, token):
+        from real_motion.nuscenes_adapter import sample_ego_to_world
+        return sample_ego_to_world(self.nusc, token)
+
+
 def long_windows(nusc, records):
     """VAL cache windows extended to 12 contiguous futures inside the same scene."""
     from real_motion.nuscenes_adapter import WindowTokens
@@ -97,14 +158,21 @@ def main(argv=None):
         if sha256(path) != contract['data'][name]: raise SystemExit(f'{name} differs from the paper model contract: {path}')
     pcfg = make_prepare_config(load_runtime_config(a.config, contract.get('overrides')))
     t = time.time()
-    inputs = NuscInputs(a.dataroot, info)
-    reader = inputs.source; nusc = reader.nusc
-    _, records = load_cache(a.dev_cache)
-    print(f'NUSCENES_LOADED {time.time()-t:.0f}s val_records={len(records)}', flush=True)
-    if a.population == 'long6':
-        jobs, _ = nusc_jobs(inputs, records, contract['eval_keys'], 'all', 'long6', genie_info=a.geniedrive_info)
+    if a.moving:  # GT Moving needs boxes -> full devkit (several GB RAM; not for a 4 GB box)
+        inputs = NuscInputs(a.dataroot, info); reader = inputs.source
     else:
-        jobs = long_windows(nusc, records)
+        inputs = None; reader = LiteSource(a.dataroot, info)
+    nusc = reader.nusc
+    print(f'NUSCENES_LOADED {time.time()-t:.0f}s lite={not a.moving}', flush=True)
+    if a.population == 'long6':
+        from tools.real_motion import geniedrive_eval_alignment as genie, joint_long_rollout_common as rollout
+        pairs, _ = genie.select_population(a.geniedrive_info, reader, [])  # no cache needed: tokens from official info
+        jobs = [w for w, _ in pairs]
+        for w in jobs: rollout.validate_timestamps(nusc, w)
+    else:
+        _, records = load_cache(a.dev_cache)
+        if len(records) != 4369: raise SystemExit('VAL4369 cache required')
+        jobs = long_windows(nusc, records); del records
     train_scenes = {str(k[0]) for k in contract.get('train_keys', [])}
     if {w.scene_name for w in jobs} & train_scenes: raise SystemExit('TRAIN/VAL scene overlap')
     by = {(w.scene_name, w.t0_token): w for w in jobs}
