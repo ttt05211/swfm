@@ -275,3 +275,116 @@ def test_same64_evaluation_label_order_integer_counts_and_resume(tmp_path, monke
     assert result['delta']['occ']['semantic_refine']['mIoU'] == 100
     assert result['reports']['candidate/stc']['semantic_refine']['average']['IoU'] == 100
     assert len(list((out/'visuals').glob('*.npz'))) == 32
+
+
+def _dual_rank(rank, directory):
+    """Actual Gloo reduction + projection gradients + ragged ranks + Adam/RNG."""
+    import copy
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from tools.coverage_projection import run
+    from tools.real_motion.joint_training_distributed import DistributedTraining
+    from tools.real_motion.joint_training_recovery import save_resume_checkpoint
+    torch.set_num_threads(1)
+    os.environ.update(WORLD_SIZE='2', RANK=str(rank), LOCAL_RANK=str(rank))
+    ctx = DistributedTraining(True, backend='gloo', init_method=Path(directory, 'rendezvous').resolve().as_uri())
+    try:
+        with patch.dict(os.environ, WORLD_SIZE='1'): single = DistributedTraining(False)
+        class Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__(); self.common = torch.nn.Linear(2, 18)
+                self.rare = torch.nn.Linear(2, 18); self.unused = torch.nn.Linear(2, 1)
+        def forward(net, provider, row, **kwargs):
+            value = net.common(row['x'])
+            if row['id'] % 2: value = value+net.rare(row['x'])
+            bias = value.new_zeros(18, 8); bias[11] = .2
+            return dict(logits=torch.stack([value.T+h*bias for h in range(6)]))
+        torch.manual_seed(21); net = Tiny(); reference = copy.deepcopy(net)
+        untouched = copy.deepcopy(net.unused.state_dict())
+        def adam(net): return torch.optim.AdamW([dict(params=net.parameters(), lr=.001, initial_lr=.001)])
+        opt, ref_opt = adam(net), adam(reference)
+        records = [dict(scene_name='test', t0_token=str(i), id=i, features=[None]*n)
+            for i, n in enumerate((50, 5, 20, 1))]
+        all_groups = [records, records[:3], records[:1], records]
+        local, slots = run.local_plan(all_groups, 2, rank)
+        provider = SimpleNamespace(provider=SimpleNamespace(device=torch.device('cpu')))
+        renderer = VolumeProjection((0, 0, 0), (.4, .4, .4), (2, 2, 2), side=4)
+        def rows(group):
+            result = []
+            for r in group:
+                x = torch.tensor([[r['id']*.1+.1, j*.03] for j in range(8)])
+                gt = np.array([[0, 4, 17, 11, 17, 17, 17, 17]]*6).reshape(6, 2, 2, 2)
+                result.append((dict(r, x=x), None, gt))
+            return result
+        calls = []
+        class Spy:
+            def loss(self, logits, labels):
+                calls.append(logits.storage_offset()//(18*8))
+                return renderer.loss(logits, labels)
+        with patch.object(run, 'forward_window', forward):
+            for update in range(1, 4):
+                i = update-1; expected = run.train_step(reference, ref_opt, provider, rows(all_groups[i]),
+                    renderer, update=update, total=4, context=single)
+                calls.clear()
+                actual = run.train_step(net, opt, provider, rows(local[i]), Spy(), update=update, total=4,
+                    context=ctx, global_windows=len(all_groups[i]), window_slots=slots[i])
+                assert calls == [(4*i+s)%6 for s in slots[i]]
+                all_slots = ctx.gather(slots[i]); assert sorted(s for shard in all_slots for s in shard) == list(range(len(all_groups[i])))
+                for name in ('CE', 'Lovasz', 'projection_semantic', 'projection_depth', 'loss'):
+                    assert actual[name] == pytest.approx(expected[name], abs=2e-6)
+                for name, value in net.state_dict().items():
+                    torch.testing.assert_close(value, reference.state_dict()[name], rtol=1e-5, atol=2e-7)
+                for key, state in ref_opt.state_dict()['state'].items():
+                    for name, value in state.items():
+                        torch.testing.assert_close(opt.state_dict()['state'][key][name], value, rtol=1e-5, atol=2e-7)
+            for name, value in net.unused.state_dict().items():
+                torch.testing.assert_close(value, untouched[name], rtol=0, atol=0)
+            rng = np.random.default_rng(21+rank); torch.manual_seed(21+rank)
+            states = ctx.gather(ctx.rng_state(rng)); expect_np, expect_torch = rng.random(3), torch.rand(3)
+            ctx.restore_rng(states, rng)
+            np.testing.assert_array_equal(rng.random(3), expect_np)
+            torch.testing.assert_close(torch.rand(3), expect_torch, rtol=0, atol=0)
+            if ctx.primary:
+                save_resume_checkpoint(Path(directory)/'last.pt', dict(protocol=PROTOCOL, contract=dict(world_size=2),
+                    updates=3, models={'gt': net.state_dict()}, optimizer=opt.state_dict(), rank_rng=states))
+            ctx.barrier()
+            saved = torch.load(Path(directory)/'last.pt', map_location='cpu', weights_only=False)
+            assert run.validate_cursor(saved, dict(world_size=2)) == 3
+            restored = Tiny(); restored.load_state_dict(saved['models']['gt']); restored_opt = adam(restored)
+            restored_opt.load_state_dict(saved['optimizer']); ctx.restore_rng(saved['rank_rng'], rng)
+            for model_, optimizer_ in ((net, opt), (restored, restored_opt)):
+                run.train_step(model_, optimizer_, provider, rows(local[3]), renderer, update=4, total=4,
+                    context=ctx, global_windows=4, window_slots=slots[3])
+            for name, value in net.state_dict().items():
+                torch.testing.assert_close(value, restored.state_dict()[name], rtol=0, atol=0)
+        assert ctx.stop(rank == 1)
+        Path(directory, f'rank{rank}.json').write_text(json.dumps(dict(ok=True, windows=list(map(len, local)))))
+    finally: ctx.close()
+
+
+def test_actual_dual_rank_projection_mean_ragged_and_resume(tmp_path):
+    import time
+    import torch.multiprocessing as mp
+    workers = mp.spawn(_dual_rank, args=(str(tmp_path),), nprocs=2, join=False)
+    deadline = time.monotonic()+90
+    try:
+        while not workers.join(timeout=1):
+            if time.monotonic() > deadline: raise AssertionError('dual projection collective timeout')
+    finally:
+        for child in workers.processes:
+            if child.is_alive(): child.terminate(); child.join(timeout=5)
+    values = [json.loads((tmp_path/f'rank{rank}.json').read_text()) for rank in (0, 1)]
+    assert all(v['ok'] for v in values)
+    assert sorted(v['windows'][2] for v in values) == [0, 1]
+
+
+def test_dual_workflow_and_world_size_resume_guard():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root/'tools/coverage_projection/workflow.sh').read_text()
+    assert '--nproc_per_node=2' in workflow and 'PILOT_GPUS:-0,1' in workflow
+    assert workflow.index('export CUDA_VISIBLE_DEVICES="$EVAL_GPU"') < workflow.index('tools.coverage_projection.evaluate')
+    c = dict(world_size=2)
+    saved = dict(protocol=PROTOCOL, contract=c, updates=64, rank_rng=[{}, {}])
+    assert validate_cursor(saved, c) == 64
+    with pytest.raises(ValueError): validate_cursor(dict(saved, rank_rng=[{}]), c)
