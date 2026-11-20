@@ -46,9 +46,24 @@ tail -f "${COVERAGE_DIR}.log"
 
 结果：`summary.txt`、`evaluation.json`、`visuals/index.html`、`visuals_and_metrics.zip`。训练进度：`progress.json` / `progress.jsonl`。完整实验没有在本机假装运行；本地仅有32个TRAIN窗口，不能替代4086窗。
 
+## 已训练模型的 STC 评估续跑修复
+
+用户真实运行已完成训练和 `control/occ 64/64`，随后在首个STC窗口报 `live t0 component count differs from source128 TRAIN grouping metadata`。原因是旧eval向共用prepare_row传了VAL缓存的GT `features`，错误要求STC组件数等于GT；该限制只服务TRAIN source128分组，不应约束任何评估输入。
+
+为保持已训练checkpoint的所有代码指纹，原 `run.py`、`evaluate.py` 和模型/渲染文件完全不改。新增 `eval_inputs.py` 仅传四项历史身份元数据，不传GT训练分组features；GT/STC均从各自四帧输入建立真实source。新 `evaluate_resume.py` 保持原模型、六帧推理、指标、source/data receipt与所有旧代码hash检查，仅替换评估输入准备。修复代码另存 `evaluation_execution_repair.json`，没有跳过hash或改写checkpoint。新workflow的评估阶段也调用此入口。
+
+对当前已经训完的任务，仅运行：
+
+```bash
+nohup bash tools/coverage_projection/eval_only.sh > coverage_eval_resume.log 2>&1 &
+tail -f coverage_eval_resume.log
+```
+
+保留当前正确 `COVERAGE_DIR`；若终端已重开且变量丢失，脚本自动寻找唯一“1031步训练完成、已有同64评估状态但未全部完成”的coverage目录，不按日期/分数选择，多解则要求明确路径。固定单卡，跳过原64个OCC整窗计数，从STC继续，并自动导图。此入口没有训练/Adam/权重写入，也不要求重新训练或重新评完OCC。
+
 ## 已完成的实现验证
 
-- 新增测试和原 FPN/AdaLN/前向关联/恢复回归共56项通过，包含同64评估在第3窗中断后恢复、256次成对前向无漏窗或重计、先预测后读取未来标签及整数混淆矩阵核验。真实双进程CPU/Gloo测试比较B4/B3/B1（含空rank）的CE/Lovasz/投影梯度均值和Adam结果，核对全局投影时距、双rank RNG保存、恢复后权重一致。另覆盖训练完成但评估状态running、源文件只读、部分checkpoint及错误结构/预算/学习率拒绝等12项控制组回归。
+- 新增测试和原 FPN/AdaLN/前向关联/恢复回归共60项通过，包含同64评估在第3窗中断后恢复、256次成对前向无漏窗或重计、先预测后读取未来标签及整数混淆矩阵核验。真实双进程CPU/Gloo测试比较B4/B3/B1（含空rank）的CE/Lovasz/投影梯度均值和Adam结果，核对全局投影时距、双rank RNG保存、恢复后权重一致。另覆盖训练完成但评估状态running、源文件只读、部分checkpoint及错误结构/预算/学习率拒绝等12项控制组回归。STC修复新增4项，使用真实prepare_row复现GT3/STC1数量差异、真实零source STC全路径前向、原评估OCC64后失败并续完其余192次前向，确认原OCC计数/图片/权重hash不变、训练guard仍保留、旧代码hash不匹配仍拒绝，以及唯一未完成目录选择。
 - CPU/CUDA 小网格真前向+全六帧 CE/Lovasz/投影反向，检查新增覆盖通道、FPN、Memory importance和source位移头梯度；实际Adam更新和CPU RNG断点续跑逐值一致。
 - 运行一个真实TRAIN窗 scene-0429 的完整200×200×16、六帧随机模型前向，并对原生网格投影损失反传；输出尺寸6×18×640000，投影梯度有限且非零，本机峰值分配1571.2MiB。仅配置来自最新模型，不导入训练权重。这是运行检查，不是质量结果或FPS。
 - 新Prior概率与旧Transport前向逐值一致；Memory CPU逐值一致。CUDA scatter_add 本身存在重复浮点差异，本轮新旧最大差4.47e-8、原版重复也4.47e-8，严格byte不一致如实保留，不声称byte parity。

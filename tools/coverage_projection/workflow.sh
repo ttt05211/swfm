@@ -24,7 +24,7 @@ if [[ "${COVERAGE_RESUME:-0}" == 1 ]]; then args+=(--resume); fi
   --module tools.coverage_projection.run "${args[@]}"
 # Training ranks have exited and released both GPUs. Quality still uses ONE.
 export CUDA_VISIBLE_DEVICES="$EVAL_GPU"
-"$PY" -u -m tools.coverage_projection.evaluate --out-dir "$OUT" --dataroot "$DATA" \
+"$PY" -u -m tools.coverage_projection.evaluate_resume --out-dir "$OUT" --dataroot "$DATA" \
   --dev-info "$DATA/nuscenes_infos_val_temporal_v3_scene.pkl" \
   --dev-cache "${DEV_CACHE:-$ROOT/data/p0_f9_v18_se2_val_all_4369.pt}" \
   --stc-root "${STC_ROOT:-$ROOT/data/stc_camera/compact}"
