@@ -8,7 +8,7 @@
 - 随机初始化，原先语义相同的参数与最新前向关联小实验逐值相同；不导入两轮/旧版/适配权重。
 - 复用原 TRAIN4086 个窗口、顺序、B4/source128 分组，共 1031 更新、一轮完整余弦，AdamW 和两组学习率 5e-4/3e-4 不变。
 - 按用户后续要求，默认两张卡训练；全局B4不变，通常每卡2窗，按source数平衡整窗分工。原控制来自单卡，明确记录此执行差异，不声称逐位等价。评估始终仅一张卡。
-- 控制默认目录：`outputs/p0_f9_shared_history/adaln_forward_single_free20_20261025_161644/C_train`。核验已完成、前向关联、AdaLN、4086×1、同64、2816122参数等契约。不能误用旧 shared-pinned 或完整两轮结果作同预算控制。
+- 控制默认目录：`outputs/p0_f9_shared_history/adaln_forward_single_free20_20261025_161644/C_train`。以 `epoch_0001.pt` 的 epoch=1/batch=0/updates=1031 以及前向关联、AdaLN、4086×1、同64、2816122参数等契约核验训练完成。不能误用旧 shared-pinned、部分训练或完整两轮结果作同预算控制。
 
 ## 三项联合变更
 
@@ -22,6 +22,7 @@
 
 - 直接从原始 TRAIN GT 读取四历史/六未来，在线重建前向关联、KTA、历史读取和 Strong；不依赖已清理的 TRAIN/VAL 几何缓存，也不新写 dense tensor/geometry 磁盘缓存。
 - `--train-cache` / `--dev-cache` 是保留的窗口元数据索引；只读用于原人口/分组核验，不使用其中的旧关联或未来运动监督。
+- 历史 C 训练已完成但随后的评估失败，recovery 明确另存报告、不改原 C_train。因此原 results.json 可能仍为 running；不再把其评估状态作为训练完成判据。先在CPU预检实际checkpoint，严格验证完成游标、协议、设置及报告/权重契约一致。保留原报告状态，不伪造其评估完成；本实验原版对照仍重新跑同64。错误时逐字段打印actual/expected，未完成checkpoint仍拒绝。该修复针对20261120_184807在0更新时被误拒绝的问题。
 - 输入标签缓存128MiB，最多一个后续批次的有界预取。仅 last / last.previous / epoch_0001 权重和小日志，不每步存模型。
 - 每64更新及 TERM/INT 后保存完整更新边界的 Adam、每个rank各自CPU/CUDA/Python/NumPy RNG和全局游标。全局均值梯度先SUM，再统一裁剪及Adam；较小批次允许空rank，无重复/填充样本。投影轮换使用原全局窗槽位，不因双卡拆分改变horizon。恢复固定同目录/双卡数；新v2协议不把旧单卡v1任务静默切为双卡。已完成训练时保留 frozen epoch 文件，评估按已存整窗计数继续。
 - 自动对同一 remaining64 分别新跑原版和候选的 OCC/STC；dense_valid、GT future ego、full-grid、1/2/3s平均。只报告 mIoU、IoU。关闭 FREE、age、STC去抖动/距离校准，不叠加以前的后处理。
@@ -47,7 +48,7 @@ tail -f "${COVERAGE_DIR}.log"
 
 ## 已完成的实现验证
 
-- 新增测试和原 FPN/AdaLN/前向关联/恢复回归共44项通过，包含同64评估在第3窗中断后恢复、256次成对前向无漏窗或重计、先预测后读取未来标签及整数混淆矩阵核验。新增真实双进程CPU/Gloo测试，比较B4/B3/B1（含空rank）的CE/Lovasz/投影梯度均值和Adam结果，核对全局投影时距、双rank RNG保存、恢复后权重一致。
+- 新增测试和原 FPN/AdaLN/前向关联/恢复回归共56项通过，包含同64评估在第3窗中断后恢复、256次成对前向无漏窗或重计、先预测后读取未来标签及整数混淆矩阵核验。真实双进程CPU/Gloo测试比较B4/B3/B1（含空rank）的CE/Lovasz/投影梯度均值和Adam结果，核对全局投影时距、双rank RNG保存、恢复后权重一致。另覆盖训练完成但评估状态running、源文件只读、部分checkpoint及错误结构/预算/学习率拒绝等12项控制组回归。
 - CPU/CUDA 小网格真前向+全六帧 CE/Lovasz/投影反向，检查新增覆盖通道、FPN、Memory importance和source位移头梯度；实际Adam更新和CPU RNG断点续跑逐值一致。
 - 运行一个真实TRAIN窗 scene-0429 的完整200×200×16、六帧随机模型前向，并对原生网格投影损失反传；输出尺寸6×18×640000，投影梯度有限且非零，本机峰值分配1571.2MiB。仅配置来自最新模型，不导入训练权重。这是运行检查，不是质量结果或FPS。
 - 新Prior概率与旧Transport前向逐值一致；Memory CPU逐值一致。CUDA scatter_add 本身存在重复浮点差异，本轮新旧最大差4.47e-8、原版重复也4.47e-8，严格byte不一致如实保留，不声称byte parity。

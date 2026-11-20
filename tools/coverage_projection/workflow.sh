@@ -18,6 +18,8 @@ args=(--control-dir "$CONTROL" --out-dir "$OUT" --dataroot "$DATA"
   --train-info "$DATA/nuscenes_infos_train_temporal_v3_scene.pkl"
   --train-cache "${TRAIN_CACHE:-$ROOT/data/p0_f9_v18_se2_train_full.pt}")
 if [[ "${COVERAGE_RESUME:-0}" == 1 ]]; then args+=(--resume); fi
+# Verify completion on CPU before launching either CUDA training process.
+"$PY" -u -m tools.coverage_projection.control --control-dir "$CONTROL"
 "$PY" -u -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=2 \
   --module tools.coverage_projection.run "${args[@]}"
 # Training ranks have exited and released both GPUs. Quality still uses ONE.

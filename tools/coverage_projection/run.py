@@ -27,9 +27,9 @@ from tools.paper_ablation_train.partition import partition, PARTITION
 from .model import make_model, from_spec
 from .adapter import forward_window
 from .projection import VolumeProjection, PROJECTION
+from .control import reference, CONTROL_PROTOCOL
 
 PROTOCOL = 'forward_coverage_projection_RANDOM_TRAIN4086x1_distributed_v2'
-CONTROL_PROTOCOL = 'AdaLN_forward_RANDOM_TRAIN4086x1_singleGPU_raw_FREEreadout_v2'
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -43,23 +43,6 @@ def sha(path):
 def write_json(path, value):
     path = Path(path); temp = path.with_suffix(path.suffix+'.tmp')
     temp.write_text(json.dumps(value, indent=2), encoding='utf-8'); temp.replace(path)
-
-
-def reference(folder):
-    folder = Path(folder).resolve()
-    result = json.loads((folder/'results.json').read_text(encoding='utf-8')); c = result['contract']
-    if (result.get('status') != 'complete' or c.get('protocol') != CONTROL_PROTOCOL
-            or result.get('epoch') != 1 or result.get('updates') != 1031
-            or c.get('epochs') != 1 or c.get('total_updates') != 1031
-            or c.get('source_policy') != 'causal_forward_CV_history' or c.get('registration') != 'none'
-            or c.get('known') != 'TRAIN_OCC_STC_dense_valid' or c.get('parameters') != 2816122
-            or len(c['train_keys']) != 4086 or len(c['eval_keys']) != 64
-            or c.get('seed') != 20261011 or c.get('learning_rates') != [5e-4, 3e-4]
-            or c.get('schedule') != 'whole_1_epoch_cosine_floor0.01'
-            or c.get('objective') != dict(CE=1., Lovasz=1., ego=0., motion=0., existence=0.)
-            or not (folder/'epoch_0001.pt').is_file()):
-        raise ValueError('completed latest FORWARD AdaLN TRAIN4086x1 control required; not old pinned/full2')
-    return result
 
 
 def make_plan(records, c):
@@ -163,6 +146,7 @@ def train(a, stop, ctx):
     device = ctx.device
     if device.type != 'cuda' or not torch.cuda.is_bf16_supported(): raise RuntimeError('BF16 CUDA GPU required')
     control = reference(a.control_dir); c = control['contract']
+    if ctx.primary: print('CONTROL_CHECKPOINT_VERIFIED '+json.dumps(control['source_checkpoint_completion']), flush=True)
     if len(set(map(tuple, c['train_keys']))) != 4086 or len(set(map(tuple, c['eval_keys']))) != 64:
         raise ValueError('duplicate population keys')
     data = dict(config=sha(a.config), train_cache=sha(a.train_cache), train_info=sha(a.train_info))
@@ -211,6 +195,7 @@ def train(a, stop, ctx):
         implementations[name] = sha(ROOT/name)
     contract = dict(protocol=PROTOCOL, model=model.configs(), control_dir=str(a.control_dir.resolve()),
         control_sha256=sha(a.control_dir/'epoch_0001.pt'), control_results_sha256=sha(a.control_dir/'results.json'),
+        control_training_evidence=control['source_checkpoint_completion'],
         train_keys=c['train_keys'], eval_keys=c['eval_keys'], total_updates=1031, epochs=1, seed=c['seed'],
         parameters=sum(p.numel() for p in model.parameters()), train_data=data, TRAIN_inventory=inventory,
         objective=dict(CE=1., Lovasz=1., projection=PROJECTION), learning_rates=c['learning_rates'],

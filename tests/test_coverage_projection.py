@@ -388,3 +388,64 @@ def test_dual_workflow_and_world_size_resume_guard():
     saved = dict(protocol=PROTOCOL, contract=c, updates=64, rank_rng=[{}, {}])
     assert validate_cursor(saved, c) == 64
     with pytest.raises(ValueError): validate_cursor(dict(saved, rank_rng=[{}]), c)
+
+
+def completed_control_fixture():
+    from tools.coverage_projection.control import CONTROL_PROTOCOL
+    c = dict(protocol=CONTROL_PROTOCOL, epochs=1, total_updates=1031,
+        source_policy='causal_forward_CV_history', registration='none',
+        known='TRAIN_OCC_STC_dense_valid', parameters=2816122, world_size=1,
+        seed=20261011, learning_rates=[5e-4, 3e-4], schedule='whole_1_epoch_cosine_floor0.01',
+        objective=dict(CE=1., Lovasz=1., ego=0., motion=0., existence=0.),
+        train_keys=[['train_scene', str(i)] for i in range(4086)],
+        eval_keys=[['val_scene', str(i)] for i in range(64)],
+        model=dict(source_policy='causal_forward_CV_history'))
+    saved = dict(protocol=CONTROL_PROTOCOL, contract=c, epoch=1, batch=0, updates=1031,
+        models={'gt': {'weight': torch.ones(2)}})
+    # This is the historical failure mode: train finished, eval crashed, a
+    # separate recovery report completed later; original report is read only.
+    result = dict(status='running', epoch=1, updates=1031, contract=c, evaluations={})
+    return saved, result
+
+
+def test_complete_control_checkpoint_accepts_stale_eval_status_read_only(tmp_path):
+    from tools.coverage_projection.control import reference, sha
+    saved, result = completed_control_fixture()
+    path = tmp_path/'epoch_0001.pt'; torch.save(saved, path)
+    report = tmp_path/'results.json'; report.write_text(json.dumps(result))
+    before = (sha(path), sha(report))
+    value = reference(tmp_path)
+    assert value['status'] == 'running' and value['evaluations'] == {}
+    proof = value['source_checkpoint_completion']
+    assert proof['training_complete'] and proof['updates'] == 1031
+    assert proof['original_report_status'] == 'running' and not proof['old_evaluation_reused']
+    assert proof['control_will_be_evaluated_fresh']
+    assert (sha(path), sha(report)) == before
+
+
+@pytest.mark.parametrize('name,value', [('updates', 1024), ('epoch', 0), ('batch', 4), ('protocol', 'old')])
+def test_partial_control_checkpoint_never_accepted_despite_complete_report(name, value):
+    from tools.coverage_projection.control import validate
+    saved, report = completed_control_fixture(); report = dict(report, status='complete')
+    with pytest.raises(ValueError, match='checkpoint.'+name): validate(dict(saved, **{name:value}), report)
+
+
+@pytest.mark.parametrize('name,value', [('source_policy','shared_pinned'), ('total_updates',10292),
+    ('world_size',2), ('parameters',1194146), ('learning_rates',[1e-5,1e-4]), ('epochs',2)])
+def test_control_wrong_architecture_budget_or_settings_are_still_rejected(name, value):
+    import copy
+    from tools.coverage_projection.control import validate
+    saved, report = copy.deepcopy(completed_control_fixture())
+    saved['contract'][name] = value  # saved/report share this same contract
+    with pytest.raises(ValueError, match='contract.'+name): validate(saved, report)
+
+
+def test_control_report_mismatch_and_missing_source_have_actionable_errors(tmp_path):
+    import copy
+    from tools.coverage_projection.control import validate, reference
+    saved, report = completed_control_fixture(); report = copy.deepcopy(report)
+    report['contract']['seed'] = 123
+    with pytest.raises(ValueError, match='results.json contract differs'): validate(saved, report)
+    with pytest.raises(ValueError, match='epoch_0001.pt missing'): reference(tmp_path)
+    workflow = (Path(__file__).resolve().parents[1]/'tools/coverage_projection/workflow.sh').read_text()
+    assert workflow.index('tools.coverage_projection.control') < workflow.index('torch.distributed.run')

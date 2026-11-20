@@ -59,6 +59,7 @@ def run(a, stop):
     inputs = DenseInputs(a.dataroot, a.dev_info, stc_root=a.stc_root, cache_mib=128)
     inventory = {kind: inputs.preflight([window(r) for r in selected], kind) for kind in ('occ', 'stc')}
     receipt = dict(candidate=sha(checkpoint), control=c['control_sha256'], keys=c['eval_keys'], inventory=inventory,
+        control_training_completion=control.get('source_checkpoint_completion'),
         full_grid=True, horizons=[1., 2., 3.], indices=[1, 3, 5], known='dense_valid',
         FREE=False, fixed_age=False, calibration=False, label_timing='all six forecasts before target labels')
     path = a.out_dir/'evaluation_state.json'
