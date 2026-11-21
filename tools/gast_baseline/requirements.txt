@@ -1,0 +1,13 @@
+# Inference, streamed metadata and the existing renderer, all in isolated gast.
+setuptools==69.5.1
+wheel==0.43.0
+numpy==1.23.5
+opencv-python==4.8.1.78
+einops==0.6.1
+PyYAML==6.0.2
+gdown==5.2.0
+ijson==3.3.0
+Pillow==10.4.0
+matplotlib==3.7.5
+pyvista==0.46.5
+vtk==9.5.2

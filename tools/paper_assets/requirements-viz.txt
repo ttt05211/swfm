@@ -1,0 +1,3 @@
+# Standalone visualization only; no training/Torch dependency changes needed.
+pyvista==0.46.5
+vtk==9.5.2
