@@ -287,3 +287,48 @@ def test_CPU_shell_steps_do_not_require_GPU_or_nvcc(tmp_path):
         subprocess.run([str(bash),str(script),phase],env=env,check=True,capture_output=True)
     text=log.read_text();assert 'nvcc' not in text and 'cuda.is_available' not in text
     assert '--no-cache-dir' in text and '--only-binary' in text and '-n gast' in text
+
+
+@pytest.mark.parametrize('phase', ['adopt-weights', 'cpucheck', 'render', 'check', 'infer'])
+def test_shell_isolates_foreign_torch_libraries_even_after_conda_activation(tmp_path, phase):
+    bash=Path('D:/Program Files/Git/bin/bash.exe')
+    if not bash.is_file():pytest.skip('Git Bash not available')
+    script=Path(__file__).resolve().parents[1]/'tools/gast_baseline/step.sh'
+    probe=tmp_path/'probe.sh';fake=tmp_path/'fakeconda';log=tmp_path/'probe.log'
+    probe.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+[[ -z "${LD_PRELOAD+x}" && -z "${PYTHONHOME+x}" ]]
+[[ "${PYTHONNOUSERSITE:-}" == 1 ]]
+[[ "$PYTHONPATH" == "$(cd "$GAST_TEST_ROOT" && pwd)" ]]
+[[ "${LD_LIBRARY_PATH:-}" == "$GAST_TEST_LIBS" ]]
+[[ "${CUDA_VISIBLE_DEVICES:-}" == "$GAST_TEST_GPU" ]]
+printf '%s\\n' "$*" >> "$GAST_TEST_LOG"
+''',encoding='utf-8')
+    fake.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+# No real Conda or Python is launched: simulate activation hooks then inspect
+# the environment of the exact command that would otherwise launch Python.
+while [[ $# -gt 0 && "$1" != env ]]; do shift; done
+[[ $# -gt 0 ]] || exit 98
+export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib
+# MSYS aborts before shell startup for nonexistent preload DLLs; keep the
+# variable present but empty to verify that the Python launch unsets it.
+export LD_PRELOAD='' PYTHONHOME=/foreign/python
+export PYTHONNOUSERSITE=0 PYTHONPATH=/foreign/site
+launch=()
+while [[ $# -gt 0 && "$1" != python ]]; do launch+=("$1"); shift; done
+[[ $# -gt 0 ]] || exit 97
+shift
+"${launch[@]}" bash "$GAST_TEST_PROBE" "$@"
+''',encoding='utf-8')
+    gpu=phase in ('check','infer')
+    drivers='/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64'
+    env={k:os.environ[k] for k in ('PATH','SystemRoot','SYSTEMROOT','WINDIR','TEMP','TMP','USERPROFILE') if k in os.environ}
+    env.update(CONDA_EXE=fake.as_posix(),GAST_TEST_PROBE=probe.as_posix(),
+        GAST_TEST_LOG=log.as_posix(),GAST_TEST_ROOT=script.parents[2].as_posix(),
+        GAST_TEST_LIBS=drivers if gpu else '',GAST_TEST_GPU='3' if gpu else '',GAST_GPU='3',
+        CUDA_VISIBLE_DEVICES='6,7',LD_PRELOAD='',PYTHONHOME='/foreign/python',
+        PYTHONPATH='/foreign/site',PYTHONNOUSERSITE='0',
+        LD_LIBRARY_PATH='/usr/local/lib/python3.12/dist-packages/torch/lib:'+drivers+':/foreign/site-packages/torch/lib:')
+    subprocess.run([str(bash),str(script),phase],env=env,check=True,capture_output=True)
+    assert log.read_text().count('\n')==(2 if phase=='render' else 1)

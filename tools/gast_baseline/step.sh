@@ -8,11 +8,30 @@ GAST_DIR="${GAST_REPO:-$TASK_ROOT/../GAST}"
 CONDA_BIN="${CONDA_EXE:-$(command -v conda || true)}"
 GAST_ENV_NAME="${GAST_ENV:-gast}"
 UPSTREAM=c4687255132e580468e1007168c57b00ce36b76a
+# Container images can export a Python 3.12 Torch library path into Python 3.10.
+# CPU steps need no inherited loader paths; GPU steps retain driver/CUDA paths,
+# excluding Python package libraries supplied by the other environment.
+GAST_CLEAN_LIBRARY_PATH=""
+if [[ "$STEP" == check || "$STEP" == infer ]]; then
+  IFS=: read -r -a gast_library_dirs <<< "${LD_LIBRARY_PATH:-}"
+  for gast_library_dir in "${gast_library_dirs[@]}"; do
+    case "$gast_library_dir" in
+      ""|*/site-packages|*/site-packages/*|*/dist-packages|*/dist-packages/*) ;;
+      *) GAST_CLEAN_LIBRARY_PATH="${GAST_CLEAN_LIBRARY_PATH:+$GAST_CLEAN_LIBRARY_PATH:}$gast_library_dir" ;;
+    esac
+  done
+fi
+unset LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME
+if [[ -n "$GAST_CLEAN_LIBRARY_PATH" ]]; then export LD_LIBRARY_PATH="$GAST_CLEAN_LIBRARY_PATH"; fi
 export PYTHONPATH="$TASK_ROOT" PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 # All preparation and rendering steps are permitted on a CPU-only instance.
 export CUDA_VISIBLE_DEVICES=""
-gp() { "$CONDA_BIN" run --no-capture-output -n "$GAST_ENV_NAME" python "$@"; }
+gast_python_env=(env -u LD_LIBRARY_PATH -u LD_PRELOAD -u PYTHONHOME PYTHONNOUSERSITE=1 PYTHONPATH="$TASK_ROOT")
+if [[ -n "$GAST_CLEAN_LIBRARY_PATH" ]]; then gast_python_env+=(LD_LIBRARY_PATH="$GAST_CLEAN_LIBRARY_PATH"); fi
+# Clean again after Conda activation, whose hooks may reintroduce image defaults.
+gp() { "$CONDA_BIN" run --no-capture-output -n "$GAST_ENV_NAME" "${gast_python_env[@]}" python "$@"; }
 dp() { gp "$@"; }
 need_conda() { [[ -n "$CONDA_BIN" ]] || { echo 'conda not found; initialize the existing miniconda installation first'; exit 1; }; }
 data_args=(--work "$WORK" --dataroot "${GAST_DATAROOT:-/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes}")

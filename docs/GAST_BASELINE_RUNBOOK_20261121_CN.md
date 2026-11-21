@@ -4,6 +4,8 @@
 
 **第1–7步可在没有GPU的CPU实例上完成。仅第8、9步需要一张GPU。** 所有脚本直接调用独立`gast`环境，不用反复手动激活Conda，不改原OccFM环境。安装使用预编译Torch/CUDA算子wheel，不调用nvcc。
 
+启动脚本自动隔离容器继承的其他Python环境：CPU阶段清除动态库搜索路径、预加载和PYTHONHOME，并禁用用户site；GPU阶段保留NVIDIA/CUDA等非Python包路径，过滤site-packages/dist-packages内的外部动态库。Conda激活后、Python启动前再次处理，避免系统Python3.12的Torch库混入gast的Python3.10。处理只作用于脚本及其子进程，不改父终端、环境安装或系统配置。权重已出现`GAST_ADOPTED`后不用再次接入，可直接继续`infos`。
+
 默认路径：
 
 | 内容 | 路径 |
