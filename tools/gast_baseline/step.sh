@@ -78,7 +78,10 @@ case "$STEP" in
     elif [[ "$result" != 0 ]]; then exit "$result"; fi
     ;;
   data)
-    need_conda; dp -u -m tools.gast_baseline.data prepare "${data_args[@]}"
+    need_conda; dp -u -m tools.gast_baseline.data prepare "${data_args[@]}" "$@"
+    ;;
+  timing)
+    need_conda; dp -u -m tools.gast_baseline.data timing "${data_args[@]}" "$@"
     ;;
   cpucheck)
     need_conda; gp -u -m tools.gast_baseline.cpu_check --work "$WORK" --gast-root "$GAST_DIR"
@@ -111,5 +114,6 @@ case "$STEP" in
     echo 'CPU phase: code -> env -> weights -> infos -> data -> cpucheck; optional render-libs -> render-check'
     echo 'GPU phase (ONE GPU): check -> infer. Then CPU: render. Reconnect: status; resume: SAME infer command.'
     echo 'Optional env: GAST_WORK, GAST_REPO, GAST_ASSETS, GAST_INFO, GAST_DATAROOT, GAST_GPU.'
+    echo 'Timing diagnostics: timing. Explicit same-method subset: data --skip-irregular-time (strict timing bounds unchanged).'
     ;;
 esac

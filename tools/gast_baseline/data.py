@@ -88,21 +88,64 @@ def paths(a):
     return work,assets,m,info
 
 
+def case_timing(key,case,source):
+    tokens=case['history_tokens']+case['future_tokens'];samples=[source.get('sample',t) for t in tokens]
+    if (len({s['scene_token'] for s in samples})!=1
+            or source.get('scene',samples[0]['scene_token'])['name']!=case['scene']
+            or any(x['next']!=y['token'] or y['prev']!=x['token'] for x,y in zip(samples,samples[1:]))):
+        raise ValueError('non-contiguous/cross-scene case: '+key)
+    # Subtract integer microseconds before converting to seconds, avoiding
+    # cancellation near the unchanged strict 0.35 / 0.65 second boundaries.
+    stamps=np.asarray([s['timestamp'] for s in samples],dtype=np.int64)
+    intervals=np.diff(stamps)/1e6;future_offsets=(stamps[4:]-stamps[3])/1e6
+    bad=np.flatnonzero((intervals<=.35)|(intervals>=.65))
+    return dict(scene=case['scene'],t0_token=case['t0_token'],eligible=not len(bad),
+        interval_seconds=intervals.tolist(),future_offset_seconds=future_offsets.tolist(),
+        bad_intervals=[dict(from_token=tokens[i],to_token=tokens[i+1],seconds=float(intervals[i])) for i in bad])
+
+
+def timing_report(work,assets,manifest,source):
+    cases={key:case_timing(key,case,source) for key,case in manifest['cases'].items()}
+    excluded={key:row for key,row in cases.items() if not row['eligible']}
+    report=dict(status='complete',assets=str(assets),assets_sha256=sha(assets),
+        policy='unchanged strict adjacent keyframes: 0.35 < dt_seconds < 0.65',
+        candidates=len(cases),eligible=len(cases)-len(excluded),excluded=len(excluded),cases=cases)
+    write_json(work/'timing_audit.json',report)
+    for key,row in excluded.items():
+        print('GAST_TIMING_INVALID',key,row['scene'],'bad_intervals='+json.dumps(row['bad_intervals']),flush=True)
+    print('GAST_TIMING',f'eligible={report["eligible"]}/{report["candidates"]}; excluded={report["excluded"]};',
+        work/'timing_audit.json',flush=True)
+    return report
+
+
+def audit_timing(a,*,source=None):
+    work,assets,m,_=paths(a)
+    if source is None:source=Metadata(a.dataroot,{t for c in m['cases'].values() for t in c['history_tokens']+c['future_tokens']})
+    return timing_report(work,assets,m,source)
+
+
 def prepare(a,*,source=None):
     work,assets,m,info=paths(a);idx,missing=probe_info(info,m)
     if missing:raise ValueError('Missing genuine ego fields; run step.sh infos. Examples='+str(missing[:5]))
     if source is None:
         source=Metadata(a.dataroot,{t for c in m['cases'].values() for t in c['history_tokens']+c['future_tokens']})
+    timing=timing_report(work,assets,m,source)
+    excluded={key:row for key,row in timing['cases'].items() if not row['eligible']}
+    if excluded and not getattr(a,'skip_irregular_time',False):
+        key=next(iter(excluded));row=excluded[key]
+        raise ValueError('expected actual 2Hz keyframes: '+key+'; bad intervals='+str(row['bad_intervals'])+
+            '; full diagnostics in '+str(work/'timing_audit.json')+
+            '; to explicitly exclude ONLY irregular-time qualitative cases, run step.sh data --skip-irregular-time')
+    included=[key for key in m['cases'] if key not in excluded]
+    if not any(k.startswith('short') for k in included) or not any(k.startswith('turn') for k in included):
+        raise ValueError('timing exclusion must retain at least one short and one long case; no prepared data was written')
     all_paths=[];result={};metadata=[]
     states,commands,_=required_fields(m)
     for key,c in m['cases'].items():
+        if key in excluded:
+            print('GAST_EXCLUDED_TIMING',key,c['scene'],'excluded from GT/GAST/CarryWorld together',flush=True)
+            continue
         tokens=c['history_tokens']+c['future_tokens'];samples=[source.get('sample',t) for t in tokens]
-        if (len({s['scene_token'] for s in samples})!=1
-                or source.get('scene',samples[0]['scene_token'])['name']!=c['scene']
-                or any(x['next']!=y['token'] or y['prev']!=x['token'] for x,y in zip(samples,samples[1:]))):
-            raise ValueError('non-contiguous/cross-scene case: '+key)
-        times=np.array([s['timestamp'] for s in samples],np.float64)/1e6
-        if not np.all((np.diff(times)>.35)&(np.diff(times)<.65)):raise ValueError('expected actual 2Hz keyframes: '+key)
         frames=[]
         for sample,token in zip(samples,tokens):
             sd=source.get('sample_data',sample['data']['LIDAR_TOP']);ego=source.get('ego_pose',sd['ego_pose_token'])
@@ -131,6 +174,7 @@ def prepare(a,*,source=None):
     payload=dict(format='GAST_CPU_prepared_v1',assets=str(assets),assets_sha256=sha(assets),info=str(info),info_sha256=sha(info),
         dataroot=str(a.dataroot.resolve()),grid=GRID,cases=result,inventory=file_inventory(all_paths),metadata=metadata,
         preparation='CPU only; genuine ego fields; future occupancy paths only; no new dense cache')
+    if excluded:payload['timing_exclusions']=dict(policy=timing['policy'],candidate_cases=len(m['cases']),cases=excluded)
     target=work/'prepared.json'
     if target.exists() and read_json(target)!=payload:raise ValueError('prepared data changed; use a NEW GAST_WORK directory')
     write_json(target,payload)
@@ -139,15 +183,19 @@ def prepare(a,*,source=None):
 
 
 def parser():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=('probe','prepare'))
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=('probe','prepare','timing'))
     p.add_argument('--work',type=Path,required=True);p.add_argument('--assets',type=Path)
     p.add_argument('--dataroot',type=Path,default=Path('/root/nas/occ/OccFM-NeurIPS2025-main/data/nuscenes'))
-    p.add_argument('--info',type=Path);return p
+    p.add_argument('--info',type=Path)
+    p.add_argument('--skip-irregular-time',action='store_true',
+        help='explicitly exclude only cases outside the unchanged 2Hz timing check; SAME subset for GT/GAST/CarryWorld')
+    return p
 
 
 def main():
     a=parser().parse_args()
     if a.action=='prepare':prepare(a)
+    elif a.action=='timing':audit_timing(a)
     else:
         _,assets,m,info=paths(a)
         if not info.is_file():

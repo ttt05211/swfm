@@ -69,6 +69,20 @@ bash tools/gast_baseline/step.sh data
 
 验证同scene、连续2Hz keyframe、ego2global、wxyz四元数、真实ego字段、与原CarryWorld包完全相同的未来位姿。只产生小型`prepared.json`，不复制标签、不生成dense cache，不改任何原数据。缺失字段不以零代替。
 
+若出现`expected actual 2Hz keyframes: turn03`等时间检查失败，默认仍严格停止，并生成`timing_audit.json`，记录所有候选的真实相邻间隔、未来相对t0时距，以及异常间隔两端token。可只运行诊断（不读取占据标签、不需要GPU或info pickle）：
+
+```bash
+bash tools/gast_baseline/step.sh timing
+```
+
+本任务是定性图的候选导出；如接受排除未通过原时间检查的候选，用明确选项继续：
+
+```bash
+bash tools/gast_baseline/step.sh data --skip-irregular-time
+```
+
+该选项保留原严格边界`0.35 < 相邻帧间隔 < 0.65秒`；不改时间戳、不插帧、不重采样、不换token或给不合格窗口贴1–6s标签。只排除时间检查不通过的整个窗口，并同时从GT/GAST/CarryWorld三行排除；与分数无关。跨scene、非连续token、ego不一致、文件缺失仍报错，不会借此跳过。必须至少留下一个短时和一个长时窗口。控制台打印`GAST_TIMING_INVALID`与`GAST_EXCLUDED_TIMING`；准备清单和最终下载包的`timing_exclusions`记录原候选数、排除原因、真实间隔及被排除ID。原CarryWorld候选ZIP不改，剩余图保持同窗。已有不同准备清单或推理结果也不会覆盖。
+
 ### 6. CPU严格加载权重
 
 ```bash

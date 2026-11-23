@@ -44,6 +44,7 @@ def packet(work,prepared,receipt):
         horizon_definition='2Hz: short exact 1/2/3s; long exact 1..6s from two 3s blocks',
         long_protocol='released 3s checkpoint, 2x3s rollout; predicted histories in block2; GT ego in both',
         not_official_long_term_table=True,source_sha256=SOURCE_SHA,cases={})
+    if prepared.get('timing_exclusions'):manifest['timing_exclusions']=prepared['timing_exclusions']
     for key,case in prepared['cases'].items():
         path=work/'predictions'/f'{key}.npz';load_prediction(path,case,prepared['grid']['shape_hwd'])
         manifest['cases'][key]=dict(scene=case['original']['scene'],t0_token=case['original']['t0_token'],

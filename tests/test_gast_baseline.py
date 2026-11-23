@@ -115,8 +115,10 @@ def test_CPU_data_genuine_fields_flat_or_scene_and_missing_rejected(tmp_path,mon
     assert a.assets.stat().st_size<2**20
 
 
-def test_data_rejects_cross_scene_and_mismatched_original_future_pose(tmp_path):
+@pytest.mark.parametrize('skip_irregular_time',[False,True])
+def test_data_rejects_cross_scene_and_mismatched_original_future_pose(tmp_path,skip_irregular_time):
     a,source=make_assets(tmp_path,2)
+    a.skip_irregular_time=skip_irregular_time
     original=source.get
     def wrong(table,token):
         r=copy.deepcopy(original(table,token))
@@ -128,6 +130,74 @@ def test_data_rejects_cross_scene_and_mismatched_original_future_pose(tmp_path):
         if table=='ego_pose' and token=='0_4':r['translation'][0]+=1
         return r
     with pytest.raises(ValueError,match='ego2global'):data.prepare(a,source=SimpleNamespace(get=wrong_pose))
+
+
+def test_time_audit_strict_default_and_explicit_same_window_exclusion(tmp_path):
+    a,source=make_assets(tmp_path);before=common.sha(a.assets)
+    source.get('sample','1_7')['timestamp']+=300000
+    with pytest.raises(ValueError,match='expected actual 2Hz keyframes: turn01'):
+        data.prepare(a,source=source)
+    assert not (a.work/'prepared.json').exists()
+    report=common.read_json(a.work/'timing_audit.json')
+    assert (report['candidates'],report['eligible'],report['excluded'])==(4,3,1)
+    bad=report['cases']['turn01']['bad_intervals']
+    assert [r['seconds'] for r in bad]==[.8,.2]
+    assert bad[0]['from_token']=='1_6' and bad[0]['to_token']=='1_7'
+    assert report['cases']['turn01']['future_offset_seconds'][3]==2.3
+    a.skip_irregular_time=True;prepared=data.prepare(a,source=source)
+    assert list(prepared['cases'])==['short01','short02','turn02']
+    assert list(prepared['timing_exclusions']['cases'])==['turn01']
+    assert prepared['timing_exclusions']['candidate_cases']==4
+    original=common.checked_archive(a.assets)
+    for key,case in prepared['cases'].items():assert case['original']==original['cases'][key]
+    assert not any('/scene-1/' in path.replace('\\','/') for path,_,_ in prepared['inventory'])
+    saved=common.sha(a.work/'prepared.json')
+    assert prepared==data.prepare(a,source=source)
+    assert saved==common.sha(a.work/'prepared.json') and before==common.sha(a.assets)
+
+
+def test_timing_diagnostic_needs_no_info_pickle_and_no_occupancy_reads(tmp_path):
+    a,source=make_assets(tmp_path,2);a.info.unlink()
+    report=data.audit_timing(a,source=source)
+    assert report['eligible']==2 and report['excluded']==0
+    assert report['cases']['turn01']['future_offset_seconds']==[.5*i for i in range(1,13)]
+    assert not (a.work/'prepared.json').exists()
+
+
+def test_timing_exclusion_cannot_remove_all_long_cases(tmp_path):
+    a,source=make_assets(tmp_path,2);a.skip_irregular_time=True
+    source.get('sample','1_7')['timestamp']+=300000
+    with pytest.raises(ValueError,match='retain at least one short and one long'):
+        data.prepare(a,source=source)
+    assert not (a.work/'prepared.json').exists()
+
+
+def test_excluded_timing_case_stays_excluded_for_all_models_and_packet_resume(tmp_path):
+    a,source=make_assets(tmp_path);a.skip_irregular_time=True
+    source.get('sample','1_7')['timestamp']+=300000
+    prepared=data.prepare(a,source=source);seen=[]
+    args=SimpleNamespace(action='infer',work=a.work,gast_root=tmp_path,weight=tmp_path/'unused',device='cpu')
+    def compute(net,case,archive,key,device):
+        assert key!='turn01';seen.append(key)
+        def predict(net,history,frames,device):return np.repeat(history[-1:],len(frames)-4,axis=0)
+        return export.compute_case(net,case,archive,key,device,predict=predict)
+    export.run(args,threading.Event(),factory=lambda *args:(object(),{'test':'no released weights'}),compute=compute)
+    assert seen==list(prepared['cases'])
+    assert not (a.work/'predictions/turn01.npz').exists()
+    progress=common.read_json(a.work/'progress.json');assert progress['windows']==progress['total']==3
+    packet=a.work/'comparison_assets.zip';before=common.sha(packet)
+    with zipfile.ZipFile(packet) as z:
+        manifest=json.loads(z.read('manifest.json'))
+        assert manifest['timing_exclusions']==prepared['timing_exclusions']
+        assert list(manifest['cases'])==list(prepared['cases'])
+        assert 'cases/turn01.npz' not in z.namelist()
+        for key in manifest['cases']:
+            with np.load(io.BytesIO(z.read('cases/'+key+'.npz')),allow_pickle=False) as values:
+                np.testing.assert_array_equal(values['gt'],values['g'])
+                np.testing.assert_array_equal(values['gt'],values['e'])
+    export.run(args,threading.Event(),factory=lambda *args:(object(),{'test':'no released weights'}),
+        compute=lambda *args:pytest.fail('completed matching subset must be reused'))
+    assert before==common.sha(packet)
 
 
 def test_actual_streamed_metadata_matches_SDK_reverse_lookup_without_GPU(tmp_path,monkeypatch):
@@ -283,10 +353,12 @@ def test_CPU_shell_steps_do_not_require_GPU_or_nvcc(tmp_path):
     log=tmp_path/'calls';fake=tmp_path/'fakeconda'
     fake.write_text('#!/usr/bin/env bash\n[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] || exit 99\nprintf "%s\\n" "$*" >> "$GAST_TEST_LOG"\n',encoding='utf-8')
     env=dict(os.environ,CONDA_EXE=fake.as_posix(),GAST_TEST_LOG=log.as_posix())
-    for phase in ('env','weights','infos','data','cpucheck','status','render-check','render'):
+    for phase in ('env','weights','infos','timing','data','cpucheck','status','render-check','render'):
         subprocess.run([str(bash),str(script),phase],env=env,check=True,capture_output=True)
+    subprocess.run([str(bash),str(script),'data','--skip-irregular-time'],env=env,check=True,capture_output=True)
     text=log.read_text();assert 'nvcc' not in text and 'cuda.is_available' not in text
     assert '--no-cache-dir' in text and '--only-binary' in text and '-n gast' in text
+    assert 'tools.gast_baseline.data timing' in text and '--skip-irregular-time' in text
 
 
 @pytest.mark.parametrize('phase', ['adopt-weights', 'cpucheck', 'render', 'check', 'infer'])
