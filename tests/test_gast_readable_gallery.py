@@ -50,6 +50,24 @@ def test_input_pose_required_to_include_t0_in_the_same_fixed_frame():
         gallery.comparison_rows('short01', arrays, case, 'motion', dict(pose, t0_token='wrong'))
 
 
+def test_long_ego_view_keeps_all_native_voxels_without_extra_future_pose_transform():
+    poses = np.repeat(np.eye(4)[None], 12, axis=0)
+    poses[:, 0, 3] = np.arange(1, 13)*5.
+    case = dict(t0_token='anchor', future_ego_poses=poses.tolist(), report_indices=[1, 3, 5, 7, 9, 11])
+    arrays = {name: np.full((6, 2, 2, 2), 17, np.uint8) for name in ('gt', 'g', 'e')}
+    arrays['t0'] = np.full((2, 2, 2), 17, np.uint8)
+    rows, columns, settings, frame = gallery.comparison_rows('turn07', arrays, case, 'ego')
+    assert columns == ['1 s', '2 s', '3 s', '4 s', '5 s', '6 s']
+    assert settings == {} and frame == 'each future ego frame; camera follows ego'
+    for (_, panels), key in zip(rows, ('gt', 'g', 'e')):
+        assert len(panels) == 6
+        for i, panel in enumerate(panels):
+            assert np.shares_memory(panel, arrays[key])
+            np.testing.assert_array_equal(panel, arrays[key][i])
+    fixed = gallery.comparison_rows('turn07', arrays, case, 'motion')
+    assert fixed[2] and fixed[3] == 'fixed 1s ego reference'
+
+
 def test_pose_sidecar_checks_exact_preparation_and_does_not_rewrite_existing_export(tmp_path):
     case, _ = sample_case()
     frames = [dict(token='past', pose=np.eye(4).tolist()) for _ in range(4)]

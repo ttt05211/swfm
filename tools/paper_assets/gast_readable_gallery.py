@@ -52,6 +52,14 @@ def checked_input_poses(path, manifest):
 
 
 def comparison_rows(key, arrays, case, view, input_pose=None):
+    if view == 'ego':
+        short = key.startswith('short')
+        rows = [(label, [arrays['t0'], *arrays[name]] if short else list(arrays[name]))
+                for label, name in (('GT', 'gt'), ('GAST', 'g'), ('CarryWorld', 'e'))]
+        columns = [f'{i} s' for i in range(1, len(case['report_indices'])+1)]
+        if short:
+            columns = ['t0', *columns]
+        return rows, columns, {}, 'each future ego frame; camera follows ego'
     if view == 'native':
         rows, columns, settings = rows_and_settings(key, arrays, case['future_ego_poses'])
         frame = 'each future ego frame' if key.startswith('short') else 'fixed 1s ego reference'
@@ -133,7 +141,8 @@ def render(assets, out, *, view='native', cases=None, input_poses=None):
             entries.append(f'<h2>{title}</h2><p>{frame}</p><a href="{key}.png">'
                            f'<img loading="lazy" style="width:100%;max-width:1800px" src="{key}.png"></a>')
             print('GAST_DISPLAY', view, key, case['scene'], frame, flush=True)
-    notes = ('Short native views: t0/1/2/3s in their respective ego frames. '
+    notes = ('Ego views: ALL future frames in their respective ego coordinates; display camera follows ego. '
+             'Short native views: t0/1/2/3s in their respective ego frames; legacy native long views use fixed 1s reference. '
              'Motion views: all displayed futures use the SAME 1s reference. '
              'Without the exact input pose, t0 is omitted from motion views. '
              'All methods/horizons use one shared transparent-margin crop and scale. '
@@ -153,7 +162,7 @@ def main():
     draw = sub.add_parser('render')
     draw.add_argument('--assets', type=Path, required=True)
     draw.add_argument('--out', type=Path, required=True)
-    draw.add_argument('--view', choices=('native', 'motion'), default='native')
+    draw.add_argument('--view', choices=('native', 'motion', 'ego'), default='native')
     draw.add_argument('--cases', nargs='+')
     draw.add_argument('--input-poses', type=Path)
     args = parser.parse_args()
