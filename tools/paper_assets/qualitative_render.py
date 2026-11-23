@@ -58,7 +58,8 @@ def fixed_reference_settings(panels, future_poses):
             for frame, transform in zip(panels, transforms)}
 
 
-def render_grid(rows, columns, grid, size, camera, *, preview=False, panel_settings=None):
+def render_grid(rows, columns, grid, size, camera, *, preview=False, panel_settings=None,
+                trim_margins=False, fit_content=False):
     # Reuse the same rendered t0 wherever all models share the observed input.
     width, height = size
     reference = camera == 'come_reference'
@@ -77,12 +78,16 @@ def render_grid(rows, columns, grid, size, camera, *, preview=False, panel_setti
                     camera_audit = {key: audit[key] for key in
                                     ('fitted_camera', 'view_angle', 'camera_clipping_range',
                                      'automatic_camera_fit')}
-    if reference:
+    if reference and not trim_margins:
         trimmed = list(rendered.values())
         crop = (0, 0, *render_size)
     else:
         trimmed, crop = vtk_render.trim_sequence(list(rendered.values()))
     crop_w, crop_h = trimmed[0].size
+    if fit_content:
+        # One aspect ratio for every method and horizon of this case. Only
+        # the common transparent margin is removed; geometry is unchanged.
+        height = max(120, round(width * crop_h / crop_w))
     scale = min((width - 12) / crop_w, (height - 12) / crop_h)
     display_size = (round(crop_w * scale), round(crop_h * scale))
     rendered = {key: panel.resize(display_size, Image.Resampling.LANCZOS) for key, panel in zip(rendered, trimmed)}
@@ -113,7 +118,8 @@ def render_grid(rows, columns, grid, size, camera, *, preview=False, panel_setti
     return canvas, dict(camera=camera, native_geometry=True, panel_width=width, panel_height=height,
                         shared_pixel_crop=list(crop), palette=PALETTE.tolist(), columns=columns,
                         rows=[label for label, _ in rows], raw_render_size=list(render_size),
-                        automatic_margin_crop=not reference,
+                        automatic_margin_crop=not reference or trim_margins,
+                        content_aspect_panels=fit_content,
                         camera_parameters=camera_audit,
                         backend='PyVista / VTK', mayavi_executed=False)
 

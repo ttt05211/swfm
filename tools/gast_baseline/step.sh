@@ -83,6 +83,10 @@ case "$STEP" in
   timing)
     need_conda; dp -u -m tools.gast_baseline.data timing "${data_args[@]}" "$@"
     ;;
+  display-poses)
+    need_conda; dp -u -m tools.paper_assets.gast_readable_gallery export-poses \
+      --prepared "$WORK/prepared.json" --out "$WORK/display_input_poses.json" "$@"
+    ;;
   cpucheck)
     need_conda; gp -u -m tools.gast_baseline.cpu_check --work "$WORK" --gast-root "$GAST_DIR"
     ;;
@@ -115,5 +119,6 @@ case "$STEP" in
     echo 'GPU phase (ONE GPU): check -> infer. Then CPU: render. Reconnect: status; resume: SAME infer command.'
     echo 'Optional env: GAST_WORK, GAST_REPO, GAST_ASSETS, GAST_INFO, GAST_DATAROOT, GAST_GPU.'
     echo 'Timing diagnostics: timing. Explicit same-method subset: data --skip-irregular-time (strict timing bounds unchanged).'
+    echo 'CPU-only t0 pose export for fixed-reference figures: display-poses (small JSON; no model inference).'
     ;;
 esac

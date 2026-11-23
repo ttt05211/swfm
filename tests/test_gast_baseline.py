@@ -353,7 +353,7 @@ def test_CPU_shell_steps_do_not_require_GPU_or_nvcc(tmp_path):
     log=tmp_path/'calls';fake=tmp_path/'fakeconda'
     fake.write_text('#!/usr/bin/env bash\n[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] || exit 99\nprintf "%s\\n" "$*" >> "$GAST_TEST_LOG"\n',encoding='utf-8')
     env=dict(os.environ,CONDA_EXE=fake.as_posix(),GAST_TEST_LOG=log.as_posix())
-    for phase in ('env','weights','infos','timing','data','cpucheck','status','render-check','render'):
+    for phase in ('env','weights','infos','timing','data','display-poses','cpucheck','status','render-check','render'):
         subprocess.run([str(bash),str(script),phase],env=env,check=True,capture_output=True)
     subprocess.run([str(bash),str(script),'data','--skip-irregular-time'],env=env,check=True,capture_output=True)
     text=log.read_text();assert 'nvcc' not in text and 'cuda.is_available' not in text
