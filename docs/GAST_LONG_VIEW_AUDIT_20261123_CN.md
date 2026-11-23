@@ -46,3 +46,13 @@ python -m tools.paper_assets.gast_scene_panels \
 ```
 
 ZIP只含`scene-1064`和`scene-0797`两个目录，各`gt_0..3.png`、`carry_0..3.png`、`gast_0..3.png`，共24张。0/1/2/3对应0/1/2/3秒，原ego坐标，不附加future→固定参考变换。每个场景共用一次完整内容并集裁边，保持10个独立渲染（3行共用t0）之间相同比例。保留原生渲染像素，白底RGB、300dpi标记，没有文字或边框。接入记录在解压目录根下，用户要求的ZIP中不放额外文件。
+
+长时仅导出GT与CarryWorld，例如scene-0345/scene-0916：
+
+```bash
+python -m tools.paper_assets.gast_scene_panels \
+  --assets /path/comparison_assets.zip --out /NEW/long_selected_scenes \
+  --scenes 0345 0916 --horizon long --models gt carry
+```
+
+每个场景`gt_1..6.png`与`carry_1..6.png`，数字直接对应1–6秒，共12张；不导出GAST，也不放入t0。长时逐帧ego坐标，不做固定世界参考显示变换。两模型六时距共用外边缘裁剪，场景内每张PNG尺寸和比例一致。默认不传`--horizon`/`--models`时保留原短时三模型导出行为。

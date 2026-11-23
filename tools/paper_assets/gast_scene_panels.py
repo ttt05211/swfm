@@ -1,4 +1,4 @@
-"""Export 12 independent native-ego PNGs per selected short scene."""
+"""Export independent native-ego PNGs per selected short or long scene."""
 import argparse
 import hashlib
 import io
@@ -13,8 +13,16 @@ from tools.gast_baseline.common import FORMAT, sha, write_json
 from . import vtk_render
 
 
-def export(assets, out, scenes):
+def export(assets, out, scenes, *, horizon='short', models=('gt', 'carry', 'gast')):
     assets, out = Path(assets), Path(out)
+    if horizon not in ('short', 'long'):
+        raise ValueError('short or long horizon required')
+    sources = dict(gt='gt', carry='e', gast='g')
+    if not models or len(set(models)) != len(models) or not set(models) <= set(sources):
+        raise ValueError('select unique gt/carry/gast models')
+    short = horizon == 'short'
+    times = [0, 1, 2, 3] if short else [1, 2, 3, 4, 5, 6]
+    report_indices = [1, 3, 5] if short else [1, 3, 5, 7, 9, 11]
     names = []
     for scene in scenes:
         match = re.fullmatch(r'(?:scene-)?(\d{1,4})', scene)
@@ -26,7 +34,7 @@ def export(assets, out, scenes):
     if out.exists() or out.with_suffix('.zip').exists():
         raise ValueError('choose a NEW output path; existing exports are preserved')
     receipt = dict(source=str(assets.resolve()), source_sha256=sha(assets), view='native ego at each time',
-                   camera='come_reference', times_s=[0, 1, 2, 3], scenes={})
+                   camera='come_reference', times_s=times, models=list(models), scenes={})
     with zipfile.ZipFile(assets) as archive:
         if len(archive.namelist()) != len(set(archive.namelist())):
             raise ValueError('duplicate source archive members')
@@ -35,14 +43,15 @@ def export(assets, out, scenes):
             raise ValueError('completed GAST comparison packet required')
         selected = {}
         for scene in names:
-            hits = [key for key, case in manifest['cases'].items() if key.startswith('short') and case['scene'] == scene]
+            hits = [key for key, case in manifest['cases'].items()
+                    if key.startswith('short' if short else 'turn') and case['scene'] == scene]
             if len(hits) != 1:
-                raise ValueError('one unambiguous short case required: ' + scene)
+                raise ValueError('one unambiguous '+horizon+' case required: ' + scene)
             selected[scene] = hits[0]
         for scene, key in selected.items():
             case = manifest['cases'][key]; payload = archive.read('cases/'+key+'.npz')
-            if case['report_indices'] != [1, 3, 5]:
-                raise ValueError('exact 1/2/3s short readouts required')
+            if case['report_indices'] != report_indices:
+                raise ValueError('exact integer-second '+horizon+' readouts required')
             if hashlib.sha256(payload).hexdigest() != case['sha256']:
                 raise ValueError('source prediction checksum differs')
             with np.load(io.BytesIO(payload), allow_pickle=False) as packed:
@@ -51,9 +60,10 @@ def export(assets, out, scenes):
             if set(arrays) != {'t0', 'gt', 'g', 'e'}:
                 raise ValueError('native comparison arrays required')
             for name, array in arrays.items():
-                if array.dtype != np.uint8 or array.shape != (shape if name == 't0' else (3, *shape)) or np.any(array > 17):
-                    raise ValueError('short native semantic array required')
-            rows = [(name, [arrays['t0'], *arrays[source]]) for name, source in (('gt', 'gt'), ('carry', 'e'), ('gast', 'g'))]
+                if array.dtype != np.uint8 or array.shape != (shape if name == 't0' else (len(report_indices), *shape)) or np.any(array > 17):
+                    raise ValueError(horizon+' native semantic array required')
+            rows = [(name, [arrays['t0'], *arrays[sources[name]]] if short else list(arrays[sources[name]]))
+                    for name in models]
             raw = {}
             for _, frames in rows:
                 for sem in frames:
@@ -64,21 +74,22 @@ def export(assets, out, scenes):
             images = dict(zip(raw, trimmed)); folder = out/scene; folder.mkdir(parents=True)
             hashes = {}
             for prefix, frames in rows:
-                for time, sem in enumerate(frames):
+                for time, sem in zip(times, frames):
                     image = images[id(sem)]; opaque = Image.new('RGB', image.size, 'white')
                     opaque.paste(image, mask=image.getchannel('A'))
                     target = folder/f'{prefix}_{time}.png'; opaque.save(target, dpi=(300, 300))
                     hashes[target.name] = sha(target)
-            assert hashes['gt_0.png'] == hashes['carry_0.png'] == hashes['gast_0.png']
+            if short:
+                assert len({hashes[f'{name}_0.png'] for name in models}) == 1
             receipt['scenes'][scene] = dict(case=key, crop=box, pixel_size=list(trimmed[0].size), files=hashes)
-            print('GAST_SCENE_PANELS', scene, key, '12 PNGs', flush=True)
+            print('GAST_SCENE_PANELS', scene, key, len(times)*len(models), 'PNGs', flush=True)
     target = out.with_suffix('.zip')
     with zipfile.ZipFile(target, 'w', zipfile.ZIP_STORED) as archive:
         for scene in names:
             for image in sorted((out/scene).glob('*.png')):
                 archive.write(image, image.relative_to(out).as_posix())
     with zipfile.ZipFile(target) as archive:
-        if archive.testzip() is not None or len(archive.namelist()) != 12*len(names):
+        if archive.testzip() is not None or len(archive.namelist()) != len(times)*len(models)*len(names):
             raise ValueError('export ZIP did not validate')
     write_json(out/'export_receipt.json', receipt)
     print('GAST_SCENE_ZIP', target.resolve(), f'{target.stat().st_size/2**20:.2f} MiB', flush=True)
@@ -90,5 +101,7 @@ if __name__ == '__main__':
     parser.add_argument('--assets', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--scenes', nargs='+', required=True)
+    parser.add_argument('--horizon', choices=('short', 'long'), default='short')
+    parser.add_argument('--models', nargs='+', choices=('gt', 'carry', 'gast'), default=['gt', 'carry', 'gast'])
     args = parser.parse_args()
-    export(args.assets, args.out, args.scenes)
+    export(args.assets, args.out, args.scenes, horizon=args.horizon, models=args.models)
