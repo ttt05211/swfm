@@ -56,3 +56,16 @@ python -m tools.paper_assets.gast_scene_panels \
 ```
 
 每个场景`gt_1..6.png`与`carry_1..6.png`，数字直接对应1–6秒，共12张；不导出GAST，也不放入t0。长时逐帧ego坐标，不做固定世界参考显示变换。两模型六时距共用外边缘裁剪，场景内每张PNG尺寸和比例一致。默认不传`--horizon`/`--models`时保留原短时三模型导出行为。
+
+## 压缩留白与统一放大
+
+用户要求0345/0916长时主体进一步放大。旧透明边界裁剪会被SSAA极浅alpha边缘撑开，实际图像上方仍有约260像素近白留白。新增可选紧凑取景，不改旧导出默认值：
+
+```bash
+python -m tools.paper_assets.gast_scene_panels \
+  --assets /path/comparison_assets.zip --out /NEW/long_zoom125 \
+  --scenes 0345 0916 --horizon long --models gt carry \
+  --tight-frame --zoom 1.25 --render-scale 1.5
+```
+
+`--tight-frame`按白底合成后实际可见像素求所有方法、所有时距边界并集（RGB任一通道<245），保留约16/2560宽度的共同外边距。`--zoom 1.25`在共同裁剪框中心进一步统一收紧到原宽高的1/1.25；会裁掉部分外圈几何，不能称为完整网格无裁剪图。不是每帧独立缩放，也不根据某一方法的误差选区域。`--render-scale 1.5`先以3840×2160原生VTK渲染，再裁图，不插值放大PNG；COME相机方向、颜色、逐帧ego坐标和语义数据不变。源包渲染前后SHA复核，receipt记录可见并集框、最终裁剪框、分辨率及统一放大参数。PNG/ZIP命名及目录结构不变，新输出路径保留原图。
